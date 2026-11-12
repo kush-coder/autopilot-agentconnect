@@ -1,0 +1,251 @@
+import { describe, it, expect, vi } from 'vitest'
+import type { RdChat, RdWebchatImageUpdate, RdWebchatPost } from '@agentconnect.md/protocol'
+import {
+  WebchatRouter,
+  bindWebchatPostAuthor,
+  fanImageUpdate,
+  imageUpdateBound,
+  type CachedParticipant
+} from './webchat-router.js'
+
+const CHAT_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const CHAT_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+
+function chat(chatId: string): RdChat {
+  return {
+    chatId,
+    seq: 0,
+    event: { kind: 'done', done: { conversationId: chatId, turnId: CHAT_B } }
+  }
+}
+const sink = () => ({ onChat: vi.fn<(chat: RdChat) => void>() })
+
+describe('WebchatRouter', () => {
+  it('delivers an rd/chat to the sink registered for its chatId', () => {
+    const r = new WebchatRouter()
+    const a = sink()
+    r.register(CHAT_A, a)
+    r.deliver(chat(CHAT_A))
+    expect(a.onChat).toHaveBeenCalledWith(chat(CHAT_A))
+    expect(r.size()).toBe(1)
+  })
+
+  it('drops an rd/chat with no attached browser (no throw)', () => {
+    const r = new WebchatRouter()
+    expect(() => r.deliver(chat(CHAT_A))).not.toThrow()
+  })
+
+  it('routes each chatId to its own sink', () => {
+    const r = new WebchatRouter()
+    const a = sink()
+    const b = sink()
+    r.register(CHAT_A, a)
+    r.register(CHAT_B, b)
+    r.deliver(chat(CHAT_B))
+    expect(a.onChat).not.toHaveBeenCalled()
+    expect(b.onChat).toHaveBeenCalledOnce()
+  })
+
+  it('unregister removes the sink and stops delivery', () => {
+    const r = new WebchatRouter()
+    const a = sink()
+    r.register(CHAT_A, a)
+    r.unregister(CHAT_A, a)
+    r.deliver(chat(CHAT_A))
+    expect(a.onChat).not.toHaveBeenCalled()
+    expect(r.size()).toBe(0)
+  })
+
+  it('a stale close removes only its own subscription', () => {
+    const r = new WebchatRouter()
+    const first = sink()
+    const second = sink()
+    r.register(CHAT_A, first)
+    r.register(CHAT_A, second)
+    r.unregister(CHAT_A, first)
+    r.deliver(chat(CHAT_A))
+    expect(second.onChat).toHaveBeenCalledOnce()
+    expect(first.onChat).not.toHaveBeenCalled()
+  })
+
+  it('tells every attached browser that a daemon relinked', () => {
+    const r = new WebchatRouter()
+    const a = { ...sink(), onDaemonReady: vi.fn<(daemonId: string) => void>() }
+    const b = { ...sink(), onDaemonReady: vi.fn<(daemonId: string) => void>() }
+    r.register(CHAT_A, a)
+    r.register(CHAT_B, b)
+    r.register(CHAT_B, sink()) // a minimal sink without the hook stays valid
+    r.deliverDaemonReady('daemon-1')
+    expect(a.onDaemonReady).toHaveBeenCalledWith('daemon-1')
+    expect(b.onDaemonReady).toHaveBeenCalledWith('daemon-1')
+  })
+
+  it('keeps the newest roster: an older verdict never replaces a newer one', () => {
+    const r = new WebchatRouter()
+    const joined = [{ agentId: CHAT_A }, { agentId: CHAT_B }]
+    r.rememberRoster(CHAT_A, joined, 2_000)
+    r.rememberRoster(CHAT_A, [{ agentId: CHAT_A }], 1_000)
+    expect(r.rosterOf(CHAT_A)).toEqual(joined)
+    r.rememberRoster(CHAT_A, [{ agentId: CHAT_A }], 3_000)
+    expect(r.rosterOf(CHAT_A)).toEqual([{ agentId: CHAT_A }])
+  })
+})
+
+// webchat-multi-agents.md §5.2a: an rd/webchat-post's authorship claim must be bound
+// to the AUTHENTICATED source daemon before its context copies may keep the
+// activation-capable depth stamp; an unbound claim is stripped to the pre-§5.2a
+// transcript-only shape rather than dropped.
+describe('bindWebchatPostAuthor', () => {
+  const AGENT = '11111111-1111-4111-8111-111111111111'
+  const OTHER = '22222222-2222-4222-8222-222222222222'
+  const post = (over: Partial<RdWebchatPost['post']['author']> = {}, agentId = AGENT): RdWebchatPost => ({
+    conversationId: CHAT_A,
+    agentId,
+    post: {
+      postId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+      conversationId: CHAT_A,
+      author: { kind: 'agent', agentId: AGENT, hopCount: 3, ...over } as RdWebchatPost['post']['author'],
+      text: 'hi',
+      at: 1_000
+    }
+  })
+  const roster: CachedParticipant[] = [
+    { agentId: AGENT, daemonId: 'daemon-1' },
+    { agentId: OTHER, daemonId: 'daemon-2' }
+  ]
+
+  it('keeps the depth when outer/inner authors agree and the verified placement is the sending daemon', () => {
+    const p = post()
+    const bound = bindWebchatPostAuthor(p, 'daemon-1', roster)
+    expect(bound.authorBound).toBe(true)
+    expect(bound.post).toBe(p) // verbatim — nothing rewritten on the bound path
+  })
+
+  it('strips the depth when the frame arrives from a daemon that does not own the claimed author', () => {
+    const bound = bindWebchatPostAuthor(post(), 'daemon-2', roster)
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post.post.author).toEqual({ kind: 'agent', agentId: AGENT }) // transcript-only shape
+  })
+
+  it('strips the depth when the outer and inner author fields disagree', () => {
+    const bound = bindWebchatPostAuthor(post({ agentId: OTHER }), 'daemon-1', roster)
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post.post.author).toEqual({ kind: 'agent', agentId: OTHER })
+  })
+
+  it('fails closed on a missing/evicted roster: depth stripped', () => {
+    const bound = bindWebchatPostAuthor(post(), 'daemon-1', [])
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post.post.author).toEqual({ kind: 'agent', agentId: AGENT })
+  })
+
+  it('fails closed when the cached participant has no placement daemonId', () => {
+    const bound = bindWebchatPostAuthor(post(), 'daemon-1', [{ agentId: AGENT }])
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post.post.author).toEqual({ kind: 'agent', agentId: AGENT })
+  })
+
+  // §3.1a: a removal reaches this relay as a newer, shrunk roster; the removed member's late post is shown but wakes no one.
+  it('after a removal refresh, a removed member gets no fan-out and its late post is delivered without depth', () => {
+    const r = new WebchatRouter()
+    r.rememberRoster(CHAT_A, roster, 1_000)
+    r.rememberRoster(CHAT_A, [roster[0]!], 2_000)
+    expect(r.rosterOf(CHAT_A).map((p) => p.agentId)).toEqual([AGENT])
+
+    const browser = { onChat: vi.fn(), onPost: vi.fn<(post: RdWebchatPost) => void>() }
+    r.register(CHAT_A, browser)
+    const bound = bindWebchatPostAuthor(post({ agentId: OTHER }, OTHER), 'daemon-2', r.rosterOf(CHAT_A))
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post.post.author).toEqual({ kind: 'agent', agentId: OTHER })
+    r.deliverPost(bound.post)
+    expect(browser.onPost).toHaveBeenCalledWith(bound.post)
+  })
+
+  it('leaves a depth-less (pre-parity) post verbatim — nothing to strip, still unbound', () => {
+    const p = post({ hopCount: undefined })
+    delete (p.post.author as { hopCount?: number }).hopCount
+    const bound = bindWebchatPostAuthor(p, 'daemon-2', roster)
+    expect(bound.authorBound).toBe(false)
+    expect(bound.post).toBe(p)
+  })
+})
+
+describe('image updates', () => {
+  const POST = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  const DAEMON = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const update: RdWebchatImageUpdate = {
+    conversationId: CHAT_A,
+    agentId: CHAT_B,
+    postId: POST,
+    revision: 1,
+    original: { kind: 'inline' }
+  }
+
+  it('delivers an update to every browser on the conversation and nowhere else', () => {
+    const r = new WebchatRouter()
+    const a = { onChat: vi.fn(), onImageUpdate: vi.fn() }
+    const tab = { onChat: vi.fn(), onImageUpdate: vi.fn() }
+    const other = { onChat: vi.fn(), onImageUpdate: vi.fn() }
+    r.register(CHAT_A, a)
+    r.register(CHAT_A, tab)
+    r.register(CHAT_B, other)
+    r.deliverImageUpdate(update)
+    expect(a.onImageUpdate).toHaveBeenCalledWith(update)
+    expect(tab.onImageUpdate).toHaveBeenCalledWith(update)
+    expect(other.onImageUpdate).not.toHaveBeenCalled()
+  })
+
+  it('binds an update to the daemon the roster places its agent on, failing closed', () => {
+    expect(imageUpdateBound(update, DAEMON, [{ agentId: CHAT_B, daemonId: DAEMON }])).toBe(true)
+    expect(imageUpdateBound(update, DAEMON, [{ agentId: CHAT_B, daemonId: CHAT_A }])).toBe(false)
+    expect(imageUpdateBound(update, DAEMON, [])).toBe(false)
+  })
+
+  it('fans an update to other capable participants only, never the author or a continued session', () => {
+    const peer = (capable: boolean) => ({ supports: vi.fn(() => capable), sendMsg: vi.fn(async () => ({})) })
+    const capable = peer(true)
+    const old = peer(false)
+    const continued = peer(true)
+    const author = peer(true)
+    const daemons: Record<string, ReturnType<typeof peer>> = { d1: capable, d2: old, d3: continued, d4: author }
+    fanImageUpdate(
+      update,
+      [
+        { agentId: CHAT_B, daemonId: 'd4' },
+        { agentId: 'peer-1', daemonId: 'd1', recordedDaemonId: 'r1' },
+        { agentId: 'peer-2', daemonId: 'd2' },
+        { agentId: 'peer-3', daemonId: 'd3', targetSessionId: 's-3' }
+      ],
+      (id) => daemons[id],
+      () => {}
+    )
+    expect(capable.sendMsg).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'webchat',
+        agentId: 'peer-1',
+        sessionKey: CHAT_A,
+        chatId: CHAT_A,
+        recordedDaemonId: 'r1',
+        payload: { op: 'image_update', update }
+      })
+    )
+    expect(old.sendMsg).not.toHaveBeenCalled()
+    expect(continued.sendMsg).not.toHaveBeenCalled()
+    expect(author.sendMsg).not.toHaveBeenCalled()
+  })
+
+  it('never hands a signed download link to a peer daemon', () => {
+    const capable = { supports: vi.fn(() => true), sendMsg: vi.fn(async () => ({})) }
+    const withLink = {
+      ...update,
+      download: { url: 'https://bucket.example.test/get', expiresAt: '2030-01-01T00:00:00.000Z' }
+    }
+    fanImageUpdate(
+      withLink,
+      [{ agentId: 'peer-1', daemonId: 'd1' }],
+      () => capable,
+      () => {}
+    )
+    expect(capable.sendMsg).toHaveBeenCalledWith(expect.objectContaining({ payload: { op: 'image_update', update } }))
+  })
+})

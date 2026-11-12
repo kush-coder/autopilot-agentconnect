@@ -1,0 +1,103 @@
+import { CompactFieldLabel } from '@/components/console/CompactFieldLabel'
+import { OutputModeHelp } from '@/components/console/OutputModeHelp'
+import { OUTPUT_CHROME_COPY, OUTPUT_MODE_OPTIONS, type OutputMode } from '@/lib/output-mode'
+
+export function OutputModeField({
+  value,
+  onChange,
+  showFooter,
+  onShowFooterChange,
+  showStatusBar,
+  onShowStatusBarChange,
+  className
+}: {
+  value: OutputMode | ''
+  onChange: (mode: OutputMode) => void
+  showFooter: boolean
+  onShowFooterChange: (show: boolean) => void
+  showStatusBar: boolean
+  onShowStatusBarChange: (show: boolean) => void
+  className?: string
+}) {
+  const t = useTranslations('Agents.outputMode')
+  return (
+    <div
+      className={
+        className
+          ? `grid grid-cols-1 gap-[14px] desktop:grid-cols-[minmax(0,1fr)_auto_auto] desktop:items-end ${className}`
+          : 'grid grid-cols-1 gap-[14px] desktop:grid-cols-[minmax(0,1fr)_auto_auto] desktop:items-end'
+      }
+    >
+      <div className="fld min-w-0">
+        <div className="flex items-center gap-[6px]">
+          <span className="fldlbl">{t('outputMode')}</span>
+          <OutputModeHelp activeMode={value} />
+        </div>
+        <div className="pillbar self-start">
+          {OUTPUT_MODE_OPTIONS.map((mode) => (
+            <button
+              key={mode.key}
+              type="button"
+              className={value === mode.key ? 'pill on px-[10px] py-1 text-[12px]' : 'pill px-[10px] py-1 text-[12px]'}
+              onClick={() => onChange(mode.key)}
+              aria-pressed={value === mode.key}
+            >
+              {mode.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="fld min-w-0 desktop:items-end">
+        <CompactFieldLabel
+          label={t('showFooter')}
+          tooltipAlign="right"
+          detail={showFooter ? OUTPUT_CHROME_COPY.footer.on : OUTPUT_CHROME_COPY.footer.off}
+        />
+        <div className="pillbar self-start desktop:self-end">
+          <button
+            type="button"
+            className={showFooter ? 'pill on px-[10px] py-1 text-[12px]' : 'pill px-[10px] py-1 text-[12px]'}
+            onClick={() => onShowFooterChange(true)}
+            aria-pressed={showFooter}
+          >
+            {t('on')}
+          </button>
+          <button
+            type="button"
+            className={showFooter ? 'pill px-[10px] py-1 text-[12px]' : 'pill on px-[10px] py-1 text-[12px]'}
+            onClick={() => onShowFooterChange(false)}
+            aria-pressed={!showFooter}
+          >
+            {t('off')}
+          </button>
+        </div>
+      </div>
+      <div className="fld min-w-0 desktop:items-end">
+        <CompactFieldLabel
+          label={t('showStatusBar')}
+          tooltipAlign="right"
+          detail={showStatusBar ? OUTPUT_CHROME_COPY.statusBar.on : OUTPUT_CHROME_COPY.statusBar.off}
+        />
+        <div className="pillbar self-start desktop:self-end">
+          <button
+            type="button"
+            className={showStatusBar ? 'pill on px-[10px] py-1 text-[12px]' : 'pill px-[10px] py-1 text-[12px]'}
+            onClick={() => onShowStatusBarChange(true)}
+            aria-pressed={showStatusBar}
+          >
+            {t('on')}
+          </button>
+          <button
+            type="button"
+            className={showStatusBar ? 'pill px-[10px] py-1 text-[12px]' : 'pill on px-[10px] py-1 text-[12px]'}
+            onClick={() => onShowStatusBarChange(false)}
+            aria-pressed={!showStatusBar}
+          >
+            {t('off')}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+import { useTranslations } from 'next-intl'

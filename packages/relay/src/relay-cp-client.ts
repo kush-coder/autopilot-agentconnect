@@ -1,0 +1,1022 @@
+/**
+ * `RelayCpClient` — the relay-side control-plane WebSocket client FSM
+ * (shared-bot-relay.md §7.1 / §8). Dials OUT to the CP `/api/v1/relays/ws`, runs
+ * the `rc/auth` → `rc/register` handshake, then emits `rc/heartbeat`, dispatches
+ * the CP's `rc/daemon-revoke` EVTs, and reconnects with backoff.
+ *
+ * It is the relay's ONE link to the CP and carries ONLY control signaling — never
+ * message content (that flows on the rd/* daemon wire, PR 2). Structurally the
+ * mirror of the daemon's `CpClient`, built on the shared `@agentconnect.md/connection`
+ * primitives (transport, correlator, backoff) so the two clients don't fork.
+ *
+ * Milestone A drives registration + heartbeat; `verify()` is the seam PR 2's
+ * daemon-facing `rd/hello` handler calls to delegate credential checks to the CP.
+ */
+import {
+  CODEHOST_FEEDBACK_FEATURE,
+  COMPUTER_MEDIA_USAGE_FEATURE,
+  FOLLOW_UP_WATCH_FEATURE,
+  type RcFollowUpWatch,
+  type RcCodeHostFeedback,
+  type RcComputerMediaUsage,
+  type RcCodeHostFeedbackResult,
+  type RcCodeHostFeedbackWatch,
+  BOT_CREDENTIAL_CHECK_FEATURE,
+  BOT_TENANT_FEATURE,
+  buildRelayCpFrame,
+  decodeRelayCpFrame,
+  FRAME_FRAGMENTS_FEATURE,
+  FrameAssembler,
+  type FrameFragment,
+  MAX_ASSEMBLED_FRAME_BYTES,
+  GITEA_V1_FEATURE,
+  AZURE_DEVOPS_HOOKS_V1_FEATURE,
+  DECISION_ROUTING_FORWARD_V1_FEATURE,
+  DECISION_ROUTING_V1_FEATURE,
+  DECISION_TRIGGER_V1_FEATURE,
+  GITLAB_COM_V1_FEATURE,
+  GITLAB_INSTANCE_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V2_FEATURE,
+  HOOK_GITHUB_INSTALLATION_V1_FEATURE,
+  HOOK_INSTRUCTIONS_V1_FEATURE,
+  OWNER_DEFAULT_DECISION_V1_FEATURE,
+  PULL_REQUEST_FEEDBACK_FEATURE,
+  WEBCHAT_SESSION_CONTINUATION_FEATURE,
+  RELAY_CP_SCHEMAS,
+  type RelayCpFrame,
+  type RelayCpFrameType,
+  type RcAuthOk,
+  type RcDeploymentConfig,
+  type RcRegistered,
+  type RcVerify,
+  type RcVerifyResult,
+  type RcCodeHostMembershipAuthz,
+  type RcGithubCommentAuthz,
+  type RcGithubRerequest,
+  type RcGithubRerequestResult,
+  type RcDaemonRevoke,
+  type RcBotAssign,
+  type RcBotUnassign,
+  type RcRoutes,
+  type RcAssign,
+  type RcParticipantAssign,
+  type RcHookAssign,
+  type RcHookRemove,
+  type RcRunReport,
+  type RcCodeHostDelivery,
+  type RcGithubInstallation,
+  type RcPullRequestFeedback,
+  type RcSetChannelAgent,
+  type RcBotChannels,
+  type RcBotConversation,
+  type RcBotCredentialCheck,
+  type RcBotTenant,
+  type RcBotRevoked,
+  type RcThreadAssign,
+  type RcThreadParticipant,
+  type RcThreadLookup,
+  type RcThreadLookupOk,
+  type RcCollabRoutes,
+  type RcMcpAssign,
+  type RcMcpUnassign,
+  type RcMemoryConnectionAssign,
+  type RcMemoryConnectionUnassign,
+  type RcGithubAppAssign,
+  type RcGithubAppUnassign,
+  GITHUB_APP_WEBHOOK_V1_FEATURE,
+  RELAY_PROJECTION_SNAPSHOT_V1_FEATURE,
+  type RcSnapshotBegin,
+  type RcSnapshotEnd,
+  type ErrorCode
+} from '@agentconnect.md/protocol'
+import {
+  Backoff,
+  ReqRep,
+  WireError,
+  type Clock,
+  type RequestOpts,
+  type TimerHandle,
+  type Transport
+} from '@agentconnect.md/connection'
+import type { z } from 'zod'
+import type { Logger } from './log.js'
+import type { RelayAuthCredential } from './config.js'
+
+const ACK_TIMEOUT_MS = 5000
+
+/** How long an out-of-band GitHub authorization waits for a reconnecting link before
+ *  failing closed. A CP restart drops the link for seconds; the delivery is already
+ *  answered 202, so waiting costs nothing and is the difference between a review and
+ *  a silently skipped one. */
+const LINK_READY_WAIT_MS = 30_000
+
+/** How long a credential check or thread lookup waits out a reconnecting link; a planned CP handoff takes seconds. */
+const HANDOFF_WAIT_MS = 10_000
+
+/** After a planned CP restart (1012), redials wait only this plus jitter and never escalate within the handoff window. */
+const HANDOFF_REDIAL_BASE_MS = 250
+
+/** Per-attempt handshake cap for those redials, so one landing on a dying pod cannot eat the handoff budget. */
+const HANDOFF_REDIAL_HANDSHAKE_MS = 1_000
+
+/** Run reports held while the link is down. Bounded — the OLDEST is dropped first
+ *  (a stale delivery-stage row is the least useful one to replay). */
+const MAX_PENDING_RUN_REPORTS = 200
+
+/** CP close code for a rejected credential — fatal, never auto-retry (mirrors the daemon's 4401). */
+const AUTH_FAILED_CLOSE = 4401
+
+interface ReadyWaiter {
+  resolve: (ready: boolean) => void
+  timer?: TimerHandle
+}
+
+export type RelayCpState = 'CONNECTING' | 'AUTHENTICATING' | 'REGISTERING' | 'READY' | 'CLOSED' | 'DEGRADED'
+
+export interface RelayCpClientDeps {
+  /** The §8 credential presented on `rc/auth` (shared token or per-relay ApiKey). */
+  auth: RelayAuthCredential
+  /** Deployment identity — the CP's `relay` upsert key (`rc/register.name`). */
+  name: string
+  /** Per-instance-routable address daemons dial (`rc/register.daemonUrl`). */
+  daemonUrl: string
+  /** This instance's public STUN address (`rc/register.stunUrl`), when it serves one. */
+  stunUrl?: string
+  /** This instance's TURN server: its public URLs, registered only once `rc/auth/ok` handed over the secret it checks credentials with. */
+  turn?: { urls: string[]; onSecret: (secret: string) => void }
+  /** Heartbeat cadence fallback when `rc/auth/ok` carries none. */
+  heartbeatDefaultMs: number
+  clock: Clock
+  /** Dial factory — prod passes a `ClientTransport.dial(...)`; a handoff redial caps its handshake. */
+  connect: (opts?: { handshakeTimeoutMs?: number }) => Promise<Transport>
+  log: Logger
+  /** Backoff jitter in [0,1); defaults to Math.random. Injected as `() => 0` in tests. */
+  jitter?: () => number
+  /** Called with the CP-assigned relayId on every successful `rc/register`. */
+  onRegistered?: (relayId: string) => void
+  /** Called on a CP `rc/daemon-revoke` EVT (PR 2 drops the daemon's rd/* connection). */
+  onRevoke?: (daemonId: string) => void
+  /** Shared-bot control (§7.1 / §10): assign/release a bot's ingest, hot-update its
+   *  routes, and seed durable thread affinity. */
+  onBotAssign?: (a: RcBotAssign) => void
+  onBotUnassign?: (a: RcBotUnassign) => void
+  onRoutes?: (r: RcRoutes) => void
+  onAssign?: (a: RcAssign) => void
+  onParticipantAssign?: (a: RcParticipantAssign) => void
+  /** Feedback subscriptions and hook rules carry signing keys; never log their payloads. */
+  onFeedbackWatch?: (watch: RcCodeHostFeedbackWatch) => void
+  /** Called on a CP `rc/follow-up-watch` EVT: one object a follow-up watches, or no longer does. */
+  onFollowUpWatch?: (watch: RcFollowUpWatch) => void
+  onHookAssign?: (rule: RcHookAssign) => void
+  /** Called on a CP `rc/hook-remove` EVT — drop one hook rule. */
+  onHookRemove?: (hookId: string) => void
+  /** Called on a CP `rc/collab-routes` EVT — FULL-REPLACE the bot-agnostic
+   *  collaboration routing snapshot (agent-collaboration §2.3/§6.2). */
+  onCollabRoutes?: (snap: RcCollabRoutes) => void
+  /** Called on a CP `rc/mcp-assign` EVT — load/replace one MCP provider's proxy binding
+   *  (centralized-tool-management.md §5.2). Carries the upstream credential — NEVER log. */
+  onMcpAssign?: (a: RcMcpAssign) => void
+  /** Called on a CP `rc/mcp-unassign` EVT — drop a whole provider or retire one grant hash. */
+  onMcpUnassign?: (a: RcMcpUnassign) => void
+  /** Purpose-separated daemon-private memory plugin proxy bindings. */
+  onMemoryConnectionAssign?: (a: RcMemoryConnectionAssign) => void
+  onMemoryConnectionUnassign?: (a: RcMemoryConnectionUnassign) => void
+  /** An organization GitHub App's webhook secret arrived or left; carries the secret — NEVER log. */
+  onGithubAppAssign?: (a: RcGithubAppAssign) => void
+  onGithubAppUnassign?: (a: RcGithubAppUnassign) => void
+  /** A full reconnect replay of one projection starts, then ends naming what failed to replay. */
+  onSnapshotBegin?: (s: RcSnapshotBegin) => void
+  onSnapshotEnd?: (s: RcSnapshotEnd) => void
+  /** Called once the relay reaches READY on each (re)connect. */
+  onReady?: () => void
+  /** First authenticated snapshot of a stored deployment document in this process; later reconnects never hot-reload it. */
+  onDeploymentConfig?: (config: RcDeploymentConfig) => void
+  /** Every connection's deployment snapshot, undefined when the CP sent none, for state that must follow the CP's current configuration. */
+  onDeploymentSnapshot?: (config: RcDeploymentConfig | undefined) => void
+}
+
+export class RelayCpClient {
+  state: RelayCpState = 'CLOSED'
+  relayId?: string
+
+  private transport?: Transport
+  /** Reassembles the current connection's `rc/fragment` streams; replaced with each transport. */
+  private fragments = new FrameAssembler()
+  private readonly correlator: ReqRep<RelayCpFrame>
+  private readonly backoff: Backoff
+  private stopped = false
+  private fatal = false // AUTH_FAILED — never auto-retry
+  private deploymentConfigDecided = false
+  private reconnectTimer?: TimerHandle
+  private heartbeatTimer?: TimerHandle
+  private heartbeatMs = 0
+  /** Bumped on every registration — identifies WHICH connection a request rode. */
+  private linkGeneration = 0
+  /** Until when redials run on the fast, non-escalating handoff cadence after a planned 1012 close. */
+  private handoffRedialUntil?: number
+  /** Callers parked in {@link waitReady} until the link registers again. */
+  private readonly readyWaiters = new Set<ReadyWaiter>()
+  /** FIFO of `rc/run-report` EVTs the link wasn't up for, replayed on READY. */
+  private readonly pendingRunReports: RcRunReport[] = []
+  private serverFeatures = new Set<string>()
+  /** What the latest registration advertised; unlike `serverFeatures`, kept while the link is down. */
+  private registeredFeatures = new Set<string>()
+  /** Controls that arrived with `rc/registered`, before this link turned READY. */
+  private registerControls?: RelayCpFrame[]
+
+  constructor(private readonly deps: RelayCpClientDeps) {
+    this.correlator = new ReqRep<RelayCpFrame>(deps.clock, ACK_TIMEOUT_MS)
+    this.backoff = new Backoff(deps.jitter ? { jitter: deps.jitter } : {})
+  }
+
+  /** Non-blocking: kicks off the connect loop and returns. */
+  start(): void {
+    this.stopped = false
+    this.fatal = false
+    void this.attemptConnect()
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    if (this.reconnectTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    this.stopHeartbeat()
+    this.correlator.rejectAll(new Error('stopping'))
+    this.releaseReadyWaiters(false)
+    this.transport?.close(1000, 'shutdown')
+    this.state = 'CLOSED'
+  }
+
+  /** True once the relay↔CP link has completed registration and is heartbeating. */
+  isReady(): boolean {
+    return this.state === 'READY'
+  }
+
+  /** Whether the CP this relay last registered with advertised `feature`, answered from that registration while the link is down. */
+  advertisedFeature(feature: string): boolean {
+    return this.registeredFeatures.has(feature)
+  }
+
+  /**
+   * Resolve as soon as the link is READY, or `false` when `timeoutMs` elapses
+   * first (or this client is stopped / fatally closed). The GitHub
+   * authorization path rides a reconnect on this instead of failing closed on a
+   * seconds-long CP restart, which would silently skip the review the delivery
+   * was going to trigger.
+   */
+  waitReady(timeoutMs: number): Promise<boolean> {
+    if (this.state === 'READY' && this.transport) return Promise.resolve(true)
+    if (this.stopped || this.fatal || timeoutMs <= 0) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
+      const waiter: ReadyWaiter = { resolve }
+      waiter.timer = this.deps.clock.setTimeout(() => {
+        this.readyWaiters.delete(waiter)
+        resolve(false)
+      }, timeoutMs)
+      this.readyWaiters.add(waiter)
+    })
+  }
+
+  private releaseReadyWaiters(ready: boolean): void {
+    for (const waiter of [...this.readyWaiters]) {
+      this.readyWaiters.delete(waiter)
+      if (waiter.timer !== undefined) this.deps.clock.clearTimeout(waiter.timer)
+      waiter.resolve(ready)
+    }
+  }
+
+  /**
+   * Delegate a credential check to the CP (`rc/verify` → `rc/verify/ok`). The
+   * relay holds no database, so the daemon-facing `rd/hello` handler (PR 2) and
+   * the browser webchat handshake (PR 3) resolve their credentials this way.
+   * Usable only while READY; throws a retryable {@link WireError} otherwise.
+   *
+   * `daemonId` is forwarded unverified; CP requires it to match the reviewed install identity.
+   */
+  async verify(
+    kind: Exclude<RcVerify['kind'], 'agent-chat-key' | 'ahp-client-key' | 'computer-relay-token'>,
+    credential: string,
+    daemonId?: string
+  ): Promise<RcVerifyResult> {
+    const request: RcVerify =
+      kind === 'webchat-token'
+        ? { kind, credential, conversationBinding: 'v1' }
+        : kind === 'daemon-token'
+          ? { kind, credential, ...(daemonId ? { daemonId } : {}) }
+          : { kind, credential }
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/verify', request),
+      'rc/verify',
+      HANDOFF_WAIT_MS,
+      {}
+    )
+    if (rep.type !== 'rc/verify/ok') {
+      throw new WireError('INTERNAL', `expected rc/verify/ok, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  /** A desktop daemon's relay-audience channel token on `cr/hello` (computer-use.md §3.7); waits like {@link verify}. */
+  async verifyComputer(credential: string, computerId: string): Promise<RcVerifyResult> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/verify', { kind: 'computer-relay-token', credential, computerId }),
+      'rc/verify computer-relay-token',
+      HANDOFF_WAIT_MS,
+      {}
+    )
+    if (rep.type !== 'rc/verify/ok') {
+      throw new WireError('INTERNAL', `expected rc/verify/ok, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  /** An API key on the agent chat API, with the agent it names and the caller's chat id (§10.4); waits like {@link verify}. */
+  async verifyAgentChatKey(credential: string, agentId: string, chatId: string): Promise<RcVerifyResult> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/verify', { kind: 'agent-chat-key', credential, agentId, chatId }),
+      'rc/verify agent-chat-key',
+      HANDOFF_WAIT_MS,
+      {}
+    )
+    if (rep.type !== 'rc/verify/ok') {
+      throw new WireError('INTERNAL', `expected rc/verify/ok, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  async verifyAhpCredential(
+    credential: string,
+    agentId: string,
+    kind: 'ahp-client-key' | 'webchat-token',
+    resource?: string
+  ): Promise<RcVerifyResult> {
+    const request: RcVerify =
+      kind === 'ahp-client-key'
+        ? { kind, credential, agentId, ...(resource ? { resource } : {}) }
+        : { kind, credential, agentId, protocol: 'ahp', conversationBinding: 'v1' }
+    const reply = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/verify', request),
+      'rc/verify ahp',
+      HANDOFF_WAIT_MS,
+      {}
+    )
+    if (reply.type !== 'rc/verify/ok') throw new WireError('INTERNAL', 'unexpected AHP authorization reply', false)
+    return reply.payload
+  }
+
+  /** One CP read that waits out a reconnect and is re-issued once only over a REPLACED link, never on the one that failed it. */
+  private async authorizationRequest(
+    build: () => RelayCpFrame,
+    label: string,
+    waitMs = LINK_READY_WAIT_MS,
+    opts: RequestOpts = { maxTries: 1, ackTimeoutMs: ACK_TIMEOUT_MS }
+  ): Promise<RelayCpFrame> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (!(await this.waitReady(waitMs)) || !this.transport) {
+        throw new WireError('INTERNAL', `relay↔CP link not ready (${this.state})`, true)
+      }
+      const generation = this.linkGeneration
+      try {
+        return await this.sendRequest(build(), opts)
+      } catch (err) {
+        if (attempt > 0 || !(err instanceof WireError) || !err.retryable) throw err
+        if (!(await this.waitReady(waitMs)) || this.linkGeneration === generation) throw err
+        this.deps.log.warn(`relay: ${label} lost its link (${err.message}) — retrying across the reconnect`)
+      }
+    }
+    throw new WireError('INTERNAL', `relay↔CP link not ready (${this.state})`, true)
+  }
+
+  /**
+   * Resolve an untrusted/stale GitHub comment association against the App's
+   * current repository permission. One upstream permission lookup per link: the
+   * request is never retransmitted on the same connection (GitHub deliveries are
+   * already deduplicated by delivery id), only re-issued once after a reconnect.
+   */
+  /** §12.2 live effective-membership gate — the provider-neutral successor to
+   * the GitHub comment authz REQ. Fail-closed at the caller on any error. */
+  async authorizeCodeHostMembership(request: RcCodeHostMembershipAuthz): Promise<boolean> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/codehost-membership-authz', request),
+      'rc/codehost-membership-authz'
+    )
+    if (rep.type !== 'rc/codehost-membership-authz/ok') {
+      throw new WireError('INTERNAL', `expected rc/codehost-membership-authz/ok, got ${rep.type}`, false)
+    }
+    return rep.payload.allowed
+  }
+
+  async authorizeGithubComment(request: RcGithubCommentAuthz): Promise<boolean> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/github-comment-authz', request),
+      'rc/github-comment-authz'
+    )
+    if (rep.type !== 'rc/github-comment-authz/ok') {
+      throw new WireError('INTERNAL', `expected rc/github-comment-authz/ok, got ${rep.type}`, false)
+    }
+    return rep.payload.allowed
+  }
+
+  /** Resolve a signature-verified Check run or suite rerequest to current
+   * informational projection targets. Same one-attempt-per-link rule: GitHub
+   * redelivery keeps the same delivery key and the daemon/hook stores provide
+   * the retry fence. */
+  async authorizeGithubRerequest(request: RcGithubRerequest): Promise<RcGithubRerequestResult> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/github-rerequest', request),
+      'rc/github-rerequest'
+    )
+    if (rep.type !== 'rc/github-rerequest/ok') {
+      throw new WireError('INTERNAL', `expected rc/github-rerequest/ok, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  /**
+   * Emit one delivery-stage bookkeeping EVT (`rc/run-report`, fire-and-forget).
+   * A report the link wasn't up for is QUEUED and replayed on READY, in order:
+   * the row it opens is the only trace some deliveries ever get (a delivery
+   * refused pre-dispatch never reaches a daemon, so no late `hook/report`
+   * converges it), and dropping it leaves the console showing nothing at all.
+   * `firedAt` travels with the report, so a replayed row keeps its real time.
+   */
+  emitRunReport(report: RcRunReport): void {
+    if (this.state !== 'READY' || !this.transport) {
+      if (this.pendingRunReports.length >= MAX_PENDING_RUN_REPORTS) {
+        const dropped = this.pendingRunReports.shift()!
+        this.deps.log.warn(`relay: dropping rc/run-report ${dropped.hookId}:${dropped.deliveryKey} (queue full)`)
+      }
+      this.pendingRunReports.push(report)
+      this.deps.log.warn(`relay: deferring rc/run-report ${report.hookId}:${report.deliveryKey} (link ${this.state})`)
+      return
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/run-report', report)))
+  }
+
+  /** Replay the reports queued while the link was down (oldest first), stopping
+   *  at the first one the link still can't take. */
+  private flushPendingRunReports(): void {
+    while (this.pendingRunReports.length > 0) {
+      if (this.state !== 'READY' || !this.transport) return
+      this.transport.send(JSON.stringify(buildRelayCpFrame('rc/run-report', this.pendingRunReports.shift()!)))
+    }
+  }
+
+  /**
+   * Emit one verified-delivery observation (`rc/codehost-delivery`, fire-and-forget). A drop is
+   * safe: the binding stays `webhook_unverified` until the next delivery, and a rotation's
+   * promotion waits for the next delivery verified under the successor.
+   */
+  emitCodeHostDelivery(observed: RcCodeHostDelivery): void {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: dropping rc/codehost-delivery ${observed.deliveryKey} (link ${this.state})`)
+      return
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/codehost-delivery', observed)))
+  }
+
+  /**
+   * Emit one installation doorbell EVT (`rc/github-installation`, fire-and-forget,
+   * decision 11). A drop is safe: the CP's pull-based sync paths (setup callback /
+   * manual Sync / mint-failure markRevoked) converge without the poke.
+   */
+  emitGithubInstallation(poke: RcGithubInstallation): void {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: dropping rc/github-installation ${poke.installationId} (link ${this.state})`)
+      return
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/github-installation', poke)))
+  }
+
+  /** Send TURN bytes per Computer (computer-use.md §15.5); `ready: false` keeps them for later, `taken: false` the CP meters none. */
+  reportComputerMediaUsage(usage: RcComputerMediaUsage): { ready: boolean; taken: boolean } {
+    if (this.state !== 'READY' || !this.transport) return { ready: false, taken: false }
+    if (!this.serverFeatures.has(COMPUTER_MEDIA_USAGE_FEATURE)) return { ready: true, taken: false }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/computer-media-usage', usage)))
+    return { ready: true, taken: true }
+  }
+
+  /** Persist feedback coordinates before acknowledging the provider webhook. */
+  async reportCodeHostFeedback(signal: RcCodeHostFeedback): Promise<RcCodeHostFeedbackResult> {
+    if (this.state !== 'READY' || !this.serverFeatures.has(CODEHOST_FEEDBACK_FEATURE))
+      throw new WireError('INTERNAL', 'code host feedback is unavailable', true)
+    const rep = await this.sendRequest(buildRelayCpFrame('rc/codehost-feedback', signal), {
+      maxTries: 1,
+      ackTimeoutMs: 30_000
+    })
+    if (rep.type !== 'rc/codehost-feedback/ok') throw new WireError('INTERNAL', 'unexpected feedback response', true)
+    return rep.payload
+  }
+
+  async reportPullRequestFeedback(signal: RcPullRequestFeedback): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport) {
+      throw new WireError('INTERNAL', `relay↔CP link not ready (${this.state})`, true)
+    }
+    if (!this.serverFeatures.has(PULL_REQUEST_FEEDBACK_FEATURE)) return false
+    const rep = await this.sendRequest(buildRelayCpFrame('rc/pull-request-feedback', signal), {
+      maxTries: 1,
+      ackTimeoutMs: ACK_TIMEOUT_MS
+    })
+    if (rep.type !== 'rc/pull-request-feedback/ok') {
+      throw new WireError('INTERNAL', `expected rc/pull-request-feedback/ok, got ${rep.type}`, false)
+    }
+    return rep.payload.accepted
+  }
+
+  /** Send one wake-only event of a watched GitLab or Gitea project; false when the CP takes none (assistant-mode.md §5.14). */
+  async reportFollowUpCodeHostEvent(signal: RcCodeHostFeedback): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport) return false
+    if (!this.serverFeatures.has(CODEHOST_FEEDBACK_FEATURE) || !this.serverFeatures.has(FOLLOW_UP_WATCH_FEATURE))
+      return false
+    const rep = await this.sendRequest(buildRelayCpFrame('rc/codehost-feedback', signal), {
+      maxTries: 1,
+      ackTimeoutMs: ACK_TIMEOUT_MS
+    })
+    if (rep.type !== 'rc/codehost-feedback/ok') throw new WireError('INTERNAL', 'unexpected feedback response', true)
+    return rep.payload.accepted
+  }
+
+  /** Send one wake-only object event; false when the CP takes none, and a failure costs only the follow-up's time. */
+  async reportFollowUpEvent(signal: RcPullRequestFeedback): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport || !this.serverFeatures.has(FOLLOW_UP_WATCH_FEATURE)) return false
+    const rep = await this.sendRequest(buildRelayCpFrame('rc/pull-request-feedback', signal), {
+      maxTries: 1,
+      ackTimeoutMs: ACK_TIMEOUT_MS
+    })
+    if (rep.type !== 'rc/pull-request-feedback/ok') {
+      throw new WireError('INTERNAL', `expected rc/pull-request-feedback/ok, got ${rep.type}`, false)
+    }
+    return rep.payload.accepted
+  }
+
+  /** Emit `rc/set-channel-agent` (fire-and-forget) — the config modal picked a
+   *  channel's default agent. Dropped if the CP link is down (the operator can retry). */
+  emitSetChannelAgent(m: RcSetChannelAgent): void {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: dropping rc/set-channel-agent for ${m.botId} (link ${this.state})`)
+      return
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/set-channel-agent', m)))
+  }
+
+  /** Emit the latest complete channel-membership snapshot for one HTTP Slack bot.
+   *  The manager retains the snapshot when this returns false and retries on READY. */
+  emitBotChannels(m: RcBotChannels): boolean {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/bot-channels for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/bot-channels', m)))
+    return true
+  }
+
+  /** Emit one incremental direct-conversation report. Best-effort: a drop
+   *  self-heals on the counterpart's next DM, so there is no pending-retry queue. */
+  emitBotConversation(m: RcBotConversation): boolean {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: dropping rc/bot-conversation for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/bot-conversation', m)))
+    return true
+  }
+
+  /** Report one workspace uninstall / token revocation and WAIT for the CP to
+   *  commit it (`rc/bot-revoked` → `/ok`). Returns false — keep it queued and retry
+   *  — when the link isn't READY or no ack came back. This is the only rc/* report
+   *  that is acknowledged: Slack acked the event before the relay's handler ran and
+   *  never redelivers it, and no CP-side probe can discover a dead token, so a
+   *  send that the socket accepted but the CP failed to persist would silently
+   *  leave an uninstalled app shown as active forever. Re-applying is a no-op. */
+  async reportBotRevoked(m: RcBotRevoked): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/bot-revoked for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    // An older CP predates the evidence fields, so it gets the report without them.
+    const { evidence: _evidence, code: _code, ...legacy } = m
+    const report = this.serverFeatures.has(BOT_CREDENTIAL_CHECK_FEATURE) ? m : legacy
+    try {
+      const rep = await this.sendRequest(buildRelayCpFrame('rc/bot-revoked', report), {
+        maxTries: 1,
+        ackTimeoutMs: ACK_TIMEOUT_MS
+      })
+      // Any reply is terminal: `applied:false` means the CP's generation fence
+      // refused a stale report, which is just as settled as applying it.
+      return rep.type === 'rc/bot-revoked/ok'
+    } catch (err) {
+      // No COMMIT ack — keep it queued. A socket that accepted the bytes proves
+      // nothing about the CP having persisted the revocation.
+      this.deps.log.warn(`relay: rc/bot-revoked for ${m.botId} unacknowledged: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /** Report one probe answer that does not revoke and wait for the CP's reply, which settles it whether or not it applied; false keeps it queued. */
+  async reportBotCredentialCheck(m: RcBotCredentialCheck): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/bot-credential-check for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    if (!this.serverFeatures.has(BOT_CREDENTIAL_CHECK_FEATURE)) return false
+    try {
+      const rep = await this.sendRequest(buildRelayCpFrame('rc/bot-credential-check', m), {
+        maxTries: 1,
+        ackTimeoutMs: ACK_TIMEOUT_MS
+      })
+      return rep.type === 'rc/bot-credential-check/ok'
+    } catch (err) {
+      this.deps.log.warn(`relay: rc/bot-credential-check for ${m.botId} unacknowledged: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /** Report one learned tenant key and wait for the CP's reply, which settles it whether or not it applied; false keeps it queued. */
+  async reportBotTenant(m: RcBotTenant): Promise<boolean> {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/bot-tenant for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    if (!this.serverFeatures.has(BOT_TENANT_FEATURE)) return false
+    try {
+      const rep = await this.sendRequest(buildRelayCpFrame('rc/bot-tenant', m), {
+        maxTries: 1,
+        ackTimeoutMs: ACK_TIMEOUT_MS
+      })
+      return rep.type === 'rc/bot-tenant/ok'
+    } catch (err) {
+      this.deps.log.warn(`relay: rc/bot-tenant for ${m.botId} unacknowledged: ${(err as Error).message}`)
+      return false
+    }
+  }
+
+  /** Emit `rc/thread-assign` — REPORT leg of the affinity dance: the relay tells the CP
+   *  which agent now owns a (channel, thread) sessionKey. The CP is the single writer;
+   *  it persists + broadcasts the binding back via `rc/assign`. Returns `false` (without
+   *  sending) if the link is down, so the caller can retry it on reconnect — a report
+   *  lost here would otherwise never persist and follow-ups on other pods would drop. */
+  emitThreadAssign(m: RcThreadAssign): boolean {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/thread-assign for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/thread-assign', m)))
+    return true
+  }
+
+  /** Persist one room member without touching the compatibility owner. */
+  emitThreadParticipant(m: RcThreadParticipant): boolean {
+    if (this.state !== 'READY' || !this.transport) {
+      this.deps.log.warn(`relay: deferring rc/thread-participant for ${m.botId} (link ${this.state})`)
+      return false
+    }
+    this.transport.send(JSON.stringify(buildRelayCpFrame('rc/thread-participant', m)))
+    return true
+  }
+
+  /** `rc/thread-lookup`: pull a missed thread's owner, waiting out a CP handoff; a longer outage still drops the message. */
+  async lookupThread(m: RcThreadLookup): Promise<RcThreadLookupOk> {
+    const rep = await this.authorizationRequest(
+      () => buildRelayCpFrame('rc/thread-lookup', m),
+      'rc/thread-lookup',
+      HANDOFF_WAIT_MS
+    )
+    if (rep.type !== 'rc/thread-lookup/ok') {
+      throw new WireError('INTERNAL', `expected rc/thread-lookup/ok, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  private async attemptConnect(): Promise<void> {
+    if (this.stopped || this.fatal) return
+    this.state = 'CONNECTING'
+    try {
+      const handoffLeft = this.handoffRedialLeft()
+      const t = await this.deps.connect(
+        handoffLeft > 0
+          ? { handshakeTimeoutMs: Math.max(HANDOFF_REDIAL_BASE_MS, Math.min(HANDOFF_REDIAL_HANDSHAKE_MS, handoffLeft)) }
+          : undefined
+      )
+      if (this.stopped || this.fatal) {
+        t.close(1000, 'shutdown') // stop() (or a fatal close) raced the dial — drop it.
+        return
+      }
+      this.transport = t
+      this.fragments = new FrameAssembler()
+      t.onMessage((txt) => void this.onText(txt))
+      t.onClose((c, r) => this.onClose(c, r))
+      await this.handshake()
+      this.backoff.reset() // connected — reset backoff
+    } catch (err) {
+      this.deps.log.warn(`relay: connect/handshake failed: ${(err as Error).message}`)
+      this.transport?.close(1011, 'handshake failed')
+      this.transport = undefined
+      this.scheduleReconnect()
+    }
+  }
+
+  private handoffRedialLeft(): number {
+    return this.handoffRedialUntil === undefined ? 0 : Math.max(0, this.handoffRedialUntil - this.deps.clock.now())
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.fatal) return
+    if (this.reconnectTimer !== undefined) return // one in flight
+    // A planned handoff redials fast without escalating; ordinary backoff resumes after the window.
+    const delay =
+      this.handoffRedialLeft() > 0
+        ? HANDOFF_REDIAL_BASE_MS + Math.floor((this.deps.jitter ?? Math.random)() * HANDOFF_REDIAL_BASE_MS)
+        : this.backoff.next()
+    this.reconnectTimer = this.deps.clock.setTimeout(() => {
+      this.reconnectTimer = undefined
+      void this.attemptConnect()
+    }, delay)
+  }
+
+  private async handshake(): Promise<void> {
+    // ── auth (§8 dual-mode: token | apikey; the credential is secret — never logged) ──
+    this.state = 'AUTHENTICATING'
+    const authOk = await this.sendRequest(
+      buildRelayCpFrame('rc/auth', { method: this.deps.auth.method, credential: this.deps.auth.credential })
+    )
+    const ok = authOk.payload as RcAuthOk
+    if (!this.deploymentConfigDecided) {
+      this.deploymentConfigDecided = true
+      // Revision 0 means the CP stores no document, so the startup environment keeps what it set.
+      if (ok.deploymentConfig && ok.deploymentConfig.revision > 0) this.deps.onDeploymentConfig?.(ok.deploymentConfig)
+    }
+    this.deps.onDeploymentSnapshot?.(ok.deploymentConfig)
+    // A CP that sends no TURN secret cannot mint credentials this relay could check, so its TURN stays unadvertised.
+    if (ok.computerTurnSecret) this.deps.turn?.onSecret(ok.computerTurnSecret)
+    const turnUrls = ok.computerTurnSecret ? this.deps.turn?.urls : undefined
+
+    // ── register (upsert by name → relayId; re-sent every reconnect) ──
+    this.state = 'REGISTERING'
+    this.registerControls = undefined
+    const registered = await this.sendRequest(
+      buildRelayCpFrame('rc/register', {
+        name: this.deps.name,
+        daemonUrl: this.deps.daemonUrl,
+        ...(this.deps.stunUrl ? { stunUrl: this.deps.stunUrl } : {}),
+        ...(turnUrls?.length ? { turnUrls } : {}),
+        // This relay preserves RdMsgWebchat.targetSessionId end to end; the CP
+        // gates session-targeted mints on every live relay advertising it.
+        // gitlab-com-v1: this relay verifies and routes GitLab project
+        // webhooks, so the CP may send it gitlab-kind compiled rules (§17.3).
+        // gitlab-instance-v1: this relay carries the compiled rule's host through onto the
+        // trusted metadata it forwards, so a self-managed rule is dispatchable here (§24.4).
+        // gitea-v1: this relay verifies and routes Gitea repository webhooks, for gitea.com
+        // and a self-hosted address alike (gitea-integration.md §7, §11).
+        features: [
+          FRAME_FRAGMENTS_FEATURE,
+          WEBCHAT_SESSION_CONTINUATION_FEATURE,
+          GITLAB_COM_V1_FEATURE,
+          GITLAB_INSTANCE_V1_FEATURE,
+          PULL_REQUEST_FEEDBACK_FEATURE,
+          CODEHOST_FEEDBACK_FEATURE,
+          // Holds the objects follow-ups watch and sends their wake-only events (assistant-mode.md §5.14).
+          FOLLOW_UP_WATCH_FEATURE,
+          GITEA_V1_FEATURE,
+          // Verifies and routes Azure DevOps service hook deliveries, so the CP may send it azure-devops rules (azure-devops-integration.md §11.9).
+          AZURE_DEVOPS_HOOKS_V1_FEATURE,
+          // This relay arbitrates `decision` routes as human-only candidates and forwards their decisionId.
+          DECISION_TRIGGER_V1_FEATURE,
+          // Parses routedConversations, never as Any.
+          DECISION_ROUTING_V1_FEATURE,
+          // Forwards a routed conversation once to its evaluation host and serves rd/route and rd/route/report.
+          DECISION_ROUTING_FORWARD_V1_FEATURE,
+          // Parses routed hook rules, sends each routed event once to its evaluation host, and fans out the host's choice.
+          HOOK_DECISION_ROUTING_V1_FEATURE,
+          // Routes GitLab and Gitea hook rules the same way, so the CP may send it their routed rules.
+          HOOK_DECISION_ROUTING_V2_FEATURE,
+          // Seats an ownerAsDefault decision route as the channel default, one writer per session.
+          OWNER_DEFAULT_DECISION_V1_FEATURE,
+          // Fills an installation-wide GitHub rule in with each event's repository, so the CP may send it one.
+          HOOK_GITHUB_INSTALLATION_V1_FEATURE,
+          // Forwards a generic rule's instructions on each delivery, so the CP may send it a rule that has them.
+          HOOK_INSTRUCTIONS_V1_FEATURE,
+          // Prunes its MCP, hook and memory tables at the end of a replay snapshot instead of keeping stale entries.
+          RELAY_PROJECTION_SNAPSHOT_V1_FEATURE,
+          // Verifies organization GitHub Apps' webhooks with the secrets the CP sends it.
+          GITHUB_APP_WEBHOOK_V1_FEATURE
+        ]
+      })
+    )
+    const registeredPayload = registered.payload as RcRegistered
+    this.relayId = registeredPayload.relayId
+    this.serverFeatures = new Set(registeredPayload.serverFeatures)
+    this.registeredFeatures = new Set(registeredPayload.serverFeatures)
+    this.deps.onRegistered?.(this.relayId)
+
+    this.state = 'READY'
+    this.handoffRedialUntil = undefined
+    this.linkGeneration += 1
+    this.heartbeatMs = ok.heartbeatSec > 0 ? ok.heartbeatSec * 1000 : this.deps.heartbeatDefaultMs
+    this.armHeartbeat()
+    this.deps.log.info(`relay: READY (relayId=${this.relayId})`)
+    this.flushPendingRunReports()
+    this.releaseReadyWaiters(true)
+    this.deps.onReady?.()
+    // After onReady, like any later control: it clears the memory bindings this replay restores.
+    this.drainRegisterControls()
+  }
+
+  /** Apply the controls held behind `rc/registered`, in arrival order. */
+  private drainRegisterControls(): void {
+    const held = this.registerControls ?? []
+    this.registerControls = undefined
+    for (const frame of held) this.dispatch(frame)
+  }
+
+  private sendRequest(frame: RelayCpFrame, opts?: RequestOpts): Promise<RelayCpFrame> {
+    return this.correlator.request(frame, (e) => this.transport!.send(e), opts)
+  }
+
+  private async onText(text: string, assembled = false): Promise<void> {
+    const decoded = decodeRelayCpFrame(text, assembled ? { maxBytes: MAX_ASSEMBLED_FRAME_BYTES } : {})
+    if (!decoded.ok) {
+      const code = this.decodeErrorCode(decoded.msg)
+      this.sendError(decoded.id, code, decoded.msg, false)
+      if (decoded.corr) {
+        this.correlator.reject(decoded.corr, new WireError(code, `invalid correlated reply: ${decoded.msg}`, false))
+      }
+      return
+    }
+    const frame = decoded.frame
+    if (frame.type === 'rc/fragment') {
+      if (assembled) return this.deps.log.warn('relay: dropped a fragment nested in a reassembled frame')
+      const result = this.fragments.push(frame.payload as FrameFragment)
+      if ('error' in result) this.deps.log.warn(`relay: dropped a fragmented frame: ${result.error}`)
+      else if (result.done) await this.onText(result.text, true)
+      return
+    }
+    // A correlated REP/error settles a pending relay-issued REQ.
+    if (frame.corr && this.correlator.settle(frame)) {
+      // One socket read can carry rc/registered and the CP's replay behind it; hold that replay until READY.
+      if (frame.type === 'rc/registered' && this.state === 'REGISTERING') this.registerControls = []
+      return
+    }
+    if (this.state === 'REGISTERING' && this.registerControls) {
+      this.registerControls.push(frame)
+      return
+    }
+    // Control frames (EVTs) are only legal once READY.
+    if (this.state !== 'READY') {
+      this.deps.log.warn(`relay: refused ${frame.type} in ${this.state}`)
+      this.sendError(frame.id, 'PROTOCOL_STATE', `${frame.type} illegal in ${this.state}`, false)
+      return
+    }
+    this.dispatch(frame)
+  }
+
+  private dispatch(frame: RelayCpFrame): void {
+    switch (frame.type) {
+      case 'rc/daemon-revoke': {
+        const { daemonId } = frame.payload as RcDaemonRevoke
+        this.deps.onRevoke?.(daemonId)
+        return
+      }
+      case 'rc/bot-assign': {
+        this.deps.onBotAssign?.(frame.payload as RcBotAssign)
+        return
+      }
+      case 'rc/bot-unassign': {
+        this.deps.onBotUnassign?.(frame.payload as RcBotUnassign)
+        return
+      }
+      case 'rc/routes': {
+        this.deps.onRoutes?.(frame.payload as RcRoutes)
+        return
+      }
+      case 'rc/assign': {
+        this.deps.onAssign?.(frame.payload as RcAssign)
+        return
+      }
+      case 'rc/participant-assign': {
+        this.deps.onParticipantAssign?.(frame.payload as RcParticipantAssign)
+        return
+      }
+      case 'rc/codehost-feedback-watch': {
+        this.deps.onFeedbackWatch?.(frame.payload as RcCodeHostFeedbackWatch)
+        return
+      }
+      case 'rc/follow-up-watch': {
+        this.deps.onFollowUpWatch?.(frame.payload as RcFollowUpWatch)
+        return
+      }
+      case 'rc/hook-assign': {
+        this.deps.onHookAssign?.(frame.payload as RcHookAssign)
+        return
+      }
+      case 'rc/hook-remove': {
+        this.deps.onHookRemove?.((frame.payload as RcHookRemove).hookId)
+        return
+      }
+      case 'rc/collab-routes': {
+        this.deps.onCollabRoutes?.(frame.payload as RcCollabRoutes)
+        return
+      }
+      case 'rc/mcp-assign': {
+        this.deps.onMcpAssign?.(frame.payload as RcMcpAssign)
+        return
+      }
+      case 'rc/mcp-unassign': {
+        this.deps.onMcpUnassign?.(frame.payload as RcMcpUnassign)
+        return
+      }
+      case 'rc/memoryconnection-assign': {
+        this.deps.onMemoryConnectionAssign?.(frame.payload as RcMemoryConnectionAssign)
+        return
+      }
+      case 'rc/memoryconnection-unassign': {
+        this.deps.onMemoryConnectionUnassign?.(frame.payload as RcMemoryConnectionUnassign)
+        return
+      }
+      case 'rc/github-app-assign': {
+        this.deps.onGithubAppAssign?.(frame.payload as RcGithubAppAssign)
+        return
+      }
+      case 'rc/github-app-unassign': {
+        this.deps.onGithubAppUnassign?.(frame.payload as RcGithubAppUnassign)
+        return
+      }
+      case 'rc/snapshot-begin': {
+        this.deps.onSnapshotBegin?.(frame.payload as RcSnapshotBegin)
+        return
+      }
+      case 'rc/snapshot-end': {
+        this.deps.onSnapshotEnd?.(frame.payload as RcSnapshotEnd)
+        return
+      }
+      default:
+        // REPs (rc/auth/ok, rc/registered, rc/verify/ok) settle via the correlator;
+        // anything else is an unexpected EVT — ignore rather than close (forward-compat).
+        this.deps.log.debug(`relay: ignoring unexpected ${frame.type}`)
+    }
+  }
+
+  private decodeErrorCode(msg: string): ErrorCode {
+    if (msg === 'FRAME_TOO_LARGE') return 'FRAME_TOO_LARGE'
+    if (msg === 'UNKNOWN_FRAME') return 'UNKNOWN_FRAME'
+    return 'BAD_PAYLOAD'
+  }
+
+  /** Correlated REP to a CP-issued REQ (the mirror of the CP's own `reply`). */
+  private reply<T extends RelayCpFrameType>(
+    corr: string,
+    type: T,
+    payload: z.input<(typeof RELAY_CP_SCHEMAS)[T]>
+  ): void {
+    if (!this.transport) return
+    this.transport.send(JSON.stringify(buildRelayCpFrame(type, payload, { corr })))
+  }
+
+  private sendError(corr: string, code: ErrorCode, message: string, retryable: boolean): void {
+    if (!this.transport) return
+    this.transport.send(JSON.stringify(buildRelayCpFrame('error', { code, message, retryable }, { corr })))
+  }
+
+  private onClose(code: number, _reason: string): void {
+    const wasReady = this.state === 'READY'
+    this.stopHeartbeat()
+    // Drop the dead transport: `ws.send` on a CLOSED socket is silently swallowed,
+    // so anything still holding it would hang for a full retransmit budget.
+    this.transport = undefined
+    this.serverFeatures.clear()
+    this.correlator.rejectAll(new WireError('INTERNAL', 'connection closed', true))
+    if (code === AUTH_FAILED_CLOSE) {
+      this.fatal = true
+      this.state = 'CLOSED'
+      this.releaseReadyWaiters(false) // nothing to wait for — this link never comes back
+      this.deps.log.error('relay: AUTH_FAILED (4401) — not reconnecting; check RELAY_TOKEN / RELAY_API_KEY')
+      return
+    }
+    if (this.stopped) {
+      this.state = 'CLOSED'
+      this.releaseReadyWaiters(false)
+      return
+    }
+    if (wasReady && code === 1012) this.handoffRedialUntil = this.deps.clock.now() + HANDOFF_WAIT_MS
+    this.state = 'DEGRADED'
+    this.scheduleReconnect()
+  }
+
+  private armHeartbeat(): void {
+    this.heartbeatTimer = this.deps.clock.setTimeout(() => {
+      if (this.state === 'READY') {
+        this.transport?.send(JSON.stringify(buildRelayCpFrame('rc/heartbeat', {})))
+        this.armHeartbeat()
+      }
+    }, this.heartbeatMs)
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.heartbeatTimer)
+      this.heartbeatTimer = undefined
+    }
+  }
+}

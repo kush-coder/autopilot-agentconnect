@@ -1,0 +1,104 @@
+// Every agent's reminders (assistant-mode.md §5.9): the cheap tier of self-scheduling, text the duty holder posts at its time with no model turn.
+import type { Agent } from '../agents/agent-schema.js'
+import { isSendQueueTimeout } from '../platforms/send-queue.js'
+import {
+  ASSISTANT_REMINDER_CLAIM_STALE_MS,
+  ASSISTANT_REMINDER_LATE_MAX_MS,
+  ASSISTANT_REMINDER_MAX_ATTEMPTS,
+  type AssistantReminder,
+  type AssistantReminderLedger
+} from '../store/assistant-reminders.js'
+
+/** Due reminders one sweep delivers per agent; the rest wait for the next sweep. */
+const REMINDERS_PER_SWEEP = 20
+
+export interface AssistantRemindersHost {
+  now(): number
+  log: { info(message: string): void; warn(message: string): void; debug(message: string): void }
+  agents(): Iterable<Pick<Agent, 'id'>>
+  /** This daemon holds the agent's duty, and the agent is neither paused nor draining. */
+  mayDeliver(agentId: string): boolean
+  draining(): boolean
+  reminders: AssistantReminderLedger
+  /** The agent is enabled in this conversation (conversation gating). */
+  placeEnabled(agentId: string, integrationId: string, channel: string): boolean
+  /** Post the text as the agent, the way an approved draft posts; the message id, or undefined when none came back. Throws on a platform error. */
+  post(reminder: AssistantReminder): Promise<string | undefined>
+}
+
+export class AssistantReminders {
+  private sweeping = false
+
+  constructor(private readonly host: AssistantRemindersHost) {}
+
+  /** One pass over the agents this daemon delivers for: expire the long overdue, fail cut claims, deliver what is due. */
+  async sweep(): Promise<void> {
+    if (this.sweeping || this.host.draining()) return
+    this.sweeping = true
+    try {
+      const deliverable = [...this.host.agents()].map((agent) => agent.id).filter((id) => this.host.mayDeliver(id))
+      if (deliverable.length === 0) return
+      const now = this.host.now()
+      // One probe for every agent, so an agent with nothing due costs no query of its own.
+      const busy = await this.host.reminders.agentsWithWork(deliverable, now, now - ASSISTANT_REMINDER_CLAIM_STALE_MS)
+      for (const agentId of deliverable) {
+        if (!busy.has(agentId) || !this.host.mayDeliver(agentId)) continue
+        try {
+          await this.deliverFor(agentId)
+        } catch (err) {
+          this.host.log.warn(`reminders: agent ${agentId} was not swept: ${(err as Error).message}`)
+        }
+      }
+    } finally {
+      this.sweeping = false
+    }
+  }
+
+  private async deliverFor(agentId: string): Promise<void> {
+    const { reminders, log } = this.host
+    const now = this.host.now()
+    const expired = await reminders.expireOverdue(agentId, now - ASSISTANT_REMINDER_LATE_MAX_MS, now)
+    if (expired > 0)
+      log.info(`reminders: agent ${agentId} had ${expired} reminder(s) more than 24 hours overdue; expired`)
+    for (const id of await reminders.failStaleClaims(agentId, now - ASSISTANT_REMINDER_CLAIM_STALE_MS, now))
+      log.warn(`reminder ${id}: a delivery was cut short and may have posted; marked failed, never posted again`)
+    for (const reminder of await reminders.due(agentId, now, REMINDERS_PER_SWEEP)) {
+      if (this.host.draining() || !this.host.mayDeliver(agentId)) return
+      await this.deliver(reminder)
+    }
+  }
+
+  /** Claim, then post once in its conversation, shared with another organization or not (#2979, B4), or not at all. */
+  private async deliver(reminder: AssistantReminder): Promise<void> {
+    const { reminders, log } = this.host
+    const { agentId, id, integrationId } = reminder
+    const attempt = await reminders.claim(agentId, id, this.host.now())
+    if (attempt === undefined) return
+    const fail = async (failure: string): Promise<void> => {
+      await reminders.settle(agentId, id, { status: 'failed', failure }, this.host.now())
+      log.warn(`reminder ${id} of agent ${agentId} failed: ${failure}`)
+    }
+    if (!this.host.placeEnabled(agentId, integrationId, reminder.place.channel))
+      return await fail('the agent is no longer enabled in that conversation')
+    let outcome: { status: 'delivered'; messageId: string }
+    try {
+      const messageId = await this.host.post(reminder)
+      // Some platforms swallow a failed send and return no id: unconfirmed, so never delivered and never retried.
+      if (!messageId) return await fail('the platform returned no message id, so it may not have posted; not retried')
+      outcome = { status: 'delivered', messageId }
+    } catch (err) {
+      const failure = (err as Error).message
+      // The queue abandoned the send but it keeps running and may still land, so a retry could post twice.
+      if (isSendQueueTimeout(err))
+        return await fail(`the post timed out and may still have landed; not retried (${failure})`)
+      if (attempt >= ASSISTANT_REMINDER_MAX_ATTEMPTS)
+        return await fail(`${attempt} attempts failed; the last: ${failure}`)
+      await reminders.release(agentId, id, failure, this.host.now())
+      log.info(`reminder ${id}: attempt ${attempt} failed (${failure}); retried on a later sweep`)
+      return
+    }
+    // Outside the retry: a settle that fails leaves the claim to go stale, never to post twice.
+    await reminders.settle(agentId, id, outcome, this.host.now())
+    log.debug(`reminder ${id} of agent ${agentId} delivered`)
+  }
+}

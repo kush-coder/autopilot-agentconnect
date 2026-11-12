@@ -1,0 +1,667 @@
+import { generateKeyPairSync } from 'node:crypto'
+import { describe, it, expect, vi } from 'vitest'
+import {
+  type WireGoogleChatCall,
+  buildRelayDaemonFrame,
+  API_AHP_V1_FEATURE,
+  RELAY_DAEMON_SUBPROTOCOL,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  RD_DECISION_ROUTE_V1,
+  RD_PLATFORM_REQUEST_V1,
+  RD_WEBCHAT_IMAGES_V1,
+  RD_WEBCHAT_PROMPT_SUGGESTION_V1,
+  type RelayDaemonFrame,
+  type RcVerifyResult
+} from '@agentconnect.md/protocol'
+import { FakeClock, type ServerTransport } from '@agentconnect.md/connection'
+import { GOOGLE_TOKEN_ENDPOINT, GoogleChatRelayEgress } from './platforms/googlechat/egress.js'
+import { DAEMON_AUTH_RECHECK_MS, RelayDaemonConnection, type RelayDaemonConnDeps } from './relay-daemon-connection.js'
+import type { Logger } from './log.js'
+
+const RELAY_ID = '11111111-1111-4111-8111-111111111111'
+const DAEMON_ID = '22222222-2222-4222-8222-222222222222'
+const OTHER_DAEMON = '33333333-3333-4333-8333-333333333333'
+const silentLog: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+
+class FakeServerTransport implements ServerTransport {
+  readonly subprotocol = RELAY_DAEMON_SUBPROTOCOL
+  readonly remoteAddr = 'test'
+  sent: RelayDaemonFrame[] = []
+  closed?: { code: number; reason: string }
+  private msgCb?: (t: string) => void
+  private closeCb?: (c: number, r: string) => void
+
+  send(text: string): void {
+    this.sent.push(JSON.parse(text) as RelayDaemonFrame)
+  }
+  onMessage(cb: (t: string) => void): void {
+    this.msgCb = cb
+  }
+  onClose(cb: (c: number, r: string) => void): void {
+    this.closeCb = cb
+  }
+  close(code: number, reason: string): void {
+    this.closed = { code, reason }
+    this.closeCb?.(code, reason)
+  }
+  feed(
+    type:
+      | 'rd/hello'
+      | 'rd/ack'
+      | 'rd/route'
+      | 'rd/route/report'
+      | 'rd/platform/request'
+      | 'rd/webchat-image-update'
+      | 'rd/webchat-prompt-suggestion',
+    payload: unknown
+  ): void {
+    this.msgCb?.(JSON.stringify(buildRelayDaemonFrame(type, payload as never)))
+  }
+  /** Deliver identical bytes again, the way a correlator retransmits an unanswered request. */
+  feedRaw(text: string): void {
+    this.msgCb?.(text)
+  }
+  lastRep(type: string): RelayDaemonFrame | undefined {
+    return [...this.sent].reverse().find((f) => f.type === type)
+  }
+}
+
+function build(
+  opts: {
+    verify?: () => Promise<RcVerifyResult>
+    relayId?: string | undefined
+    onRoute?: RelayDaemonConnDeps['onRoute']
+    onRouteReport?: RelayDaemonConnDeps['onRouteReport']
+    onPlatformRequest?: RelayDaemonConnDeps['onPlatformRequest']
+    onWebchatImageUpdate?: RelayDaemonConnDeps['onWebchatImageUpdate']
+    onWebchatPromptSuggestion?: RelayDaemonConnDeps['onWebchatPromptSuggestion']
+    bufferedAmount?: () => number
+  } = {}
+) {
+  const verify = vi.fn(opts.verify ?? (async () => ({ ok: true, daemonId: DAEMON_ID, orgId: 'org-1' })))
+  const onReady = vi.fn()
+  const onClosed = vi.fn()
+  const transport = new FakeServerTransport()
+  const clock = new FakeClock()
+  const conn = new RelayDaemonConnection(transport, {
+    verify,
+    relayId: () => ('relayId' in opts ? opts.relayId : RELAY_ID),
+    clock,
+    onChat: () => {},
+    onWebchatPost: () => {},
+    ...(opts.onWebchatImageUpdate ? { onWebchatImageUpdate: opts.onWebchatImageUpdate } : {}),
+    ...(opts.onWebchatPromptSuggestion ? { onWebchatPromptSuggestion: opts.onWebchatPromptSuggestion } : {}),
+    onAgentMsg: async () => ({ deliveryId: 'unused', delivered: false }),
+    onRoute: opts.onRoute ?? (async (_from, msg) => ({ deliveryId: msg.deliveryId, disposition: 'admitted' as const })),
+    onRouteReport: opts.onRouteReport ?? (() => ({ accepted: true })),
+    ...(opts.onPlatformRequest ? { onPlatformRequest: opts.onPlatformRequest } : {}),
+    onReady,
+    onClosed,
+    log: silentLog,
+    ...(opts.bufferedAmount ? { bufferedAmount: opts.bufferedAmount } : {})
+  })
+  conn.start()
+  return { conn, transport, clock, verify, onReady, onClosed }
+}
+
+describe('RelayDaemonConnection (rd/* accept FSM)', () => {
+  it.each([
+    { ok: false, reason: 'not authorized' },
+    { ok: true, daemonId: OTHER_DAEMON }
+  ] as RcVerifyResult[])('closes an established link when revalidation rejects its identity: %j', async (verdict) => {
+    const h = build()
+    h.transport.feed('rd/hello', { apiKey: 'test-key', daemonId: DAEMON_ID })
+    await vi.waitFor(() => expect(h.conn.state).toBe('READY'))
+    h.verify.mockResolvedValue(verdict)
+    h.clock.advance(DAEMON_AUTH_RECHECK_MS)
+    await vi.waitFor(() => expect(h.conn.state).toBe('CLOSED'))
+    expect(h.onClosed).toHaveBeenCalledWith(DAEMON_ID, h.conn)
+    await expect(h.conn.forwardAgentMsg({} as never)).rejects.toThrow('not ready')
+  })
+
+  it('keeps established ingress through CP errors and rechecks after recovery', async () => {
+    const h = build()
+    h.transport.feed('rd/hello', { apiKey: 'test-key', daemonId: DAEMON_ID })
+    await vi.waitFor(() => expect(h.conn.state).toBe('READY'))
+    h.verify.mockRejectedValue(new Error('CP unavailable'))
+    for (let i = 0; i < 3; i++) {
+      h.clock.advance(DAEMON_AUTH_RECHECK_MS)
+      await vi.waitFor(() => expect(h.clock.pending).toBe(1))
+    }
+    expect(h.verify).toHaveBeenCalledTimes(4)
+    expect(h.conn.state).toBe('READY')
+    h.transport.feed('rd/route/report', { botId: RELAY_ID, sessionKey: 'C1/C1', channel: 'C1', participants: [] })
+    await vi.waitFor(() => expect(h.transport.lastRep('rd/route/report/ack')?.payload).toEqual({ accepted: true }))
+    h.verify.mockResolvedValue({ ok: false, reason: 'not authorized' })
+    h.clock.advance(DAEMON_AUTH_RECHECK_MS)
+    await vi.waitFor(() => expect(h.conn.state).toBe('CLOSED'))
+  })
+
+  it('cannot revive a revoked connection from an in-flight successful recheck', async () => {
+    const h = build()
+    h.transport.feed('rd/hello', { apiKey: 'test-key', daemonId: DAEMON_ID })
+    await vi.waitFor(() => expect(h.conn.state).toBe('READY'))
+    let release!: (result: RcVerifyResult) => void
+    h.verify.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve
+        })
+    )
+    h.clock.advance(DAEMON_AUTH_RECHECK_MS)
+    h.conn.close(1013, 'daemon authorization changed')
+    expect(h.conn.state).toBe('CLOSED')
+    release({ ok: true, daemonId: DAEMON_ID })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(h.clock.pending).toBe(0)
+    expect(h.conn.state).toBe('CLOSED')
+    expect(h.onReady).toHaveBeenCalledTimes(1)
+  })
+  it('rd/hello with a valid key + matching daemonId → rd/hello/ok{relayId} + onReady', async () => {
+    const { conn, transport, verify, onReady } = build()
+    transport.feed('rd/hello', { apiKey: 'the-key', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(verify).toHaveBeenCalledWith('daemon-key', 'the-key', DAEMON_ID)
+    expect(transport.lastRep('rd/hello/ok')!.payload).toEqual({
+      relayId: RELAY_ID,
+      capabilities: [
+        RD_CODEHOST_REPLY_TARGET_V1,
+        RD_DECISION_ROUTE_V1,
+        RD_PLATFORM_REQUEST_V1,
+        RD_WEBCHAT_IMAGES_V1,
+        RD_WEBCHAT_PROMPT_SUGGESTION_V1
+      ]
+    })
+    expect(conn.state).toBe('READY')
+    expect(conn.daemonId).toBe(DAEMON_ID)
+    expect(onReady).toHaveBeenCalledWith(DAEMON_ID, conn)
+  })
+
+  it('hands an rd/webchat-image-update to its handler bound to the authenticated daemon', async () => {
+    const onWebchatImageUpdate = vi.fn()
+    const { transport } = build({ onWebchatImageUpdate })
+    transport.feed('rd/hello', { apiKey: 'the-key', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    const update = {
+      conversationId: RELAY_ID,
+      agentId: OTHER_DAEMON,
+      postId: DAEMON_ID,
+      revision: 2,
+      original: { kind: 'inline' }
+    }
+    transport.feed('rd/webchat-image-update', update)
+    await Promise.resolve()
+    expect(onWebchatImageUpdate).toHaveBeenCalledWith(DAEMON_ID, update)
+  })
+
+  it('hands an rd/webchat-prompt-suggestion to its handler bound to the authenticated daemon', async () => {
+    const onWebchatPromptSuggestion = vi.fn()
+    const { transport } = build({ onWebchatPromptSuggestion })
+    transport.feed('rd/hello', { apiKey: 'the-key', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    const suggestion = { conversationId: RELAY_ID, agentId: OTHER_DAEMON, text: 'Run the tests' }
+    transport.feed('rd/webchat-prompt-suggestion', suggestion)
+    transport.feed('rd/webchat-prompt-suggestion', { ...suggestion, text: null })
+    await Promise.resolve()
+    expect(onWebchatPromptSuggestion.mock.calls).toEqual([
+      [DAEMON_ID, suggestion],
+      [DAEMON_ID, { ...suggestion, text: null }]
+    ])
+  })
+
+  it('honours a per-request ack budget on rd/msg: one send, rejected only after its own timeout', async () => {
+    const { conn, transport, clock } = build()
+    transport.feed('rd/hello', { apiKey: 'the-key', daemonId: DAEMON_ID })
+    await vi.waitFor(() => expect(conn.state).toBe('READY'))
+    const msg = {
+      source: 'hook' as const,
+      agentId: OTHER_DAEMON,
+      sessionKey: 'example-org/example-repo#1',
+      msgId: 'h:d:route',
+      hookId: RELAY_ID,
+      deliveryKey: 'd',
+      firedAt: '2026-01-01T00:00:00.000Z'
+    }
+    let settled: unknown
+    conn.sendMsg(msg, { ackTimeoutMs: 15_000, maxTries: 1 }).then(
+      () => (settled = 'resolved'),
+      (err: unknown) => (settled = err)
+    )
+    clock.advance(10_000)
+    await Promise.resolve()
+    expect(settled).toBeUndefined()
+    expect(transport.sent.filter((f) => f.type === 'rd/msg')).toHaveLength(1)
+    clock.advance(5_000)
+    await vi.waitFor(() => expect(settled).toBeInstanceOf(Error))
+    expect(transport.sent.filter((f) => f.type === 'rd/msg')).toHaveLength(1)
+  })
+
+  it('delegates a projected ServiceAccount token as daemon-token, in place of any key', async () => {
+    const { conn, transport, verify } = build()
+    transport.feed('rd/hello', { serviceAccountToken: 'projected', apiKey: 'stale-key', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    // The token wins: a stale key must never pick a different identity than the CP socket did.
+    // The claimed id rides along so CP can match it to the install-wide daemon record.
+    // tells the CP which of them this token is presented for.
+    expect(verify).toHaveBeenCalledWith('daemon-token', 'projected', DAEMON_ID)
+    expect(conn.state).toBe('READY')
+  })
+
+  it('keeps a verified pool socket after its original token expires and still honors revocation', async () => {
+    const h = build()
+    h.transport.feed('rd/hello', { serviceAccountToken: 'projected', daemonId: DAEMON_ID })
+    await vi.waitFor(() => expect(h.conn.state).toBe('READY'))
+    h.verify.mockResolvedValue({ ok: false, reason: 'projected token expired' })
+    h.clock.advance(3_600_000 + DAEMON_AUTH_RECHECK_MS)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(h.conn.state).toBe('READY')
+    expect(h.verify).toHaveBeenCalledTimes(1)
+    h.transport.feed('rd/route/report', { botId: RELAY_ID, sessionKey: 'C1/C1', channel: 'C1', participants: [] })
+    await vi.waitFor(() => expect(h.transport.lastRep('rd/route/report/ack')?.payload).toEqual({ accepted: true }))
+    h.conn.close(4409, 'revoked')
+    expect(h.conn.state).toBe('CLOSED')
+    expect(h.onClosed).toHaveBeenCalledWith(DAEMON_ID, h.conn)
+    expect(h.clock.pending).toBe(0)
+  })
+
+  it('refuses a hello carrying no credential at all (close 4401)', async () => {
+    const { transport, verify } = build()
+    transport.feed('rd/hello', { daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(verify).not.toHaveBeenCalled()
+    expect(transport.lastRep('error')!.payload).toMatchObject({ code: 'AUTH_FAILED' })
+    expect(transport.closed?.code).toBe(4401)
+  })
+
+  it('rejects an invalid credential with AUTH_FAILED + close(4401)', async () => {
+    const { transport } = build({ verify: async () => ({ ok: false, reason: 'nope' }) })
+    transport.feed('rd/hello', { apiKey: 'bad', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(transport.lastRep('error')!.payload).toMatchObject({ code: 'AUTH_FAILED' })
+    expect(transport.closed?.code).toBe(4401)
+  })
+
+  it('rejects a daemonId that the key does not resolve to (close 4401)', async () => {
+    const { transport } = build({ verify: async () => ({ ok: true, daemonId: DAEMON_ID, orgId: 'org-1' }) })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: OTHER_DAEMON }) // claims a different id
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(transport.closed?.code).toBe(4401)
+  })
+
+  it('asks the daemon to retry (close 1013) when the relay is not yet registered', async () => {
+    const { transport, verify } = build({ relayId: undefined })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    expect(verify).not.toHaveBeenCalled() // no CP link to verify against
+    expect(transport.closed?.code).toBe(1013)
+  })
+
+  it('asks the daemon to retry (close 1013) when verify throws (link not ready)', async () => {
+    const { transport } = build({
+      verify: async () => {
+        throw new Error('link not ready')
+      }
+    })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(transport.lastRep('error')!.payload).toMatchObject({ code: 'INTERNAL', retryable: true })
+    expect(transport.closed?.code).toBe(1013)
+  })
+
+  it('gates by state — an rd/ack before hello is PROTOCOL_STATE', async () => {
+    const { transport } = build()
+    transport.feed('rd/ack', { msgId: 'm', accepted: true })
+    await Promise.resolve()
+    expect(transport.lastRep('error')!.payload).toMatchObject({ code: 'PROTOCOL_STATE' })
+  })
+
+  it('does NOT register (onReady) if the socket closes during the verify RTT', async () => {
+    let resolveVerify!: (r: RcVerifyResult) => void
+    const { conn, transport, onReady, onClosed } = build({
+      verify: () => new Promise<RcVerifyResult>((res) => (resolveVerify = res))
+    })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    // Socket dies mid-verify: onClose runs with daemonId still '' → onClosed skipped.
+    transport.close(1006, 'peer gone')
+    expect(conn.state).toBe('CLOSED')
+    // verify now resolves OK — the CLOSED guard must prevent a dead onReady insert.
+    resolveVerify({ ok: true, daemonId: DAEMON_ID, orgId: 'org-1' })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(onReady).not.toHaveBeenCalled()
+    expect(onClosed).not.toHaveBeenCalled() // never registered ⇒ nothing to unregister
+    expect(conn.state).toBe('CLOSED')
+  })
+
+  it('answers a hello the daemon retransmitted during a slow verify exactly once', async () => {
+    let resolveVerify!: (r: RcVerifyResult) => void
+    const { conn, transport, verify, onReady } = build({
+      verify: () => new Promise<RcVerifyResult>((res) => (resolveVerify = res))
+    })
+    const hello = JSON.stringify(buildRelayDaemonFrame('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID }))
+    transport.feedRaw(hello)
+    await Promise.resolve()
+    transport.feedRaw(hello)
+    await Promise.resolve()
+    expect(verify).toHaveBeenCalledTimes(1)
+    resolveVerify({ ok: true, daemonId: DAEMON_ID, orgId: 'org-1' })
+    await vi.waitFor(() => expect(conn.state).toBe('READY'))
+    expect(transport.sent.filter((frame) => frame.type === 'rd/hello/ok')).toHaveLength(1)
+    expect(onReady).toHaveBeenCalledTimes(1)
+  })
+
+  it('fires onClosed with the daemonId once authenticated', async () => {
+    const { conn, transport, onClosed } = build()
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    conn.close(4409, 'revoked')
+    expect(onClosed).toHaveBeenCalledWith(DAEMON_ID, conn)
+  })
+
+  it('runs each onceClosed listener exactly once, skips an unsubscribed one, and runs a late one at once', async () => {
+    const { conn } = build()
+    const kept = vi.fn()
+    const dropped = vi.fn()
+    conn.onceClosed(kept)
+    conn.onceClosed(dropped)()
+    conn.close(4409, 'revoked') // the fake transport also fires its own close callback
+    expect(kept).toHaveBeenCalledTimes(1)
+    expect(dropped).not.toHaveBeenCalled()
+    const late = vi.fn()
+    conn.onceClosed(late)
+    await Promise.resolve()
+    expect(late).toHaveBeenCalledTimes(1)
+  })
+
+  it('answers rd/route and rd/route/report bound to the authenticated daemon', async () => {
+    const onRoute = vi.fn(async (_from: string, msg: { deliveryId: string }) => ({
+      deliveryId: msg.deliveryId,
+      disposition: 'retry' as const,
+      reason: 'offline' as const
+    }))
+    const onRouteReport = vi.fn((_from: string, _msg: unknown) => ({ accepted: false, reason: 'not_host' }))
+    const { transport } = build({ onRoute, onRouteReport })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    const payload = {
+      msgId: 'Ev1',
+      traceId: 't',
+      source: 'user',
+      platform: 'slack',
+      channel: 'C1',
+      sender: { id: 'U1', isBot: false },
+      text: 'hi',
+      mentionedBots: [],
+      isDm: false
+    }
+    transport.feed('rd/route', {
+      deliveryId: 'b:Ev1#a',
+      botId: RELAY_ID,
+      sessionKey: 'C1/C1',
+      toAgentId: OTHER_DAEMON,
+      frozenDaemonId: OTHER_DAEMON,
+      payload,
+      selection: {
+        selectionId: '1:router:b',
+        hostSeq: 1,
+        decisionId: 'd-1',
+        question: { type: 'boolean', instructions: 'Q?', criteria: { true: 'Yes', false: 'No' } },
+        requestedModel: 'jev-1.13.0',
+        result: { status: 'not_evaluated', reason: 'all_participants' },
+        effect: 'participant',
+        constrained: true,
+        targetAgentIds: [OTHER_DAEMON],
+        evaluatedMessageId: 'Ev1',
+        partial: { partial: false, reasons: [], omittedMessages: 0 }
+      }
+    })
+    transport.feed('rd/route/report', { botId: RELAY_ID, sessionKey: 'C1/C1', channel: 'C1', participants: [] })
+    await vi.waitFor(() => expect(transport.lastRep('rd/route/report/ack')).toBeDefined())
+    await vi.waitFor(() => expect(transport.lastRep('rd/route/ack')).toBeDefined())
+    expect(onRoute.mock.calls[0]![0]).toBe(DAEMON_ID)
+    expect(onRouteReport.mock.calls[0]![0]).toBe(DAEMON_ID)
+    expect(transport.lastRep('rd/route/ack')!.payload).toEqual({
+      deliveryId: 'b:Ev1#a',
+      disposition: 'retry',
+      reason: 'offline'
+    })
+    expect(transport.lastRep('rd/route/report/ack')!.payload).toEqual({ accepted: false, reason: 'not_host' })
+  })
+
+  it('binds rd/platform/request to the authenticated daemon and refuses it where no handler is wired', async () => {
+    const onPlatformRequest = vi.fn(async () => ({ outcome: 'ok' as const, payload: { status: 200 } }))
+    const { transport } = build({ onPlatformRequest })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    transport.feed('rd/platform/request', { platformId: 'msteams', botId: RELAY_ID, payload: { op: 'graph-token' } })
+    await vi.waitFor(() => expect(transport.lastRep('rd/platform/reply')).toBeDefined())
+    expect(onPlatformRequest).toHaveBeenCalledWith(DAEMON_ID, {
+      platformId: 'msteams',
+      botId: RELAY_ID,
+      payload: { op: 'graph-token' }
+    })
+    expect(transport.lastRep('rd/platform/reply')!.payload).toEqual({ outcome: 'ok', payload: { status: 200 } })
+
+    const bare = build()
+    bare.transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    bare.transport.feed('rd/platform/request', { platformId: 'msteams', botId: RELAY_ID, payload: {} })
+    await vi.waitFor(() => expect(bare.transport.lastRep('rd/platform/reply')).toBeDefined())
+    expect(bare.transport.lastRep('rd/platform/reply')!.payload).toEqual({ outcome: 'refused', reason: 'unsupported' })
+  })
+
+  it('answers a handler failure with an error, never a reply that says nothing was sent', async () => {
+    const { transport } = build({
+      onPlatformRequest: async () => {
+        throw new Error('failed after the provider call')
+      }
+    })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    transport.feed('rd/platform/request', { platformId: 'msteams', botId: RELAY_ID, payload: {} })
+    await vi.waitFor(() => expect(transport.sent.some((f) => f.type === 'error')).toBe(true))
+    expect(transport.lastRep('rd/platform/reply')).toBeUndefined()
+  })
+
+  it('posts once when the reply to a 201 cannot be sent, and sends no second answer', async () => {
+    const posts: string[] = []
+    const { transport } = build({
+      onPlatformRequest: async () => {
+        posts.push('POST')
+        return { outcome: 'ok' as const, payload: { status: 201, body: { id: 'act-1' } } }
+      }
+    })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    const send = transport.send.bind(transport)
+    transport.send = (text: string) => {
+      if (text.includes('rd/platform/reply')) throw new Error('socket write failed')
+      send(text)
+    }
+    const before = transport.sent.length
+    transport.feed('rd/platform/request', { platformId: 'msteams', botId: RELAY_ID, payload: {} })
+    await vi.waitFor(() => expect(posts).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(posts).toEqual(['POST'])
+    expect(transport.sent.slice(before)).toEqual([])
+  })
+})
+
+describe('a Google Chat create through the relay', () => {
+  it('reaches Google once when the reply to it cannot be sent, and no second answer goes out', async () => {
+    const creates: string[] = []
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      if (url === GOOGLE_TOKEN_ENDPOINT) return Response.json({ access_token: 'token', expires_in: 3600 })
+      if (init?.method === 'POST') {
+        creates.push(url)
+        return Response.json({ name: 'spaces/S1/messages/m1' })
+      }
+      return Response.json({ name: 'spaces/S1', spaceType: 'SPACE', customer: 'customers/C0000000001' })
+    }) as typeof fetch
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    const egress = new GoogleChatRelayEgress(
+      {
+        projectNumber: '100000000000',
+        serviceAccountKey: JSON.stringify({
+          type: 'service_account',
+          private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+          client_email: 'chat-app@example.test'
+        })
+      },
+      fetchImpl
+    )
+    const { transport } = build({
+      onPlatformRequest: (_daemon, req) =>
+        egress.call({ botId: req.botId, tenantIds: ['customers/C0000000001'] }, req.payload as WireGoogleChatCall)
+    })
+    transport.feed('rd/hello', { apiKey: 'k', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    const send = transport.send.bind(transport)
+    transport.send = (text: string) => {
+      if (text.includes('rd/platform/reply')) throw new Error('socket write failed')
+      send(text)
+    }
+    const before = transport.sent.length
+    transport.feed('rd/platform/request', {
+      platformId: 'googlechat',
+      botId: RELAY_ID,
+      payload: { op: 'create-message', space: 'spaces/S1', requestId: 'client-1', messageId: 'client-1', text: 'hello' }
+    })
+    await vi.waitFor(() => expect(creates).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(creates).toHaveLength(1)
+    expect(transport.sent.slice(before)).toEqual([])
+  })
+})
+
+describe('AHP carrier binding', () => {
+  const attachmentId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const authorization = {
+    orgId: RELAY_ID,
+    agentId: OTHER_DAEMON,
+    userId: 'user',
+    user: 'User',
+    callerRole: 'owner' as const,
+    callerApproves: true,
+    grant: { token: 'signed', expiresAtMs: Date.now() + 60_000 }
+  }
+
+  async function ready(bufferedAmount?: () => number) {
+    const h = build(bufferedAmount ? { bufferedAmount } : {})
+    h.transport.feed('rd/hello', { apiKey: 'key', daemonId: DAEMON_ID, capabilities: [API_AHP_V1_FEATURE] })
+    await Promise.resolve()
+    await Promise.resolve()
+    return h
+  }
+
+  it('never opens an attachment on an older daemon', async () => {
+    const { conn, transport } = build()
+    transport.feed('rd/hello', { apiKey: 'key', daemonId: DAEMON_ID })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(await conn.authorizeAhp({ attachmentId, authorization }, true)).toBe(false)
+    expect(transport.lastRep('rd/ahp/open')).toBeUndefined()
+  })
+
+  it('correlates open and refresh receipts, and routes only the registered attachment', async () => {
+    const { conn, transport } = await ready()
+    const sink = vi.fn()
+    const remove = conn.listenAhp(attachmentId, sink)
+    for (const initial of [true, false]) {
+      const pending = conn.authorizeAhp({ attachmentId, authorization }, initial)
+      const sent = transport.lastRep(initial ? 'rd/ahp/open' : 'rd/ahp/authorize')!
+      transport.feedRaw(
+        JSON.stringify(
+          buildRelayDaemonFrame(
+            initial ? 'rd/ahp/opened' : 'rd/ahp/authorized',
+            {
+              attachmentId,
+              accepted: true
+            },
+            { corr: sent.id }
+          )
+        )
+      )
+      expect(await pending).toBe(true)
+    }
+    transport.feedRaw(
+      JSON.stringify(buildRelayDaemonFrame('rd/ahp/message', { attachmentId: RELAY_ID, message: 'wrong' }))
+    )
+    expect(sink).not.toHaveBeenCalled()
+    transport.feedRaw(JSON.stringify(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' })))
+    expect(sink).toHaveBeenCalledWith({ attachmentId, message: '{}' })
+    remove()
+    transport.feedRaw(JSON.stringify(buildRelayDaemonFrame('rd/ahp/close', { attachmentId, reason: 'unavailable' })))
+    expect(sink).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the replacement attachment listener when its predecessor is removed', async () => {
+    const { conn, transport } = await ready()
+    const old = vi.fn()
+    const current = vi.fn()
+    const removeOld = conn.listenAhp(attachmentId, old)
+    const removeCurrent = conn.listenAhp(attachmentId, current)
+    removeOld()
+    transport.feedRaw(JSON.stringify(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' })))
+    expect(old).not.toHaveBeenCalled()
+    expect(current).toHaveBeenCalledOnce()
+    removeCurrent()
+    transport.feedRaw(JSON.stringify(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' })))
+    expect(current).toHaveBeenCalledOnce()
+  })
+
+  it('notifies every attachment once when the daemon closes, even if another listener throws', async () => {
+    const { conn, transport } = await ready()
+    const first = vi.fn(() => {
+      throw new Error('listener failed')
+    })
+    const second = vi.fn()
+    conn.listenAhp(attachmentId, first)
+    conn.listenAhp(RELAY_ID, second)
+    conn.close(1001, 'shutdown')
+    transport.close(1001, 'duplicate close')
+    expect(first).toHaveBeenCalledExactlyOnceWith({ attachmentId, reason: 'unavailable' })
+    expect(second).toHaveBeenCalledExactlyOnceWith({ attachmentId: RELAY_ID, reason: 'unavailable' })
+  })
+
+  it('rejects a mismatched receipt and refuses a saturated daemon socket without affecting legacy delivery', async () => {
+    let buffered = 0
+    const { conn, transport } = await ready(() => buffered)
+    const pending = conn.authorizeAhp({ attachmentId, authorization }, true)
+    const sent = transport.lastRep('rd/ahp/open')!
+    transport.feedRaw(
+      JSON.stringify(
+        buildRelayDaemonFrame(
+          'rd/ahp/opened',
+          {
+            attachmentId: RELAY_ID,
+            accepted: true
+          },
+          { corr: sent.id }
+        )
+      )
+    )
+    expect(await pending).toBe(false)
+    buffered = 1024 * 1024
+    expect(() => conn.sendAhp({ attachmentId, message: '{}' })).toThrow('overloaded')
+    expect(conn.state).toBe('READY')
+    expect(transport.lastRep('rd/ahp/message')).toBeUndefined()
+  })
+})

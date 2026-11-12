@@ -1,0 +1,82 @@
+// No 'use client' here: reached only from ModalProvider's tree (the client boundary).
+
+import type { WebPlatformModule } from '../contract'
+import { identityCards, inviteBotHint } from '../wizard-chrome'
+import { SlackAgentCardHeaderActions, SlackAgentCardNotice, SlackAgentCardProvider } from './agent-card'
+import { slackApi, type SlackApi } from './api'
+import { SlackWizardBody, SLACK_TRANSPORT_LABEL } from './Body'
+import { SlackMark } from './mark'
+import { SlackConfigCard } from './profile'
+import { slackSettingsFragments } from './settings'
+import { useSlackPlatformInstall } from './use-platform-install'
+
+/** Slack's provider-native message id: epoch seconds with a sub-second part
+ *  (`1754123456.000200`). Chosen so a daemon-local 13-digit `monotonicTs()`
+ *  millisecond stamp can never match it. */
+const SLACK_NATIVE_TS = /^\d+\.\d+$/
+
+export const slackModule: WebPlatformModule<SlackApi> = {
+  platformId: 'slack',
+  docsPath: 'connect-automate/chat-platforms/slack',
+  Mark: SlackMark,
+  wizard: {
+    Body: SlackWizardBody,
+    // A disconnected workspace app can reconnect; adding another agent still requires sharing.
+    freeBotFilter: (bot) => !bot.teamId || bot.shareable || bot.agentIds.length === 0,
+    buildReuseInput: (bot, ctx) => ({
+      platform: 'slack',
+      agentId: ctx.agentId,
+      botId: bot.id,
+      // Reuse keeps the bot's own transport; the CP treats the durable bot row
+      // as authoritative either way.
+      transport: bot.transport ?? 'socket',
+      ...(ctx.shared ? { shareable: true } : {})
+    }),
+    affordances: {
+      transport: { labels: SLACK_TRANSPORT_LABEL, httpByDefaultWhenRelayAvailable: true },
+      share: true
+    },
+    identityCards: () => identityCards('slack'),
+    inviteHint: () => inviteBotHint('channel', 'Platforms.slack.brand')
+  },
+  settingsFragments: slackSettingsFragments,
+  apiBindings: slackApi,
+  // The caller's OWN App Configuration token — per-user, so it lives on Profile
+  // rather than on any bot row. Slack is the only platform with one.
+  ProfileCredentialCard: SlackConfigCard,
+  installPolling: { useInstallPoll: useSlackPlatformInstall },
+  channelList: {
+    roomNoun: 'channel',
+    roomGlyph: '#',
+    // `conversations.leave` needs `channels:manage` (a re-authorize for every workspace); removing the bot in Slack clears the row instead.
+    leave: 'none',
+    // A Slack DM opens a session per top-level message, so it can choose one session instead.
+    dmSessionModes: ['createNew', 'append'],
+    // A group DM is a small private room, with a room's modes.
+    groupDmSessionModes: ['createNew', 'append', 'auto'],
+    // The web client opens any conversation kind under the bot's workspace.
+    conversationUrl: ({ channelId, workspaceId }) =>
+      workspaceId
+        ? `https://app.slack.com/client/${encodeURIComponent(workspaceId)}/${encodeURIComponent(channelId)}`
+        : undefined
+  },
+  // No Body: the rows stay generic; a revoked app's repair sits in the header, its progress beneath it.
+  agentCard: {
+    CardProvider: SlackAgentCardProvider,
+    HeaderActions: SlackAgentCardHeaderActions,
+    Notice: SlackAgentCardNotice
+  },
+  // Replies hang under a root named by its ts, and the web client opens a thread beside its channel.
+  threadShape: {
+    isThreadId: (id) => SLACK_NATIVE_TS.test(id),
+    threadUrl: ({ channelId, workspaceId, rootId }) =>
+      workspaceId
+        ? `https://app.slack.com/client/${encodeURIComponent(workspaceId)}/${encodeURIComponent(channelId)}/thread/${encodeURIComponent(`${channelId}-${rootId}`)}`
+        : undefined
+  },
+  messageIdentity: (row) => (SLACK_NATIVE_TS.test(row.ts) ? `ts:${row.ts}` : null),
+  // Slack rows carry the workspace's own send-time, and a page must present
+  // them in it: the daemon `seq` is ingest order, which reorders a burst that
+  // arrived out of order. Every other platform trusts `seq`.
+  transcriptOrdering: 'event-time'
+}

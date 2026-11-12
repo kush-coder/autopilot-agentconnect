@@ -1,0 +1,244 @@
+import { handleAhpSession } from './ahp-session.js'
+import { handleDecisionRead } from './decisions.js'
+import {
+  handleMemoryTransaction,
+  handleMemoryHistoryAppend,
+  handleMemoryHistoryRead,
+  handleMemoryHomeMigrated,
+  handleMemoryStore
+} from './memory-store.js'
+/**
+ * `FrameRouter` (design §4.6) — the flat `type → handler` dispatch table.
+ *
+ * Handlers are `(frame, conn, deps) => Promise<void>` with all side effects
+ * through the injected services/registry/clock. Correlated REPs to CP-issued
+ * REQs are settled by the `ReqRep` in `connection.ts` BEFORE dispatch, and the
+ * legal-frame gate (protocol §2.1) is checked there too — so a handler only ever
+ * sees a legal, fully-validated inbound frame.
+ *
+ * Registers `auth`, `daemon/bootstrap/result`, `register`, `heartbeat`, `facts/runtime-profile`,
+ * `facts/daemon-runtimes`, `usage/report`, `integration/channels`, `cron/report`.
+ * Unhandled-but-legal EVTs (telemetry that lands in later phases) are a deliberate
+ * no-op (forward-compat), never an error.
+ */
+import type { AnyFrame, FrameType } from '@agentconnect.md/protocol'
+import type { DaemonWsDeps } from '../deps.js'
+// Type-only import — erased at runtime, so there is no cycle with connection.ts.
+import type { DaemonConnection } from '../connection.js'
+import { handleAuth } from './auth.js'
+import { handleDaemonBootstrapResult } from './daemon-bootstrap-result.js'
+import { handleDaemonLifecycleProgress } from './daemon-lifecycle-progress.js'
+import { handleDaemonLifecycleBegin } from './daemon-lifecycle-begin.js'
+import { handleRegister } from './register.js'
+import { handleCapabilitiesUpdate } from './capabilities-update.js'
+import { handleHeartbeat } from './heartbeat.js'
+import { handleRuntimeProfile } from './runtime-profile.js'
+import { handleDaemonRuntimes } from './daemon-runtimes.js'
+import { handleMemoryConnections } from './memory-connections.js'
+import { handleUsageReport } from './usage-report.js'
+import { handleIntegrationChannels } from './integration-channels.js'
+import { handleIntegrationRevoked } from './integration-revoked.js'
+import { handleIntegrationTenant } from './integration-tenant.js'
+import { handleCronReport, handleCronReportSync } from './cron-report.js'
+import { handleAgentCron } from './agent-cron.js'
+import { handleDutyRelease } from './duty-release.js'
+import { handleDutyClaim } from './duty-claim.js'
+import { handleDutyFetch } from './duty-fetch.js'
+import { handleExecutorCandidates, handleExecutorPrepare, handleExecutorRelease } from './executor.js'
+import { handleAgentExists } from './agent-exists.js'
+import { handleComputerLeaseAcquire, handleComputerLeaseRelease } from './computer-lease.js'
+import { handleComputerPoolAcquire } from './computer-pool.js'
+import { handleComputerChannelGrant } from './computer-channel.js'
+import { handleHookReport } from './hook-report.js'
+import { handleChannelAgents } from './channel-agents.js'
+import { handleChildSessionStatus } from './child-session-status.js'
+import { handleEventSession, handleEventSessionSync } from './event-session.js'
+import { handleSessionActivity } from './event-session-activity.js'
+import { handleAgentActivity } from './agent-activity.js'
+import { handleAgentSkillStatus } from './agent-skill-status.js'
+import { handleSessionPurged } from './event-session-purged.js'
+import { handleGitCredRequest } from './gitcred.js'
+import { handleLinearCredRequest } from './linearcred.js'
+import { handleProviderCredentials } from './provider-credentials.js'
+import { handleRepoCandidates } from './repo-candidates.js'
+import { handleHookStart } from './hook-start.js'
+import { handleHookPreparing } from './hook-preparing.js'
+import { handleApprovalRoute } from './approval-route.js'
+import { handleReadAccess } from './read-access.js'
+import { handleFollowUpWatch } from './follow-up-watch.js'
+import { handleCapabilityDecide, handleCapabilityRequest, handleCapabilityWithdraw } from './capability-request.js'
+import { handleGithubReviewAuthorize } from './github-review-authorize.js'
+import { handleSharedImageGet, handleSharedImagePut } from './shared-image.js'
+import { handleTransferGet, handleTransferSettle, handleTransferSign } from './file-transfer.js'
+import { handleGithubReviewResult } from './github-review-result.js'
+import { handleCodeHostNoteResult } from './codehost-note-result.js'
+import {
+  handleCodeHostReviewAuthorize,
+  handleCodeHostReviewLeaseRenew,
+  handleCodeHostReviewOp,
+  handleCodeHostReviewResult
+} from './codehost-review.js'
+import {
+  handleWebchatMcpGrantAccept,
+  handleWebchatMcpGrantIssue,
+  handleWebchatMcpGrantRenew,
+  handleWebchatMcpGrantRevoke
+} from './webchat-mcp-grant.js'
+import {
+  handleKnowledgeSearch,
+  handleKnowledgeList,
+  handleKnowledgeRecordRead,
+  handleKnowledgeRecordWrite,
+  handleOrgSkills,
+  handleManagedSkillRead,
+  handleOrganizationSuggestionsSync
+} from './organization-knowledge.js'
+
+export type Handler = (frame: AnyFrame, conn: DaemonConnection, deps: DaemonWsDeps) => Promise<void>
+
+export class FrameRouter {
+  private readonly table: Partial<Record<FrameType, Handler>>
+
+  constructor(overrides: Partial<Record<FrameType, Handler>> = {}) {
+    this.table = {
+      'ahp/session/reserve': handleAhpSession,
+      'ahp/session/finalize': handleAhpSession,
+      'ahp/session/resolve': handleAhpSession,
+      'ahp/session/list': handleAhpSession,
+      auth: handleAuth,
+      'daemon/bootstrap/result': handleDaemonBootstrapResult,
+      'daemon/lifecycle/progress': handleDaemonLifecycleProgress,
+      'daemon/lifecycle/begin': handleDaemonLifecycleBegin,
+      register: handleRegister,
+      'capabilities/update': handleCapabilitiesUpdate,
+      heartbeat: handleHeartbeat,
+      'facts/runtime-profile': handleRuntimeProfile,
+      'facts/daemon-runtimes': handleDaemonRuntimes,
+      'facts/memory-connections': handleMemoryConnections,
+      'usage/report': handleUsageReport,
+      'integration/channels': handleIntegrationChannels,
+      'integration/revoked': handleIntegrationRevoked,
+      'integration/tenant': handleIntegrationTenant,
+      'cron/report': handleCronReport,
+      'cron/report-sync': handleCronReportSync,
+      'cron/self': handleAgentCron,
+      'duty/release': handleDutyRelease,
+      'duty/claim': handleDutyClaim,
+      'duty/fetch': handleDutyFetch,
+      'executor/candidates': handleExecutorCandidates,
+      'executor/prepare': handleExecutorPrepare,
+      'executor/release': handleExecutorRelease,
+      'agent/exists': handleAgentExists,
+      'computer-lease/acquire': handleComputerLeaseAcquire,
+      'computer-lease/release': handleComputerLeaseRelease,
+      'computer-channel/grant': handleComputerChannelGrant,
+      'computer-pool/acquire': handleComputerPoolAcquire,
+      'hook/report': handleHookReport,
+      'hook/preparing': handleHookPreparing,
+      'hook/start': handleHookStart,
+      'agent/approval-route': handleApprovalRoute,
+      'agent/read-access': handleReadAccess,
+      'assistant/follow-up-watch': handleFollowUpWatch,
+      'capability/request': handleCapabilityRequest,
+      'capability/withdraw': handleCapabilityWithdraw,
+      'capability/decide': handleCapabilityDecide,
+      'github/review-authorize': handleGithubReviewAuthorize,
+      'transfer/sign': handleTransferSign,
+      'transfer/settle': handleTransferSettle,
+      'transfer/get': handleTransferGet,
+      'image/original/put': handleSharedImagePut,
+      'image/original/get': handleSharedImageGet,
+      'github/review-result': handleGithubReviewResult,
+      'codehost/note-result': handleCodeHostNoteResult,
+      'codehost/review-authz': handleCodeHostReviewAuthorize,
+      'codehost/review-op': handleCodeHostReviewOp,
+      'codehost/review-lease-renew': handleCodeHostReviewLeaseRenew,
+      'codehost/review-result': handleCodeHostReviewResult,
+      'channel/agents': handleChannelAgents,
+      'session/child-status': handleChildSessionStatus,
+      'event/session': handleEventSession,
+      'event/session-sync': handleEventSessionSync,
+      'event/session-activity': handleSessionActivity,
+      'agent/activity': handleAgentActivity,
+      'agent/skill-status': handleAgentSkillStatus,
+      'event/session-purged': handleSessionPurged,
+      'gitcred/request': handleGitCredRequest,
+      'linearcred/request': handleLinearCredRequest,
+      'provider-credentials/request': handleProviderCredentials,
+      'repo-candidates/request': handleRepoCandidates,
+      'decision/list': handleDecisionRead,
+      'decision/get': handleDecisionRead,
+      'webchat/mcp-grant/issue': handleWebchatMcpGrantIssue,
+      'webchat/mcp-grant/accept': handleWebchatMcpGrantAccept,
+      'webchat/mcp-grant/renew': handleWebchatMcpGrantRenew,
+      'webchat/mcp-grant/revoke': handleWebchatMcpGrantRevoke,
+      'knowledge/search': handleKnowledgeSearch,
+      'knowledge/list': handleKnowledgeList,
+      'knowledge/record/read': handleKnowledgeRecordRead,
+      'knowledge/record/write': handleKnowledgeRecordWrite,
+      'skills/org': handleOrgSkills,
+      'knowledge/suggestions/sync': handleOrganizationSuggestionsSync,
+      'managed-skill/read': handleManagedSkillRead,
+      'memory/transaction/v1': handleMemoryTransaction,
+      'memory/store': handleMemoryStore,
+      'memory/history/append': handleMemoryHistoryAppend,
+      'memory/history/read': handleMemoryHistoryRead,
+      'memory/home/migrated': handleMemoryHomeMigrated,
+      ...overrides
+    }
+  }
+
+  /** Dispatch a legal, validated inbound frame to its handler (no-op if none). */
+  async dispatch(frame: AnyFrame, conn: DaemonConnection, deps: DaemonWsDeps): Promise<void> {
+    const handler = this.table[frame.type as FrameType]
+    if (handler) await handler(frame, conn, deps)
+  }
+}
+
+export {
+  handleAuth,
+  handleDaemonBootstrapResult,
+  handleRegister,
+  handleCapabilitiesUpdate,
+  handleHeartbeat,
+  handleRuntimeProfile,
+  handleDaemonRuntimes,
+  handleMemoryConnections,
+  handleUsageReport,
+  handleIntegrationChannels,
+  handleIntegrationRevoked,
+  handleIntegrationTenant,
+  handleCronReport,
+  handleCronReportSync,
+  handleHookReport,
+  handleHookStart,
+  handleApprovalRoute,
+  handleGithubReviewAuthorize,
+  handleGithubReviewResult,
+  handleCodeHostNoteResult,
+  handleCodeHostReviewAuthorize,
+  handleCodeHostReviewOp,
+  handleCodeHostReviewLeaseRenew,
+  handleCodeHostReviewResult,
+  handleChannelAgents,
+  handleChildSessionStatus,
+  handleExecutorCandidates,
+  handleExecutorPrepare,
+  handleEventSession,
+  handleEventSessionSync,
+  handleSessionActivity,
+  handleAgentActivity,
+  handleAgentSkillStatus,
+  handleSessionPurged,
+  handleWebchatMcpGrantIssue,
+  handleWebchatMcpGrantAccept,
+  handleWebchatMcpGrantRenew,
+  handleWebchatMcpGrantRevoke,
+  handleKnowledgeSearch,
+  handleOrganizationSuggestionsSync,
+  handleManagedSkillRead,
+  handleMemoryStore,
+  handleMemoryHistoryAppend,
+  handleMemoryHistoryRead,
+  handleMemoryHomeMigrated
+}

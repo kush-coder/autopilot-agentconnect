@@ -1,0 +1,268 @@
+// The boot-time memory-home flip (memory-evolution.md §3.2.1 "Rollout", assistant-mode.md §4.1): set-placed and assistant-mode agents, and only those, move home.
+import { afterEach, describe, expect, it } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import type { Ack, AgentActivate, AgentDetach, AgentUpsert, McpServerSpec } from '@agentconnect.md/protocol'
+import { prisma } from '../setup.db.js'
+import { seedAgent, seedDaemon, seedDutyGroup } from '../fixtures/seed.js'
+import { buildHttpApp, type HttpApp } from '../fakes/build-http.js'
+import { poolSetId, seedPoolMember } from '../fakes/member-set.js'
+import type { DaemonLiveness } from '../../src/ports.js'
+import type { ControlSender } from '../../src/orchestrator/outbound.js'
+import { SetMemoryHomeReconciler } from '../../src/orchestrator/setMemoryHomeReconciler.js'
+
+const SOURCE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const MEMBER = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const CAPS = { platforms: ['slack'], runtimes: ['Claude Code'], acp: true, features: ['agent-move-v1'] }
+
+const CP = { provider: 'managed', home: 'control-plane' }
+const PENDING = { ...CP, homeMigration: 'pending' }
+const DAEMON_HOME = { provider: 'managed', home: 'daemon' }
+const EXTERNAL = { provider: 'external', connectionId: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee' }
+
+let running: HttpApp | undefined
+afterEach(async () => {
+  await running?.close()
+  running = undefined
+})
+
+/** The daemon-side seam: records every spec push with the binding it carried. */
+class ControlSpy {
+  readonly upserts: Array<{ daemonId: string; agentId: string; memory: unknown }> = []
+  async agentDetach(_daemonId: string, _value: AgentDetach): Promise<Ack> {
+    return { ok: true }
+  }
+  async agentActivate(_daemonId: string, _value: AgentActivate): Promise<Ack> {
+    return { ok: true }
+  }
+  async agentUpsert(daemonId: string, value: AgentUpsert): Promise<void> {
+    this.upserts.push({ daemonId, agentId: value.agentId, memory: (value.spec as { memory?: unknown }).memory })
+  }
+  async mcpServerUpsert(_daemonId: string, _spec: McpServerSpec): Promise<void> {}
+  async mcpServerRemove(_daemonId: string, _orgId: string, _name: string): Promise<void> {}
+}
+
+const live: DaemonLiveness = {
+  get: (id) => ([SOURCE, MEMBER].includes(id) ? { state: 'READY', reachable: true, sessionEpoch: 1 } : undefined)
+}
+
+const logs: unknown[] = []
+const log = { info: (obj: unknown) => void logs.push(obj), warn: () => {} }
+
+function harness(): { reconciler: SetMemoryHomeReconciler; spy: ControlSpy } {
+  const spy = new ControlSpy()
+  running = buildHttpApp(prisma, undefined, live, spy as unknown as ControlSender)
+  const { repos, agentDelivery } = running.deps
+  return {
+    reconciler: new SetMemoryHomeReconciler({
+      agents: repos.agent,
+      memberSets: repos.memberSet,
+      delivery: agentDelivery,
+      log
+    }),
+    spy
+  }
+}
+
+const row = (agentId: string) => prisma.agent.findUniqueOrThrow({ where: { id: agentId } })
+const storedMemory = async (agentId: string) =>
+  ((await row(agentId)).runtimeOverrides as { memory?: unknown } | null)?.memory ?? null
+
+/** An agent on the pool set, on a group, or pinned to a machine; `memory` is what its row already carries. */
+async function seed(
+  memory: Record<string, unknown> | null,
+  placement: { pool: true } | { setId: string } | { daemonId: string }
+): Promise<string> {
+  const agentId = randomUUID()
+  const target =
+    'pool' in placement
+      ? { setId: await poolSetId(prisma) }
+      : 'setId' in placement
+        ? { setId: placement.setId }
+        : placement
+  await seedAgent(prisma, agentId, { ...target, ...(memory ? { runtimeOverrides: { memory } } : {}) })
+  return agentId
+}
+
+/** One of the org's groups with `SOURCE` as its member. */
+async function seedGroup(): Promise<string> {
+  await seedDaemon(prisma, SOURCE, { capabilities: CAPS })
+  const setId = randomUUID()
+  await prisma.memberSet.create({ data: { id: setId, orgId: DEFAULT_ORG_ID, name: 'lab' } })
+  await prisma.memberSetMember.create({ data: { setId, daemonId: SOURCE } })
+  return setId
+}
+
+describe('SetMemoryHomeReconciler', () => {
+  it('a pool agent with no binding is flipped to the Control Plane, flagged for migration, and pushed to its holder', async () => {
+    await seedPoolMember(prisma, MEMBER)
+    const agentId = await seed(null, { pool: true })
+    await seedDutyGroup(prisma, randomUUID(), MEMBER, [agentId], { confirmed: true })
+    const before = await row(agentId)
+    const { reconciler, spy } = harness()
+
+    expect(await reconciler.run()).toEqual({ flipped: 1, already: 0, skipped: 0, failed: 0 })
+    expect(await storedMemory(agentId)).toEqual(PENDING)
+    const after = await row(agentId)
+    expect(after.configRevision).toBe(before.configRevision + 1n)
+    expect(spy.upserts).toEqual([{ daemonId: MEMBER, agentId, memory: PENDING }])
+  })
+
+  it('flips an agent placed on one of the org’s groups and leaves the agent pinned to that group’s member alone', async () => {
+    const setId = await seedGroup()
+    const grouped = await seed({ ...DAEMON_HOME, scope: 'channel' }, { setId })
+    const groupedBare = await seed(null, { setId })
+    const external = await seed(EXTERNAL, { setId })
+    const pinned = await seed(DAEMON_HOME, { daemonId: SOURCE })
+    await seedDutyGroup(prisma, randomUUID(), SOURCE, [grouped, groupedBare, external], { confirmed: true })
+    const { reconciler, spy } = harness()
+
+    expect(await reconciler.run()).toEqual({ flipped: 2, already: 0, skipped: 1, failed: 0 })
+    expect(await storedMemory(grouped)).toEqual({ ...PENDING, scope: 'channel' })
+    expect(await storedMemory(groupedBare)).toEqual(PENDING)
+    expect(await storedMemory(external)).toEqual(EXTERNAL)
+    expect(await storedMemory(pinned)).toEqual(DAEMON_HOME)
+    expect(spy.upserts.map((u) => [u.daemonId, u.agentId]).sort()).toEqual(
+      [grouped, groupedBare].map((id) => [SOURCE, id]).sort()
+    )
+  })
+
+  it('a legacy agent pinned to a pool member keeps its managed policy and is pushed to that member', async () => {
+    await seedPoolMember(prisma, MEMBER)
+    const agentId = await seed({ ...DAEMON_HOME, autoDistill: false }, { daemonId: MEMBER })
+    const { reconciler, spy } = harness()
+
+    expect(await reconciler.run()).toMatchObject({ flipped: 1 })
+    expect(await storedMemory(agentId)).toEqual({ ...PENDING, autoDistill: false })
+    expect(spy.upserts.map((u) => u.daemonId)).toEqual([MEMBER])
+  })
+
+  it('leaves alone what has no daemon home to move: already homed, non-managed, or pinned to a machine', async () => {
+    await seedDaemon(prisma, SOURCE, { capabilities: CAPS })
+    await seedPoolMember(prisma, MEMBER)
+    const homed = await seed(CP, { pool: true })
+    const migrating = await seed(PENDING, { pool: true })
+    const external = await seed(EXTERNAL, { pool: true })
+    const selfHosted = await seed(DAEMON_HOME, { daemonId: SOURCE })
+    const selfHostedBare = await seed(null, { daemonId: SOURCE })
+    await seedDutyGroup(prisma, randomUUID(), MEMBER, [homed, migrating, external], { confirmed: true })
+    const revisions = await Promise.all(
+      [homed, migrating, external, selfHosted].map(async (id) => (await row(id)).configRevision)
+    )
+    const { reconciler, spy } = harness()
+
+    expect(await reconciler.run()).toEqual({ flipped: 0, already: 2, skipped: 1, failed: 0 })
+    expect(await storedMemory(homed)).toEqual(CP)
+    expect(await storedMemory(migrating)).toEqual(PENDING)
+    expect(await storedMemory(external)).toEqual(EXTERNAL)
+    expect(await storedMemory(selfHosted)).toEqual(DAEMON_HOME)
+    expect(await storedMemory(selfHostedBare)).toBeNull()
+    expect(
+      await Promise.all([homed, migrating, external, selfHosted].map(async (id) => (await row(id)).configRevision))
+    ).toEqual(revisions)
+    expect(spy.upserts).toEqual([])
+  })
+
+  it('flips an assistant-mode agent wherever it is placed, and gives one with memory off the managed default', async () => {
+    const setId = await seedGroup()
+    const pinned = await seed({ ...DAEMON_HOME, autoDistill: false }, { daemonId: SOURCE })
+    const bare = await seed(null, { daemonId: SOURCE })
+    const off = await seed({ provider: 'none' }, { daemonId: SOURCE })
+    const homed = await seed(CP, { daemonId: SOURCE })
+    const grouped = await seed({ provider: 'none' }, { setId })
+    const plain = await seed(DAEMON_HOME, { daemonId: SOURCE })
+    await seedDutyGroup(prisma, randomUUID(), SOURCE, [grouped], { confirmed: true })
+    await prisma.agent.updateMany({
+      where: { id: { in: [pinned, bare, off, homed, grouped] } },
+      data: { assistantMode: { enabled: true } }
+    })
+    const { reconciler, spy } = harness()
+
+    // The grouped agent is listed by both scans and counted once.
+    expect(await reconciler.run()).toEqual({ flipped: 4, already: 1, skipped: 0, failed: 0 })
+    expect(await storedMemory(pinned)).toEqual({ ...PENDING, autoDistill: false })
+    expect(await storedMemory(bare)).toEqual(PENDING)
+    expect(await storedMemory(off)).toEqual(CP)
+    expect(await storedMemory(homed)).toEqual(CP)
+    expect(await storedMemory(grouped)).toEqual(CP)
+    expect(await storedMemory(plain)).toEqual(DAEMON_HOME)
+    expect(spy.upserts.map((u) => u.agentId).sort()).toEqual([pinned, bare, off, grouped].sort())
+    expect(await reconciler.run()).toEqual({ flipped: 0, already: 5, skipped: 0, failed: 0 })
+  })
+
+  it('leaves an assistant-mode agent alone when the mode is switched off before the row lock', async () => {
+    await seedDaemon(prisma, SOURCE, { capabilities: CAPS })
+    const agentId = await seed(DAEMON_HOME, { daemonId: SOURCE })
+    await prisma.agent.update({ where: { id: agentId }, data: { assistantMode: { enabled: true } } })
+    const spy = new ControlSpy()
+    running = buildHttpApp(prisma, undefined, live, spy as unknown as ControlSender)
+    const { repos, agentDelivery } = running.deps
+    const agents: typeof repos.agent = Object.assign(Object.create(repos.agent), {
+      update: async (...args: Parameters<typeof repos.agent.update>) => {
+        await repos.agent.update(args[0], args[1], { assistantMode: { enabled: false } })
+        return repos.agent.update(...args)
+      }
+    })
+    const reconciler = new SetMemoryHomeReconciler({
+      agents,
+      memberSets: repos.memberSet,
+      delivery: agentDelivery,
+      log
+    })
+
+    expect(await reconciler.run()).toEqual({ flipped: 0, already: 0, skipped: 1, failed: 0 })
+    expect(await storedMemory(agentId)).toEqual(DAEMON_HOME)
+    expect(spy.upserts).toEqual([])
+  })
+
+  it('honors an edit that lands between the scan and the row lock instead of overwriting it', async () => {
+    await seedPoolMember(prisma, MEMBER)
+    const switched = await seed(null, { pool: true })
+    const repoliced = await seed({ ...DAEMON_HOME, autoDistill: true }, { pool: true })
+    await seedDutyGroup(prisma, randomUUID(), MEMBER, [switched, repoliced], { confirmed: true })
+    const spy = new ControlSpy()
+    running = buildHttpApp(prisma, undefined, live, spy as unknown as ControlSender)
+    const { repos, agentDelivery } = running.deps
+    // A user's edit commits after the scan read the row and before the flip takes the lock.
+    const raced: Record<string, Record<string, unknown>> = {
+      [switched]: { provider: 'none' },
+      [repoliced]: { ...DAEMON_HOME, autoDistill: false }
+    }
+    const agents: typeof repos.agent = Object.assign(Object.create(repos.agent), {
+      update: async (...args: Parameters<typeof repos.agent.update>) => {
+        const [orgId, agentId] = args
+        await repos.agent.update(orgId, agentId, { memory: raced[agentId] as never })
+        return repos.agent.update(...args)
+      }
+    })
+    const reconciler = new SetMemoryHomeReconciler({
+      agents,
+      memberSets: repos.memberSet,
+      delivery: agentDelivery,
+      log
+    })
+
+    expect(await reconciler.run()).toEqual({ flipped: 1, already: 0, skipped: 1, failed: 0 })
+    expect(await storedMemory(switched)).toEqual({ provider: 'none' })
+    expect(await storedMemory(repoliced)).toEqual({ ...PENDING, autoDistill: false })
+    expect(spy.upserts.map((u) => u.agentId)).toEqual([repoliced])
+  })
+
+  it('is idempotent: a second pass changes nothing and pushes nothing', async () => {
+    await seedPoolMember(prisma, MEMBER)
+    const bare = await seed(null, { pool: true })
+    const pinned = await seed(DAEMON_HOME, { daemonId: MEMBER })
+    await seedDutyGroup(prisma, randomUUID(), MEMBER, [bare], { confirmed: true })
+    const { reconciler, spy } = harness()
+
+    expect(await reconciler.run()).toEqual({ flipped: 2, already: 0, skipped: 0, failed: 0 })
+    expect(spy.upserts.map((u) => u.agentId).sort()).toEqual([bare, pinned].sort())
+    const revisions = await Promise.all([bare, pinned].map(async (id) => (await row(id)).configRevision))
+
+    expect(await reconciler.run()).toEqual({ flipped: 0, already: 2, skipped: 0, failed: 0 })
+    expect(spy.upserts).toHaveLength(2)
+    expect(await Promise.all([bare, pinned].map(async (id) => (await row(id)).configRevision))).toEqual(revisions)
+    expect(await storedMemory(bare)).toEqual(PENDING)
+    expect(logs.at(-1)).toEqual({ flipped: 0, already: 2, skipped: 0, failed: 0 })
+  })
+})

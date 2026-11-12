@@ -1,0 +1,471 @@
+/**
+ * `HookService` — compiles `HookDef` rows into relay-side rules and keeps the
+ * pool converged (webhook-triggers-and-github-events.md decision 4).
+ *
+ * The relay is the ingress but holds no database: every enabled, placed hook is
+ * pushed as an `rc/hook-assign` rule (upsert semantics) and dropped with
+ * `rc/hook-remove`. Convergence points:
+ *   - hook CRUD/enable          → `broadcast(hook)` (routes call it)
+ *   - agent placement change    → `rebroadcastForAgent(agentId)` (daemon delete
+ *     unplaces its agents via FK SetNull — the daemons route re-converges)
+ *   - relay (re)register        → `replayTo(channel)` — the relay's table is a
+ *     memory copy, so a fresh connection gets the full enabled set
+ *
+ * A hook that cannot fire (disabled / legacy orphaned / agent unplaced)
+ * compiles to null and is actively removed from the pool — a rule the relay
+ * holds is always dispatchable. Compiled rules carry the hook's hmacSecret:
+ * NEVER log.
+ */
+import { codeHostHookRuleOf, type RcHookAssign, type RcHookRouting } from '@agentconnect.md/protocol'
+import { advertises } from '../domain/daemon-features.js'
+import { codeHostProviders } from '../codehost/registry.js'
+import type { AgentId, OrgId } from '../domain/ids.js'
+import type {
+  AgentRecord,
+  AzureDevOpsConnectionRepo,
+  AzureDevOpsHookRepo,
+  AzureDevOpsRepositoryBindingRepo,
+  CodeHostDecisionRoutingRepo,
+  GiteaConnectionRepo,
+  GiteaRepositoryBindingRepo,
+  GiteaWebhookSecretStore,
+  GithubAppRepo,
+  GithubInstallationRepo,
+  GitlabAgentAccountRepo,
+  GitlabProjectBindingRepo,
+  GitlabWebhookSecretStore,
+  HookRecord,
+  HookRepo,
+  HookSecretStore
+} from '../persistence/ports.js'
+import { compilesHookRule } from '../gitea/binding-state.js'
+import { hookRuleSupported, relayRuleFeatures, type RelayControlSender } from '../orchestrator/relayControl.js'
+import { PLACEMENT_ONLY, type PlacementResolver } from '../orchestrator/placementResolver.js'
+import type { RelayChannel } from '../ws/relay-registry.js'
+import { toDbPlatform } from '../persistence/platform.js'
+import { routingScopeOf } from './hook-routing.js'
+import { hookBindingOf } from '../azure-devops/hook.service.js'
+
+/** The narrow agent read the compiler needs (placement lookup). */
+export interface HookAgentReads {
+  getUnscoped(agentId: AgentId): Promise<AgentRecord | null>
+}
+
+export interface HookServiceLog {
+  warn(obj: unknown, msg?: string): void
+}
+
+/** gitea-kind compile sources (gitea-integration.md §7): the binding, its bot connection and the sealed signing keys. */
+export interface GiteaHookCompileSources {
+  bindings: Pick<GiteaRepositoryBindingRepo, 'byRepo'>
+  connections: Pick<GiteaConnectionRepo, 'get'>
+  webhookSecrets: Pick<GiteaWebhookSecretStore, 'get'>
+  /** The deployment's normalized Gitea base URL (§3); it rides every compiled gitea rule as the fence host. */
+  host: string
+}
+
+/** azure-devops-kind compile sources (azure-devops-integration.md §11.3): the hooked binding, its connection, its keys and recorded subscriptions. */
+export interface AzureDevOpsHookCompileSources {
+  bindings: Pick<AzureDevOpsRepositoryBindingRepo, 'listForRepo'>
+  connections: Pick<AzureDevOpsConnectionRepo, 'get'>
+  hooks: Pick<AzureDevOpsHookRepo, 'keys' | 'subscriptions'>
+}
+
+/** Re-converges code-host routing scopes (code-host-decisions.md §3.2): host choice, the scope's rules, the hosts' specs. */
+export interface HookRoutingReconciler {
+  reconcileHooks(
+    hooks: ReadonlyArray<Pick<HookRecord, 'orgId' | 'kind' | 'repoId' | 'family'> | null | undefined>
+  ): Promise<void>
+  reconcileForAgent(agentId: AgentId): Promise<void>
+}
+
+export class HookService {
+  private routing?: HookRoutingReconciler
+
+  constructor(
+    private readonly hooks: HookRepo,
+    private readonly secrets: HookSecretStore,
+    private readonly agents: HookAgentReads,
+    private readonly relayControl: RelayControlSender,
+    /** Names the member a compiled rule dispatches to (placement, or the current duty holder). */
+    private readonly placement: Pick<PlacementResolver, 'routableDaemon'> = PLACEMENT_ONLY,
+    /** github-kind compile source: the org's installations, each of one App (the relay's attribution gate, decision 6); absent ⇒ github hooks never compile. */
+    private readonly installations?: Pick<GithubInstallationRepo, 'listClaimsForOrg'>,
+    /** The App's slug (GITHUB_APP_SLUG) — compiled into github rules as the
+     *  broadcast mention handle (P3). The agent record supplies the targeted
+     *  handle. */
+    private readonly appSlug?: string,
+    private readonly log?: HookServiceLog,
+    /** gitlab-kind compile sources (gitlab-com-integration.md §11.3): the org's
+     *  managed bindings, the sealed signing keys, and the per-agent accounts.
+     *  Absent ⇒ gitlab hooks never compile (deployment without the OAuth app). */
+    private readonly gitlabBindings?: Pick<GitlabProjectBindingRepo, 'byProject'>,
+    private readonly gitlabWebhookSecrets?: GitlabWebhookSecretStore,
+    private readonly gitlabAccounts?: Pick<GitlabAgentAccountRepo, 'listForBinding'>,
+    /** The deployment's normalized GitLab instance base URL (§24.1); it rides every
+     *  compiled gitlab rule as the turn-time fence host. */
+    private readonly gitlabHost?: string,
+    /** Re-project the hook agent's spec (§24.4). An enabled gitlab hook is a GitLab consumer,
+     *  so it puts `gitlabHost` on that agent's spec — and the spec is what the daemon fences a
+     *  delivery against. It lives HERE rather than in the CRUD routes because a route is not
+     *  the only thing that assigns a rule: the gitlab provisioning bracket commits the row and
+     *  rebroadcasts from inside the write, before any route code after it runs. Best-effort. */
+    private readonly projectAgentSpec?: (orgId: OrgId, agentId: AgentId) => Promise<void>,
+    /** Absent ⇒ gitea hooks never compile (no connection surface wired). */
+    private readonly gitea?: GiteaHookCompileSources,
+    /** The repository scopes' Decision routings; absent ⇒ every code-host rule compiles unrouted. */
+    private readonly routings?: Pick<CodeHostDecisionRoutingRepo, 'get'>,
+    /** The org's GitHub Apps: an agent's rules carry its own App, and every App's pull requests are the internal CI lane. */
+    private readonly githubApps?: Pick<GithubAppRepo, 'listForOrg'>,
+    /** Absent ⇒ azure-devops hooks never compile. */
+    private readonly azureDevOps?: AzureDevOpsHookCompileSources
+  ) {}
+
+  /** Wire the scope reconciler (it rebroadcasts through this service, so it attaches after construction). */
+  attachRouting(routing: HookRoutingReconciler): void {
+    this.routing = routing
+  }
+
+  /** Re-converge the routing scopes these hooks (before and after a write) belong to. */
+  async reconcileRouting(
+    hooks: ReadonlyArray<Pick<HookRecord, 'orgId' | 'kind' | 'repoId' | 'family'> | null | undefined>
+  ): Promise<void> {
+    await this.routing?.reconcileHooks(hooks)
+  }
+
+  /** The rule's routing: undefined when its scope is unrouted or paused, null when routed without a placed host (held). */
+  private async routingOf(hook: HookRecord): Promise<RcHookRouting | undefined | null> {
+    const scope = routingScopeOf(hook)
+    if (!this.routings || !scope) return undefined
+    const record = await this.routings.get(scope)
+    if (!record || !record.enabled) return undefined
+    const host = record.evaluationAgentId ? await this.agents.getUnscoped(record.evaluationAgentId) : null
+    const hostDaemonId = host && host.pause !== true ? await this.placement.routableDaemon(host) : null
+    if (!host || !hostDaemonId) return null
+    return {
+      routingId: record.id,
+      decisionId: record.decisionId,
+      evaluationAgentId: host.id,
+      evaluationDaemonId: hostDaemonId
+    }
+  }
+
+  /**
+   * HookDef → relay rule, or null when it must not be in the pool (disabled,
+   * legacy orphaned, paused, unplaced, missing kind columns, or — github kind —
+   * no valid installation left to attribute events with).
+   */
+  async compile(hook: HookRecord): Promise<RcHookAssign | null> {
+    if (!hook.enabled || !hook.agentId) return null
+    const agent = await this.agents.getUnscoped(hook.agentId)
+    // A paused agent rejects every fire at the daemon, so a rule left in the pool buys only a
+    // dispatch that dies and, for a github hook, a Check that reports nothing anyone can act on.
+    // Pause leaves the pool the same way an unplaced agent does, and resuming re-assigns it.
+    if (agent?.pause === true) return null
+    // The relay needs one member to address; for a pool agent that is the current duty holder,
+    // since placement names none. Nothing serving it ⇒ the rule leaves the relay pool, exactly as
+    // an unplaced agent's does.
+    const agentDaemonId = agent ? await this.placement.routableDaemon(agent) : null
+    if (!agent || !agentDaemonId) return null
+    const snapshot =
+      typeof hook.configRevision === 'bigint' &&
+      typeof hook.dispatchRevision === 'bigint' &&
+      hook.reviewPolicy !== undefined &&
+      hook.reportingMode !== undefined &&
+      hook.gateMode !== undefined
+        ? {
+            configRevision: hook.configRevision.toString(),
+            dispatchRevision: hook.dispatchRevision.toString(),
+            dispatchDaemonId: agentDaemonId,
+            // Both code hosts carry their own effect axes; a generic webhook has none.
+            reviewPolicy: hook.kind === 'webhook' ? ('off' as const) : hook.reviewPolicy,
+            reportingMode: hook.kind === 'webhook' ? ('off' as const) : hook.reportingMode,
+            // Only github has a gate axis; GitLab has no required-gate surface and webhooks none at all.
+            gateMode: hook.kind === 'github' ? hook.gateMode : ('informational' as const)
+          }
+        : ({ reviewPolicy: 'off', reportingMode: 'off', gateMode: 'informational' } as const)
+    const base = {
+      hookId: hook.id,
+      agentId: hook.agentId,
+      daemonId: agentDaemonId,
+      ...snapshot,
+      sessionMode: hook.sessionMode,
+      // Anchoring target only when a channel is set (null channel ⇒ headless);
+      // platform narrowed the same way the cron wire mapping does.
+      ...(hook.targetChannel
+        ? {
+            target: {
+              platform: toDbPlatform(hook.targetPlatform),
+              channel: hook.targetChannel,
+              ...(hook.targetIntegrationId ? { integrationId: hook.targetIntegrationId } : {})
+            }
+          }
+        : {})
+    }
+    if (hook.kind === 'webhook') {
+      if (!hook.urlToken) return null
+      const hmacSecret = await this.secrets.get(hook.orgId, hook.id)
+      return {
+        ...base,
+        kind: 'webhook',
+        webhook: {
+          urlToken: hook.urlToken,
+          ...(hmacSecret ? { hmacSecret } : {}),
+          ...(hook.instructions ? { instructions: hook.instructions } : {})
+        }
+      }
+    }
+    // A routed scope without a live host leaves the pool rather than firing unrouted.
+    const routing = await this.routingOf(hook)
+    if (routing === null) return null
+    // A routed rule fires on every update in its provider's vocabulary (code-host-decisions.md §4); the stored mode is kept.
+    const scope = routing ? routingScopeOf(hook) : null
+    const cadence = scope
+      ? codeHostProviders[scope.provider].routing.anyUpdateCadence(scope.family)
+      : { events: hook.events, commentFamilies: hook.commentFamilies, mentionOnly: hook.mentionOnly }
+    const routed = routing ? { routing } : {}
+    if (hook.kind === 'gitlab') {
+      // gitlab (§11.3): the rule carries the hook agent's runtime identity and
+      // the inline signing token. A hook without a working ingress (no webhook,
+      // no signing key, no ready agent account, or entering cleanup) must leave
+      // the pool — a rule the relay holds is always verifiable and dispatchable.
+      if (hook.repoId === null || !this.gitlabBindings || !this.gitlabWebhookSecrets || !this.gitlabAccounts) {
+        return null
+      }
+      const binding = await this.gitlabBindings.byProject(hook.orgId, hook.repoId)
+      if (!binding || binding.state === 'cleanup_pending' || binding.webhookId === null) return null
+      // §7.2: the rule names the HOOK AGENT's own account, and vetoes every
+      // account bound to the project — one agent's replies never wake a sibling.
+      const accounts = await this.gitlabAccounts.listForBinding(binding.id)
+      const account = accounts.find((candidate) => candidate.agentId === hook.agentId)
+      if (!account || account.serviceAccountUserId === null || account.state !== 'ready') return null
+      const bound = accounts
+        .map((candidate) => candidate.serviceAccountUserId)
+        .filter((userId): userId is bigint => userId !== null)
+        .map((userId) => userId.toString())
+      const signingToken = await this.gitlabWebhookSecrets.get(hook.orgId, binding.id)
+      if (!signingToken) return null
+      return {
+        ...base,
+        kind: 'gitlab',
+        ...routed,
+        gitlab: {
+          projectId: hook.repoId.toString(),
+          projectPath: binding.projectPath,
+          sessionKeyPrefix: hook.githubSessionKey ?? `gitlab:${hook.repoId}`,
+          events: cadence.events,
+          ...(cadence.commentFamilies.length > 0
+            ? {
+                commentFamilies: cadence.commentFamilies.filter(
+                  (family): family is 'issues' | 'merge_request' => family !== 'pull_request'
+                )
+              }
+            : {}),
+          labelFilter: hook.labelFilter,
+          mentionOnly: cadence.mentionOnly,
+          agentName: agent.name,
+          serviceAccountUserId: account.serviceAccountUserId.toString(),
+          serviceAccountUsername: account.username,
+          // §12.1 veto set: every managed account bound to the project.
+          boundServiceAccountUserIds: [...new Set(bound)],
+          signingToken,
+          ...(this.gitlabHost !== undefined ? { host: this.gitlabHost } : {})
+        }
+      }
+    }
+    if (hook.kind === 'gitea') {
+      // gitea (gitea-integration.md §7): the rule carries the connection's single bot user as the
+      // veto set and the signing keys inline. A hook without a working ingress — no binding, no
+      // webhook, no key, a connection mid-removal, or a binding entering cleanup — leaves the pool.
+      if (hook.repoId === null || !this.gitea) return null
+      const binding = await this.gitea.bindings.byRepo(hook.orgId, hook.repoId)
+      if (!binding || !compilesHookRule(binding.state) || binding.webhookId === null) return null
+      const connection = await this.gitea.connections.get(hook.orgId, binding.connectionId)
+      if (!connection || connection.state === 'disconnecting') return null
+      const keys = await this.gitea.webhookSecrets.get(hook.orgId, binding.id)
+      if (!keys) return null
+      return {
+        ...base,
+        kind: 'gitea',
+        ...routed,
+        gitea: {
+          repoId: hook.repoId.toString(),
+          repoPath: binding.repoPath,
+          sessionKeyPrefix: hook.githubSessionKey ?? `gitea:${hook.repoId}`,
+          events: cadence.events,
+          // The row stores the merge_request FAMILY scope; the wire names the comment SUBJECT the relay filters on.
+          ...(cadence.commentFamilies.length > 0
+            ? {
+                commentFamilies: cadence.commentFamilies.map((family): 'issues' | 'pull_request' =>
+                  family === 'issues' ? 'issues' : 'pull_request'
+                )
+              }
+            : {}),
+          labelFilter: hook.labelFilter,
+          mentionOnly: cadence.mentionOnly,
+          agentName: agent.name,
+          botUserId: connection.botUserId.toString(),
+          botUsername: connection.botUsername,
+          signingKey: keys.current,
+          ...(keys.next !== null ? { nextSigningKey: keys.next } : {}),
+          host: this.gitea.host
+        }
+      }
+    }
+    if (hook.kind === 'azure-devops') {
+      // §11.3: Decision routing is not offered for Azure DevOps, so a routed rule never compiles; the relay would skip it.
+      if (routing || hook.repoId === null || !this.azureDevOps) return null
+      // The rule names every subscription of the hooked binding and its keys inline; without them it verifies nothing.
+      const binding = hookBindingOf(await this.azureDevOps.bindings.listForRepo(hook.orgId, hook.repoId))
+      if (!binding) return null
+      const connection = await this.azureDevOps.connections.get(hook.orgId, binding.connectionId)
+      if (!connection) return null
+      const subscriptions = await this.azureDevOps.hooks.subscriptions(binding.id)
+      const keys = await this.azureDevOps.hooks.keys(hook.orgId, binding.id)
+      if (subscriptions.length === 0 || !keys) return null
+      return {
+        ...base,
+        kind: 'azure-devops',
+        azureDevOps: {
+          repoId: hook.repoId.toString(),
+          repoPath: binding.repoPath,
+          sessionKeyPrefix: hook.githubSessionKey ?? `azure-devops:${hook.repoId}`,
+          organization: connection.organization,
+          projectId: binding.projectId,
+          repositoryId: binding.repositoryId,
+          instanceId: connection.organizationInstanceId,
+          subscriptions: subscriptions.map(({ subscriptionId, kind }) => ({ subscriptionId, kind })),
+          events: cadence.events,
+          // The row stores the merge_request family scope; the wire names the pull-request subject.
+          ...(cadence.commentFamilies.includes('merge_request') ? { commentFamilies: ['pull_request' as const] } : {}),
+          mentionOnly: cadence.mentionOnly,
+          agentName: agent.name,
+          identityId: connection.identityId,
+          signingKey: keys.current,
+          ...(keys.next !== null ? { nextSigningKey: keys.next } : {}),
+          ...(keys.previous !== null && keys.previousExpiresAt !== null
+            ? { previousSigningKey: keys.previous, previousSigningKeyExpiresAt: keys.previousExpiresAt.toISOString() }
+            : {})
+        }
+      }
+    }
+    // github (P2): the rule carries the live installation ids of the App the agent works through, so only that App's deliveries fire it.
+    if (!this.installations) return null
+    const githubAppId = agent.githubAppId ?? null
+    const valid = (await this.installations.listClaimsForOrg(hook.orgId)).filter(
+      (i) => (i.githubAppId ?? null) === githubAppId && !i.revokedAt && !i.suspendedAt
+    )
+    // Empty stored comment families keep the published API's legacy repo-wide meaning, so the optional field is omitted.
+    const commentFamilies = cadence.commentFamilies.filter(
+      (family): family is 'issues' | 'pull_request' => family !== 'merge_request'
+    )
+    const orgApps = (await this.githubApps?.listForOrg(hook.orgId)) ?? []
+    // The App handle summons only the agents working through that App.
+    const appSlug = githubAppId ? orgApps.find((app) => app.id === githubAppId)?.slug : this.appSlug
+    const internalAppSlugs = [this.appSlug, ...orgApps.map((app) => app.slug)].filter(
+      (slug): slug is string => !!slug && slug !== appSlug
+    )
+    const matching = {
+      events: cadence.events,
+      ...(commentFamilies.length > 0 ? { commentFamilies } : {}),
+      labelFilter: hook.labelFilter,
+      ...(hook.skipDrafts ? { skipDrafts: true } : {}),
+      mentionOnly: cadence.mentionOnly,
+      ...(appSlug ? { appSlug } : {}),
+      ...(internalAppSlugs.length > 0 ? { internalAppSlugs } : {}),
+      agentName: agent.name
+    }
+    // An installation row fires for every repository of its one installation, while that installation stays live.
+    if (hook.installationId != null) {
+      const installation = valid.find((i) => i.installationId === hook.installationId)
+      if (!installation || !hook.installationAccount) return null
+      const installationId = installation.installationId.toString()
+      return {
+        ...base,
+        kind: 'github',
+        githubInstallation: {
+          ...matching,
+          installationId,
+          accountLogin: installation.accountLogin,
+          installationIds: [installationId]
+        }
+      }
+    }
+    if (hook.repoId === null || !hook.repoFullName || valid.length === 0) return null
+    return {
+      ...base,
+      kind: 'github',
+      ...routed,
+      github: {
+        repoId: hook.repoId.toString(),
+        repoFullName: hook.repoFullName,
+        sessionKeyPrefix: hook.githubSessionKey ?? hook.repoFullName,
+        // The App slug broadcasts to every matching rule; the immutable agent slug targets this one.
+        ...matching,
+        installationIds: valid.map((i) => i.installationId.toString())
+      }
+    }
+  }
+
+  /**
+   * Converge the pool on one hook: assign when compilable, remove otherwise.
+   *
+   * The spec projection is ordered against the rule, never merely paired with it (§24.4): the
+   * agent must carry the host for as long as a rule that can fire exists, so a GAINING
+   * projection lands before the assign and a LOSING one after the remove. Every caller
+   * inherits that — the CRUD routes, the gitlab provisioning rebroadcast, and a placement
+   * re-converge alike — which is the point of it living here.
+   */
+  async broadcast(hook: HookRecord): Promise<void> {
+    const rule = await this.compile(hook)
+    if (rule) {
+      if (hook.agentId) await this.projectAgentSpec?.(hook.orgId, hook.agentId)
+      this.relayControl.hookAssign(rule)
+    } else {
+      this.relayControl.hookRemove(hook.id)
+      if (hook.agentId) await this.projectAgentSpec?.(hook.orgId, hook.agentId)
+    }
+  }
+
+  /** Explicit pool-wide removal (hook deleted — no row left to compile). */
+  remove(hookId: string): void {
+    this.relayControl.hookRemove(hookId)
+  }
+
+  /** Re-converge every hook firing `agentId` (its placement changed). */
+  async rebroadcastForAgent(agentId: AgentId): Promise<void> {
+    for (const hook of await this.hooks.listForAgent(agentId)) {
+      await this.broadcast(hook)
+    }
+    // Its scopes may need a new host, whose id every sibling rule carries.
+    await this.routing?.reconcileForAgent(agentId)
+  }
+
+  /**
+   * Re-converge the org's github hooks — the installation set baked into each
+   * rule changed (doorbell pull / sync). broadcast() converges to assign OR
+   * remove per hook, which covers suspend/uninstall (compile → null → remove)
+   * and unsuspend/reinstall (compile succeeds with the fresh set) alike.
+   */
+  async rebroadcastGithubForOrg(orgId: OrgId): Promise<void> {
+    for (const hook of await this.hooks.listForOrgKind(orgId, 'github')) {
+      await this.broadcast(hook)
+    }
+  }
+
+  /** Full replay to one freshly (re)registered relay: compilable, supported rules only; a failing row is logged and skipped. */
+  async replayTo(ch: RelayChannel, withhold: (hookId: string) => void = () => {}): Promise<void> {
+    for (const hook of await this.hooks.listEnabled()) {
+      try {
+        const rule = await this.compile(hook)
+        // The §17.3/§24.4 negotiation gate, per channel (mirrors RelayControlSender).
+        const host = rule && codeHostHookRuleOf(rule)
+        if (host && !advertises(ch.features, relayRuleFeatures(host))) continue
+        if (rule && hookRuleSupported(rule, ch.features)) ch.send('rc/hook-assign', rule)
+      } catch (err) {
+        this.log?.warn({ hookId: hook.id, err }, 'hook replay: compile/send failed — skipped')
+        withhold(hook.id)
+      }
+    }
+  }
+}

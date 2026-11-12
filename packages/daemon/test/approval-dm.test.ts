@@ -1,0 +1,508 @@
+import { agentHostKey } from '../src/acp/host-key.js'
+import { DatabaseSync } from 'node:sqlite'
+import { describe, expect, it, vi } from 'vitest'
+import type { CreateElicitationRequest, RequestPermissionRequest } from '@agentclientprotocol/sdk/unstable'
+import { PermissionCoordinator, type PermissionHost } from '../src/permissions/coordinator.js'
+import type { SlackConnection } from '../src/slack/connection.js'
+import { elicitOptionToken } from '../src/slack/render.js'
+import { LocalStore } from '../src/store/local-store.js'
+import { SqliteAsyncDatabase } from '../src/store/sqlite-async-database.js'
+import { pendingTurnKey, type Pending } from '../src/daemon/turn-types.js'
+
+const AGENT = 'bot-a'
+const OWNER = agentHostKey(AGENT)
+const ACP_SESSION = 'acp-1'
+const COMPUTER_ID = '00000000-0000-4000-8000-0000000000c1'
+const TARGET = { integrationId: 'int-1', teamId: 'T1', userId: 'U1', consoleUserId: 'cu-1', displayName: 'Ada' }
+
+function fakeSlackConn() {
+  return {
+    openDirectMessage: vi.fn(async () => 'D1'),
+    postBlocks: vi.fn(async () => '111.222'),
+    updateBlocks: vi.fn(async () => undefined),
+    workspaceUrl: 'https://w.slack.com',
+    workspaceId: () => 'T1'
+  }
+}
+
+function permissionParams(): RequestPermissionRequest {
+  return {
+    sessionId: ACP_SESSION,
+    toolCall: { toolCallId: 'call-1', title: 'Bash: rm -rf build' },
+    options: [
+      { optionId: 'o-allow', name: 'Allow', kind: 'allow_once' },
+      { optionId: 'o-deny', name: 'Deny', kind: 'reject_once' }
+    ]
+  } as unknown as RequestPermissionRequest
+}
+
+/** An MCP-approval elicitation whose single enum field offers `options` — the DM's card path. */
+function approvalElicitation(options: string[]): CreateElicitationRequest {
+  return {
+    sessionId: ACP_SESSION,
+    toolCallId: 'call-e',
+    mode: 'form',
+    message: 'Which one?',
+    requestedSchema: { type: 'object', properties: { pick: { type: 'string', enum: options } }, required: ['pick'] },
+    _meta: { codex_approval_kind: 'mcp_tool_call' }
+  } as unknown as CreateElicitationRequest
+}
+
+async function world(over?: {
+  route?: ReturnType<typeof vi.fn>
+  noChannel?: boolean
+  platform?: string
+  requesterId?: string
+  activity?: PermissionHost['emitApprovalActivity']
+  computers?: boolean
+  externalAsker?: ReturnType<typeof vi.fn>
+}) {
+  const store = await LocalStore.open({ database: SqliteAsyncDatabase.adopt(new DatabaseSync(':memory:')) })
+  const conn = fakeSlackConn()
+  const route =
+    over?.route ??
+    vi.fn(async (payload: { requestId: string; verify?: unknown }) =>
+      payload.verify
+        ? { requestId: payload.requestId, allowed: true, displayName: 'Ada' }
+        : { requestId: payload.requestId, target: TARGET }
+    )
+  const pending = new Map<string, Pending>()
+  const p = {
+    plan: {
+      sessionKey: 'sess-key',
+      agentId: AGENT,
+      agentName: 'Butler',
+      platform: over?.platform ?? 'webchat',
+      channel: 'C0',
+      integrationId: over?.platform === 'slack' ? 'int-1' : undefined,
+      requesterId: over?.requesterId,
+      approvalSurfaceSuppressed: false
+    },
+    approval: { waitMs: 0, depth: 0 },
+    acpSessionId: ACP_SESSION,
+    hostKey: OWNER,
+    outwardSessionId: 'outward-1',
+    builtinSystemToolCallIds: new Set<string>(),
+    entry: { msg: { text: 'please run ls /' } }
+  } as unknown as Pending
+  pending.set(pendingTurnKey(OWNER, ACP_SESSION), p)
+  const host: PermissionHost = {
+    log: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) as never,
+    clock: () => ({ now: () => Date.now() }) as never,
+    cancelTurn: vi.fn(async () => {}),
+    store: () => store,
+    agents: () =>
+      new Map([[AGENT, (over?.externalAsker ? { id: AGENT, chatActions: 'approve' } : { id: AGENT }) as never]]),
+    pending: () => pending,
+    evalHooks: () => ({ emit: vi.fn() }) as never,
+    memoryExtraction: () => undefined,
+    enqueueApply: vi.fn(),
+    postCardSerialized: vi.fn(async () => undefined),
+    // The approval DM is its own surface; no in-channel elicitation card is posted from here.
+    elicitCardFacet: () => undefined,
+    // An external place needs a card surface for its asker's DM to be chosen.
+    approvalCardFacet: () => (over?.externalAsker ? ({ maxOptions: 5 } as never) : undefined),
+    chatCardsAt: () => undefined,
+    httpSlackSessionTarget: () => undefined,
+    maskAgentSecrets: (_agentId, payload) => payload,
+    logSessionAction: vi.fn(),
+    emitApprovalActivity: over?.activity ?? vi.fn(),
+    approvalGateOpened: () => false,
+    approvalGateClosed: vi.fn(),
+    cpApprovalRoute: () => ({ approvalRoute: route as never }),
+    orgForAgent: () => 'org-1',
+    sessionLink: (sessionId) => `https://console.example/sessions/${sessionId}`,
+    slackConnFor: (integrationId) =>
+      integrationId === TARGET.integrationId && !over?.noChannel ? (conn as unknown as SlackConnection) : undefined,
+    approvalDmIntegrations: () => ['int-1'],
+    slackDmSessionTarget: () => 'encoded-target',
+    chatSurface: () => (over?.externalAsker ? 'external' : 'open'),
+    ...(over?.externalAsker ? { externalAskerDm: over.externalAsker as never } : {}),
+    placeExternal: () => false,
+    chatEditorsOnly: () => false,
+    chatActor: async () => 'allowed' as const,
+    servesComputerApprovers: () => over?.computers === true,
+    computerActor: async () => 'unavailable' as const
+  }
+  return { store, conn, route, host, coordinator: new PermissionCoordinator(host), p }
+}
+
+const requestIdOf = (route: ReturnType<typeof vi.fn>): string =>
+  (route.mock.calls[0]![0] as { requestId: string }).requestId
+
+describe('approval DM (slack-approval-dm.md §5–§6)', () => {
+  it('routes, DMs the target, and resolves on the verified target click', async () => {
+    const w = await world({ platform: 'slack', requesterId: 'U1' })
+    const decided = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    expect(w.conn.openDirectMessage).toHaveBeenCalledWith('U1')
+    // Top-level message: no thread ts.
+    expect((w.conn.postBlocks.mock.calls[0] as unknown[])[3]).toBeUndefined()
+    // §5.2 intro: session deep link plus — for the message's own author — its quote.
+    const posted = JSON.stringify((w.conn.postBlocks.mock.calls[0] as unknown[])[1])
+    expect(posted).toContain('https://console.example/sessions/outward-1')
+    expect(posted).toContain('> please run ls /')
+    // A recipient who is NOT the author never receives the text (Slack ACL stays intact).
+    const other = await world({ platform: 'slack', requesterId: 'U-someone-else' })
+    void other.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(other.conn.postBlocks).toHaveBeenCalledTimes(1))
+    const otherPosted = JSON.stringify((other.conn.postBlocks.mock.calls[0] as unknown[])[1])
+    expect(otherPosted).toContain('https://console.example/sessions/outward-1')
+    expect(otherPosted).not.toContain('please run ls /')
+    await other.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await other.store.close()
+    const requestId = requestIdOf(w.route)
+
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U1' } })
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    // The resolved rewrite keeps the intro — the links must survive the decision.
+    const rewritten = JSON.stringify((w.conn.updateBlocks.mock.calls[0] as unknown[])[2])
+    expect(rewritten).toContain('https://console.example/sessions/outward-1')
+    // The verify form named the addressed console user.
+    const verify = (w.route.mock.calls[1]![0] as { verify?: { consoleUserId: string } }).verify
+    expect(verify?.consoleUserId).toBe('cu-1')
+    const rows = await w.store.listPermissionRequests(AGENT)
+    expect(rows).toMatchObject([{ status: 'allowed', resolvedBy: 'slack:T1:U1', resolvedByName: 'Ada' }])
+    expect(w.conn.updateBlocks).toHaveBeenCalled()
+    await w.store.close()
+  })
+
+  it('sends a computer-use approval to the Computer owner first, and down the usual chain when they cannot be reached (computer-use.md §4.2)', async () => {
+    const owner = 'cu-owner'
+    const route = vi.fn(async (payload: { requestId: string; consoleUserId?: string; verify?: unknown }) => {
+      if (payload.verify) return { requestId: payload.requestId, allowed: true, displayName: 'Ada' }
+      if (payload.consoleUserId === owner)
+        return { requestId: payload.requestId, target: { ...TARGET, consoleUserId: owner } }
+      return { requestId: payload.requestId, target: TARGET }
+    })
+    const w = await world({ platform: 'slack', requesterId: 'U-asker', route })
+    const params = {
+      ...permissionParams(),
+      toolCall: {
+        toolCallId: 'computer-approval-1',
+        title: 'Computer use on “Desk”: click at (1, 2) (first input this session)'
+      }
+    } as RequestPermissionRequest
+    const decided = w.coordinator.askComputerApproval(w.p, params, { computerId: COMPUTER_ID, ownerUserId: owner })
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    expect(route.mock.calls[0]![0]).toMatchObject({ consoleUserId: owner, integrationIds: ['int-1'] })
+    expect(route.mock.calls).toHaveLength(1)
+    await w.coordinator.handlePermissionChoice({
+      requestId: requestIdOf(route),
+      optionId: 'o-allow',
+      actor: { userId: 'U1' }
+    })
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    expect((route.mock.calls[1]![0] as { verify?: { consoleUserId: string } }).verify?.consoleUserId).toBe(owner)
+    await w.store.close()
+
+    // An owner the CP cannot route (not an editor, or not linked) leaves the usual chain to pick someone.
+    const fallback = vi.fn(async (payload: { requestId: string; consoleUserId?: string }) =>
+      payload.consoleUserId ? { requestId: payload.requestId } : { requestId: payload.requestId, target: TARGET }
+    )
+    const other = await world({ platform: 'slack', requesterId: 'U1', route: fallback })
+    void other.coordinator.askComputerApproval(other.p, params, { computerId: COMPUTER_ID, ownerUserId: owner })
+    await vi.waitFor(() => expect(other.conn.postBlocks).toHaveBeenCalledTimes(1))
+    expect(fallback.mock.calls.map((call) => (call[0] as { consoleUserId?: string }).consoleUserId)).toEqual([
+      owner,
+      undefined
+    ])
+    await other.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await other.store.close()
+  })
+
+  it('routes and verifies a computer-use approval by the Computer, and takes console decisions from its approvers alone', async () => {
+    const owner = 'cu-owner'
+    const route = vi.fn(async (payload: { requestId: string; consoleUserId?: string; verify?: unknown }) =>
+      payload.verify
+        ? { requestId: payload.requestId, allowed: true, displayName: 'Ada' }
+        : { requestId: payload.requestId, target: { ...TARGET, consoleUserId: owner } }
+    )
+    const w = await world({ platform: 'slack', requesterId: 'U-asker', route, computers: true })
+    const params = {
+      ...permissionParams(),
+      toolCall: { toolCallId: 'computer-approval-2', title: 'Computer use on “Desk”: click at (1, 2)' }
+    } as RequestPermissionRequest
+    const decided = w.coordinator.askComputerApproval(w.p, params, {
+      computerId: COMPUTER_ID,
+      ownerUserId: owner,
+      approvers: [owner, 'cu-member']
+    })
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    expect(route.mock.calls[0]![0]).toMatchObject({ consoleUserId: owner, computerId: COMPUTER_ID })
+    const requestId = requestIdOf(route)
+    // An editor who is not one of the Computer's allowed members decides nothing.
+    await expect(
+      w.coordinator.decideEditorPermission({
+        agentId: AGENT,
+        requestId,
+        decision: 'allow',
+        decidedBy: 'user:cu-editor'
+      })
+    ).resolves.toEqual({ ok: false, reason: 'Only people allowed to use this Computer can answer this request.' })
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U1' } })
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    expect(route.mock.calls[1]![0]).toMatchObject({ computerId: COMPUTER_ID, verify: { consoleUserId: owner } })
+    await w.store.close()
+
+    const member = await world({ platform: 'slack', requesterId: 'U-asker', route, computers: true })
+    const allowed = member.coordinator.askComputerApproval(member.p, params, {
+      computerId: COMPUTER_ID,
+      ownerUserId: owner,
+      approvers: [owner, 'cu-member']
+    })
+    await vi.waitFor(() => expect(member.conn.postBlocks).toHaveBeenCalledTimes(1))
+    await expect(
+      member.coordinator.decideEditorPermission({
+        agentId: AGENT,
+        requestId: (route.mock.calls.at(-1)![0] as { requestId: string }).requestId,
+        decision: 'allow',
+        decidedBy: 'user:cu-member'
+      })
+    ).resolves.toEqual({ ok: true })
+    await expect(allowed).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    await member.store.close()
+  })
+
+  it("routes a computer-use approval to the Computer's owner from an external place and a sub-session, never to the asker alone", async () => {
+    const owner = 'cu-owner'
+    const route = vi.fn(async (payload: { requestId: string; verify?: unknown }) =>
+      payload.verify
+        ? { requestId: payload.requestId, allowed: true }
+        : { requestId: payload.requestId, target: { ...TARGET, consoleUserId: owner } }
+    )
+    const asker = vi.fn(async () => ({ integrationId: 'int-1', teamId: 'T1', userId: 'U-asker', channel: 'D-ASK' }))
+    const scope = { computerId: COMPUTER_ID, ownerUserId: owner, approvers: [owner] }
+    const params = {
+      ...permissionParams(),
+      toolCall: { toolCallId: 'computer-approval-3', title: 'Computer use on “Desk”: click at (1, 2)' }
+    } as RequestPermissionRequest
+    const w = await world({ platform: 'slack', requesterId: 'U-asker', route, computers: true, externalAsker: asker })
+    void w.coordinator.askComputerApproval(w.p, params, scope)
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    expect(asker).not.toHaveBeenCalled()
+    expect(route.mock.calls[0]![0]).toMatchObject({ consoleUserId: owner, computerId: COMPUTER_ID })
+    // A sub-session's DM keeps the Computer too, dropping only the requester preference.
+    const requestId = requestIdOf(route)
+    route.mockClear()
+    await (w.coordinator as unknown as { routeApprovalDm: (...a: unknown[]) => Promise<unknown> }).routeApprovalDm(
+      requestId,
+      AGENT,
+      w.p,
+      true
+    )
+    expect(route.mock.calls[0]![0]).toMatchObject({ consoleUserId: owner, computerId: COMPUTER_ID })
+    await w.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await w.store.close()
+
+    // A plain request in the same place still goes to its asker first.
+    const plain = await world({ platform: 'slack', requesterId: 'U-asker', route, externalAsker: asker })
+    void plain.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(asker).toHaveBeenCalledTimes(1))
+    await plain.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await plain.store.close()
+  })
+
+  it('settles a console decision on the DM card with the chosen option and its decider (#2592)', async () => {
+    const w = await world({ platform: 'slack', requesterId: 'U1' })
+    const decided = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.coordinator.dmNotifiedVia(requestIdOf(w.route), AGENT, 'int-1')).toBe(true))
+    const requestId = requestIdOf(w.route)
+    const ack = await w.coordinator.decideEditorPermission({
+      agentId: AGENT,
+      requestId,
+      decision: 'deny',
+      optionId: 'o-deny',
+      decidedBy: 'user:cu-2',
+      decidedByName: 'Grace'
+    })
+    expect(ack).toEqual({ ok: true })
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-deny' } })
+    const rewritten = JSON.stringify((w.conn.updateBlocks.mock.calls[0] as unknown[])[2])
+    expect(rewritten).toContain('Deny — Grace')
+    expect(rewritten).toContain('https://console.example/sessions/outward-1')
+    // Settled once: a late DM tap finds nothing to decide.
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U1' } })
+    const rows = await w.store.listPermissionRequests(AGENT)
+    expect(rows).toMatchObject([{ status: 'denied', resolvedBy: 'user:cu-2', resolvedByName: 'Grace' }])
+    await w.store.close()
+  })
+
+  // The DM builds its card with the very same `buildElicitationCard` the in-channel card uses,
+  // so #1794 gap 7's option cap has to read the same on both — every option, or no card at all.
+  it('carries every option of a long enum onto the approval DM, and declines past the cap', async () => {
+    const seven = ['a', 'b', 'c', 'd', 'e', 'f', 'g']
+    const w = await world()
+    void w.coordinator.onAcpElicit(OWNER, ACP_SESSION, approvalElicitation(seven))
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    const blocks = (w.conn.postBlocks.mock.calls[0] as unknown[])[1] as any[]
+    const actions = blocks.find((b) => b.type === 'actions')
+    expect(actions.elements.map((e: any) => e.text.text)).toEqual([...seven, 'Dismiss'])
+    await w.store.close()
+
+    // Past the cap `buildElicitationCard` returns null. The DM used to go out carrying its intro
+    // and nothing else — a live request with no controls and no hint that the console holds the
+    // same ask (#1794) — so the missing card is now a block that says what was asked and where.
+    const over = await world()
+    void over.coordinator.onAcpElicit(
+      OWNER,
+      ACP_SESSION,
+      approvalElicitation(Array.from({ length: 25 }, (_, i) => `o${i}`))
+    )
+    await vi.waitFor(() => expect(over.conn.postBlocks).toHaveBeenCalledTimes(1))
+    const overBlocks = (over.conn.postBlocks.mock.calls[0] as unknown[])[1] as any[]
+    // Nothing to tap — the answer is not collectable here, and that is the point of the line.
+    expect(overBlocks.some((b) => b.type === 'actions')).toBe(false)
+    const stand = overBlocks.at(-1).text.text as string
+    expect(stand).toContain('Which one?')
+    expect(stand).toContain("This chat can't collect an answer for it")
+    // It points at the link the intro already built rather than repeating the URL.
+    expect(stand).toContain('*Open session*')
+    expect(JSON.stringify(overBlocks[0])).toContain('https://console.example/sessions/outward-1|Open session')
+    // The request itself is untouched: still open on the editor path, exactly as before.
+    expect((await over.store.listPermissionRequests(AGENT))[0]!.status).toBe('pending')
+    await over.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await over.store.close()
+  })
+
+  // Same card builder, so the same #1812 re-derivation: the actor and verify checks establish
+  // WHO tapped, never what this card offered.
+  it('re-derives the DM answer against its own card, dropping one it never offered', async () => {
+    const w = await world()
+    const answered = w.coordinator.onAcpElicit(OWNER, ACP_SESSION, approvalElicitation(['once', 'session']))
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    const requestId = requestIdOf(w.route)
+
+    // A DM card is a Slack button row, so its taps carry each option's POSITION (#1794): a
+    // literal, and a position past the list, are both answers this card never offered.
+    await w.coordinator.handleElicitChoice({ requestId, value: 'always', actor: { userId: 'U1' } })
+    await w.coordinator.handleElicitChoice({ requestId, value: elicitOptionToken(9), actor: { userId: 'U1' } })
+    expect(w.conn.updateBlocks).not.toHaveBeenCalled()
+    expect((await w.store.listPermissionRequests(AGENT))[0]!.status).toBe('pending')
+
+    await w.coordinator.handleElicitChoice({ requestId, value: elicitOptionToken(1), actor: { userId: 'U1' } })
+    await expect(answered).resolves.toEqual({ action: 'accept', content: { pick: 'session' } })
+    await w.store.close()
+  })
+
+  it('refuses a wrong actor and an unanswerable verify without settling the request', async () => {
+    const w = await world()
+    const decided = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    const requestId = requestIdOf(w.route)
+
+    // Wrong actor: no verify round trip, card untouched, still pending.
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U-intruder' } })
+    expect(w.route).toHaveBeenCalledTimes(1)
+    expect(w.conn.updateBlocks).not.toHaveBeenCalled()
+
+    // Verify outage: fail closed but keep the live card for a retry.
+    w.route.mockRejectedValueOnce(new Error('cp down'))
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U1' } })
+    expect(w.conn.updateBlocks).not.toHaveBeenCalled()
+    expect((await w.store.listPermissionRequests(AGENT))[0]!.status).toBe('pending')
+
+    // Authoritative refusal: rights are gone — the card retires, the request stays pending.
+    w.route.mockResolvedValueOnce({ requestId, allowed: false })
+    await w.coordinator.handlePermissionChoice({ requestId, optionId: 'o-allow', actor: { userId: 'U1' } })
+    expect(w.conn.updateBlocks).toHaveBeenCalledTimes(1)
+    expect((await w.store.listPermissionRequests(AGENT))[0]!.status).toBe('pending')
+
+    // The console can still decide it.
+    const ack = await w.coordinator.decideEditorPermission({
+      agentId: AGENT,
+      requestId,
+      decision: 'deny',
+      decidedBy: 'user:cu-2',
+      decidedByName: 'Lin'
+    })
+    expect(ack.ok).toBe(true)
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-deny' } })
+    expect((await w.store.listPermissionRequests(AGENT))[0]).toMatchObject({
+      status: 'denied',
+      resolvedBy: 'user:cu-2',
+      resolvedByName: 'Lin'
+    })
+    // The console decision also retired the DM card.
+    expect(w.conn.updateBlocks).toHaveBeenCalledTimes(2)
+    await w.store.close()
+  })
+
+  it("leaves today's behavior intact when the CP answers no target", async () => {
+    const route = vi.fn(async (payload: { requestId: string }) => ({ requestId: payload.requestId }))
+    const w = await world({ route })
+    const decided = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(route).toHaveBeenCalledTimes(1))
+    expect(w.conn.openDirectMessage).not.toHaveBeenCalled()
+    const requestId = requestIdOf(route)
+    await w.coordinator.decideEditorPermission({ agentId: AGENT, requestId, decision: 'allow' })
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    await w.store.close()
+  })
+
+  it('release retires the DM card and cancels the request', async () => {
+    const w = await world()
+    const decided = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.conn.postBlocks).toHaveBeenCalledTimes(1))
+    await w.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await expect(decided).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(w.conn.updateBlocks).toHaveBeenCalledTimes(1)
+    expect((await w.store.listPermissionRequests(AGENT))[0]!.status).toBe('expired')
+    await w.store.close()
+  })
+})
+
+describe('approval activity (slack-approval-dm.md §7)', () => {
+  it('flips awaiting_permission on the first park, idle on the last release, and never in between', async () => {
+    const activity = vi.fn()
+    const w = await world({ activity })
+    const first = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.route).toHaveBeenCalledTimes(1))
+    expect(activity).toHaveBeenCalledTimes(1)
+    expect(activity).toHaveBeenLastCalledWith(OWNER, ACP_SESSION, 'awaiting_permission')
+
+    const second = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(w.route).toHaveBeenCalledTimes(2))
+    // A second request on an already-waiting session is not news to the console.
+    expect(activity).toHaveBeenCalledTimes(1)
+
+    const [firstId, secondId] = w.route.mock.calls.map((call) => (call[0] as { requestId: string }).requestId)
+    await w.coordinator.decideEditorPermission({ agentId: AGENT, requestId: firstId!, decision: 'allow' })
+    await expect(first).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-allow' } })
+    // One request settled, one still parked: the session is still waiting.
+    expect(activity).toHaveBeenCalledTimes(1)
+
+    await w.coordinator.decideEditorPermission({ agentId: AGENT, requestId: secondId!, decision: 'deny' })
+    await expect(second).resolves.toEqual({ outcome: { outcome: 'selected', optionId: 'o-deny' } })
+    expect(activity).toHaveBeenCalledTimes(2)
+    expect(activity).toHaveBeenLastCalledWith(OWNER, ACP_SESSION, 'idle')
+    await w.store.close()
+  })
+
+  it('clears the wait when the turn is cancelled, and replays only live waits on reconnect', async () => {
+    const activity = vi.fn()
+    const w = await world({ activity })
+    const parked = w.coordinator.onAcpPermission(OWNER, ACP_SESSION, permissionParams())
+    await vi.waitFor(() => expect(activity).toHaveBeenCalledWith(OWNER, ACP_SESSION, 'awaiting_permission'))
+
+    expect(w.coordinator.isAwaitingApproval(OWNER, ACP_SESSION)).toBe(true)
+    expect(w.coordinator.isAwaitingApproval(OWNER, 'acp-other')).toBe(false)
+
+    // The CP forgot this daemon's waits on disconnect: the replay re-asserts the live one.
+    activity.mockClear()
+    w.coordinator.replayApprovalActivity()
+    expect(activity).toHaveBeenCalledTimes(1)
+    expect(activity).toHaveBeenLastCalledWith(OWNER, ACP_SESSION, 'awaiting_permission')
+
+    await w.coordinator.releaseApprovals(OWNER, ACP_SESSION)
+    await expect(parked).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
+    expect(activity).toHaveBeenLastCalledWith(OWNER, ACP_SESSION, 'idle')
+    expect(w.coordinator.isAwaitingApproval(OWNER, ACP_SESSION)).toBe(false)
+
+    // Nothing is waiting any more, so a reconnect replays nothing.
+    activity.mockClear()
+    w.coordinator.replayApprovalActivity()
+    expect(activity).not.toHaveBeenCalled()
+    await w.store.close()
+  })
+})

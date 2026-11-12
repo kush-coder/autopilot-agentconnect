@@ -1,0 +1,264 @@
+/** An organization's own daemon groups (docs/designs/daemon-groups.md §2, §3); every write is owner-only because a member serves the set's agents. */
+import type { FastifyInstance, FastifyReply } from 'fastify'
+import { z } from 'zod'
+import type { ZodTypeProvider } from '../plugins/zod.js'
+import { Tag } from '../plugins/openapi.js'
+import type { HttpDeps } from '../deps.js'
+import { DaemonId, type OrgId } from '../../domain/ids.js'
+import {
+  DaemonAlreadyInSet,
+  DaemonHoldsDuty,
+  MemberSetInUse,
+  MemberSetTenancyMismatch
+} from '../../persistence/errors.js'
+import { orgOf, denyNonOwner } from '../rbac.js'
+import {
+  MemberSetBody,
+  MemberSetDto,
+  MemberSetListDto,
+  MemberSetMemberParams,
+  MemberSetSpreadSessionsBody,
+  IdParam,
+  ErrorDto
+} from '../dto/index.js'
+
+function notFound(reply: FastifyReply): FastifyReply {
+  return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'member set not found' })
+}
+
+function conflict(reply: FastifyReply, message: string): FastifyReply {
+  return reply.code(409).send({ error: 'Conflict', statusCode: 409, message })
+}
+
+export function memberSetRoutes(deps: HttpDeps) {
+  /** One set plus its members and what is placed on it — the only projection these routes return. */
+  const toDto = async (set: { id: string; name: string; spreadSessions: boolean }) => {
+    const [memberDaemonIds, agentCounts] = await Promise.all([
+      deps.repos.memberSet.memberIdsOf(set.id),
+      deps.repos.memberSet.agentCountsOf([set.id])
+    ])
+    return {
+      setId: set.id,
+      name: set.name,
+      memberDaemonIds,
+      agentCount: agentCounts.get(set.id) ?? 0,
+      spreadSessions: set.spreadSessions
+    }
+  }
+
+  /** The list read, batched: one membership query and one count query for every set at once. */
+  const toDtoList = async (sets: { id: string; name: string; spreadSessions: boolean }[]) => {
+    const agentCounts = await deps.repos.memberSet.agentCountsOf(sets.map((s) => s.id))
+    return Promise.all(
+      sets.map(async (set) => ({
+        setId: set.id,
+        name: set.name,
+        memberDaemonIds: await deps.repos.memberSet.memberIdsOf(set.id),
+        agentCount: agentCounts.get(set.id) ?? 0,
+        spreadSessions: set.spreadSessions
+      }))
+    )
+  }
+
+  /** Resolve a path id to one of THIS org's sets. Null ⇒ 404, including for the org-less pool:
+   *  it is not this organization's to see or change. */
+  const ownSet = async (orgId: OrgId, setId: string) => {
+    const set = await deps.repos.memberSet.get(setId)
+    return set && set.orgId === orgId ? set : null
+  }
+
+  return async function memberSetRoutesPlugin(app: FastifyInstance): Promise<void> {
+    const r = app.withTypeProvider<ZodTypeProvider>()
+
+    r.get(
+      '/member-sets',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'List member sets',
+          description:
+            'The organization’s member sets — named sets of its daemons within which an agent’s duty may be claimed. The install-wide pool is not among them.',
+          operationId: 'listMemberSets',
+          response: { 200: MemberSetListDto }
+        }
+      },
+      async (req) => toDtoList(await deps.repos.memberSet.listForOrg(orgOf(req)))
+    )
+
+    r.post(
+      '/member-sets',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Create a member set',
+          description:
+            'Create an empty member set. Daemons join it afterwards, one set per daemon. Organization owners only.',
+          operationId: 'createMemberSet',
+          body: MemberSetBody,
+          response: { 201: MemberSetDto, 403: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        const set = await deps.repos.memberSet.createForOrg(orgOf(req), req.body.name)
+        return reply.code(201).send(await toDto(set))
+      }
+    )
+
+    r.patch(
+      '/member-sets/:id',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Rename a member set',
+          description:
+            'Change a member set’s display name. Membership and placements are untouched. Organization owners only.',
+          operationId: 'renameMemberSet',
+          params: IdParam,
+          body: MemberSetBody,
+          response: { 200: MemberSetDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        const set = await deps.repos.memberSet.renameForOrg(orgOf(req), req.params.id, req.body.name)
+        return set ? toDto(set) : notFound(reply)
+      }
+    )
+
+    r.put(
+      '/member-sets/:id/spread-sessions',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Spread sessions across a member set',
+          description:
+            'Turn the set’s session spreading on or off. On, an agent placed on the set may run its isolated sessions — with its repositories, provider credentials and agent secrets — on members other than the one holding it, provided that machine’s owner has opted it in with `sandbox.share`. Off (the default), every session runs on its holder. Every member-set response carries the current value as `spreadSessions`. Organization owners only.',
+          operationId: 'setMemberSetSpreadSessions',
+          params: IdParam,
+          body: MemberSetSpreadSessionsBody,
+          response: { 200: MemberSetDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        const set = await deps.repos.memberSet.setSpreadSessionsForOrg(orgOf(req), req.params.id, req.body.enabled)
+        return set ? toDto(set) : notFound(reply)
+      }
+    )
+
+    r.delete(
+      '/member-sets/:id',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Delete a member set',
+          description:
+            'Delete an EMPTY member set. A set that still has members, or agents placed on it, returns 409 — dropping it would silently unplace them. Organization owners only.',
+          operationId: 'deleteMemberSet',
+          params: IdParam,
+          response: { 204: z.null(), 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        try {
+          const deleted = await deps.repos.memberSet.deleteForOrg(orgOf(req), req.params.id)
+          return deleted ? reply.code(204).send(null) : notFound(reply)
+        } catch (err) {
+          if (err instanceof MemberSetInUse) {
+            return conflict(reply, 'remove its daemons and re-place its agents before deleting the set')
+          }
+          throw err
+        }
+      }
+    )
+
+    r.put(
+      '/member-sets/:id/members/:daemonId',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Enroll a daemon in a member set',
+          description:
+            'Add an approved organization daemon to the set. Pinned agents stay on that machine. Refused (409) if approval is missing or the daemon is already in another set. Organization owners only, since a member serves the set’s agents and receives their credentials.',
+          operationId: 'enrollDaemonInMemberSet',
+          params: MemberSetMemberParams,
+          response: { 200: MemberSetDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        const orgId = orgOf(req)
+        const set = await ownSet(orgId, req.params.id)
+        if (!set) return notFound(reply)
+        const daemonId = DaemonId(req.params.daemonId)
+        const daemon = await deps.registry.getAvailable(orgId, daemonId)
+        if (!daemon) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+        }
+        if (daemon.memberSetId === set.id) return toDto(set)
+        if (daemon.memberSetId) return conflict(reply, 'the daemon is already in another member set')
+        // Agents pinned here neither block the join nor move: the ledger's eligibility predicate
+        // has no membership term for a `daemon` placement, so this machine stays their only
+        // possible holder (§3). Joining changes HOW it holds them, not who serves them.
+        try {
+          await deps.repos.memberSet.enrollOperator(set.id, daemonId)
+        } catch (err) {
+          if (err instanceof DaemonAlreadyInSet) {
+            return conflict(reply, 'the daemon is already in another member set')
+          }
+          // The set's tenancy invariant, surfaced rather than swallowed: the daemon is not this
+          // org's. The org-fenced read above already refuses that, so this is a concurrent change.
+          if (err instanceof MemberSetTenancyMismatch) return conflict(reply, 'the daemon is not in this organization')
+          throw err
+        }
+        // Duty is what it holds them by now, so the org's groups are re-derived before the machine
+        // comes back and claims — otherwise its first beat as a member finds nothing to take.
+        deps.recomputeDuties?.(orgId)
+        deps.liveness.reconnectForAuthorization?.(daemonId)
+        return toDto(set)
+      }
+    )
+
+    r.delete(
+      '/member-sets/:id/members/:daemonId',
+      {
+        schema: {
+          tags: [Tag.MemberSets],
+          summary: 'Withdraw a daemon from a member set',
+          description:
+            'Remove one daemon from the set. Refused (409) while it still holds a live duty lease: drain it first (or wait for its leases to lapse, which is strictly later than its own self-fence) so it has provably stopped serving before the duties re-grant elsewhere. The set’s agents stay placed on the set and re-grant to its remaining members. Organization owners only.',
+          operationId: 'withdrawDaemonFromMemberSet',
+          params: MemberSetMemberParams,
+          response: { 200: MemberSetDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyNonOwner(req, reply)) return reply
+        const orgId = orgOf(req)
+        const set = await ownSet(orgId, req.params.id)
+        if (!set) return notFound(reply)
+        const daemonId = DaemonId(req.params.daemonId)
+        const daemon = await deps.registry.getAvailable(orgId, daemonId)
+        if (!daemon || daemon.memberSetId !== set.id) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon is not in this set' })
+        }
+        // Stop the old authority and CONFIRM it stopped, before committing the change (§3). A live
+        // lease is exactly "it may still be serving"; a lapsed one is not, because the daemon's own
+        // self-fence fires strictly before the CP's reassignment horizon. The repository takes that
+        // check and the delete together under the per-daemon fence, so a claim cannot land between.
+        try {
+          await deps.repos.memberSet.withdraw(daemonId, new Date(deps.clock.now()))
+        } catch (err) {
+          if (err instanceof DaemonHoldsDuty) {
+            return conflict(reply, `drain this daemon first — it still holds ${err.held} duty group(s)`)
+          }
+          throw err
+        }
+        deps.liveness.reconnectForAuthorization?.(daemonId)
+        return toDto(set)
+      }
+    )
+  }
+}

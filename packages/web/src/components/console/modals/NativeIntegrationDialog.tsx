@@ -1,0 +1,508 @@
+'use client'
+
+import { useEffect, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import {
+  AGENT_SETUP_URI,
+  AGENT_TOOLS_URI,
+  CODE_HOST_SETUP_URI,
+  INTEGRATION_SETUP_URI,
+  MCP_SETUP_URI,
+  SKILL_SETUP_URI,
+  type NativeMcpUi
+} from '@agentconnect.md/protocol/mcp-app'
+import { isCodeHostProvider } from '@agentconnect.md/protocol/code-host'
+import { Button } from '@/components/ui'
+import { useOrgs } from '@/lib/org-context'
+import { useConsoleData } from '@/lib/data-context'
+import {
+  fetchAgentHooks,
+  fetchAgentInstallations,
+  fetchAgentRepos,
+  fetchGithubInstallations,
+  updateGithubHook,
+  updateGitlabHook,
+  updateGiteaHook,
+  updateAzureDevOpsHook,
+  updateIntegrationChannel,
+  type HookDto,
+  type AgentInstallationAuthDto,
+  type AgentRepoAuthDto,
+  type GithubInstallationDto
+} from '@/lib/api'
+import { GithubReviewSettings } from '../GithubReviewSettings'
+import { GitlabReviewSettings } from '../GitlabReviewSettings'
+import { GiteaReviewSettings } from '../GiteaReviewSettings'
+import { AzureDevOpsReviewSettings } from '../AzureDevOpsReviewSettings'
+import {
+  azureDevOpsCommentFamilies,
+  azureDevOpsFamilySubscription,
+  azureDevOpsTriggerModeOf,
+  type AzFamily
+} from '@/lib/azure-devops-events'
+import { channelListSemantics } from '../platforms/registry'
+import {
+  effectiveRepoAccess,
+  installationForRepo,
+  requiredRepoAccess,
+  repoAccessSatisfies,
+  hasChecksWritePermission,
+  hasPullRequestsReadPermission,
+  hasPullRequestsWritePermission,
+  type HookReviewPolicy,
+  type HookReportingMode
+} from '@/lib/github-review-settings'
+import type { IntegrationRow } from '@/lib/data'
+import {
+  triggerModeOf,
+  githubCommentFamilies,
+  githubFamilySubscription,
+  type GhFamily,
+  type GhTriggerMode
+} from '@/lib/github-events'
+import {
+  gitlabTriggerModeOf,
+  gitlabCommentFamilies,
+  gitlabFamilySubscription,
+  type GlFamily,
+  type GlTriggerMode
+} from '@/lib/gitlab-events'
+import {
+  giteaTriggerModeOf,
+  giteaCommentFamilies,
+  giteaFamilySubscription,
+  type GtFamily,
+  type GtTriggerMode
+} from '@/lib/gitea-events'
+import { AddIntegrationForOrgModal } from './AddIntegrationModal'
+import CodeHostSetupDialog from './CodeHostSetupDialog'
+import AgentSetupDialog from './AgentSetupDialog'
+import AgentToolsDialog from './AgentToolsDialog'
+import SkillSetupDialog from './SkillSetupDialog'
+import McpSetupDialog from './McpSetupDialog'
+import { NativeDialogNotice } from './NativeDialogNotice'
+import { nativeFailureReport, type NativeDialogReport } from './native-dialog-report'
+import { githubHookScope, githubHookScopeKey } from '@/lib/github-hook-scope'
+
+interface Props {
+  ui: Extract<NativeMcpUi, { resourceUri: typeof INTEGRATION_SETUP_URI }>
+  onClose: () => void
+  onCompleted: NativeDialogReport
+}
+
+/** One presentation intent, one dialog: the `ui://` resource the tool named picks which. */
+export default function NativeIntegrationDialog({
+  ui,
+  onClose,
+  onCompleted
+}: {
+  ui: NativeMcpUi
+  onClose: () => void
+  onCompleted: NativeDialogReport
+}) {
+  const props = { onClose, onCompleted }
+  switch (ui.resourceUri) {
+    case CODE_HOST_SETUP_URI:
+      return <CodeHostSetupDialog ui={ui} {...props} />
+    case AGENT_SETUP_URI:
+      return <AgentSetupDialog ui={ui} {...props} />
+    case AGENT_TOOLS_URI:
+      return <AgentToolsDialog ui={ui} {...props} />
+    case SKILL_SETUP_URI:
+      return <SkillSetupDialog ui={ui} {...props} />
+    case MCP_SETUP_URI:
+      return <McpSetupDialog ui={ui} {...props} />
+    default:
+      return <IntegrationSetupDialog ui={ui} {...props} />
+  }
+}
+
+function IntegrationSetupDialog({ ui, onClose, onCompleted }: Props) {
+  const t = useTranslations('Integrations.dialog')
+  const { activeOrg } = useOrgs()
+  const { agents, integrations, loading } = useConsoleData()
+  const intent = ui.intent
+  const agent = agents.find((item) => item.id === intent.agentId)
+  const notice = (text: string) => <NativeDialogNotice heading={t('configuration')} text={text} onClose={onClose} />
+  if (activeOrg?.id !== ui.orgId) return notice(t('wrongOrganization'))
+  if (loading) return notice(t('loading'))
+  if (intent.agentId && !agent?.canEdit) return notice(t('cannotEdit'))
+  if (intent.mode === 'create')
+    return (
+      <AddIntegrationForOrgModal
+        initialPlatform={intent.provider}
+        initialAgentId={intent.agentId}
+        onClose={onClose}
+        onCompleted={onCompleted}
+        onFailed={nativeFailureReport(t('adding'), onCompleted, onClose)}
+      />
+    )
+  if (intent.target.kind === 'codehost-subscription')
+    return <EditSubscription key={intent.target.id} {...{ ui, onClose, onCompleted }} />
+  const integration = integrations.find((item) => item.id === intent.target.id && item.agentId === intent.agentId)
+  return integration ? (
+    <EditChannels
+      key={integration.id}
+      integration={integration}
+      orgId={ui.orgId}
+      onClose={onClose}
+      onCompleted={onCompleted}
+    />
+  ) : (
+    notice(t('unavailable'))
+  )
+}
+
+function EditChannels({
+  integration,
+  orgId,
+  onClose,
+  onCompleted
+}: {
+  integration: IntegrationRow
+  orgId: string
+  onClose: () => void
+  onCompleted: NativeDialogReport
+}) {
+  const t = useTranslations('Integrations.dialog')
+  const { refresh } = useConsoleData()
+  const allowed = channelListSemantics(integration.platform).triggers
+  const [draft, setDraft] = useState(() =>
+    Object.fromEntries(integration.channels.map((row) => [row.channelId, row.trigger]))
+  )
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const save = async () => {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    try {
+      for (const row of integration.channels) {
+        const next = draft[row.channelId]
+        // By decision is written only with its binding, never from this trigger picker.
+        if (next !== row.trigger && next !== undefined && next !== 'decision')
+          await updateIntegrationChannel(integration.id!, row.channelId, { trigger: next }, orgId)
+      }
+      await refresh()
+      onCompleted(t('updatedTriggers', { name: integration.name }))
+      onClose()
+    } catch (e) {
+      const reason = `${t('partialSave')} ${e instanceof Error ? e.message : String(e)}`
+      setError(reason)
+      nativeFailureReport(t('updatingTriggers', { name: integration.name }), onCompleted, onClose)(reason)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <>
+      <div className="modalhead">{t('edit', { name: integration.name })}</div>
+      <div className="modalbody flex flex-col gap-3">
+        <p className="text-[13px] text-(--text-secondary)">{t('triggerDescription')}</p>
+        {integration.channels.map((row) => (
+          <label key={row.channelId} className="flex items-center justify-between gap-3">
+            {row.name}
+            <select
+              className="inp"
+              value={draft[row.channelId]}
+              disabled={busy}
+              onChange={(e) => setDraft({ ...draft, [row.channelId]: e.target.value as 'off' | 'mention' | 'any' })}
+            >
+              <option value="off">{t('off')}</option>
+              {row.kind !== 'im' && (!allowed || allowed.includes('mention')) && (
+                <option value="mention">{t('whenMentioned')}</option>
+              )}
+              {(row.kind === 'im' || !allowed || allowed.includes('any')) && (
+                <option value="any">{t('everyMessage')}</option>
+              )}
+            </select>
+          </label>
+        ))}
+        {!integration.channels.length && <p>{t('noConversationsAvailable')}</p>}
+        {error && <p role="alert">{error}</p>}
+      </div>
+      <div className="modalfoot">
+        <Button variant="secondary" disabled={busy} onClick={onClose}>
+          {t('cancel')}
+        </Button>
+        <Button disabled={busy || !integration.channels.length} onClick={() => void save()}>
+          {t('saveChanges')}
+        </Button>
+      </div>
+    </>
+  )
+}
+
+function EditSubscription({ ui, onClose, onCompleted }: Props) {
+  const t = useTranslations('Integrations.dialog')
+  const intent = ui.intent
+  const [hook, setHook] = useState<HookDto | null>(null)
+  const [name, setName] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const [mode, setMode] = useState<GhTriggerMode>('first')
+  const [modeChanged, setModeChanged] = useState(false)
+  const [reviewPolicy, setReviewPolicy] = useState<HookReviewPolicy>('off')
+  const [reportingMode, setReportingMode] = useState<HookReportingMode>('off')
+  const [repos, setRepos] = useState<AgentRepoAuthDto[]>([])
+  const [installationGrants, setInstallationGrants] = useState<AgentInstallationAuthDto[]>([])
+  const [installations, setInstallations] = useState<GithubInstallationDto[]>([])
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const { refresh, agents } = useConsoleData()
+  const repoAccess = effectiveRepoAccess({
+    repoId: hook?.repoId,
+    repoFullName: hook ? githubHookScopeKey(hook) : undefined,
+    workspace: agents.find((agent) => agent.id === intent.agentId)?.workspace ?? { mode: 'scratch' },
+    authorizations: repos,
+    installationGrants
+  })
+  const installation = installationForRepo(hook ? githubHookScopeKey(hook) : undefined, installations)
+  const reviewChanged = !!hook && (reviewPolicy !== hook.reviewPolicy || reportingMode !== hook.reportingMode)
+  const reviewBlocked =
+    hook?.kind === 'github' &&
+    reviewChanged &&
+    (!repoAccessSatisfies(repoAccess, requiredRepoAccess({ reviewPolicy, reportingMode })) ||
+      (reviewPolicy !== 'off' && !hasPullRequestsWritePermission(installation)) ||
+      (reportingMode === 'check' &&
+        (!hasChecksWritePermission(installation) || !hasPullRequestsReadPermission(installation))))
+  useEffect(() => {
+    if (intent.mode !== 'edit') return
+    let alive = true
+    void fetchAgentHooks(intent.agentId, ui.orgId)
+      .then((rows) => {
+        if (!alive) return
+        const found = rows.find((row) => row.id === intent.target.id && row.agentId === intent.agentId)
+        if (!found || !isCodeHostProvider(found.kind)) {
+          setError(t('subscriptionUnavailable'))
+          return
+        }
+        setHook(found)
+        setName(found.name)
+        setEnabled(found.enabled)
+        setReviewPolicy(found.reviewPolicy)
+        setReportingMode(found.reportingMode)
+        if (found.kind === 'github') {
+          void Promise.all([
+            fetchAgentRepos(intent.agentId, ui.orgId),
+            fetchAgentInstallations(intent.agentId, ui.orgId),
+            fetchGithubInstallations(ui.orgId)
+          ])
+            .then(([authorizations, grants, installed]) => {
+              if (alive) {
+                setRepos(authorizations)
+                setInstallationGrants(grants)
+                setInstallations(installed.installations)
+              }
+            })
+            .catch(() => {
+              if (alive) setError(t('repoPermissionsError'))
+            })
+        }
+        setMode(
+          found.kind === 'github'
+            ? triggerModeOf(found)
+            : found.kind === 'gitlab'
+              ? gitlabTriggerModeOf(found)
+              : found.kind === 'azure-devops'
+                ? azureDevOpsTriggerModeOf(found)
+                : giteaTriggerModeOf(found)
+        )
+      })
+      .catch((e: unknown) => {
+        if (alive) setError(e instanceof Error ? e.message : String(e))
+      })
+    return () => {
+      alive = false
+    }
+  }, [intent, ui.orgId])
+  const save = async () => {
+    if (busy || !hook || intent.mode !== 'edit' || reviewBlocked) return
+    setBusy(true)
+    setError('')
+    try {
+      const latest = (await fetchAgentHooks(intent.agentId, ui.orgId)).find((row) => row.id === hook.id)
+      if (!latest || latest.configRevision !== hook.configRevision) throw new Error(t('subscriptionChanged'))
+      const common = {
+        agentId: intent.agentId,
+        name: name.trim(),
+        enabled,
+        reviewPolicy,
+        reportingMode
+      }
+      if (hook.kind === 'github')
+        await updateGithubHook(
+          hook.id,
+          {
+            ...common,
+            ...githubHookScope(hook),
+            ...(modeChanged
+              ? githubFamilySubscription(hook.family as GhFamily, mode)
+              : {
+                  events: hook.events,
+                  mentionOnly: hook.mentionOnly,
+                  commentFamilies: githubCommentFamilies(hook.commentFamilies)
+                }),
+            labelFilter: hook.labelFilter,
+            gateMode: 'informational'
+          },
+          ui.orgId
+        )
+      else if (hook.kind === 'gitlab')
+        await updateGitlabHook(
+          hook.id,
+          {
+            ...common,
+            projectId: hook.repoId!,
+            ...(modeChanged
+              ? gitlabFamilySubscription(hook.family as GlFamily, mode as GlTriggerMode)
+              : {
+                  events: hook.events,
+                  mentionOnly: hook.mentionOnly,
+                  commentFamilies: gitlabCommentFamilies(hook.commentFamilies)
+                })
+          },
+          ui.orgId
+        )
+      else if (hook.kind === 'azure-devops')
+        await updateAzureDevOpsHook(
+          hook.id,
+          {
+            ...common,
+            repoId: hook.repoId!,
+            ...(modeChanged
+              ? azureDevOpsFamilySubscription(hook.family as AzFamily, mode as 'first' | 'every' | 'mention')
+              : {
+                  events: hook.events,
+                  mentionOnly: hook.mentionOnly,
+                  commentFamilies: azureDevOpsCommentFamilies(hook.commentFamilies)
+                })
+          },
+          ui.orgId
+        )
+      else
+        await updateGiteaHook(
+          hook.id,
+          {
+            ...common,
+            repoId: hook.repoId!,
+            ...(modeChanged
+              ? giteaFamilySubscription(hook.family as GtFamily, mode as GtTriggerMode)
+              : {
+                  events: hook.events,
+                  mentionOnly: hook.mentionOnly,
+                  commentFamilies: giteaCommentFamilies(hook.commentFamilies)
+                })
+          },
+          ui.orgId
+        )
+      await refresh()
+      onCompleted(
+        t('updatedSubscription', { kind: hook.kind, name: name.trim(), repo: hook.repoFullName ?? hook.repoId ?? '' })
+      )
+      onClose()
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e)
+      setError(reason)
+      // A stale-revision refusal is a local fix — reopening is the retry, and the caller is not told
+      // a save failed that it never saw start. Anything else is a refusal the caller must hear.
+      if (!reason.includes('Close and reopen'))
+        nativeFailureReport(t('updatingSubscription'), onCompleted, onClose)(reason)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <>
+      <div className="modalhead">{t('editIntegration')}</div>
+      <div className="modalbody flex flex-col gap-3">
+        {hook ? (
+          <>
+            <p>
+              {hook.repoFullName ?? hook.repoId} · {hook.family}
+            </p>
+            <label>
+              {t('name')}
+              <input
+                className="inp"
+                value={name}
+                disabled={busy}
+                maxLength={120}
+                onChange={(e) => setName(e.target.value)}
+              />
+            </label>
+            <label>
+              <input type="checkbox" checked={enabled} disabled={busy} onChange={(e) => setEnabled(e.target.checked)} />{' '}
+              {t('enabled')}
+            </label>
+            <label>
+              {t('trigger')}
+              <select
+                className="inp"
+                value={mode}
+                disabled={busy}
+                onChange={(e) => {
+                  setMode(e.target.value as GhTriggerMode)
+                  setModeChanged(true)
+                }}
+              >
+                <option value="first">{t('whenCreated')}</option>
+                <option value="every">{t('everyUpdate')}</option>
+                <option value="mention">{t('whenMentioned')}</option>
+                {hook.kind === 'github' && hook.family === 'issues' && (
+                  <option value="labeled">{t('whenLabeled')}</option>
+                )}
+              </select>
+            </label>
+            <p className="text-[13px] text-(--text-secondary)">{t('repositoryTriggerDescription')}</p>
+            {(hook.family === 'pull_request' || hook.family === 'merge_request') && (
+              <fieldset disabled={busy}>
+                {hook.kind === 'github' ? (
+                  <GithubReviewSettings
+                    value={{ reviewPolicy, reportingMode }}
+                    onReviewPolicyChange={setReviewPolicy}
+                    onReportingModeChange={setReportingMode}
+                    repoAccess={repoAccess}
+                    installation={installation}
+                    defaultExpanded
+                  />
+                ) : hook.kind === 'gitlab' ? (
+                  <GitlabReviewSettings
+                    value={{ reviewPolicy, reportingMode }}
+                    onReviewPolicyChange={setReviewPolicy}
+                    onReportingModeChange={setReportingMode}
+                    defaultExpanded
+                  />
+                ) : hook.kind === 'azure-devops' ? (
+                  <AzureDevOpsReviewSettings
+                    value={{ reviewPolicy, reportingMode }}
+                    onReviewPolicyChange={setReviewPolicy}
+                    onReportingModeChange={setReportingMode}
+                    defaultExpanded
+                  />
+                ) : (
+                  <GiteaReviewSettings
+                    value={{ reviewPolicy, reportingMode }}
+                    onReviewPolicyChange={setReviewPolicy}
+                    onReportingModeChange={setReportingMode}
+                    defaultExpanded
+                  />
+                )}
+              </fieldset>
+            )}
+          </>
+        ) : (
+          !error && <p>{t('loading')}</p>
+        )}
+        {error && <p role="alert">{error}</p>}
+      </div>
+      <div className="modalfoot">
+        <Button variant="secondary" disabled={busy} onClick={onClose}>
+          {t('cancel')}
+        </Button>
+        <Button disabled={!hook || busy || !name.trim() || reviewBlocked} onClick={() => void save()}>
+          {t('saveChanges')}
+        </Button>
+      </div>
+    </>
+  )
+}

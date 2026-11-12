@@ -1,0 +1,325 @@
+import { describe, expect, it } from 'vitest'
+import type { SessionMessageDto } from './api'
+import type { SessionStep } from './data'
+import { liveThreadScope, mergeSessionMessages, reconcilePersistedLiveSteps } from './session-transcript'
+
+function message(seq: number, ts: string, text: string): SessionMessageDto {
+  return { seq, ts, text, sender: 'agent', kind: 'reasoning' }
+}
+
+describe('mergeSessionMessages', () => {
+  it('upserts stable rows and restores chronological order after a backfill', () => {
+    const current = [message(1, '1784098843.000000', 'trigger'), message(2, '1784098844000', 'running')]
+    const merged = mergeSessionMessages(
+      current,
+      [message(2, '1784098844000', 'complete'), message(3, '1784098711.000000', 'backfilled')],
+      'event-time'
+    )
+
+    expect(merged.map(({ seq, text }) => [seq, text])).toEqual([
+      [3, 'backfilled'],
+      [1, 'trigger'],
+      [2, 'complete']
+    ])
+  })
+
+  it('trusts the daemon sequence under the conservative ordering', () => {
+    // The arm every platform but Slack takes (§10 `transcriptOrdering`), and
+    // the one an unrecognized platform id resolves to. Same upsert, no re-sort.
+    const merged = mergeSessionMessages(
+      [message(1, '1784098843.000000', 'trigger')],
+      [message(3, '1784098711.000000', 'backfilled'), message(2, '1784098844000', 'running')],
+      'seq'
+    )
+
+    expect(merged.map(({ seq }) => seq)).toEqual([1, 2, 3])
+  })
+})
+
+describe('reconcilePersistedLiveSteps', () => {
+  const agentId = 'agent'
+
+  function prompt(text: string, observedAtMs: number): SessionStep {
+    return { kind: 'msg', who: '@you', turnId: `u:${observedAtMs}`, text, observedAtMs }
+  }
+
+  function persistedPrompt(seq: number, text: string, ts: number): SessionMessageDto {
+    return { seq, ts: String(ts), text, sender: '@you', kind: 'text' }
+  }
+
+  it('preserves an unpersisted failed turn when a tail refresh is empty', () => {
+    const live = [
+      prompt('ship it', 1_785_000_000_000),
+      {
+        kind: 'done',
+        turnId: 'warn-1',
+        text: '⚠️ Your browser couldn’t connect to the chat server — check your network connection and try again.',
+        observedAtMs: 1_785_000_000_100
+      }
+    ] satisfies SessionStep[]
+
+    expect(reconcilePersistedLiveSteps(live, [], agentId)).toBe(live)
+  })
+
+  it('hides only the duplicate prompt closest to the persisted retry while its answer is pending', () => {
+    const failedAt = 1_785_000_000_000
+    const retriedAt = failedAt + 30_000
+    const live = [
+      prompt('ship it', failedAt),
+      {
+        kind: 'done',
+        turnId: 'warn-1',
+        text: '⚠️ Your browser couldn’t connect to the chat server — check your network connection and try again.',
+        observedAtMs: failedAt + 100
+      },
+      prompt('ship it', retriedAt),
+      { kind: 'done', turnId: 'ok-1', text: 'deployed', observedAtMs: retriedAt + 1_000 }
+    ] satisfies SessionStep[]
+
+    expect(reconcilePersistedLiveSteps(live, [persistedPrompt(1, 'ship it', retriedAt + 50)], agentId)).toEqual([
+      ...live.slice(0, 2),
+      { ...live[2], hidden: true },
+      live[3]
+    ])
+  })
+
+  it('does not confirm a failed prompt from a matching peer-agent row', () => {
+    const at = 1_785_000_000_000
+    const live = [
+      prompt('yes', at),
+      {
+        kind: 'done',
+        turnId: 'warn-2',
+        text: '⚠️ Your browser couldn’t connect to the chat server — check your network connection and try again.',
+        observedAtMs: at + 100
+      }
+    ] satisfies SessionStep[]
+    const peerRows = [
+      { seq: 1, ts: String(at + 50), text: 'yes', sender: 'bot-b', kind: 'text' }
+    ] satisfies SessionMessageDto[]
+
+    expect(reconcilePersistedLiveSteps(live, peerRows, agentId, [])).toEqual(live)
+  })
+
+  it('retires silent work after the prompt is saved and all lanes finish', () => {
+    const at = 1_785_000_000_000
+    const live = [
+      prompt('inspect', at),
+      { kind: 'tool', turnId: `u:${at}`, text: 'Read file', observedAtMs: at + 100 }
+    ] satisfies [SessionStep, SessionStep]
+    const saved = persistedPrompt(1, 'inspect', at + 10)
+    const waiting = reconcilePersistedLiveSteps(live, [saved], agentId)
+    expect(waiting).toEqual([{ ...live[0], hidden: true }, live[1]])
+    expect(reconcilePersistedLiveSteps([{ ...waiting[0]!, turnComplete: true }, waiting[1]!], [], agentId)).toEqual([])
+    expect(reconcilePersistedLiveSteps([{ ...live[0], turnComplete: true }, live[1]], [saved], agentId)).toEqual([])
+    const notice = { kind: 'notice', turnId: `u:${at}`, text: 'Approval unavailable', standing: true } as const
+    expect(
+      reconcilePersistedLiveSteps([{ ...live[0], turnComplete: true }, live[1], notice], [saved], agentId)
+    ).toEqual([notice])
+  })
+
+  it('retires a prompt with files once its row lands with the daemon’s attached-file note', () => {
+    const at = 1_785_000_000_000
+    const live = [
+      { ...prompt('read this', at), turnComplete: true },
+      { kind: 'done', turnId: `u:${at}`, agentId, text: 'PELICAN', observedAtMs: at + 100 }
+    ] satisfies [SessionStep, SessionStep]
+    const rows = [
+      persistedPrompt(1, 'read this\n[attached: secret.txt (text/plain)]', at + 10),
+      { seq: 2, ts: String(at + 200), text: 'PELICAN', sender: agentId, kind: 'text' }
+    ]
+    expect(reconcilePersistedLiveSteps(live, rows, agentId)).toEqual([])
+    const fileOnly: SessionStep[] = [{ ...live[0], text: '' }, live[1]]
+    expect(
+      reconcilePersistedLiveSteps(
+        fileOnly,
+        [persistedPrompt(1, '[attached: secret.txt (text/plain)]', at + 10), rows[1]!],
+        agentId
+      )
+    ).toEqual([])
+  })
+
+  function persistedReply(seq: number, sender: string, text: string, ts: number, postId: string): SessionMessageDto {
+    return { seq, ts: String(ts), text, sender, kind: 'text', postId }
+  }
+
+  it('keeps streamed reply blocks until every canonical post is available', () => {
+    const at = 1_785_000_000_000
+    const live = [
+      prompt('build', at),
+      { kind: 'done', turnId: 'reply', text: 'First', postId: 'post-1', observedAtMs: at + 100 },
+      { kind: 'plan', turnId: 'reply', text: 'working', observedAtMs: at + 200 },
+      { kind: 'done', turnId: 'reply', text: 'Second', postId: 'post-2', observedAtMs: at + 300 }
+    ] satisfies SessionStep[]
+    const promptRow = persistedPrompt(1, 'build', at + 10)
+    const partial = [promptRow, persistedReply(2, 'agent', 'First', at + 400, 'post-1')]
+
+    const waiting = reconcilePersistedLiveSteps(live, [promptRow], agentId)
+    expect(waiting).toEqual([{ ...live[0], hidden: true }, ...live.slice(1)])
+    const afterFirst = reconcilePersistedLiveSteps(live, partial, agentId)
+    expect(afterFirst).toEqual([{ ...live[0], hidden: true }, { ...live[1], hidden: true }, ...live.slice(2)])
+    expect(reconcilePersistedLiveSteps(waiting, partial.slice(1), agentId)).toEqual(afterFirst)
+    expect(
+      reconcilePersistedLiveSteps(
+        afterFirst,
+        [...partial, persistedReply(3, 'agent', 'Second', at + 500, 'post-2')],
+        agentId
+      )
+    ).toEqual([])
+    expect(
+      reconcilePersistedLiveSteps(afterFirst, [persistedReply(3, 'agent', 'Second', at + 500, 'post-2')], agentId)
+    ).toEqual([])
+  })
+
+  it('retires an image-only reply only once the saved post with its postId is present', () => {
+    const at = 1_785_000_000_000
+    const image = {
+      kind: 'done',
+      turnId: 'reply',
+      text: '[shared: out/a.png (image/png, 9 bytes, sha256:1a2b3c4d5e6f7a8b)]',
+      postId: 'post-img',
+      segmentId: 'post-img',
+      observedAtMs: at + 100,
+      sharedImage: {
+        attachment: { name: 'a.png', mimeType: 'image/png', data: 'AAAA' },
+        original: { kind: 'inline' },
+        revision: 0
+      }
+    } satisfies SessionStep
+    const live = [prompt('draw', at), image]
+    const promptRow = persistedPrompt(1, 'draw', at + 10)
+    // An unrelated agent row after the prompt must not stand in for the image's own post.
+    const other = persistedReply(2, 'agent', 'unrelated', at + 200, 'post-other')
+    expect(reconcilePersistedLiveSteps(live, [promptRow, other], agentId)).toEqual([
+      { ...live[0], hidden: true },
+      image
+    ])
+    expect(
+      reconcilePersistedLiveSteps(
+        live,
+        [promptRow, persistedReply(3, 'agent', image.text, at + 300, 'post-img')],
+        agentId
+      )
+    ).toEqual([])
+  })
+
+  // #753: an agent-initiated post has no optimistic `msg` prompt to anchor a turn —
+  // it renders as a standalone step, identified only by its canonical postId.
+  it('drops a standalone agent-post step once ITS postId lands in a persisted row (adopted-conversation refresh)', () => {
+    const live = [
+      {
+        kind: 'done',
+        turnId: 'post-1',
+        text: 'Sent "hello" to bot-b',
+        agentId: 'bot-a',
+        postId: 'post-1',
+        observedAtMs: 1
+      }
+    ] satisfies SessionStep[]
+
+    expect(
+      reconcilePersistedLiveSteps(live, [persistedReply(1, 'bot-a', 'Sent "hello" to bot-b', 1, 'post-1')], agentId)
+    ).toEqual([])
+  })
+
+  it('keeps a standalone agent-post step whose postId has not been persisted yet', () => {
+    const live = [
+      {
+        kind: 'done',
+        turnId: 'post-1',
+        text: 'Sent "hello" to bot-b',
+        agentId: 'bot-a',
+        postId: 'post-1',
+        observedAtMs: 1
+      }
+    ] satisfies SessionStep[]
+
+    expect(
+      reconcilePersistedLiveSteps(live, [persistedReply(1, 'bot-a', 'unrelated', 1, 'post-other')], agentId)
+    ).toEqual(live)
+  })
+
+  // The reconciling view's OWN agent is "agent" here, but the confirming row belongs to
+  // a PEER participant's session (a merged multi-agent conversation, #753) — postId
+  // matching must not be gated by sender the way the prompt heuristic is.
+  it('drops a peer participant’s post confirmed by a row from that peer’s OWN session', () => {
+    const live = [
+      { kind: 'done', turnId: 'post-2', text: 'hi from bot-b', agentId: 'bot-b', postId: 'post-2', observedAtMs: 1 }
+    ] satisfies SessionStep[]
+
+    expect(
+      reconcilePersistedLiveSteps(live, [persistedReply(1, 'bot-b', 'hi from bot-b', 1, 'post-2')], agentId)
+    ).toEqual([])
+  })
+
+  it('reconciles a standalone post step and a prompt-anchored turn independently in the same refresh', () => {
+    const at = 1_785_000_000_000
+    const live = [
+      { kind: 'done', turnId: 'post-3', text: 'stale post', agentId: 'bot-a', postId: 'post-3', observedAtMs: at },
+      prompt('ship it', at + 1_000),
+      { kind: 'done', turnId: 'ok-2', text: 'deployed', observedAtMs: at + 2_000 }
+    ] satisfies SessionStep[]
+
+    const persisted = [
+      persistedReply(1, 'bot-a', 'stale post', at, 'post-3'),
+      persistedPrompt(2, 'ship it', at + 1_050)
+    ]
+    expect(reconcilePersistedLiveSteps(live, persisted, agentId)).toEqual([{ ...live[1], hidden: true }, live[2]])
+  })
+})
+
+describe('reconciling a coordinator conversation’s threads (webchat-threads.md §6)', () => {
+  const agentId = 'agent'
+  const at = 1_785_000_000_000
+  const rootPrompt: SessionStep = { kind: 'msg', who: '@you', turnId: 'r', text: 'plan the release', observedAtMs: at }
+  const rootAnswer: SessionStep = { kind: 'done', agentId, turnId: 'r', text: 'Planned.', observedAtMs: at + 10 }
+  // A task answers this thread message in the thread.
+  const heldPrompt: SessionStep = {
+    kind: 'msg',
+    who: '@you',
+    turnId: 'h',
+    text: 'and the notes?',
+    thread: 'root-1',
+    observedAtMs: at + 20
+  }
+  const heldAnswer: SessionStep = {
+    kind: 'done',
+    agentId,
+    turnId: 'h',
+    text: 'Notes drafted.',
+    thread: 'root-1',
+    observedAtMs: at + 30
+  }
+  // The coordinator answers this one, so its turn belongs to the main timeline.
+  const askedPrompt: SessionStep = {
+    kind: 'msg',
+    who: '@you',
+    turnId: 'c',
+    text: 'who owns it?',
+    thread: 'root-2',
+    observedAtMs: at + 40
+  }
+  const askedAnswer: SessionStep = { kind: 'done', agentId, turnId: 'c', text: 'Dana does.', observedAtMs: at + 50 }
+  const live = [rootPrompt, rootAnswer, heldPrompt, heldAnswer, askedPrompt, askedAnswer]
+  const row = (seq: number, sender: string, text: string, ms: number): SessionMessageDto => ({
+    seq,
+    ts: String(ms),
+    text,
+    sender,
+    kind: 'text'
+  })
+
+  it('scopes the root to its turns and a thread message the coordinator answered, and a thread to its own', () => {
+    expect(live.filter(liveThreadScope(live))).toEqual([rootPrompt, rootAnswer, askedPrompt, askedAnswer])
+    expect(live.filter(liveThreadScope(live, 'root-1'))).toEqual([heldPrompt, heldAnswer])
+    expect(live.filter(liveThreadScope(live, 'root-2'))).toEqual([])
+  })
+
+  it('retires a thread’s turn from its record and leaves the root’s alone', () => {
+    const record = [row(7, '@you', 'and the notes?', at + 25), row(8, agentId, 'Notes drafted.', at + 35)]
+    const scoped = reconcilePersistedLiveSteps(live, record, agentId, record, liveThreadScope(live, 'root-1'))
+    expect(scoped).toEqual([rootPrompt, rootAnswer, askedPrompt, askedAnswer])
+    // The same rows read at the root confirm nothing there: the thread's turn is not the root's to retire.
+    expect(reconcilePersistedLiveSteps(live, record, agentId, record, liveThreadScope(live))).toBe(live)
+  })
+})

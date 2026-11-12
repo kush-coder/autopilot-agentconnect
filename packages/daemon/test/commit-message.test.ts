@@ -1,0 +1,180 @@
+import { describe, expect, it } from 'vitest'
+import {
+  COMMIT_MESSAGE_SYSTEM_PROMPT,
+  buildCommitMessagePrompt,
+  sanitizeCommitMessage
+} from '../src/workspace/commit-message.js'
+
+// The sanitiser is the only thing between a model's answer and a commit, so every case below is a
+// shape a real runtime actually produces: fenced, prefaced, bulleted, labelled, signed, or empty.
+
+function drafted(raw: string): string {
+  const draft = sanitizeCommitMessage(raw)
+  if (!draft.ok) throw new Error(`expected a usable message, got refusal: ${draft.detail}`)
+  return draft.message
+}
+
+function refused(raw: string): string {
+  const draft = sanitizeCommitMessage(raw)
+  if (draft.ok) throw new Error(`expected a refusal, got: ${draft.message}`)
+  return draft.detail
+}
+
+describe('sanitizeCommitMessage — the shape that reaches the commit box', () => {
+  it('passes a well-formed answer through unchanged', () => {
+    const raw = 'feat(dock): stage files from the git panel\n\nThe panel was read-only.\n- and this is why'
+    expect(drafted(raw)).toBe(raw)
+  })
+
+  it('keeps a subject-only answer as a single line with no trailing newline', () => {
+    expect(drafted('fix: drop the stale mtime fence\n\n\n')).toBe('fix: drop the stale mtime fence')
+  })
+
+  it('unwraps the first fenced block, with or without an info string, closed or not', () => {
+    expect(drafted('```\nfix(api): handle a 404 from the hook\n\nWhy.\n```')).toBe(
+      'fix(api): handle a 404 from the hook\n\nWhy.'
+    )
+    expect(drafted('Here you go:\n\n```text\nchore: bump the lockfile\n```\n\nAnything else?')).toBe(
+      'chore: bump the lockfile'
+    )
+    // An unclosed fence runs to the end of the answer rather than losing the message.
+    expect(drafted('```\ndocs: explain the dock\n')).toBe('docs: explain the dock')
+  })
+
+  it('drops preamble prose before the subject', () => {
+    expect(drafted("Sure! Here's the commit message:\n\nfix(dock): keep the badge count in sync")).toBe(
+      'fix(dock): keep the badge count in sync'
+    )
+  })
+
+  it('refuses an answer that is only prose', () => {
+    expect(refused('I looked at the diff and it mostly renames a few variables.')).toContain('conventional-commit')
+  })
+
+  it('refuses an empty, whitespace-only or control-only answer', () => {
+    expect(refused('')).toBe('The runtime returned no commit message.')
+    expect(refused('   \n\n\t\n')).toBe('The runtime returned no commit message.')
+    expect(refused('\u0000')).toBe('The runtime returned no commit message.')
+  })
+
+  it('does not mistake a prose line that ends in a colon for a subject', () => {
+    // The type vocabulary is CLOSED precisely so these lines cannot be read as a subject.
+    expect(refused('Note: the diff is large.\nSummary: it renames things.')).toContain('conventional-commit')
+    // …and the real subject after such a line is still found.
+    expect(drafted('Note: the diff is large.\n\nrefactor(git): split the parser out')).toBe(
+      'refactor(git): split the parser out'
+    )
+  })
+
+  it('recognises a subject wrapped as a bullet, a heading, a quote, bold or inline code', () => {
+    expect(drafted('- feat: add the wand button')).toBe('feat: add the wand button')
+    expect(drafted('1. feat: add the wand button')).toBe('feat: add the wand button')
+    expect(drafted('## feat: add the wand button')).toBe('feat: add the wand button')
+    expect(drafted('> feat: add the wand button')).toBe('feat: add the wand button')
+    expect(drafted('**feat: add the wand button**')).toBe('feat: add the wand button')
+    expect(drafted('`feat: add the wand button`')).toBe('feat: add the wand button')
+    expect(drafted('Subject: feat: add the wand button')).toBe('feat: add the wand button')
+  })
+
+  it('normalises the type, the separator and the trailing punctuation', () => {
+    expect(drafted('Feat(Dock):   add the wand button...')).toBe('feat(Dock): add the wand button')
+    expect(drafted('FIX:\tstop double-staging a renamed path')).toBe('fix: stop double-staging a renamed path')
+    expect(drafted('feat: "quote the whole summary"')).toBe('feat: quote the whole summary')
+  })
+
+  it('keeps the breaking-change marker', () => {
+    expect(drafted('feat(api)!: drop the v1 workspace route')).toBe('feat(api)!: drop the v1 workspace route')
+  })
+
+  it('truncates an over-long subject at a word boundary and keeps it conventional', () => {
+    const long = `feat(dock): ${'describe the change '.repeat(8)}`
+    const message = drafted(long)
+    expect(message.length).toBeLessThanOrEqual(72)
+    expect(message.startsWith('feat(dock): ')).toBe(true)
+    expect(message.endsWith('change')).toBe(true) // cut on a space, no dangling punctuation
+    expect(message).not.toContain('  ')
+  })
+
+  it('refuses a subject whose description is only punctuation', () => {
+    // The reachable end of the truncation path: nothing survives the cleanup, so there is no subject.
+    expect(refused('feat: ...')).toContain('conventional-commit')
+  })
+
+  it('normalises CRLF, trailing whitespace and stray control bytes', () => {
+    expect(drafted('fix: trim the row\t \r\n\r\nBody line \r\n')).toBe('fix: trim the row\n\nBody line')
+    expect(drafted('fix: trim the row')).toBe('fix: trim the row')
+  })
+
+  it('drops invented attribution trailers from the body', () => {
+    const raw = [
+      'feat(git): push from the console',
+      '',
+      'Because the dock had no push.',
+      '',
+      '🤖 Generated with Claude Code',
+      'Co-Authored-By: Someone <someone@example.invalid>',
+      'Signed-off-by: Someone <someone@example.invalid>'
+    ].join('\n')
+    expect(drafted(raw)).toBe('feat(git): push from the console\n\nBecause the dock had no push.')
+  })
+
+  it('keeps body bullets and indentation, and collapses blank runs to one', () => {
+    const raw = 'fix: keep the body\n\n\n\n- one\n  indented\n\n\n- two\n\n\n'
+    expect(drafted(raw)).toBe('fix: keep the body\n\n- one\n  indented\n\n- two')
+  })
+
+  it('drops fence markers that survive inside the body', () => {
+    expect(drafted('docs: describe it\n\nSee:\n```\ncode\n```')).toBe('docs: describe it\n\nSee:\ncode')
+  })
+
+  it('caps a runaway body by whole lines', () => {
+    const raw = ['chore: reformat', '', ...Array.from({ length: 60 }, (_, i) => `line ${i}`)].join('\n')
+    const message = drafted(raw)
+    expect(message.split('\n').length).toBe(22) // subject + blank + 20 body lines
+    expect(message).toContain('line 19')
+    expect(message).not.toContain('line 20')
+  })
+
+  it('caps the total message length on a line boundary', () => {
+    const raw = ['chore: reformat', '', ...Array.from({ length: 20 }, () => 'x'.repeat(600))].join('\n')
+    const message = drafted(raw)
+    expect(message.length).toBeLessThanOrEqual(8_000)
+    expect(message.endsWith('x')).toBe(true) // whole lines only — never a line cut in half
+    expect(message.split('\n').every((line) => line === '' || line === 'chore: reformat' || line.length === 600)).toBe(
+      true
+    )
+  })
+})
+
+describe('buildCommitMessagePrompt', () => {
+  const files = [
+    { status: 'M', path: 'packages/web/src/App.tsx' },
+    { status: 'R100', path: 'old.ts -> new.ts' }
+  ]
+
+  it('leads with the complete staged name list, then the diff, then the output contract', () => {
+    const prompt = buildCommitMessagePrompt({ files, diff: '@@ -1 +1 @@\n-a\n+b\n', truncated: false })
+    expect(prompt).toContain('Staged files (2):')
+    expect(prompt).toContain('M\tpackages/web/src/App.tsx')
+    expect(prompt).toContain('R100\told.ts -> new.ts')
+    expect(prompt.indexOf('Staged files')).toBeLessThan(prompt.indexOf('<<<STAGED_DIFF'))
+    expect(prompt).toContain('@@ -1 +1 @@')
+    expect(prompt).toContain('at most 72 characters')
+    expect(prompt).toContain('No markdown code fence')
+    expect(prompt).not.toContain('cut off at its size limit')
+  })
+
+  it('tells the model when the diff was capped, and how many files it did not list', () => {
+    const prompt = buildCommitMessagePrompt({ files, diff: 'partial', truncated: true, omittedFiles: 7 })
+    expect(prompt).toContain('cut off at its size limit')
+    expect(prompt).toContain('and 7 more file(s)')
+  })
+
+  it('states the untrusted-data policy in the system prompt, and the format in the prompt', () => {
+    // The two halves are split on purpose: `_meta.systemPrompt` is optional on the wire, so the
+    // format contract has to ride the channel every runtime delivers.
+    expect(COMMIT_MESSAGE_SYSTEM_PROMPT).toContain('untrusted data')
+    expect(COMMIT_MESSAGE_SYSTEM_PROMPT).not.toContain('type(scope)')
+    expect(buildCommitMessagePrompt({ files, diff: 'd', truncated: false })).toContain('type(scope): summary')
+  })
+})

@@ -1,0 +1,63 @@
+import { spawn } from 'node:child_process'
+import { existsSync, readFileSync } from 'node:fs'
+import { cliEntryPointer } from '../paths.js'
+
+export interface UpgradeLog {
+  info(message: string): void
+  error(message: string): void
+}
+
+/** Resolve the stable CLI entry that owns the daemon version store. */
+export function readCliEntry(root: string): string | undefined {
+  try {
+    const entry = readFileSync(cliEntryPointer(root), 'utf8').trim()
+    return entry && existsSync(entry) ? entry : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Install and atomically activate one CP-selected daemon version. */
+export async function runCliUpgrade(
+  cliEntry: string,
+  targetVersion: string,
+  root: string,
+  log: UpgradeLog,
+  configPath?: string
+): Promise<boolean> {
+  log.info(`cp: installing daemon ${targetVersion} via ${cliEntry}`)
+  return await new Promise<boolean>((resolve) => {
+    const args = [cliEntry, 'upgrade', '--to', targetVersion, '--root', root]
+    if (configPath) args.push('--config', configPath)
+    const child = spawn(process.execPath, args, {
+      stdio: 'inherit'
+    })
+    child.on('exit', (code) => {
+      if (code === 0) log.info(`cp: daemon ${targetVersion} installed and activated`)
+      else log.error(`cp: CLI upgrade exited ${code ?? 'via signal'}`)
+      resolve(code === 0)
+    })
+    child.on('error', (err) => {
+      log.error(`cp: could not launch CLI upgrade: ${err.message}`)
+      resolve(false)
+    })
+  })
+}
+
+/** Run `agentconnect <args> --root <root>`, forwarding its stderr while keeping a bounded tail for failure classification. */
+export async function runCliCommand(
+  cliEntry: string,
+  args: string[],
+  root: string
+): Promise<{ ok: boolean; stderr: string }> {
+  return await new Promise((resolve) => {
+    const child = spawn(process.execPath, [cliEntry, ...args, '--root', root], { stdio: ['ignore', 'inherit', 'pipe'] })
+    let stderr = ''
+    child.stderr?.on('data', (chunk: Buffer) => {
+      process.stderr.write(chunk)
+      stderr = (stderr + chunk.toString('utf8')).slice(-8_192)
+    })
+    child.on('close', (code) => resolve({ ok: code === 0, stderr }))
+    child.on('error', (err) => resolve({ ok: false, stderr: err.message }))
+  })
+}

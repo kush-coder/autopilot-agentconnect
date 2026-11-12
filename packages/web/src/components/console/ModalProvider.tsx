@@ -1,0 +1,285 @@
+'use client'
+
+// The "Add …" dialogs are self-contained (data context + onClose, no navigation),
+// so the simplest home for them is a provider: views call openModal(kind); the host
+// JSX lives here, mounted once by the console shell. The scoped dialogs take a target
+// via openModal's 2nd arg — a DaemonRow (reconnect / delete daemon) or an Agent
+// (add integration / delete / edit agent); the kind selects which the render casts it to.
+
+import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react'
+import type { Agent, DaemonRow, IntegrationRow, MemberSetRow } from '@/lib/data'
+import type { CronDto, HookDto } from '@/lib/api'
+import { AGENT_SETUP_URI, AGENT_TOOLS_URI, nativeUiTitle, type NativeMcpUi } from '@agentconnect.md/protocol/mcp-app'
+import NativeIntegrationDialog from './modals/NativeIntegrationDialog'
+import type { NativeDialogReport } from './modals/native-dialog-report'
+import AddAgentModal from './modals/AddAgentModal'
+import AddDaemonModal from './modals/AddDaemonModal'
+import AddComputerModal from './modals/AddComputerModal'
+import AddPoolComputer from './modals/AddPoolComputer'
+import AddIntegrationModal, {
+  AddIntegrationForOrgModal,
+  type FeishuRegion,
+  type Platform as IntegrationPlatform
+} from './modals/AddIntegrationModal'
+import DeleteIntegrationModal from './modals/DeleteIntegrationModal'
+import DeleteHookModal from './modals/DeleteHookModal'
+import AddCronModal from './modals/AddCronModal'
+import ReconnectDaemonModal from './modals/ReconnectDaemonModal'
+import ReconnectIntegrationModal from './modals/ReconnectIntegrationModal'
+import DeleteDaemonModal from './modals/DeleteDaemonModal'
+import DaemonLifecycleModal from './modals/DaemonLifecycleModal'
+import EditDaemonModal from './modals/EditDaemonModal'
+import DaemonApprovalModal from './modals/DaemonApprovalModal'
+import DeleteAgentModal from './modals/DeleteAgentModal'
+import EditAgentModal, { type EditAgentSection } from './modals/EditAgentModal'
+import EditDescriptionModal from './modals/EditDescriptionModal'
+import EditProfileModal from './modals/EditProfileModal'
+import EditOrgModal from './modals/EditOrgModal'
+import GroupModal from './modals/GroupModal'
+import RuntimeLoginModal, { type RuntimeLoginTarget } from './modals/RuntimeLoginModal'
+import DeleteGroupModal from './modals/DeleteGroupModal'
+import { Scrim } from './Scrim'
+
+export type ModalKind =
+  | 'nativeIntegration'
+  | 'agent'
+  | 'daemon'
+  | 'computer'
+  | 'poolComputer'
+  | 'integration'
+  | 'deleteIntegration'
+  | 'deleteHook'
+  | 'cron'
+  | 'reconnectDaemon'
+  | 'deleteDaemon'
+  | 'upgradeDaemon'
+  | 'restartDaemon'
+  | 'editDaemon'
+  | 'approveDaemon'
+  | 'revokeDaemon'
+  | 'deleteAgent'
+  | 'editAgent'
+  | 'editAgentDesc'
+  | 'editProfile'
+  | 'editOrg'
+  | 'group'
+  | 'deleteGroup'
+  | 'runtimeLogin'
+
+// HookDto[] = the whole GitHub group (header unplug — disconnect every repo subscription).
+type ModalTarget =
+  DaemonRow | Agent | CronDto | IntegrationRow | HookDto | HookDto[] | MemberSetRow | RuntimeLoginTarget
+
+// Per-kind extras: `platform` preselects the Add-integration pane (the GitHub group
+// card's "Add repository" lands on GitHub, not the Slack default). `focusSection`
+// scrolls the Edit-agent modal to the group whose Edit was clicked (Basics / Runtime
+// behavior / Access), so every Configuration group edits through the same surface.
+interface ModalOpts {
+  nativeUi?: NativeMcpUi
+  nativeRequestId?: string
+  onCompleted?: NativeDialogReport
+  platform?: IntegrationPlatform
+  botId?: string
+  feishuRegion?: FeishuRegion
+  focusSection?: EditAgentSection
+  /** The daemon the Edit-agent picker opens on — the one the chained Add-daemon dialog just connected. */
+  daemonId?: string
+  /** Edit agent: fired once the save went through, so the opener can re-read what it shows. */
+  onSaved?: () => void
+}
+
+interface ModalData {
+  openNativeIntegration: (ui: NativeMcpUi, onCompleted: NativeDialogReport, requestId: string) => boolean
+  closeNativeIntegration: (requestId: string) => void
+  // `target` is the scoped dialog's subject (DaemonRow or Agent); ignored by the rest.
+  openModal: (kind: ModalKind, target?: ModalTarget, opts?: ModalOpts) => void
+}
+
+const Ctx = createContext<ModalData | null>(null)
+
+export function ModalProvider({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState<{ kind: ModalKind; target?: ModalTarget; opts?: ModalOpts } | null>(null)
+  const dismissHandler = useRef<(() => void) | null>(null)
+  const occupied = useRef(false)
+  const nativeRequestId = useRef<string | undefined>(undefined)
+  const openModal = useCallback((kind: ModalKind, target?: ModalTarget, opts?: ModalOpts) => {
+    dismissHandler.current = null
+    occupied.current = true
+    nativeRequestId.current = opts?.nativeRequestId
+    setOpen({ kind, target, opts })
+  }, [])
+  const close = useCallback(() => {
+    dismissHandler.current = null
+    occupied.current = false
+    nativeRequestId.current = undefined
+    setOpen(null)
+  }, [])
+  const requestClose = useCallback(() => {
+    const dismiss = dismissHandler.current
+    if (dismiss) dismiss()
+    else close()
+  }, [close])
+  const registerDismiss = useCallback((handler: () => void) => {
+    dismissHandler.current = handler
+    return () => {
+      if (dismissHandler.current === handler) dismissHandler.current = null
+    }
+  }, [])
+
+  const openNativeIntegration = useCallback(
+    (nativeUi: NativeMcpUi, onCompleted: NativeDialogReport, requestId: string) => {
+      if (occupied.current) return false
+      openModal('nativeIntegration', undefined, { nativeUi, onCompleted, nativeRequestId: requestId })
+      return true
+    },
+    [openModal]
+  )
+  const closeNativeIntegration = useCallback(
+    (requestId: string) => {
+      if (nativeRequestId.current === requestId) close()
+    },
+    [close]
+  )
+  const value = useMemo<ModalData>(
+    () => ({ openModal, openNativeIntegration, closeNativeIntegration }),
+    [openModal, openNativeIntegration, closeNativeIntegration]
+  )
+
+  return (
+    <Ctx.Provider value={value}>
+      {children}
+      {/* No close on a scrim click (it would discard form state); Esc asks the active dialog to dismiss first. */}
+      {open && (
+        <Scrim onEscape={requestClose}>
+          <div
+            role={open.kind === 'nativeIntegration' ? 'dialog' : undefined}
+            aria-modal={open.kind === 'nativeIntegration' ? true : undefined}
+            aria-label={
+              open.kind === 'nativeIntegration' && open.opts?.nativeUi ? nativeUiTitle(open.opts.nativeUi) : undefined
+            }
+            className={
+              // Agent editors: the narrowest width that keeps the Visibility tiles two-up beside the section rail.
+              open.kind === 'agent' ||
+              open.kind === 'editAgent' ||
+              (open.kind === 'nativeIntegration' &&
+                (open.opts?.nativeUi?.resourceUri === AGENT_SETUP_URI ||
+                  open.opts?.nativeUi?.resourceUri === AGENT_TOOLS_URI))
+                ? 'modal desktop:max-w-[830px]'
+                : (open.kind === 'integration' && !open.opts?.botId) || open.kind === 'nativeIntegration'
+                  ? 'modal desktop:max-w-[700px]'
+                  : 'modal'
+            }
+          >
+            {open.kind === 'nativeIntegration' && open.opts?.nativeUi && (
+              <NativeIntegrationDialog
+                ui={open.opts.nativeUi}
+                onClose={() => closeNativeIntegration(open.opts!.nativeRequestId!)}
+                onCompleted={open.opts.onCompleted!}
+              />
+            )}
+            {/* `group` with no target creates; with one it renames — a group has one property. */}
+            {open.kind === 'group' && <GroupModal group={open.target as MemberSetRow | undefined} onClose={close} />}
+            {open.kind === 'deleteGroup' && open.target && (
+              <DeleteGroupModal group={open.target as MemberSetRow} onClose={close} />
+            )}
+            {open.kind === 'agent' && <AddAgentModal onClose={close} />}
+            {open.kind === 'computer' && <AddComputerModal onClose={close} />}
+            {open.kind === 'poolComputer' && <AddPoolComputer onClose={close} />}
+            {/* Opened from an agent's "Add daemon" affordance: once the daemon connects,
+                Continue chains back into that agent's edit dialog with the fresh daemon
+                selected in the placement picker. */}
+            {open.kind === 'daemon' && (
+              <AddDaemonModal
+                onClose={close}
+                onDone={
+                  open.target
+                    ? (daemonId) => openModal('editAgent', open.target, { ...open.opts, daemonId })
+                    : undefined
+                }
+                registerDismiss={registerDismiss}
+              />
+            )}
+            {/* Reconnect fixes the app; ordinary adds either fix the calling agent or offer a picker. */}
+            {open.kind === 'integration' &&
+              (open.opts?.botId ? (
+                <ReconnectIntegrationModal botId={open.opts.botId} onClose={close} />
+              ) : open.target ? (
+                <AddIntegrationModal
+                  agent={open.target as Agent}
+                  initialPlatform={open.opts?.platform}
+                  initialFeishuRegion={open.opts?.feishuRegion}
+                  onClose={close}
+                />
+              ) : (
+                <AddIntegrationForOrgModal
+                  initialPlatform={open.opts?.platform}
+                  initialFeishuRegion={open.opts?.feishuRegion}
+                  onClose={close}
+                />
+              ))}
+            {open.kind === 'deleteIntegration' && open.target && (
+              <DeleteIntegrationModal integration={open.target as IntegrationRow} onClose={close} />
+            )}
+            {open.kind === 'deleteHook' && open.target && (
+              <DeleteHookModal hook={open.target as HookDto | HookDto[]} onClose={close} />
+            )}
+            {open.kind === 'cron' && <AddCronModal cron={open.target as CronDto | undefined} onClose={close} />}
+            {open.kind === 'reconnectDaemon' && open.target && (
+              <ReconnectDaemonModal daemon={open.target as DaemonRow} onClose={close} />
+            )}
+            {open.kind === 'deleteDaemon' && open.target && (
+              <DeleteDaemonModal daemon={open.target as DaemonRow} onClose={close} />
+            )}
+            {open.kind === 'upgradeDaemon' && open.target && (
+              <DaemonLifecycleModal daemon={open.target as DaemonRow} mode="upgrade" onClose={close} />
+            )}
+            {open.kind === 'restartDaemon' && open.target && (
+              <DaemonLifecycleModal daemon={open.target as DaemonRow} mode="restart" onClose={close} />
+            )}
+            {open.kind === 'editDaemon' && open.target && (
+              <EditDaemonModal daemon={open.target as DaemonRow} onClose={close} />
+            )}
+            {(open.kind === 'approveDaemon' || open.kind === 'revokeDaemon') && open.target && (
+              <DaemonApprovalModal
+                daemon={open.target as DaemonRow}
+                revoke={open.kind === 'revokeDaemon'}
+                onClose={close}
+              />
+            )}
+            {open.kind === 'deleteAgent' && open.target && (
+              <DeleteAgentModal agent={open.target as Agent} onClose={close} />
+            )}
+            {open.kind === 'editAgent' && open.target && (
+              <EditAgentModal
+                agent={open.target as Agent}
+                focusSection={open.opts?.focusSection}
+                preselectDaemonId={open.opts?.daemonId}
+                {...(open.opts?.onSaved ? { onSaved: open.opts.onSaved } : {})}
+                onClose={close}
+              />
+            )}
+            {open.kind === 'editAgentDesc' && open.target && (
+              <EditDescriptionModal agent={open.target as Agent} onClose={close} />
+            )}
+            {/* The "Login required" warning on a runtime row — the command belongs on that host. */}
+            {open.kind === 'runtimeLogin' && open.target && (
+              <RuntimeLoginModal target={open.target as RuntimeLoginTarget} onClose={close} />
+            )}
+            {open.kind === 'editProfile' && <EditProfileModal onClose={close} />}
+            {open.kind === 'editOrg' && <EditOrgModal onClose={close} />}
+          </div>
+        </Scrim>
+      )}
+    </Ctx.Provider>
+  )
+}
+
+export function useModal(): ModalData {
+  const ctx = useContext(Ctx)
+  if (!ctx) throw new Error('useModal must be used within <ModalProvider>')
+  return ctx
+}
+
+export function useOptionalModal(): ModalData | null {
+  return useContext(Ctx)
+}

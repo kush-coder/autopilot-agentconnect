@@ -1,0 +1,166 @@
+# AgentConnect documentation
+
+This directory holds the guides and design documents for the whole system. This
+page is the index: every document is listed exactly once, under its primary
+area, with one line on what it covers. A document whose design is not implemented
+yet is marked **(draft)**; finer implementation status and ownership live in each
+document's own header. When a document spans two areas, follow the
+cross-references inside it.
+
+## Guides
+
+- [product-conventions.md](product-conventions.md) — User-facing product behavior every implementation must preserve.
+- [GLOSSARY.md](../GLOSSARY.md) — Agreed domain terms, including shared images, previews and original delivery.
+- [capability-matrices.md](capability-matrices.md) — Integration ingress and sharing boundaries, and daemon-reported ACP runtime capabilities.
+- [config-file-secrets.md](config-file-secrets.md) — The `*_DATA` secret convention for file-shaped credentials (Docker config, kubeconfig).
+- [self-host-caddy-https.md](self-host-caddy-https.md) — Publishing a self-hosted stack behind Caddy HTTPS.
+- [self-host-computer-container.md](self-host-computer-container.md) — Running the desktop image on your own server as a Computer, and TURN for its viewer.
+
+## Designs
+
+The authoritative designs live in [`designs/`](designs/). Start with
+[architecture.md](designs/architecture.md); everything else details one part of
+the picture it draws.
+
+### Core architecture
+
+- [architecture.md](designs/architecture.md) — The anchor: bridging messaging platforms to agent execution, the daemon/relay data-plane boundary, and the deployment shapes.
+- [system-detailed-design.md](designs/system-detailed-design.md) — Components, technology choices, and the interfaces between them.
+- [daemon-detailed-design.md](designs/daemon-detailed-design.md) — The daemon: CLI, configuration, lifecycle, platform integration, CP interaction.
+- [control-plane-implementation.md](designs/control-plane-implementation.md) — The Control Plane: composition root, persistence, and the HTTP/WS edges.
+- [cli-daemon-split.md](designs/cli-daemon-split.md) — Why `agentconnect` and `agentconnect-daemon` are separate bins, and the contract between them.
+- [daemon-auto-upgrade.md](designs/daemon-auto-upgrade.md) — Per-daemon opt-in auto-upgrade: the CP announces the release, the daemon picks an idle window and rolls back a failed start.
+- [daemon-cp-ws-protocol.md](designs/daemon-cp-ws-protocol.md) — The daemon ↔ CP WebSocket wire specification.
+- [api-versioning.md](designs/api-versioning.md) — The REST `/api/v1` versioning policy.
+- [high-availability.md](designs/high-availability.md) — The availability contract and proposed active-active CP replication for uninterrupted business traffic during CP-only upgrades.
+
+### Chat platforms and ingress
+
+- [integration-plugin-architecture.md](designs/integration-plugin-architecture.md) — The per-host platform-module seam: contracts, registries, and the shared manifest.
+- [shared-bot-relay.md](designs/shared-bot-relay.md) — Shared bots and the unified inbound relay.
+- [ingress-tenant-fence.md](designs/ingress-tenant-fence.md) — Fencing inbound deliveries to the owning tenant.
+- [slack-integration-install.md](designs/slack-integration-install.md) — Slack installation and credential distribution.
+- [slack-install-smoothing.md](designs/slack-install-smoothing.md) — The streamlined Slack install flow.
+- [slack-identity.md](designs/slack-identity.md) — Slack accounts as a sign-in method, and the one rule for reading that identity.
+- [telegram-discord-permission-sync.md](designs/telegram-discord-permission-sync.md) — Shared login applications (Telegram, Discord, Microsoft) and conversation permission checks for Telegram and Discord.
+- [slack-approval-dm.md](designs/slack-approval-dm.md) — DM-ing a linked agent editor to decide a pending approval from Slack, the editor check on synced platforms' in-chat cards, and one settle path for every approval surface.
+- [slack-streaming-turn-output.md](designs/slack-streaming-turn-output.md) — Streaming a Slack turn's tool-call chrome over one native card stream.
+- **(draft)** [slack-code-channels.md](designs/slack-code-channels.md) — Slack Code code channels: what is buildable now on generally available primitives, and what waits on the partner-only API.
+- [feishu-integration.md](designs/feishu-integration.md) — The Lark / Feishu integration, international and CN variants.
+- [qq-integration.md](designs/qq-integration.md) — Official QQ bot integration, attachment support, the shared group-context dependency, and why QQ has no approval card.
+- [dingtalk-integration.md](designs/dingtalk-integration.md) — DingTalk integration: per-organization internal apps over Stream, never-redelivered messages, a thinking reaction with Markdown answers, question cards answered by a tap, and the edition quota.
+- **(draft)** [wechat-integration.md](designs/wechat-integration.md) — Personal WeChat through Tencent's iLink (ClawBot): a self-service QR binding of one member to one agent, a daemon-owned long poll, private sessions, complete plain-text replies with no edits, no sends after a long silence, and quotes resolved from a local record.
+- **(draft)** [teams-integration.md](designs/teams-integration.md) — Proposed Microsoft Teams integration: relay ingress with Bot Framework token checks, resource-specific consent filtered like Slack, DingTalk's reply chain for group chats, and Adaptive Card approvals.
+- **(draft)** [google-chat-integration.md](designs/google-chat-integration.md) — Proposed native Google Chat integration with HTTPS relay ingress, threaded replies, durable admission, and a Pub/Sub alternative.
+- **(draft)** [voice-meeting-participation.md](designs/voice-meeting-participation.md) — Agents in voice calls: joining and transcribing Google Meet through a meeting runner first, then speaking, Discord voice channels, the console microphone, and Zoom, Teams, and huddles on the same runner seam.
+
+### Webchat and console
+
+- **(proposal)** [ahp-adoption.md](designs/ahp-adoption.md) — An open AHP v1 interface for third-party clients: separate legacy/AHP services, feature switches, interoperability, and gateway reuse.
+- **(proposal)** [ahp-repository-picker.md](designs/ahp-repository-picker.md) — Choose an agent's repository from an AHP client's folder picker: a virtual repository namespace over `resourceList`, `defaultDirectory`, and the chosen folder as the session's repository pin.
+- **(proposal)** [ahp-client-sign-in.md](designs/ahp-client-sign-in.md) — Browser sign-in for AHP clients such as VS Code through the CP OAuth server: an `ahp` scope, per-agent resource binding, and token refresh on a live connection.
+- **(proposal)** [webchat-threads.md](designs/webchat-threads.md) — Slack-like threads in webchat: a coordinator's task holds a thread as on Slack, routing unchanged, and every coordinator page drawn in its platform's thread shape.
+- [webchat-multi-agents.md](designs/webchat-multi-agents.md) — Multi-agent webchat conversations: roster, primary agent, activation.
+- [webchat-generated-images.md](designs/webchat-generated-images.md) — Runtime-generated workspace images, explicit publication through `shareFile`, and retained inline previews in webchat.
+- [webchat-side-panels.md](designs/webchat-side-panels.md) — The session-detail right dock.
+- [webchat-cross-integration-continuation.md](designs/webchat-cross-integration-continuation.md) — Continuing other integrations' sessions from webchat.
+- [webchat-preset-agentconnect-mcp.md](designs/webchat-preset-agentconnect-mcp.md) — The AgentConnect admin MCP for webchat sessions.
+- [webchat-mcp-apps.md](designs/webchat-mcp-apps.md) — MCP Apps (`ui://`) rendered in a sandboxed console frame; webchat-only by construction.
+- [webchat-native-integration-ui.md](designs/webchat-native-integration-ui.md) — Trusted admin MCP resources mapped to native integration configuration dialogs.
+- [merged-conversation-view.md](designs/merged-conversation-view.md) — One merged transcript across a conversation's sessions.
+- [icon-uploads.md](designs/icon-uploads.md) — Agent and organization icon upload, storage, and serving.
+
+### Code hosts and triggers
+
+- [webhook-triggers-and-github-events.md](designs/webhook-triggers-and-github-events.md) — General webhook triggers: mapping one inbound delivery to one agent turn.
+- [github-app-git-credentials.md](designs/github-app-git-credentials.md) — GitHub App repository selection, credential-free Git, the shared Azure workspace Git proxy path, and proposed migrations for other managed providers.
+- [codehost-pr-feedback.md](designs/codehost-pr-feedback.md) — Continuing the author session after GitHub, GitLab or Gitea review and CI feedback.
+- [github-pr-review-checks.md](designs/github-pr-review-checks.md) — Formal GitHub PR reviews and durable informational Checks.
+- [gitlab-com-integration.md](designs/gitlab-com-integration.md) — The GitLab integration end to end.
+- [gitea-integration.md](designs/gitea-integration.md) — The Gitea integration: one bot token per organization over the GitLab skeleton.
+- [azure-devops-integration.md](designs/azure-devops-integration.md) — In progress (A1 to A3 and A4's Console and Setup landed; the documentation-site page follows): Azure Repos workspaces through the daemon credential proxy, connected with the deployment's Microsoft application.
+- [linear-integration.md](designs/linear-integration.md) — The Linear integration.
+- [git-workspace-model.md](designs/git-workspace-model.md) — The host-neutral git workspace contract, and session isolation under an OS boundary.
+- [multi-repository-workspaces.md](designs/multi-repository-workspaces.md) — Secondary workspace roots and cross-repository review.
+- [agent-multi-repo-authorization.md](designs/agent-multi-repo-authorization.md) — Explicit multi-repository allowlists, per-repository minting, and the `gh` wrapper.
+
+### Sessions and messaging
+
+- [session-concept.md](designs/session-concept.md) — What a session is.
+- [send-message-routing-rework.md](designs/send-message-routing-rework.md) — The `sendMessage` routing ladder.
+- [send-message-guide.md](designs/send-message-guide.md) — Require an explicit `sendMessage` action, with `getToolGuide`, a source-backed parity audit, delegated tasks (`delegateTask`, `messageTask`, `stopTask`, `listTasks`), existing peer sessions, and `replyToSession` replies addressed to session messages by id.
+- [activation-parity.md](designs/activation-parity.md) — Consistent activation semantics across surfaces.
+- [Decisions](designs/decisions.md) — Reusable typed judgments; Stage 1 adds fixed-target activation and context, Stage 2 adds shared-bot routing.
+- [Decision UI foundation](designs/decision-ui-foundation.md) — Shared contracts, real condition matching, and an opt-in in-memory API for mock UI work.
+- [message-intake.md](designs/message-intake.md) — Record first, judge second, admit last: the channel record every IM message enters, per-agent admissions into sessions, the Decision gate's place in the ladder, the relay evaluation host, and retention.
+- [code-host-decisions.md](designs/code-host-decisions.md) — Decision routing across the agents watching a GitHub repository, judged once on an evaluation host, and By decision on Linear team conversations.
+- [channel-session-mode.md](designs/channel-session-mode.md) — Per-conversation session modes: Per thread, Single session and Auto, their console controls and new-conversation defaults.
+- [auto-session-mode.md](designs/auto-session-mode.md) — Implemented `auto` session mode: a coordinator session hands each channel-root message to a task, opens one, replies, or ignores it; tasks and delegated tasks become one concept.
+- [turn-final-context-refresh.md](designs/turn-final-context-refresh.md) — Turn-final context refresh and answer regeneration on IM turns.
+- [transcript-full-tool-body.md](designs/transcript-full-tool-body.md) — Complete tool-call bodies in transcripts.
+- [agent-authored-attachments.md](designs/agent-authored-attachments.md) — Outbound agent-authored files across platforms.
+- **(draft)** [inbound-file-attachments.md](designs/inbound-file-attachments.md) — Inbound user files: the workspace landing zone and the web-console upload.
+- [source-cache-file-transfer.md](designs/source-cache-file-transfer.md) — Console file uploads and large workspace downloads through the Source Cache bucket, signed by the Control Plane for any daemon.
+
+### Authorization, identity, and visibility
+
+- [authorization-policy.md](designs/authorization-policy.md) — The OSS authorization policy.
+- [resource-visibility.md](designs/resource-visibility.md) — Resource visibility and sharing: the org/restricted model.
+- [session-visibility.md](designs/session-visibility.md) — Session visibility and conversation audiences.
+- [directional-agent-visibility.md](designs/directional-agent-visibility.md) — Directional visibility between agents.
+- [session-access-cold-visit.md](designs/session-access-cold-visit.md) — Session access for the infrequent visitor.
+- [daemon-api-key-auth.md](designs/daemon-api-key-auth.md) — Daemon API-key authentication.
+- [org-scoped-data-layer.md](designs/org-scoped-data-layer.md) — The org-scoped persistence convention.
+
+### Secrets and credentials
+
+- [secret-store-seams.md](designs/secret-store-seams.md) — Secret-store interfaces and the shared `SecretCipher`.
+- [per-org-secret-encryption.md](designs/per-org-secret-encryption.md) — Per-org key derivation and crypto-shredding.
+- [organization-secrets-and-variables.md](designs/organization-secrets-and-variables.md) — Organization-level secrets, variables, and environments.
+- [key-server.md](designs/key-server.md) — Dynamic provider-credential issuance for cloud daemons.
+
+### Agents and collaboration
+
+- [agents-collaboration-design.md](designs/agents-collaboration-design.md) — The product vision for agent-to-agent collaboration.
+- [agent-collaboration-implementation.md](designs/agent-collaboration-implementation.md) — The collaboration mechanics: agent-to-agent delivery and concurrency.
+- [loop-breaker-design.md](designs/loop-breaker-design.md) — Feedback-loop protection for platform messages and collaboration.
+- [collaboration-arena.md](designs/collaboration-arena.md) — The collaboration arena.
+- [collaboration-arena-baseline.md](designs/collaboration-arena-baseline.md) — The arena's measured baseline.
+- [agent-reachability-graph.md](designs/agent-reachability-graph.md) — Which agents can reach which: the reachability graph.
+- [preset-agents.md](designs/preset-agents.md) — Preset agents and guided onboarding.
+- [agent-assistant.md](designs/agent-assistant.md) — The AgentConnect MCP: system operations for AI tools.
+- [assistant-mode.md](designs/assistant-mode.md) — Assistant mode: one long conversation per place, one shared mind, external places detected by the platform, background tasks and follow-ups; §5.18 proposes the work board that shows each coordinator the agent's open work.
+- [capability-requests.md](designs/capability-requests.md) — Capability requests: an agent asks for a setting, tool, repository, connection or secret it lacks, a person completes it in the console, and the conversation resumes.
+- [agent-capability-benchmark-harness.md](designs/agent-capability-benchmark-harness.md) — Add-on evaluation and harness neutrality.
+
+### Memory, knowledge, and tools
+
+- [memory-system-plan.md](designs/memory-system-plan.md) — The managed memory system.
+- [memory-evolution.md](designs/memory-evolution.md) — `MemoryProvider` and external memory plugins.
+- [unified-memory-interface.md](designs/unified-memory-interface.md) — Implemented common entry operations and console, supported activation catalogs, and remaining live-refresh/compatibility work.
+- [memory-dreaming.md](designs/memory-dreaming.md) — Offline memory consolidation ("dreaming").
+- [organization-knowledge.md](designs/organization-knowledge.md) — Organization knowledge bundles and dream suggestions.
+- [shared-skills.md](designs/shared-skills.md) — One isolated `skills` CLI for git and local skill sources.
+- [centralized-tool-management.md](designs/centralized-tool-management.md) — Centralized tool management: the relay-data-plane MCP proxy.
+- [mcp-provider-oauth.md](designs/mcp-provider-oauth.md) — OAuth-authorized MCP providers: the CP holds the grant, the relay injects the current access token.
+- [mcp-elicitation.md](designs/mcp-elicitation.md) — Elicitation on the MCP wire: which bridge tools could ask, and why we need no MCP client to render a third-party server's ask.
+
+### Runtimes and fleet
+
+- [daemon-sandbox-backends.md](designs/daemon-sandbox-backends.md) — Daemon sandbox backend configuration, shared mounts, development-environment tradeoffs, and `sandbox.share`: what lending a machine to its group opens.
+- [k8s-daemon-pool.md](designs/k8s-daemon-pool.md) — Multi-org cloud daemons and the duty ledger.
+- [cluster-spawn-and-shim.md](designs/cluster-spawn-and-shim.md) — Running ACP runtimes in sandbox pods, and the in-sandbox shim.
+- [cloud-data-plane-postgres.md](designs/cloud-data-plane-postgres.md) — PostgreSQL as the cloud daemon's durable store.
+- [source-cache.md](designs/source-cache.md) — S3-backed Source Cache for in-pod workspace and skill Git materialization, including non-GitHub sources.
+- [daemon-groups.md](designs/daemon-groups.md) — Daemon groups and agent placement.
+- [session-executors.md](designs/session-executors.md) — Spreading one agent's sessions across a daemon group: the executor facet, the shim contract, execution strategies.
+- [background-task-aware-reclaim.md](designs/background-task-aware-reclaim.md) — ACP host reclamation that respects background jobs.
+- [runtime-model-catalog.md](designs/runtime-model-catalog.md) — Runtime model discovery, per-model fallback, and local caching.
+- **(draft)** [computer-use.md](designs/computer-use.md) — Computers: user desktops and Linux containers that agents operate through a desktop daemon with Cua Driver, a built-in WebRTC viewer, and the Linux → Docker → macOS → Windows development plan.
+- **(draft)** [computer-form-fill-and-vault.md](designs/computer-form-fill-and-vault.md) — Linux browser-extension form filling, model-private Fill cards, personal and organization Vaults, agent grants, encrypted storage, and staged delivery.
+
+## Working papers
+
+[`superpowers/`](superpowers/) holds point-in-time design specs produced during
+development. They record how a change was shaped, are not kept current, and
+never override the designs above.

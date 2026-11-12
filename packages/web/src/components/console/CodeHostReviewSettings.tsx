@@ -1,0 +1,244 @@
+'use client'
+
+import { useState, type ReactNode } from 'react'
+import { useTranslations } from 'next-intl'
+import { Icon } from '@/components/ui'
+import {
+  codeHostReviewCapabilities,
+  codeHostReviewSettingsFromCapabilities,
+  REVIEW_FORMATS,
+  REVIEW_PRESETS,
+  reviewFormatOf,
+  reviewFormatValue,
+  reviewPresetOf,
+  withCapability,
+  withStatusMode,
+  type CodeHostReviewCapabilities,
+  type CodeHostReviewSettingsValue,
+  type HookReportingMode,
+  type HookReviewPolicy,
+  type StatusReportingMode
+} from '@/lib/code-host-review-settings'
+
+/** The four capability labels are shared; only the hover copy differs per host. */
+export interface ReviewCapabilityHelp {
+  inlineComments: string
+  requestChanges: string
+  approve: string
+  statusCheck: string
+}
+
+// The surface both code hosts render, in one of two layouts. `disclosure` is the
+// agent page's collapsible None/Brief/Details block; `format` is the create
+// surface's "Review format" section, where None is replaced by Custom — an
+// all-off Custom IS the no-review state. It holds no authorization opinion —
+// each host computes its own blockers and passes them in.
+export function CodeHostReviewSettings({
+  title,
+  value,
+  onReviewPolicyChange,
+  onReportingModeChange,
+  help,
+  statusCheckLabel,
+  statusMode = 'check',
+  layout = 'disclosure',
+  defaultExpanded = false,
+  notices
+}: {
+  title: string
+  value: CodeHostReviewSettingsValue
+  onReviewPolicyChange: (policy: HookReviewPolicy) => void
+  onReportingModeChange: (mode: HookReportingMode) => void
+  help: ReviewCapabilityHelp
+  statusCheckLabel: string
+  // The reporting mode the status switch stands for on THIS host — Gitea reports a commit status.
+  statusMode?: StatusReportingMode
+  layout?: 'disclosure' | 'format'
+  defaultExpanded?: boolean
+  notices?: ReactNode
+}) {
+  const t = useTranslations('Integrations.dialog.codeHostReview')
+  const [expanded, setExpanded] = useState(defaultExpanded)
+  // Custom is a disclosure the value cannot express: an exact Details value the
+  // user opened Custom on must keep the checkboxes visible.
+  const [customPinned, setCustomPinned] = useState(() => reviewFormatOf(value, statusMode) === 'custom')
+  const preset = reviewPresetOf(value)
+  const capabilities = codeHostReviewCapabilities(value)
+
+  const applyValue = (next: CodeHostReviewSettingsValue) => {
+    if (next.reviewPolicy !== value.reviewPolicy) onReviewPolicyChange(next.reviewPolicy)
+    if (next.reportingMode !== value.reportingMode) onReportingModeChange(next.reportingMode)
+  }
+
+  const setCapability = (key: keyof CodeHostReviewCapabilities, enabled: boolean) => {
+    applyValue(codeHostReviewSettingsFromCapabilities(withCapability(capabilities, key, enabled), statusMode))
+  }
+
+  const checkboxes = (
+    <div className="grid grid-cols-2 gap-x-3 gap-y-2 desktop:grid-cols-4">
+      <Capability
+        label={t('inlineComments')}
+        help={help.inlineComments}
+        checked={capabilities.inlineComments}
+        onChange={(checked) => setCapability('inlineComments', checked)}
+      />
+      <Capability
+        label={t('requestChanges')}
+        help={help.requestChanges}
+        checked={capabilities.requestChanges}
+        onChange={(checked) => setCapability('requestChanges', checked)}
+      />
+      <Capability
+        label={t('approve')}
+        help={help.approve}
+        checked={capabilities.approve}
+        onChange={(checked) => setCapability('approve', checked)}
+      />
+      <Capability
+        label={statusCheckLabel}
+        help={help.statusCheck}
+        checked={capabilities.statusCheck}
+        onChange={(checked) => setCapability('statusCheck', checked)}
+      />
+    </div>
+  )
+
+  if (layout === 'format') {
+    const format = customPinned ? 'custom' : reviewFormatOf(value, statusMode)
+    return (
+      <div className="flex flex-col gap-3">
+        <div className="fldlbl">{t('reviewFormat')}</div>
+        <div className="grid grid-cols-3 gap-2">
+          {REVIEW_FORMATS.map((option) => {
+            const active = format === option.id
+            return (
+              <button
+                key={option.id}
+                type="button"
+                data-review-format={option.id}
+                aria-pressed={active}
+                onClick={() => {
+                  setCustomPinned(option.id === 'custom')
+                  const next = reviewFormatValue(option.id, statusMode)
+                  if (next) applyValue(next)
+                }}
+                className={
+                  active
+                    ? 'h-10 rounded-md border border-(--border-strong) bg-(--surface-hover) font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary)'
+                    : 'h-10 rounded-md border border-(--border-default) bg-(--surface-card) font-sans text-[12.5px] font-semibold leading-normal text-(--text-secondary)'
+                }
+              >
+                {t(`formats.${option.id}`)}
+              </button>
+            )
+          })}
+        </div>
+        {format === 'custom' && checkboxes}
+        {notices}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((open) => !open)}
+        className="flex min-h-10 w-full items-center justify-between gap-3 rounded-md border border-(--border-default) bg-(--surface-card) px-3 py-[9px] text-left font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary)"
+      >
+        <span>{title}</span>
+        <Icon name={expanded ? 'chevron-up' : 'chevron-down'} size={15} className="flex-none" />
+      </button>
+
+      {expanded && (
+        <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-3 gap-2">
+            {REVIEW_PRESETS.map((option) => {
+              const active = preset === option.id
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() => applyValue(withStatusMode(option.value, statusMode))}
+                  className={
+                    active
+                      ? 'h-10 rounded-md border border-(--border-strong) bg-(--surface-hover) font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary)'
+                      : 'h-10 rounded-md border border-(--border-default) bg-(--surface-card) font-sans text-[12.5px] font-semibold leading-normal text-(--text-secondary)'
+                  }
+                >
+                  {t(`presets.${option.id}`)}
+                </button>
+              )
+            })}
+          </div>
+
+          {preset === 'details' && checkboxes}
+        </div>
+      )}
+
+      {notices}
+    </div>
+  )
+}
+
+function Capability({
+  label,
+  help,
+  checked,
+  onChange
+}: {
+  label: string
+  help: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex min-w-0 cursor-help items-center gap-[7px]" title={help}>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+        className="accent-(--brand)"
+      />
+      <span className="truncate font-sans text-[11.5px] font-medium leading-normal text-(--text-secondary)">
+        {label}
+      </span>
+      <Icon name="info" size={12} color="var(--text-tertiary)" className="flex-none" />
+    </label>
+  )
+}
+
+/** The host-specific warning row; both wrappers render their blockers through it. */
+export function ReviewNotice({
+  icon,
+  tone,
+  action,
+  children
+}: {
+  icon: string
+  tone: 'warning' | 'error'
+  action?: ReactNode
+  children: ReactNode
+}) {
+  const error = tone === 'error'
+  return (
+    <div
+      className={
+        error
+          ? 'flex items-start gap-2 rounded-md border border-(--status-error) bg-(--status-error-soft) px-3 py-[9px] font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)'
+          : 'flex items-start gap-2 rounded-md border border-(--status-paused) bg-(--status-paused-soft) px-3 py-[9px] font-sans text-[12px] font-normal leading-[1.5] text-(--amber-500)'
+      }
+    >
+      <Icon
+        name={icon}
+        size={14}
+        color={error ? 'var(--status-error)' : 'var(--amber-500)'}
+        className="mt-[2px] flex-none"
+      />
+      <span className="min-w-0 flex-1">{children}</span>
+      {action}
+    </div>
+  )
+}

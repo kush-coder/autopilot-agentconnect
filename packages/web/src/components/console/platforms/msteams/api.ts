@@ -1,0 +1,28 @@
+// No 'use client' here: reached only from ModalProvider's tree and the Settings view, both client trees.
+
+import {
+  cancelMsTeamsAgentBotRequest,
+  checkMsTeamsAgentBotRequest,
+  createIntegration,
+  fetchMsTeamsAgentBotRequests,
+  downloadMsTeamsAppPackage,
+  fetchMsTeamsAppPackageStatus,
+  fetchMsTeamsDeploymentApp,
+  replaceMsTeamsSecret,
+  startMsTeamsConnect
+} from '@/lib/api'
+
+// The Teams module's own CP client surface ({@link WebPlatformModule.apiBindings}); the pane keeps the created row's id for the package download.
+export const msTeamsApi = {
+  create: createIntegration,
+  replaceSecret: replaceMsTeamsSecret,
+  appPackage: downloadMsTeamsAppPackage,
+  appPackageStatus: fetchMsTeamsAppPackageStatus,
+  deploymentApp: fetchMsTeamsDeploymentApp,
+  connect: startMsTeamsConnect,
+  requests: fetchMsTeamsAgentBotRequests,
+  checkRequest: checkMsTeamsAgentBotRequest,
+  cancelRequest: cancelMsTeamsAgentBotRequest
+}
+
+export type MsTeamsApi = typeof msTeamsApi

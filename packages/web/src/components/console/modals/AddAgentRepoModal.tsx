@@ -1,0 +1,1230 @@
+'use client'
+
+// Authorize a repository for one agent (issue #457,
+// agent-multi-repo-authorization.md §web 1; gitlab-com-integration.md §18.1):
+// one picker per code host — GitHub repositories across the org's App
+// installations, GitLab projects the connection administers, Gitea repositories
+// the organization's bot administers — plus an access choice, preflighted against
+// the per-user identity-assertion gate when the deployment has one, and a checkout choice. Picking a
+// GitLab project that is not set up yet runs its provisioning saga inline before
+// the selection lands; a Gitea repository is bound by the grant itself (§6).
+//
+// This renders its own scrim/modal overlay because Edit workspace can expose it
+// as a preserved-state subview while another editor (such as GitHub hook setup)
+// remains underneath. Escape closes only this layer (capture-phase listener),
+// so a nested open never tears down the caller.
+
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useTranslations } from 'next-intl'
+import { type CodeHostProvider } from '@agentconnect.md/protocol/code-host'
+import type { AgentRepositorySelector } from '@agentconnect.md/protocol/decision'
+import { GithubMark, LoadingState } from '@/components/marks'
+import { CodeHostMark } from '@/components/console/CodeHostMark'
+import { Button, Icon } from '@/components/ui'
+import { CODE_HOST_PROJECTION, PICKABLE_CODE_HOST_PROVIDERS } from '@/lib/code-hosts'
+import { agentLabel, type Agent } from '@/lib/data'
+import { useOrgs } from '@/lib/org-context'
+import { useRepositoryDecision } from '@/lib/repository-selector'
+import {
+  AzureDevOpsNoRepositoriesNotice,
+  AzureDevOpsRepositoryField,
+  AzureDevOpsRepositoryOption,
+  GiteaNoRepositoriesNotice,
+  GiteaRepositoryField,
+  GiteaRepositoryOption,
+  GithubPrivateReposNotice,
+  GitlabNoProjectsNotice,
+  GitlabProjectField,
+  GitlabProjectOption,
+  INSTALLATION_MATERIALIZE_OPTIONS,
+  RepositoryMaterializeField
+} from '@/components/console/WorkspaceFormFields'
+import { matchAzureDevOpsRepositories } from '@/lib/azure-devops-repositories'
+import { matchGiteaRepositories, type GiteaRepositoryChoice } from '@/lib/gitea-repositories'
+import { matchGitlabProjects, type GitlabProjectChoice } from '@/lib/gitlab-projects'
+import { useAzureDevOpsRepositories } from '@/lib/use-azure-devops-repositories'
+import { AzureDevOpsRepositoryError } from '../AzureDevOpsRepositoryError'
+import { useGiteaRepositories } from '@/lib/use-gitea-repositories'
+import { useGitlabProjects } from '@/lib/use-gitlab-projects'
+import {
+  ApiError,
+  createAgentInstallation,
+  createAgentRepo,
+  fetchGithubInstallations,
+  githubInstallUrlFor,
+  fetchGithubRepoRoster,
+  fetchGithubRepoAccess,
+  invalidateGithubRepoRosterCache,
+  repoAuthProvider,
+  syncGithubInstallations,
+  type AgentInstallationAuthDto,
+  type AgentRepoAuthDto,
+  type GithubInstallationDto,
+  type GithubRepoAccess,
+  type GithubRepoDto,
+  type InstallationMaterialize,
+  type RepoAccess,
+  type RepoMaterialize
+} from '@/lib/api'
+
+/** Which host the picker is offering. Grants are provider-qualified (§8.1), so the offer IS the provider axis. */
+type GrantProvider = CodeHostProvider
+
+// The two grant tiers. Read is a clone/read scope; write additionally grants
+// push access, pull_requests:write for formal reviews, and actions:write for
+// GitHub Actions. (The former
+// `comment` middle tier was retired — it already carried PR-write, so it was
+// never a genuine read-only middle ground.)
+const TIERS: { v: RepoAccess; label: string; icon: string; desc: string }[] = [
+  { v: 'read', label: 'Read only', icon: 'eye', desc: 'Clone & read files only' },
+  {
+    v: 'write',
+    label: 'Read & write',
+    icon: 'git-branch',
+    desc: 'Push, open PRs & run GitHub Actions'
+  }
+]
+
+// The same two tiers in GitLab's vocabulary — merge requests and pipelines, and a
+// project rather than a repository.
+const GITLAB_TIERS: { v: RepoAccess; label: string; icon: string; desc: string }[] = [
+  { v: 'read', label: 'Read only', icon: 'eye', desc: 'Clone & read files only' },
+  {
+    v: 'write',
+    label: 'Read & write',
+    icon: 'git-branch',
+    desc: 'Push, open merge requests & run pipelines'
+  }
+]
+
+// The same two tiers in Gitea's vocabulary. Gitea has no hosted CI of its own in this
+// contract, so write buys pushing and proposing changes — never a pipeline promise.
+const GITEA_TIERS: { v: RepoAccess; label: string; icon: string; desc: string }[] = [
+  { v: 'read', label: 'Read only', icon: 'eye', desc: 'Clone & read files only' },
+  {
+    v: 'write',
+    label: 'Read & write',
+    icon: 'git-branch',
+    desc: 'Push, open pull requests & request reviews'
+  }
+]
+
+// Azure DevOps keeps the two tiers the proxy enforces; there are no hooks, so nothing for a comment tier to mean.
+const AZURE_DEVOPS_TIERS: readonly RepoAccess[] = ['read', 'write']
+
+/** Installations an owner may still grant: live, unsuspended, and not already held by the agent. */
+export function grantableInstallations(
+  installations: readonly GithubInstallationDto[],
+  granted: readonly AgentInstallationAuthDto[]
+): GithubInstallationDto[] {
+  const held = new Set(granted.map((grant) => grant.installationId))
+  return installations.filter((installation) => !installation.suspended && !held.has(installation.installationId))
+}
+
+export default function AddAgentRepoModal({
+  agent,
+  workspaceRepo,
+  authorized,
+  installationGrants = [],
+  canAuthorizeInstallation = false,
+  onInstallationCreated,
+  repositorySelector,
+  initialRepo,
+  initialInstallationId,
+  fixedRepo,
+  initialAccess,
+  initialProvider,
+  initialSearch,
+  workspaceContext = false,
+  showBack = false,
+  onClose,
+  onExit,
+  onCreated
+}: {
+  agent: Agent
+  /** Implicitly covered App-backed workspace repo (pinned — not grantable here). */
+  workspaceRepo: string | null
+  /** Existing grants — offered rows are disabled, duplicates rejected inline. */
+  authorized: AgentRepoAuthDto[]
+  /** The agent's installation grants; their installations are not offered again. */
+  installationGrants?: readonly AgentInstallationAuthDto[]
+  /** An organization owner may pick a whole installation (agent-multi-repo-authorization.md decision 10). */
+  canAuthorizeInstallation?: boolean
+  /** Given, the GitHub picker also offers each grantable installation as "All of <account>". */
+  onInstallationCreated?: (grant: AgentInstallationAuthDto) => void
+  /** The selector as Edit workspace holds it, which may be newer than `agent`'s. */
+  repositorySelector?: AgentRepositorySelector | null
+  /** Pre-selected owner/repo (the hook editor's "Authorize…" shortcut). */
+  initialRepo?: string
+  /** Pre-selected installation (an installation-wide trigger's "Authorize…" shortcut). */
+  initialInstallationId?: number
+  /** Repo locked by a manual GitHub workspace; it cannot authorize any other repo. */
+  fixedRepo?: string
+  /** Default access tier — the review/hook flow opens this dialog at `write`. */
+  initialAccess?: RepoAccess
+  /** The code host to open on (a capability request names one); GitHub otherwise. */
+  initialProvider?: GrantProvider
+  /** Seeds the GitLab project search, which has no single pre-selected row to point at. */
+  initialSearch?: string
+  /** Present this authorization step as part of the Edit workspace surface. */
+  workspaceContext?: boolean
+  /** The parent workspace form is preserved behind this step. */
+  showBack?: boolean
+  /** Close the whole parent editor while `onClose` returns to its prior view. */
+  onExit?: () => void
+  onClose: () => void
+  onCreated: (row: AgentRepoAuthDto) => void
+}) {
+  const t = useTranslations('Agents.repoModal')
+  const tWorkspace = useTranslations('Agents.workspaceEdit')
+  const tInstallation = useTranslations('Agents.installationModal')
+  const { orgPath } = useOrgs()
+  // A repository locked by a manual GitHub workspace pins the host too — that arm
+  // may authorize only its own repository, so the choice would be a dead end.
+  const [provider, setProvider] = useState<GrantProvider>(fixedRepo ? 'github' : (initialProvider ?? 'github'))
+  const [gh, setGh] = useState<{ enabled: boolean; installations: GithubInstallationDto[] } | null>(null)
+  const [ghSyncing, setGhSyncing] = useState(false)
+  // Repos merged across every installation; partial pages render immediately
+  // and each row remembers which installation owns its preflight.
+  const [repos, setRepos] = useState<Array<GithubRepoDto & { installationId: string }> | null>(null)
+  // At least one installation's roster failed to load — the list may be
+  // incomplete, which must not read as "no repositories".
+  const [reposError, setReposError] = useState<'failed' | null>(null)
+  const [privateReposHidden, setPrivateReposHidden] = useState(false)
+  const [reposNonce, setReposNonce] = useState(0)
+  const [pick, setPick] = useState(fixedRepo ?? initialRepo ?? '')
+  // A whole installation picked instead of one repository; `pick` is empty then.
+  const [pickInstallation, setPickInstallation] = useState<number | null>(initialInstallationId ?? null)
+  const [pickOpen, setPickOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const [access, setAccess] = useState<RepoAccess>(initialAccess ?? 'read')
+  const [materialize, setMaterialize] = useState<RepoMaterialize>(
+    initialInstallationId !== undefined ? 'on-demand' : 'always'
+  )
+  const { block: decisionBlock } = useRepositoryDecision(
+    agent,
+    repositorySelector !== undefined ? repositorySelector : agent.repositorySelector
+  )
+  // Per-user authz preflight for the picked repo. null = unknown/loading —
+  // never blocks; the CP re-checks at create either way.
+  const [probe, setProbe] = useState<GithubRepoAccess | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const busyRef = useRef(false)
+  // GitLab arm: the connection's Maintainer-or-Owner projects merged with the ones
+  // already added. Inert until the GitLab tile is picked, so a GitHub-only
+  // deployment issues no GitLab request at all.
+  const [glQ, setGlQ] = useState(initialProvider === 'gitlab' ? (initialSearch ?? '') : '')
+  const [glPick, setGlPick] = useState('')
+  const [glPickOpen, setGlPickOpen] = useState(false)
+  const gl = useGitlabProjects(provider === 'gitlab', glQ)
+  // Gitea arm: the repositories the organization's ONE bot administers, merged with the ones
+  // already added. Inert until the Gitea tile is picked, so a GitHub-only deployment issues no
+  // Gitea request at all.
+  const [gtQ, setGtQ] = useState('')
+  const [gtPick, setGtPick] = useState('')
+  const [gtPickOpen, setGtPickOpen] = useState(false)
+  const gt = useGiteaRepositories(provider === 'gitea')
+  // Azure DevOps arm: what the connection's identity can see, keyed by GUID; inert until its tile is picked.
+  const [azQ, setAzQ] = useState('')
+  const [azPick, setAzPick] = useState('')
+  const [azPickOpen, setAzPickOpen] = useState(false)
+  const az = useAzureDevOpsRepositories(provider === 'azure-devops')
+
+  // Escape closes THIS layer only: capture-phase + stopPropagation beats the
+  // ModalProvider's bubble-phase window listener when we're nested in a dialog.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      onClose()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [onClose])
+
+  // Probe installations on open; re-probe on focus ("Install GitHub app"
+  // finishes in another tab, coming back should light the picker up).
+  useEffect(() => {
+    let alive = true
+    const probeInstalls = () =>
+      fetchGithubInstallations(undefined, agent.githubAppId).then(
+        (r) => alive && setGh(r),
+        () => alive && setGh({ enabled: false, installations: [] })
+      )
+    void probeInstalls()
+    const onFocus = () => void probeInstalls()
+    window.addEventListener('focus', onFocus)
+    return () => {
+      alive = false
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!gh?.enabled || gh.installations.length === 0) return
+    let alive = true
+    const ctrl = new AbortController()
+    setPrivateReposHidden(false)
+    void fetchGithubRepoRoster(gh.installations, ctrl.signal, (partial) => {
+      if (alive) setRepos(partial)
+    }).then(({ repos, privateReposHidden, failed }) => {
+      if (!alive) return
+      // A failed roster read (GitHub outage) must not render as an empty
+      // list — keep the pages that loaded and surface the gap with a retry.
+      setReposError(failed ? 'failed' : null)
+      setPrivateReposHidden(privateReposHidden)
+      setRepos(repos)
+    })
+    return () => {
+      alive = false
+      ctrl.abort()
+    }
+  }, [gh, reposNonce])
+
+  const openGhInstall = async () => {
+    const url = await githubInstallUrlFor(agent.githubAppId).catch(() => null)
+    if (url) window.open(url, '_blank', 'noopener,noreferrer')
+  }
+
+  const syncGh = async () => {
+    if (ghSyncing) return
+    setGhSyncing(true)
+    setErr(null)
+    try {
+      const installations = await syncGithubInstallations(agent.githubAppId)
+      setGh({ enabled: true, installations })
+      setReposError(null)
+      setPrivateReposHidden(false)
+      setRepos(null) // fresh install set ⇒ re-pull the repo list
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setGhSyncing(false)
+    }
+  }
+
+  const authorizedByName = useMemo(
+    () => new Set(authorized.filter((r) => repoAuthProvider(r) === 'github').map((r) => r.repoFullName.toLowerCase())),
+    [authorized]
+  )
+  const isWorkspace = (fullName: string) => !!workspaceRepo && workspaceRepo.toLowerCase() === fullName.toLowerCase()
+  const isAuthorized = (fullName: string) => authorizedByName.has(fullName.toLowerCase())
+
+  // GitLab identity is the numeric project id, never the namespaced path.
+  const authorizedProjects = useMemo(
+    () =>
+      new Set(authorized.filter((r) => repoAuthProvider(r) === 'gitlab' && r.repoId).map((r) => r.repoId as string)),
+    [authorized]
+  )
+  const workspaceProject =
+    agent.workspace.mode === 'git' && agent.workspace.provider === 'gitlab' ? agent.workspace.repoId : undefined
+  const glMatches = matchGitlabProjects(gl.choices, glQ)
+  const glPicked = gl.choices.find((c) => c.projectId === glPick)
+  const glTakenBy = (projectId: string): 'workspace' | 'authorized' | null =>
+    workspaceProject === projectId ? 'workspace' : authorizedProjects.has(projectId) ? 'authorized' : null
+  const glNoProjects = gl.empty || !gl.enabled || !gl.connected
+
+  // Gitea identity is the numeric repository id, never the owner/repo path.
+  const authorizedRepositories = useMemo(
+    () => new Set(authorized.filter((r) => repoAuthProvider(r) === 'gitea' && r.repoId).map((r) => r.repoId as string)),
+    [authorized]
+  )
+  const workspaceRepository =
+    agent.workspace.mode === 'git' && agent.workspace.provider === 'gitea' ? agent.workspace.repoId : undefined
+  const gtMatches = matchGiteaRepositories(gt.choices, gtQ)
+  const gtPicked = gt.choices.find((c) => c.repoId === gtPick)
+  const gtTakenBy = (repoId: string): 'workspace' | 'authorized' | null =>
+    workspaceRepository === repoId ? 'workspace' : authorizedRepositories.has(repoId) ? 'authorized' : null
+  const gtNoRepositories = gt.empty || !gt.enabled || !gt.connected
+
+  // Azure DevOps identity is the surrogate numeric id once bound; an unbound row is held by nothing yet.
+  const authorizedAzureRepositories = useMemo(
+    () =>
+      new Set(
+        authorized.filter((r) => repoAuthProvider(r) === 'azure-devops' && r.repoId).map((r) => r.repoId as string)
+      ),
+    [authorized]
+  )
+  const workspaceAzureRepository =
+    agent.workspace.mode === 'git' && agent.workspace.provider === 'azure-devops' ? agent.workspace.repoId : undefined
+  const azMatches = matchAzureDevOpsRepositories(az.choices, azQ)
+  const azPicked = az.choices.find((c) => c.repositoryId === azPick)
+  const azTakenBy = (repoId: string | null): 'workspace' | 'authorized' | null =>
+    repoId === null
+      ? null
+      : workspaceAzureRepository === repoId
+        ? 'workspace'
+        : authorizedAzureRepositories.has(repoId)
+          ? 'authorized'
+          : null
+  const azNoRepositories = az.empty || !az.enabled || !az.connected
+
+  // A repository that is not added yet is bound by the grant itself (gitea-integration.md §6).
+  const selectRepository = (choice: GiteaRepositoryChoice) => {
+    setGtPick(choice.repoId)
+    setGtPickOpen(false)
+    setErr(null)
+  }
+
+  // Picking a project that is not set up yet runs the provisioning saga first; a
+  // failed setup selects nothing, so the footer stays inert (§18.1).
+  const selectProject = async (choice: GitlabProjectChoice) => {
+    if (!choice.binding && !(await gl.provision(choice.projectId))) return
+    setGlPick(choice.projectId)
+    setGlPickOpen(false)
+    setErr(null)
+  }
+
+  const installationChoices =
+    onInstallationCreated && !fixedRepo ? grantableInstallations(gh?.installations ?? [], installationGrants) : []
+  const pickedInstallation = installationChoices.find(
+    (installation) => installation.installationId === pickInstallation
+  )
+  const chooseRepository = (fullName: string) => {
+    // An installation's checkout choices lack Always, so a repository after one starts from the default again.
+    if (pickInstallation !== null) setMaterialize('always')
+    setPickInstallation(null)
+    setPick(fullName)
+    setPickOpen(false)
+  }
+  const chooseInstallation = (installationId: number) => {
+    if (!canAuthorizeInstallation) return
+    if (materialize === 'always') setMaterialize('on-demand')
+    setPick('')
+    setPickInstallation(installationId)
+    setPickOpen(false)
+    setErr(null)
+  }
+
+  const picked = repos?.find((r) => r.fullName.toLowerCase() === pick.toLowerCase())
+  const pickOwner = pick.split('/')[0] ?? ''
+  // Installation covering the pick: the picked row's own, else match the owner
+  // to an installation account — mirrors the CP's liveByOrgAndAccount lookup.
+  const pickInstallationId =
+    picked?.installationId ??
+    (gh?.installations ?? []).find((i) => i.accountLogin.toLowerCase() === pickOwner.toLowerCase())?.id ??
+    null
+  const uncovered = !!pick && gh !== null && gh.enabled && pickInstallationId === null
+
+  // Preflight the caller's OWN GitHub access to the picked repo (identity-
+  // assertion deployments): the read tier needs ≥read, write needs ≥write.
+  useEffect(() => {
+    setProbe(null)
+    if (!pick || !pickInstallationId) return
+    const [owner, repo] = pick.split('/')
+    if (!owner || !repo) return
+    let alive = true
+    fetchGithubRepoAccess(pickInstallationId, owner, repo)
+      .then((a) => alive && setProbe(a))
+      .catch(() => alive && setProbe(null)) // unknown — don't block; the CP enforces at create
+    return () => {
+      alive = false
+    }
+  }, [pick, pickInstallationId])
+
+  const needWrite = access === 'write'
+  const probeDenies = !!probe?.gated && (needWrite ? !probe.canWrite : !probe.canRead)
+  const probeNote = probeDenies
+    ? probe?.identityRequired || probe?.denied === 'GITHUB_IDENTITY_REQUIRED'
+      ? 'Link your GitHub profile to verify repository access, then retry.'
+      : needWrite && probe?.canRead
+        ? 'You need write access to this repository on GitHub to grant the write tier.'
+        : 'You don’t have access to this repository on GitHub.'
+    : null
+
+  const q1 = q.trim().toLowerCase()
+  const matches = (repos ?? []).filter((r) => !q1 || r.fullName.toLowerCase().includes(q1))
+  const installationMatches = installationChoices.filter(
+    (installation) => !q1 || installation.accountLogin.toLowerCase().includes(q1)
+  )
+  // A typed owner/repo missing from a failed or stale roster refresh — the CP
+  // re-validates it against the installations either way.
+  const typedRepo = /^[^/\s]+\/[^/\s]+$/.test(q.trim()) ? q.trim() : null
+  const typedIsListed = !!typedRepo && matches.some((r) => r.fullName.toLowerCase() === typedRepo.toLowerCase())
+  const typedTaken = !!typedRepo && (isWorkspace(typedRepo) || isAuthorized(typedRepo))
+
+  // Each host's own footer gate and create payload (§8.1); total, so a new host never submits through GitHub's.
+  const grantSubmit: Record<CodeHostProvider, { ready: boolean; input: Parameters<typeof createAgentRepo>[1] | null }> =
+    {
+      github: {
+        ready: !!pick && !isWorkspace(pick) && !isAuthorized(pick) && !uncovered && !probeDenies,
+        input: { repoFullName: pick, access, materialize }
+      },
+      gitlab: {
+        ready: !!glPick && glTakenBy(glPick) === null && gl.provisioning === null,
+        input: { provider: 'gitlab', projectId: glPick, access, materialize }
+      },
+      gitea: {
+        // Nothing to wait for: an unadded repository is bound by the grant itself (gitea-integration.md §6).
+        ready: !!gtPick && gtTakenBy(gtPick) === null,
+        input: { provider: 'gitea', repoId: gtPick, access, materialize }
+      },
+      'azure-devops': {
+        // Bound by the grant itself, through the organization's one connection (azure-devops-integration.md §5).
+        ready: !!azPicked && !!az.connectionId && azTakenBy(azPicked.repoId) === null,
+        input: az.connectionId
+          ? { provider: 'azure-devops', connectionId: az.connectionId, repositoryId: azPick, access, materialize }
+          : null
+      }
+    }
+  const installationPicked = provider === 'github' && pickedInstallation !== undefined
+  const canSubmit = installationPicked ? canAuthorizeInstallation : grantSubmit[provider].ready
+
+  const submit = async () => {
+    const input = grantSubmit[provider].input
+    if (busyRef.current || !canSubmit || (!installationPicked && !input)) return
+    busyRef.current = true
+    setSaving(true)
+    setErr(null)
+    try {
+      if (installationPicked && pickedInstallation && onInstallationCreated) {
+        onInstallationCreated(
+          await createAgentInstallation(agent.id, {
+            installationId: pickedInstallation.installationId,
+            access,
+            materialize: materialize as InstallationMaterialize
+          })
+        )
+        return
+      }
+      const row = await createAgentRepo(agent.id, input!)
+      onCreated(row)
+    } catch (e) {
+      if (e instanceof ApiError && e.code === 'GITHUB_IDENTITY_REQUIRED') {
+        setErr('Link your GitHub profile to verify repository access, then retry.')
+      } else if (e instanceof ApiError && e.code === 'USER_NO_ACCESS') {
+        setErr(
+          needWrite
+            ? 'You need write access to this repository on GitHub to grant the write tier.'
+            : 'You don’t have access to this repository on GitHub.'
+        )
+      } else {
+        // 400 not-covered / 409 duplicate-or-workspace come back with the CP's
+        // human-readable message — surface it verbatim.
+        setErr(e instanceof Error ? e.message : String(e))
+      }
+      setSaving(false)
+      busyRef.current = false
+    }
+  }
+
+  // How the picked host is named and what it calls the object being authorized.
+  const hostProjection = CODE_HOST_PROJECTION[provider]
+  // One tile per code host — the offer's row set IS the provider axis, each tile worded by its projection.
+  const hostTiles = PICKABLE_CODE_HOST_PROVIDERS.map((v) => ({
+    v,
+    label: CODE_HOST_PROJECTION[v].label,
+    hint: `Authorize a ${CODE_HOST_PROJECTION[v].repoNoun}.`,
+    mark: <CodeHostMark provider={v} color="var(--text-primary)" />
+  }))
+
+  // The GitHub picker groups by account: its "All repositories" choice first, then its repositories, in installation order.
+  const pickerGroups = (() => {
+    const order = (gh?.installations ?? []).map((installation) => installation.accountLogin.toLowerCase())
+    type PickerGroup = { key: string; account: string; installation?: GithubInstallationDto; repos: typeof matches }
+    const groups = new Map<string, PickerGroup>()
+    const groupOf = (account: string) => {
+      const key = account.toLowerCase()
+      const existing = groups.get(key)
+      if (existing) return existing
+      const created: PickerGroup = { key, account, repos: [] }
+      groups.set(key, created)
+      return created
+    }
+    for (const installation of installationMatches) groupOf(installation.accountLogin).installation = installation
+    for (const r of matches) groupOf(r.fullName.split('/')[0] ?? r.fullName).repos.push(r)
+    const rank = (key: string) => (order.includes(key) ? order.indexOf(key) : order.length)
+    return [...groups.values()].sort((a, b) => rank(a.key) - rank(b.key) || a.key.localeCompare(b.key))
+  })()
+  const installationOption = (installation: GithubInstallationDto) => (
+    <button
+      key={`installation:${installation.installationId}`}
+      type="button"
+      data-installation={installation.installationId}
+      aria-disabled={canAuthorizeInstallation ? undefined : true}
+      title={canAuthorizeInstallation ? undefined : tWorkspace('installationOwnerOnly')}
+      className={
+        canAuthorizeInstallation
+          ? 'fopt min-h-[46px] items-center gap-3 px-2 py-2'
+          : 'fopt min-h-[46px] cursor-default items-center gap-3 px-2 py-2 opacity-55'
+      }
+      onClick={() => chooseInstallation(installation.installationId)}
+    >
+      <Icon name="layers" size={16} color="var(--text-secondary)" className="flex-none" />
+      <span className="flex min-w-0 flex-1 flex-col items-start gap-[2px] overflow-hidden">
+        <span className="block w-full min-w-0 truncate font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary)">
+          {tWorkspace.rich('allRepositoriesIn', {
+            account: installation.accountLogin,
+            mono: (chunks) => <span className="mono">{chunks}</span>
+          })}
+        </span>
+        <span className="block w-full min-w-0 truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+          {installation.repositorySelection === 'all'
+            ? tInstallation('allRepositories')
+            : tInstallation('selectedRepositories')}
+        </span>
+      </span>
+      {pickInstallation === installation.installationId && <Icon name="check" size={17} color="var(--brand)" />}
+    </button>
+  )
+  const repositoryOption = (r: (typeof matches)[number]) => {
+    const taken = isWorkspace(r.fullName) || isAuthorized(r.fullName)
+    return (
+      <button
+        key={r.fullName}
+        className={`fopt min-h-[46px] items-center gap-3 px-2 py-2 ${taken ? 'cursor-default opacity-55' : ''}`}
+        disabled={taken}
+        onClick={() => chooseRepository(r.fullName)}
+      >
+        <Icon
+          name={r.private ? 'lock' : 'book-bookmark'}
+          size={16}
+          color="var(--text-tertiary)"
+          className="flex-none"
+        />
+        <span className="flex min-w-0 flex-1 flex-col items-start gap-[2px] overflow-hidden">
+          <span
+            className="block w-full min-w-0 truncate font-mono text-[12.5px] font-semibold leading-normal text-(--text-primary)"
+            title={r.fullName}
+          >
+            {r.fullName}
+          </span>
+          <span className="block w-full min-w-0 truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+            {isWorkspace(r.fullName)
+              ? t('workspaceCovered')
+              : isAuthorized(r.fullName)
+                ? t('alreadyAuthorized')
+                : (r.description ?? t('noDescription'))}
+          </span>
+        </span>
+        {isWorkspace(r.fullName) ? (
+          <span className="badge flex-none bg-(--surface-active) text-(--text-tertiary)">{t('workspace')}</span>
+        ) : isAuthorized(r.fullName) ? (
+          <span className="badge flex-none bg-(--surface-active) text-(--text-tertiary)">{t('added')}</span>
+        ) : (
+          pick.toLowerCase() === r.fullName.toLowerCase() && <Icon name="check" size={17} color="var(--brand)" />
+        )}
+      </button>
+    )
+  }
+
+  // Each host's own picker pane; total, so a new code host never renders another host's.
+  const grantPicker: Record<CodeHostProvider, () => ReactNode> = {
+    gitea: () =>
+      gt.error ? (
+        <div className="mb-4 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+          {t('giteaLoadError', { error: gt.error })}
+        </div>
+      ) : gt.loading ? (
+        <div className="mb-4">
+          <LoadingState size={20} padding={16} />
+        </div>
+      ) : gtNoRepositories ? (
+        <div className="mb-4">
+          <GiteaNoRepositoriesNotice
+            connected={gt.connected}
+            enabled={gt.enabled}
+            integrationsHref={orgPath('/integrations')}
+            onSync={gt.reload}
+            syncing={gt.reloading}
+          />
+        </div>
+      ) : (
+        <>
+          <div className="mb-[18px]">
+            <GiteaRepositoryField
+              value={gtPicked?.repoPath ?? ''}
+              icon="book-bookmark"
+              loading={false}
+              open={gtPickOpen}
+              query={gtQ}
+              onToggle={() => {
+                setGtQ('')
+                setGtPickOpen((value) => !value)
+              }}
+              onClose={() => setGtPickOpen(false)}
+              onQueryChange={setGtQ}
+            >
+              {gtMatches.map((choice) => {
+                const taken = gtTakenBy(choice.repoId)
+                if (taken !== null) {
+                  return (
+                    <div key={choice.repoId} className="fnohit">
+                      {choice.repoPath}
+                      {taken === 'workspace' ? t('workspaceRepository') : t('alreadyAuthorized')}
+                    </div>
+                  )
+                }
+                return (
+                  <GiteaRepositoryOption
+                    key={choice.repoId}
+                    choice={choice}
+                    selected={gtPick === choice.repoId}
+                    onSelect={() => selectRepository(choice)}
+                  />
+                )
+              })}
+              {gtMatches.length === 0 && <div className="fnohit">{t('noRepositoriesMatch', { query: gtQ })}</div>}
+            </GiteaRepositoryField>
+          </div>
+
+          <div className="fldlbl mb-2">{t('access')}</div>
+          <div className="mb-4 flex flex-col gap-[9px]">
+            {GITEA_TIERS.map((tier) => {
+              const on = access === tier.v
+              return (
+                <div
+                  key={tier.v}
+                  className={`flex cursor-pointer items-center gap-[11px] rounded-[9px] border px-[13px] py-[11px] ${
+                    on
+                      ? 'border-(--border-strong) bg-(--surface-hover)'
+                      : 'border-(--border-subtle) bg-(--surface-card)'
+                  }`}
+                  onClick={() => setAccess(tier.v)}
+                >
+                  <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                    <Icon name={tier.icon} size={16} color={on ? 'var(--brand)' : 'var(--text-tertiary)'} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-sans text-[13px] font-semibold leading-normal">
+                      {tier.v === 'read' ? t('readOnly') : t('readWrite')}
+                    </div>
+                    <div className="mt-[2px] font-sans text-[11.5px] font-normal leading-[1.4] text-(--text-tertiary)">
+                      {tier.v === 'read' ? t('readOnlyDescription') : t('giteaWriteDescription')}
+                    </div>
+                  </div>
+                  <span
+                    className={`flex h-4 w-4 flex-none items-center justify-center rounded-full border-[1.5px] ${
+                      on ? 'border-(--brand)' : 'border-(--border-strong)'
+                    }`}
+                  >
+                    {on && <span className="h-2 w-2 rounded-full bg-(--brand)" />}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          <RepositoryMaterializeField value={materialize} decisionBlock={decisionBlock} onChange={setMaterialize} />
+        </>
+      ),
+    github: () =>
+      gh === null ? (
+        <div className="mb-4 flex items-center gap-[10px] rounded-[9px] border border-(--border-subtle) bg-(--surface-app) p-[14px] font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+          <Icon name="loader" size={15} className="flex-none animate-spin" />
+          {t('checkingGithub')}
+        </div>
+      ) : !gh.enabled ? (
+        <div className="mb-4 flex items-start gap-[10px] rounded-[9px] border border-(--border-subtle) bg-(--surface-app) p-[14px] font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-tertiary)">
+          <Icon name="info" size={15} className="mt-[1px] flex-none" />
+          <span>{t('githubNotConfigured')}</span>
+        </div>
+      ) : gh.installations.length === 0 ? (
+        <div className="mb-4 rounded-[9px] border border-(--border-subtle) bg-(--surface-app) p-[14px]">
+          <div className="font-sans text-[13.5px] font-semibold leading-normal text-(--text-primary)">
+            {t('connectGithubTitle')}
+          </div>
+          <div className="mt-[3px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+            {t('connectGithubDescription')}
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <Button size="sm" onClick={() => void openGhInstall()}>
+              <span className="flex h-4 w-4 items-center justify-center">
+                <GithubMark color="#fff" />
+              </span>
+              {t('installGithub')}
+            </Button>
+            <button type="button" className="lnk inline-flex items-center gap-[6px]" onClick={() => void syncGh()}>
+              <Icon
+                name={ghSyncing ? 'loader' : 'refresh-cw'}
+                size={13}
+                className={ghSyncing ? 'animate-spin' : undefined}
+              />
+              {t('installedSync')}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="fld relative mb-[18px] min-w-0">
+            <span className="fldlbl">{t('repository')}</span>
+            <div
+              className={fixedRepo ? 'inp min-w-0 cursor-default gap-2' : 'inp min-w-0 cursor-pointer gap-2'}
+              onClick={() => {
+                if (fixedRepo) return
+                setQ('')
+                setPickOpen((v) => !v)
+              }}
+            >
+              <span className="inline-flex min-w-0 flex-1 items-center gap-[7px]">
+                {pickedInstallation ? (
+                  <>
+                    <Icon name="layers" size={16} color="var(--text-secondary)" className="flex-none" />
+                    <span className="min-w-0 flex-1 truncate font-sans text-[12.5px] font-medium leading-normal">
+                      {tWorkspace.rich('allRepositoriesIn', {
+                        account: pickedInstallation.accountLogin,
+                        mono: (chunks) => <span className="mono">{chunks}</span>
+                      })}
+                    </span>
+                  </>
+                ) : pick ? (
+                  <>
+                    <Icon
+                      name={picked && !picked.private ? 'book-bookmark' : 'lock'}
+                      size={16}
+                      color="var(--text-tertiary)"
+                      className="flex-none"
+                    />
+                    <span
+                      className="min-w-0 flex-1 truncate font-mono text-[12.5px] font-medium leading-normal"
+                      title={pick}
+                    >
+                      {pick}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <span className="imark h-4 w-4 flex-none border-0 bg-transparent">
+                      <GithubMark color="var(--text-secondary)" />
+                    </span>
+                    <span className="truncate text-(--text-tertiary)">
+                      {repos === null ? 'Loading repositories…' : 'Pick a repository'}
+                    </span>
+                  </>
+                )}
+              </span>
+              {!fixedRepo && <Icon name="chevron-down" size={15} color="var(--text-tertiary)" />}
+            </div>
+            {privateReposHidden ? <GithubPrivateReposNotice profileHref={orgPath('/profile#sign-in-methods')} /> : null}
+            {!fixedRepo && pickOpen && (
+              <>
+                <div className="fscrim" onClick={() => setPickOpen(false)} />
+                <div className="fmenu left-0 right-0 z-40 min-w-0 rounded-lg p-2 shadow-(--shadow-xl)">
+                  <input
+                    className="fsearch h-10 rounded-md px-3 font-sans text-[13px] font-medium leading-normal"
+                    value={q}
+                    onChange={(e) => setQ(e.target.value)}
+                    placeholder={t('searchRepository')}
+                    autoFocus
+                  />
+                  {reposError === 'failed' && (
+                    <div className="flex items-center gap-2 px-2 py-[7px] font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+                      <span className="min-w-0 flex-1">{t('githubLoadError')}</span>
+                      <button
+                        type="button"
+                        className="lnk flex-none text-[12px]"
+                        onClick={() => {
+                          invalidateGithubRepoRosterCache()
+                          setReposError(null)
+                          setPrivateReposHidden(false)
+                          setRepos(null)
+                          setReposNonce((n) => n + 1)
+                        }}
+                      >
+                        {t('retry')}
+                      </button>
+                    </div>
+                  )}
+                  {pickerGroups.map((group) => (
+                    <div key={group.key} role="group" aria-label={group.account} data-picker-group={group.key}>
+                      <div className="fhdr flex items-center gap-[6px]">
+                        <span className="h-[11px] w-[11px] flex-none opacity-70">
+                          <GithubMark color="var(--text-tertiary)" />
+                        </span>
+                        {group.account}
+                      </div>
+                      {group.installation && installationOption(group.installation)}
+                      {group.repos.map(repositoryOption)}
+                    </div>
+                  ))}
+                  {typedRepo && !typedIsListed && !typedTaken && (
+                    <button
+                      key={`typed:${typedRepo}`}
+                      className="fopt min-h-[46px] items-center gap-3 px-2 py-2"
+                      onClick={() => chooseRepository(typedRepo)}
+                    >
+                      <Icon name="book-bookmark" size={16} color="var(--text-tertiary)" className="flex-none" />
+                      <span className="flex min-w-0 flex-1 flex-col items-start gap-[2px] overflow-hidden">
+                        <span className="block w-full min-w-0 truncate font-mono text-[12.5px] font-semibold leading-normal text-(--text-primary)">
+                          {typedRepo}
+                        </span>
+                        <span className="block w-full min-w-0 truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                          {t('useRepository')}
+                        </span>
+                      </span>
+                    </button>
+                  )}
+                  {typedRepo && typedTaken && (
+                    <div className="fnohit">
+                      {isWorkspace(typedRepo)
+                        ? t('isWorkspace', { repo: typedRepo })
+                        : t('isAuthorized', { repo: typedRepo })}
+                    </div>
+                  )}
+                  {repos !== null &&
+                    matches.length === 0 &&
+                    installationMatches.length === 0 &&
+                    !typedRepo &&
+                    !reposError && <div className="fnohit">{t('noRepositoriesMatch', { query: q })}</div>}
+                  {repos === null && (
+                    <div className="px-2 py-[7px] font-sans text-[11px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('loadingRepositories')}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="fldlbl mb-2">{t('access')}</div>
+          <div className="mb-4 flex flex-col gap-[9px]">
+            {TIERS.map((t) => {
+              const on = access === t.v
+              return (
+                <div
+                  key={t.v}
+                  className={`flex cursor-pointer items-center gap-[11px] rounded-[9px] border px-[13px] py-[11px] ${
+                    on
+                      ? 'border-(--border-strong) bg-(--surface-hover)'
+                      : 'border-(--border-subtle) bg-(--surface-card)'
+                  }`}
+                  onClick={() => setAccess(t.v)}
+                >
+                  <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                    <Icon name={t.icon} size={16} color={on ? 'var(--brand)' : 'var(--text-tertiary)'} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-sans text-[13px] font-semibold leading-normal">{t.label}</div>
+                    <div className="mt-[2px] font-sans text-[11.5px] font-normal leading-[1.4] text-(--text-tertiary)">
+                      {pickedInstallation && t.v === 'write' ? tInstallation('writeDescription') : t.desc}
+                    </div>
+                  </div>
+                  <span
+                    className={`flex h-4 w-4 flex-none items-center justify-center rounded-full border-[1.5px] ${
+                      on ? 'border-(--brand)' : 'border-(--border-strong)'
+                    }`}
+                  >
+                    {on && <span className="h-2 w-2 rounded-full bg-(--brand)" />}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          <RepositoryMaterializeField
+            value={materialize}
+            {...(pickedInstallation ? { options: INSTALLATION_MATERIALIZE_OPTIONS } : {})}
+            decisionBlock={decisionBlock}
+            onChange={setMaterialize}
+          />
+
+          {uncovered && (
+            <div className="mb-4 flex items-start gap-2 rounded-[9px] border border-(--border-subtle) bg-(--surface-sunken) px-3 py-[11px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+              <Icon name="info" size={14} className="mt-[1px] flex-none" />
+              <span>{t('installationMissing', { owner: pickOwner })}</span>
+            </div>
+          )}
+          {!uncovered && probeNote && (
+            <div className="mb-4 flex items-start gap-2 rounded-[9px] border border-(--border-subtle) bg-(--surface-sunken) px-3 py-[11px] font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+              <Icon name="shield-alert" size={14} className="mt-[1px] flex-none" />
+              <span>{probeNote}</span>
+            </div>
+          )}
+        </>
+      ),
+    gitlab: () =>
+      gl.error ? (
+        <div className="mb-4 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+          {t('gitlabLoadError', { error: gl.error })}
+        </div>
+      ) : gl.loading ? (
+        <div className="mb-4">
+          <LoadingState size={20} padding={16} />
+        </div>
+      ) : glNoProjects ? (
+        <div className="mb-4">
+          <GitlabNoProjectsNotice
+            connected={gl.connected}
+            enabled={gl.enabled}
+            onConnect={() => void gl.connect()}
+            onSync={gl.reload}
+            syncing={gl.reloading}
+          />
+        </div>
+      ) : (
+        <>
+          <div className="mb-[18px]">
+            <GitlabProjectField
+              value={glPicked?.projectPath ?? ''}
+              icon="book-bookmark"
+              loading={false}
+              open={glPickOpen}
+              query={glQ}
+              onToggle={() => {
+                setGlQ('')
+                setGlPickOpen((value) => !value)
+              }}
+              onClose={() => setGlPickOpen(false)}
+              onQueryChange={setGlQ}
+              error={gl.provisionError ? `Couldn’t set up that project — ${gl.provisionError}` : undefined}
+            >
+              {glMatches.map((choice) => {
+                const taken = glTakenBy(choice.projectId)
+                if (taken !== null) {
+                  return (
+                    <div key={choice.projectId} className="fnohit">
+                      {choice.projectPath}
+                      {taken === 'workspace'
+                        ? ' is the agent’s workspace project'
+                        : ' is already authorized for this agent'}
+                    </div>
+                  )
+                }
+                return (
+                  <GitlabProjectOption
+                    key={choice.projectId}
+                    choice={choice}
+                    selected={glPick === choice.projectId}
+                    busy={gl.provisioning === choice.projectId}
+                    onSelect={() => void selectProject(choice)}
+                  />
+                )
+              })}
+              {glMatches.length === 0 && <div className="fnohit">{t('noProjectsMatch', { query: glQ })}</div>}
+            </GitlabProjectField>
+          </div>
+
+          <div className="fldlbl mb-2">{t('access')}</div>
+          <div className="mb-4 flex flex-col gap-[9px]">
+            {GITLAB_TIERS.map((tier) => {
+              const on = access === tier.v
+              return (
+                <div
+                  key={tier.v}
+                  className={`flex cursor-pointer items-center gap-[11px] rounded-[9px] border px-[13px] py-[11px] ${
+                    on
+                      ? 'border-(--border-strong) bg-(--surface-hover)'
+                      : 'border-(--border-subtle) bg-(--surface-card)'
+                  }`}
+                  onClick={() => setAccess(tier.v)}
+                >
+                  <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                    <Icon name={tier.icon} size={16} color={on ? 'var(--brand)' : 'var(--text-tertiary)'} />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-sans text-[13px] font-semibold leading-normal">
+                      {tier.v === 'read' ? t('readOnly') : t('readWrite')}
+                    </div>
+                    <div className="mt-[2px] font-sans text-[11.5px] font-normal leading-[1.4] text-(--text-tertiary)">
+                      {tier.v === 'read' ? t('readOnlyDescription') : t('gitlabWriteDescription')}
+                    </div>
+                  </div>
+                  <span
+                    className={`flex h-4 w-4 flex-none items-center justify-center rounded-full border-[1.5px] ${
+                      on ? 'border-(--brand)' : 'border-(--border-strong)'
+                    }`}
+                  >
+                    {on && <span className="h-2 w-2 rounded-full bg-(--brand)" />}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          <RepositoryMaterializeField value={materialize} decisionBlock={decisionBlock} onChange={setMaterialize} />
+        </>
+      ),
+    'azure-devops': () =>
+      az.error ? (
+        <AzureDevOpsRepositoryError picker={az} />
+      ) : az.loading ? (
+        <div className="mb-4">
+          <LoadingState size={20} padding={16} />
+        </div>
+      ) : azNoRepositories ? (
+        <div className="mb-4">
+          <AzureDevOpsNoRepositoriesNotice
+            connected={az.connected}
+            enabled={az.enabled}
+            integrationsHref={orgPath('/integrations')}
+            onSync={az.reload}
+            syncing={az.reloading}
+          />
+        </div>
+      ) : (
+        <>
+          <div className="mb-[18px]">
+            <AzureDevOpsRepositoryField
+              value={azPicked?.repoPath ?? ''}
+              icon="book-bookmark"
+              loading={false}
+              open={azPickOpen}
+              query={azQ}
+              onToggle={() => {
+                setAzQ('')
+                setAzPickOpen((value) => !value)
+              }}
+              onClose={() => setAzPickOpen(false)}
+              onQueryChange={setAzQ}
+              error={az.listError ? t('azureDevOpsLoadError', { error: az.listError }) : undefined}
+              onRetry={az.reload}
+            >
+              {azMatches.map((choice) => {
+                const taken = azTakenBy(choice.repoId)
+                if (taken !== null) {
+                  return (
+                    <div key={choice.repositoryId} className="fnohit">
+                      {choice.repoPath}
+                      {taken === 'workspace' ? t('workspaceRepository') : t('alreadyAuthorized')}
+                    </div>
+                  )
+                }
+                return (
+                  <AzureDevOpsRepositoryOption
+                    key={choice.repositoryId}
+                    choice={choice}
+                    selected={azPick === choice.repositoryId}
+                    onSelect={() => {
+                      setAzPick(choice.repositoryId)
+                      setAzPickOpen(false)
+                      setErr(null)
+                    }}
+                  />
+                )
+              })}
+              {azMatches.length === 0 && <div className="fnohit">{t('noRepositoriesMatch', { query: azQ })}</div>}
+            </AzureDevOpsRepositoryField>
+          </div>
+
+          <div className="fldlbl mb-2">{t('access')}</div>
+          <div className="mb-4 flex flex-col gap-[9px]">
+            {AZURE_DEVOPS_TIERS.map((tier) => {
+              const on = access === tier
+              return (
+                <div
+                  key={tier}
+                  className={`flex cursor-pointer items-center gap-[11px] rounded-[9px] border px-[13px] py-[11px] ${
+                    on
+                      ? 'border-(--border-strong) bg-(--surface-hover)'
+                      : 'border-(--border-subtle) bg-(--surface-card)'
+                  }`}
+                  onClick={() => setAccess(tier)}
+                >
+                  <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                    <Icon
+                      name={tier === 'read' ? 'eye' : 'git-branch'}
+                      size={16}
+                      color={on ? 'var(--brand)' : 'var(--text-tertiary)'}
+                    />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-sans text-[13px] font-semibold leading-normal">
+                      {tier === 'read' ? t('readOnly') : t('readWrite')}
+                    </div>
+                    <div className="mt-[2px] font-sans text-[11.5px] font-normal leading-[1.4] text-(--text-tertiary)">
+                      {tier === 'read' ? t('readOnlyDescription') : t('azureDevOpsWriteDescription')}
+                    </div>
+                  </div>
+                  <span
+                    className={`flex h-4 w-4 flex-none items-center justify-center rounded-full border-[1.5px] ${
+                      on ? 'border-(--brand)' : 'border-(--border-strong)'
+                    }`}
+                  >
+                    {on && <span className="h-2 w-2 rounded-full bg-(--brand)" />}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          <RepositoryMaterializeField value={materialize} decisionBlock={decisionBlock} onChange={setMaterialize} />
+        </>
+      )
+  }
+
+  return (
+    <div className="scrim">
+      <div className="modal">
+        <div className="modalhead">
+          {showBack ? (
+            <button className="iconbtn" title={t('backToWorkspace')} onClick={onClose}>
+              <Icon name="arrow-left" size={16} />
+            </button>
+          ) : (
+            <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-subtle) bg-(--surface-sunken)">
+              <span className="flex h-[17px] w-[17px] items-center justify-center">
+                <GithubMark color="var(--text-secondary)" />
+              </span>
+            </span>
+          )}
+          <div className="min-w-0 flex-1">
+            <div className="font-sans text-[16px] font-semibold leading-normal">
+              {workspaceContext ? t('editWorkspace') : t('addRepository')}
+            </div>
+            <div className="mt-[1px] truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+              {workspaceContext
+                ? t('authorizeAdditional', { noun: hostProjection.repoNoun })
+                : t('authorizeRepo', { host: hostProjection.label, noun: hostProjection.repoNoun })}{' '}
+              <span className="mono">{agentLabel(agent)}</span>
+            </div>
+          </div>
+          <button className="iconbtn" onClick={onExit ?? onClose}>
+            <Icon name="x" size={16} />
+          </button>
+        </div>
+        <div className="modalbody">
+          {/* A repository fixed by a manual GitHub workspace pins the host too. */}
+          {!fixedRepo && (
+            <div className="fld mb-[18px]">
+              <span className="fldlbl">{t('codeHost')}</span>
+              <div className="grid grid-cols-1 gap-[10px] desktop:grid-cols-2">
+                {hostTiles.map((host) => (
+                  <button
+                    key={host.v}
+                    type="button"
+                    className={provider === host.v ? 'ptile on items-start text-left' : 'ptile items-start text-left'}
+                    onClick={() => {
+                      setProvider(host.v)
+                      setErr(null)
+                    }}
+                  >
+                    <span className="flex h-[30px] w-[30px] flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                      <span className="flex h-4 w-4 items-center justify-center">{host.mark}</span>
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-sans text-[13px] font-semibold leading-normal">{host.label}</span>
+                      <span className="mt-[2px] block truncate font-sans text-[11.5px] font-normal leading-[1.4] text-(--text-tertiary)">
+                        {host.hint}
+                      </span>
+                    </span>
+                    <span
+                      className={
+                        provider === host.v
+                          ? 'ml-auto flex h-4 w-4 flex-none items-center justify-center self-center rounded-full border-[1.5px] border-(--brand)'
+                          : 'ml-auto flex h-4 w-4 flex-none items-center justify-center self-center rounded-full border-[1.5px] border-(--border-strong)'
+                      }
+                    >
+                      {provider === host.v && <span className="h-2 w-2 rounded-full bg-(--brand)" />}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* The picked host's own picker, selected through the table above. */}
+          {grantPicker[provider]()}
+          {err && <div className="font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">{err}</div>}
+        </div>
+        <div className="modalfoot">
+          <span className="flex-1" />
+          <Button variant="ghost" onClick={onClose}>
+            {t('cancel')}
+          </Button>
+          <Button
+            onClick={() => void submit()}
+            className={!canSubmit || saving ? 'pointer-events-none opacity-50' : undefined}
+          >
+            {saving ? t('adding') : t('add')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}

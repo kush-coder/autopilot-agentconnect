@@ -1,0 +1,83 @@
+import {
+  matchDecisionCondition,
+  type ApiGateTryState,
+  type DecisionCondition,
+  type DecisionEvaluation,
+  type DecisionEvaluationAgent,
+  type DecisionPreviewSample,
+  type DecisionQuestion
+} from '@agentconnect.md/protocol'
+
+/** The sender a Gate Try sample's current message gets when the operator names none. */
+export const PREVIEW_SENDER = 'preview-user'
+
+/** A Gate Try sample in the live state shape the daemon builds (decisions.md §8.2), with synthetic ids. */
+export function gateSampleState(
+  sample: DecisionPreviewSample,
+  target: { agentId: string; conversationName?: string; agent?: DecisionEvaluationAgent }
+): Record<string, unknown> {
+  const history = sample.history.map((entry, index) => ({
+    id: `preview-${index + 1}`,
+    sender: { id: entry.sender },
+    text: entry.text,
+    threadId: null
+  }))
+  return {
+    ...(target.agent ? { agent: target.agent } : {}),
+    currentMessage: {
+      id: `preview-${history.length + 1}`,
+      sender: { id: sample.currentMessage.sender ?? PREVIEW_SENDER },
+      text: sample.currentMessage.text,
+      threadId: null
+    },
+    history,
+    conversation: target.conversationName ? { name: target.conversationName } : {},
+    addressing: { mentions: [], target: { agentId: target.agentId, via: 'implicit' } },
+    context: { partial: false, reasons: [], omittedMessages: 0 }
+  }
+}
+
+export interface GatePreviewOutcome {
+  outcome: 'trigger' | 'skip' | 'unavailable'
+  matched: boolean
+  matchedKeys: string[]
+  evaluation: DecisionEvaluation
+}
+
+/** Apply the draft condition; a provider failure or an answer the matcher rejects is unavailable, never a skip. */
+export function gatePreviewOutcome(
+  question: DecisionQuestion,
+  when: DecisionCondition,
+  evaluation: DecisionEvaluation
+): GatePreviewOutcome {
+  if (evaluation.status !== 'answered') return { outcome: 'unavailable', matched: false, matchedKeys: [], evaluation }
+  try {
+    const match = matchDecisionCondition(question, when, evaluation.answer)
+    return {
+      outcome: match.matched ? 'trigger' : 'skip',
+      matched: match.matched,
+      matchedKeys: match.matchedKeys,
+      evaluation
+    }
+  } catch {
+    return {
+      outcome: 'unavailable',
+      matched: false,
+      matchedKeys: [],
+      evaluation: { status: 'unavailable', reason: 'invalid_response' }
+    }
+  }
+}
+
+const API_GATE_TEXT_MAX_BYTES = 8 * 1024
+
+/** An API gate Try in the state the daemon's API gate builds: the call's text, cut to 8 KiB, and no history. */
+export function apiGateSampleState(sample: ApiGateTryState, agent: DecisionEvaluationAgent): Record<string, unknown> {
+  const text = sample.currentMessage.text
+  const bytes = new TextEncoder().encode(text)
+  const content =
+    bytes.length <= API_GATE_TEXT_MAX_BYTES
+      ? text
+      : new TextDecoder().decode(bytes.subarray(0, API_GATE_TEXT_MAX_BYTES)).replace(/\uFFFD$/, '')
+  return { source: 'chat', agent, currentMessage: { text: content }, history: [], truncated: content !== text }
+}

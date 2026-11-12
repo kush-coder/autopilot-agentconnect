@@ -1,0 +1,210 @@
+import { existsSync, lstatSync, readdirSync } from 'node:fs'
+import { isAbsolute, join, relative, sep } from 'node:path'
+import { sessionKeyDirName } from '../acp/host-key.js'
+import {
+  isRepoSegment,
+  PRIMARY_CHECKOUT_DIR,
+  SECONDARY_ROOTS_DIR,
+  secondarySubtreesIn,
+  WORKTREES_DIR
+} from './secondary-layout.js'
+import type { WorkspaceFs } from './workspace-fs.js'
+
+// The on-disk shape of one confined session's directory, `<agentDir>/sessions/<leaf>/{workspace,repos/<a>/<b>,home}` (git-workspace-model.md §11) — separate from the manager, like secondary-layout.ts, so the launch path derives a session host's grants without the whole workspace module.
+
+/** Every confined session's directory hangs off one agent-owned parent. */
+export const SESSIONS_DIR = 'sessions'
+
+/** `<agentRoot>/sessions` — the parent of every session directory. */
+export function sessionsDirIn(agentRoot: string): string {
+  return join(agentRoot, SESSIONS_DIR)
+}
+
+/** `<agentRoot>/sessions/<leaf>` — one session's own directory. */
+export function sessionDirIn(agentRoot: string, leaf: string): string {
+  return join(sessionsDirIn(agentRoot), leaf)
+}
+
+/**
+ * THE record of a session's tier (§11): its own directory when this disk holds one, else undefined.
+ *
+ * One function, so preparation, launch, the console reads and retirement cannot answer differently.
+ * The leaf is the session key's, never a host key's — a session is one tier whichever host serves it.
+ */
+export function confinedSessionDirIn(agentRoot: string, sessionKey: string): string | undefined {
+  const dir = sessionDirIn(agentRoot, sessionKeyDirName(sessionKey))
+  return isRealDir(dir) ? dir : undefined
+}
+
+/** The confined session directory `path` is in, by the same record; undefined for a path outside every one. */
+export function confinedSessionDirOf(agentRoot: string, path: string): string | undefined {
+  const rel = relative(agentRoot, path)
+  if (rel === '' || isAbsolute(rel)) return undefined
+  const [parent, leaf] = rel.split(sep)
+  if (parent !== SESSIONS_DIR || leaf === undefined || sessionLeafId(leaf) === undefined) return undefined
+  const dir = sessionDirIn(agentRoot, leaf)
+  return isRealDir(dir) ? dir : undefined
+}
+
+/**
+ * The other half of that record: whether the session already stands in a per-session WORKTREE of any
+ * root — the primary's or a secondary's.
+ *
+ * The `.git` marker is the proof, exactly as {@link sessionGitDirsIn} takes it for a clone. An empty
+ * `worktrees/<id>` stub is therefore absent, not a worktree: it is what a failed or degraded
+ * preparation leaves behind, and counting it would pin the session to a tier nothing on disk serves —
+ * a cwd no checkout root contains, which is how such a session stopped being able to recover at all.
+ */
+export function hasSessionWorktreeIn(agentRoot: string, sessionWorktreeId: string): boolean {
+  const parents = [
+    join(agentRoot, WORKTREES_DIR),
+    ...secondarySubtreesIn(agentRoot).map((entry) => entry.worktreesPath)
+  ]
+  return parents.some((parent) => existsSync(join(parent, sessionWorktreeId, '.git')))
+}
+
+/** One root's clone inside a session directory: the primary's `workspace`, a secondary's `repos/<subtree name>`. */
+export function sessionRootCloneIn(sessionDir: string, subtreeName?: string): string {
+  if (subtreeName === undefined) return join(sessionDir, PRIMARY_CHECKOUT_DIR)
+  return join(sessionDir, SECONDARY_ROOTS_DIR, ...subtreeName.split('/'))
+}
+
+/** `<sessionDir>/home` — the session's own runtime HOME (state, temp, XDG, package caches), gone with the leaf. */
+export function sessionHomeIn(sessionDir: string): string {
+  return join(sessionDir, 'home')
+}
+
+/** `<sessionDir>/.session-cwd.json` — which secondary root's clone is the session's cwd, kept with the session wherever it runs and gone with the leaf. */
+export function sessionCwdRecordIn(sessionDir: string): string {
+  return join(sessionDir, '.session-cwd.json')
+}
+
+/** `<clone>/.git/agentconnect-materialization.json` — which repository a session's secondary clone holds and the default branch it was taken at, published with the clone and gone with it. */
+export function sessionRootAttestationIn(clone: string): string {
+  return join(clone, '.git', 'agentconnect-materialization.json')
+}
+
+/** Every `repos/<a>/<b>` clone ON DISK in a session directory, sorted by name; symlinks are skipped. */
+export function sessionSecondaryClonesIn(sessionDir: string): { subtreeName: string; path: string }[] {
+  const parent = join(sessionDir, SECONDARY_ROOTS_DIR)
+  const out: { subtreeName: string; path: string }[] = []
+  for (const owner of realDirEntries(parent)) {
+    for (const repo of realDirEntries(join(parent, owner))) {
+      out.push({ subtreeName: `${owner}/${repo}`, path: join(parent, owner, repo) })
+    }
+  }
+  return out
+}
+
+/** Every clone a session directory holds — the primary's when it has one, then the secondaries'. */
+export function sessionClonesIn(sessionDir: string): { subtreeName?: string; path: string }[] {
+  const primary = sessionRootCloneIn(sessionDir)
+  return [...(isRealDir(primary) ? [{ path: primary }] : []), ...sessionSecondaryClonesIn(sessionDir)]
+}
+
+/** {@link sessionClonesIn} asked of the filesystem that HOLDS the directory — a pod's volume as much as this disk. */
+export async function sessionClonesUnder(
+  fs: Pick<WorkspaceFs, 'stat' | 'readdir'>,
+  sessionDir: string
+): Promise<{ subtreeName?: string; path: string }[]> {
+  const out: { subtreeName?: string; path: string }[] = []
+  const primary = sessionRootCloneIn(sessionDir)
+  if ((await fs.stat(primary)) === 'dir') out.push({ path: primary })
+  const parent = join(sessionDir, SECONDARY_ROOTS_DIR)
+  for (const owner of await dirEntriesUnder(fs, parent)) {
+    for (const repo of await dirEntriesUnder(fs, join(parent, owner))) {
+      out.push({ subtreeName: `${owner}/${repo}`, path: join(parent, owner, repo) })
+    }
+  }
+  return out
+}
+
+/** Whether `dir` holds nothing but empty directories, within `budget` entries — a tree with no file in it holds no work. */
+export async function holdsNoFiles(
+  fs: Pick<WorkspaceFs, 'stat' | 'readdir'>,
+  dir: string,
+  budget = { entries: 64 }
+): Promise<boolean> {
+  for (const name of await fs.readdir(dir)) {
+    if (--budget.entries < 0) return false
+    const path = join(dir, name)
+    if ((await fs.stat(path)) !== 'dir' || !(await holdsNoFiles(fs, path, budget))) return false
+  }
+  return true
+}
+
+/** Child directories of `dir` whose names are legal repository segments, sorted, as `fs` reports them; a missing parent is empty. */
+async function dirEntriesUnder(fs: Pick<WorkspaceFs, 'stat' | 'readdir'>, dir: string): Promise<string[]> {
+  if ((await fs.stat(dir)) !== 'dir') return []
+  const names: string[] = []
+  for (const name of await fs.readdir(dir)) {
+    if (isRepoSegment(name) && (await fs.stat(join(dir, name))) === 'dir') names.push(name)
+  }
+  return names.sort()
+}
+
+/** The `.git` DIRECTORY of every clone in a session directory — a clone's own, never a worktree's link file. */
+export function sessionGitDirsIn(sessionDir: string): string[] {
+  return sessionClonesIn(sessionDir)
+    .map((clone) => join(clone.path, '.git'))
+    .filter(isRealDir)
+}
+
+/** {@link sessionGitDirsIn} asked of the filesystem that HOLDS the directory; its `stat` follows no symlink, so a linked `.git` is refused there too. */
+export async function sessionGitDirsUnder(
+  fs: Pick<WorkspaceFs, 'stat' | 'readdir'>,
+  sessionDir: string
+): Promise<string[]> {
+  const gitDirs: string[] = []
+  for (const clone of await sessionClonesUnder(fs, sessionDir)) {
+    const gitDir = join(clone.path, '.git')
+    if ((await fs.stat(gitDir)) === 'dir') gitDirs.push(gitDir)
+  }
+  return gitDirs
+}
+
+/** Whether `path` is a directory in its own right — never a symlink to one. */
+export function isRealDir(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+/** Real (never symlinked) child directories whose names are legal repository segments, sorted. */
+function realDirEntries(dir: string): string[] {
+  if (!isRealDir(dir)) return []
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && isRepoSegment(entry.name))
+      .map((entry) => entry.name)
+      .sort()
+  } catch {
+    return []
+  }
+}
+
+/** Whether the agent has any session directory at all — the cheap prefilter the retention GC wants. */
+export function hasSessionsDirIn(agentRoot: string): boolean {
+  return existsSync(sessionsDirIn(agentRoot))
+}
+
+/** The worktree id a session directory's leaf carries (`session-<id>`, as sessionKeyDirName names it), else undefined. */
+export function sessionLeafId(leaf: string): string | undefined {
+  return /^session-([a-f0-9]{24})$/.exec(leaf)?.[1]
+}
+
+/** Every session directory ON DISK under `<agentRoot>/sessions`, by leaf name, sorted; symlinks are skipped. */
+export function sessionDirsIn(agentRoot: string): { leaf: string; path: string }[] {
+  const parent = sessionsDirIn(agentRoot)
+  if (!isRealDir(parent)) return []
+  try {
+    return readdirSync(parent, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => ({ leaf: entry.name, path: join(parent, entry.name) }))
+      .sort((a, b) => (a.leaf < b.leaf ? -1 : a.leaf > b.leaf ? 1 : 0))
+  } catch {
+    return []
+  }
+}

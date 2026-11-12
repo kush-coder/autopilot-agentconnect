@@ -1,0 +1,1636 @@
+/**
+ * `RelayIngressManager` (shared-bot-relay.md §10 / §12) — glues the CP's HTTP-bot
+ * control frames (`rc/bot-assign` / `rc/bot-unassign` / `rc/routes` / `rc/assign`)
+ * to the ingest lifecycle, arbitration ({@link BotArbitrationRouter}), and forwarding
+ * onto the target daemon (`rd/msg` `im`).
+ *
+ * Flow: `rc/bot-assign` loads the bot's inbound routing + credentials; inbound
+ * arrives via the public Slack or Feishu callback routes, which authenticate,
+ * normalize, arbitrate, and forward to the resolved daemon as a pre-addressed
+ * `rd/msg(im)`. A daemon that is offline / has no connection here is a TYPED
+ * delivery miss → bounded-loss drop + count (never a silent success, §17).
+ *
+ * Affinity (§10 step 3, the 3-leg dance): on the FIRST route of a (channel, thread)
+ * `sessionKey` (or a Switch-agent) the manager REPORTS it to the CP (`rc/thread-assign`);
+ * on an un-mentioned follow-up it has no cached affinity for, it PULLS the persisted
+ * owner from the CP (`rc/thread-lookup`) rather than dropping the message.
+ */
+import {
+  hasReachedAgentCallHopLimit,
+  MAX_AGENT_CALL_HOPS,
+  RD_AGENT_IMPLICIT_ROUTING_V1,
+  DECISION_ROUTING_V1_FEATURE,
+  DECISION_TRIGGER_V1_FEATURE,
+  RD_ACK_NOT_HOLDER,
+  RD_IM_ADMISSION_V1
+} from '@agentconnect.md/protocol'
+import { parseCommand } from '@agentconnect.md/activation-policy'
+import { commandText } from '@agentconnect.md/message'
+import type {
+  RdMsg,
+  RdRoute,
+  RdRouteAck,
+  RdRouteReason,
+  RdRouteReport,
+  RdPlatformReply,
+  RdPlatformRequest,
+  RdRouteReportAck,
+  RdAck,
+  RdMsgIm,
+  RcBotChannels,
+  RcBotConversation,
+  RcBotCredentialCheck,
+  RcBotRevoked,
+  RcBotTenant,
+  RcDeploymentConfig,
+  WireNormalizedMessage,
+  RcThreadAssign,
+  RcThreadParticipant,
+  RcThreadLookup
+} from '@agentconnect.md/protocol'
+import type { Clock } from '@agentconnect.md/connection'
+import type { Logger } from './log.js'
+import {
+  BotArbitrationRouter,
+  explicitlyAddressesBot,
+  sessionKeyOf,
+  type BotAssignment,
+  type RouteTarget,
+  type RoutesPatch
+} from './bot-arbitration.js'
+import { DemuxIndex, IngressPool, relayIngressPlugins } from './platforms/registry.js'
+import type {
+  HandledDelivery,
+  RelayAdmission,
+  RelayBotIngress,
+  RelayCredentialCheck,
+  RelayForwardOutcome,
+  RelayIngressHost,
+  RelayIngressSidecar,
+  RelayPlatformIngressPlugin
+} from './platforms/contract.js'
+import { SlackEventDedup } from './slack-event-dedup.js'
+import { admissionFrom, createRouteForwarder, type RouteForward } from './route-forwarder.js'
+import type { RelayDaemonConnection } from './relay-daemon-connection.js'
+
+const rejected = (reason: RdRouteReason): RelayAdmission => ({ disposition: 'rejected', reason })
+const retry = (reason: RdRouteReason): RelayAdmission => ({ disposition: 'retry', reason })
+
+/** The strict reading of one ack: `accepted` with no verdict took the shared best-effort path, which a platform answering from admission must not. */
+function strictAdmissionFrom(ack: RdAck): RelayAdmission {
+  return ack.accepted && ack.routeAdmission === undefined ? rejected('unsupported') : admissionFrom(ack)
+}
+
+/** The best-effort reading of one ack: an `accepted` with no verdict took the message, so a resend must not reach that target again. */
+function bestEffortAdmissionFrom(ack: RdAck): RelayAdmission {
+  return ack.accepted && ack.routeAdmission === undefined ? { disposition: 'admitted' } : admissionFrom(ack)
+}
+
+/** One delivery's verdict over its fan-out: one admission settles it, else one retry does, else the first rejection. */
+export function aggregateAdmission(verdicts: readonly RelayAdmission[]): RelayAdmission {
+  return (
+    verdicts.find((v) => v.disposition === 'admitted') ??
+    verdicts.find((v) => v.disposition === 'retry') ??
+    verdicts[0] ??
+    rejected('rejected')
+  )
+}
+
+/** Cap on the learned `api_app_id → botId` demux index before it is flushed. */
+/** Cap on the retry buffer for thread-assign reports dropped while the CP link was
+ *  down. Bounded so a long CP outage can't grow it without limit; oldest-cleared. */
+const MAX_PENDING_REPORTS = 10_000
+
+/** Backoff (5s → 60s) re-sending an unacknowledged revocation or check on a READY link, since a retryable CP error keeps the socket and `onReady` never fires. */
+const ACK_RETRY_INITIAL_MS = 5_000
+const ACK_RETRY_MAX_MS = 60_000
+
+/** Default interval between periodic credential probes of one bot. */
+const CREDENTIAL_PROBE_INTERVAL_MS = 3_600_000
+/** Each later probe lands at the interval ± this fraction, so a pod's bots drift apart. */
+const CREDENTIAL_PROBE_JITTER = 0.1
+/** How many answered messages the §14.3 notice latch remembers before dropping the oldest. */
+const GATED_NOTICE_LATCH_LIMIT = 10_000
+
+/** Provably-older ordering between two revoke reports for one bot: by credential
+ *  generation first, then by Slack's occurrence time when the generations agree
+ *  (or are absent — a legacy bot carries neither). "Not provably older" preserves
+ *  arrival order, which is all an unfenced report has. */
+function isOlderRevokeReport(incoming: RcBotRevoked, queued: RcBotRevoked): boolean {
+  if (
+    incoming.credentialRevision !== undefined &&
+    queued.credentialRevision !== undefined &&
+    incoming.credentialRevision !== queued.credentialRevision
+  ) {
+    return incoming.credentialRevision < queued.credentialRevision
+  }
+  // Same generation (or none to compare). A report WITHOUT an occurrence time is
+  // the STRONGER claim, not a degenerate one: the auth.test dead-credential
+  // backstop deliberately reports the exact current revision with no eventAtMs —
+  // "this credential is dead NOW" — which passes the CP's time arm
+  // unconditionally, while a timestamped lifecycle event of the same generation
+  // may still be refused as predating the credential. Never let the weaker,
+  // refusable report displace it; equal strength keeps arrival order.
+  if (queued.eventAtMs === undefined) return incoming.eventAtMs !== undefined
+  if (incoming.eventAtMs === undefined) return false
+  return incoming.eventAtMs < queued.eventAtMs
+}
+
+export interface RelayIngressManagerDeps {
+  /** A live `rd/*` connection to a daemon on THIS relay, or undefined if none. */
+  getDaemon: (daemonId: string) => RelayDaemonConnection | undefined
+  /** Persist a channel's default agent chosen in the config modal (→ CP `rc/set-channel-agent`). */
+  setChannelAgent: (botId: string, channelId: string, agentId: string) => void
+  /** Report the authoritative HTTP Slack channel-membership snapshot to the CP.
+   *  Returns false when the CP link is down so the latest snapshot can be retried. */
+  reportBotChannels: (m: RcBotChannels) => boolean
+  /** Report one observed direct conversation to the CP (→ `rc/bot-conversation`).
+   *  Best-effort: loss self-heals on the counterpart's next DM. */
+  reportBotConversation: (m: RcBotConversation) => boolean
+  /** Report a workspace uninstall / token revocation (→ `rc/bot-revoked`) so the CP
+   *  marks the Bot + its installs revoked. Returns `false` when the CP link wasn't
+   *  READY, so the manager can retry on reconnect ({@link
+   *  RelayIngressManager.flushPendingReports}) — this report is NOT droppable: Slack
+   *  acked the HTTP event before this ran and never redelivers it, and a dead token
+   *  gives the CP nothing to observe. */
+  reportBotRevoked: (m: RcBotRevoked) => Promise<boolean>
+  /** Report a probe answer that does not revoke (→ `rc/bot-credential-check`) and wait for the CP's reply; `false` keeps it queued. */
+  reportBotCredentialCheck: (m: RcBotCredentialCheck) => Promise<boolean>
+  /** Whether the CP this relay last registered with advertised `bot-credential-check-v2` (kept while the link is down). */
+  credentialCheckSupported: () => boolean
+  /** Report a tenant key a single-tenant row learned (→ `rc/bot-tenant`) and wait for the CP's reply; `false` keeps it queued. */
+  reportBotTenant: (m: RcBotTenant) => Promise<boolean>
+  /** Whether the CP this relay last registered with advertised `bot-tenant-v1`; without it the fence stays in memory alone. */
+  tenantReportSupported: () => boolean
+  /** Interval between periodic credential probes of each bot; defaults to one hour. */
+  credentialProbeIntervalMs?: number
+  /** Randomness for the probe schedule's first offset and jitter; defaults to `Math.random`. */
+  random?: () => number
+  /** Report the thread's now-resolved owner to the CP (→ `rc/thread-assign`). Returns
+   *  `false` if the CP link was not READY and the frame was dropped, so the manager can
+   *  retry it when the link recovers ({@link RelayIngressManager.flushPendingReports}). */
+  reportThreadAssign: (m: RcThreadAssign) => boolean
+  /** Persist one joined participant without changing the compatibility owner. */
+  reportThreadParticipant: (m: RcThreadParticipant) => boolean
+  /** Pull a thread's persisted owner from the CP on an affinity miss (→ `rc/thread-lookup`). */
+  lookupThread: (m: RcThreadLookup) => Promise<import('@agentconnect.md/protocol').RcThreadLookupOk>
+  /** This pod's CP-assigned relayId (stable pool identity; undefined before the
+   *  first register) — compared against the assignment's §14.3 noticeAuthority. */
+  selfRelayId: () => string | undefined
+  /** True when `targetAgentId`'s bot in this channel IS the app that sent the message.
+   *  Two uses: recognizing AgentConnect-authored traffic at all, and — with the author's
+   *  own id — proving that a claimed author is one of the agents that app represents
+   *  (send-message-routing-rework.md §4 condition 3). */
+  isAgentBotApp: (targetAgentId: string, platform: string, channelId: string, appId: string) => boolean
+  /** The directional agent-call policy (caller outbound ∧ target inbound, one org), from
+   *  the relay's own collaboration snapshot. Every author→target edge of a verified
+   *  agent-authored message is checked independently through this (§5 closing paragraph);
+   *  the carried recipient set is a claim until each edge passes CURRENT policy. */
+  admitsAgentCall: (callerAgentId: string, targetAgentId: string) => boolean
+  /** Clock for the inbound Slack HMAC replay window (`resolveVerified`). */
+  clock: Clock
+  log: Logger
+}
+
+/** One registered platform's live state: its plugin, its pool of per-bot
+ *  ingests, and its demux identity index. The pool holds ONLY ingests this
+ *  plugin built, which is what lets core hand a pooled ingest straight back to
+ *  `plugin.verify` / `plugin.handle` through the erased `RelayBotIngress`
+ *  bound — core never reads a `TIngest`'s internals (§8). */
+interface RelayPlatformEntry {
+  plugin: RelayPlatformIngressPlugin
+  pool: IngressPool<RelayBotIngress>
+  demux: DemuxIndex
+}
+
+export class RelayIngressManager {
+  private readonly router = new BotArbitrationRouter()
+  /**
+   * §8 registry (S3): one entry per REGISTERED platform — its plugin, one pool
+   * of per-bot ingests, and one demux identity index. Adding a platform adds
+   * one line to `platforms/registry.ts`; no method here grows a branch, and no
+   * method here names a platform.
+   *
+   * Every lifecycle edge reads this map: assign builds through it, inbound
+   * demuxes through it, and teardown/shutdown iterate it (audit F2/F3/F4 —
+   * before that, three of them named `slackPool`/`feishuPool` directly and a
+   * third platform's ingest was never stopped, its pool entry never dropped,
+   * and its demux entries never forgotten).
+   *
+   * The index owns the composite/app-only decision per ASSIGNMENT shape
+   * (tenant-scoped ⇒ composite only, never learned; app-only ⇒ learnable) —
+   * see platforms/registry.ts.
+   */
+  private readonly ingressPlugins: ReadonlyMap<string, RelayPlatformEntry>
+  /** Core's side of the §8 contract — what a plugin's ingest may call back
+   *  into. Every member maps onto the same manager/router machinery the
+   *  pre-plugin callbacks used; nothing here is platform-shaped. */
+  private get ingressHost(): RelayIngressHost {
+    return (this.ingressHostMemo ??= this.buildIngressHost())
+  }
+  private ingressHostMemo?: RelayIngressHost
+  private buildIngressHost(): RelayIngressHost {
+    return {
+      forward: (botId, message, sidecar) => this.forward(botId, message, sidecar),
+      forwardStrict: (botId, message, sidecar) => this.forwardStrict(botId, message, sidecar),
+      forwardAction: async (msg, route) => {
+        // An interaction is as pre-addressed as an `rd/msg` and its recorded member is
+        // as likely to have handed the duty on, so it takes the SAME rendezvous path:
+        // one `not_holder` re-route, and a refusal counted as the drop it is.
+        const context = `relay-ingress(${msg.botId}) interaction`
+        const daemon = this.deps.getDaemon(route.daemonId)
+        if (!daemon) {
+          return this.dropUnrouted(msg.botId, `${context}: daemon ${route.daemonId} is not on this relay`, {
+            msgId: msg.msgId,
+            accepted: false,
+            reason: 'offline'
+          })
+        }
+        return this.sendWithRendezvous(daemon, msg, msg.botId, context)
+      },
+      reportChannels: (snapshot) => this.reportChannels(snapshot),
+      reportRevoked: (botId, revocation, credentialRevision) => {
+        // The revision is the OBSERVING assignment's, captured by the plugin at buildIngest.
+        this.reportRevoked({
+          botId,
+          reason: revocation.reason,
+          evidence: revocation.evidence,
+          ...(credentialRevision !== undefined ? { credentialRevision } : {}),
+          ...(revocation.eventAtMs !== undefined ? { eventAtMs: revocation.eventAtMs } : {}),
+          ...(revocation.code !== undefined ? { code: revocation.code } : {})
+        })
+      },
+      reportCredentialCheck: (botId, check, credentialRevision) =>
+        this.reportCredentialCheck(botId, check, credentialRevision),
+      credentialCheckSupported: () => this.deps.credentialCheckSupported(),
+      reportTenant: (botId, tenantId) => this.reportTenant({ botId, tenantId }),
+      directory: {
+        agents: (botId) => this.router.get(botId)?.agents ?? [],
+        channelOwner: (botId, channelId) => this.router.channelOwner(botId, channelId),
+        targetForAgentId: (botId, agentId) => this.router.targetForAgentId(botId, agentId),
+        resolveTarget: (botId, coords) => this.resolveConversationTarget(botId, coords),
+        resolveBoundTarget: (botId, sessionKey) => this.resolveBoundTarget(botId, sessionKey),
+        conversationParticipants: (botId, coords) =>
+          this.router.conversationParticipants(
+            botId,
+            sessionKeyOf({ channel: coords.channelId, thread: coords.threadTs }),
+            coords.channelId
+          ),
+        targetForAgent: (botId, agentId, integrationId) => this.router.targetForAgent(botId, agentId, integrationId),
+        integrationTarget: (botId, agentId, integrationId) =>
+          this.router.integrationTarget(botId, agentId, integrationId),
+        soleTarget: (botId) => this.router.soleTarget(botId)
+      },
+      dedupSeen: (identity) => this.eventDedup.seen(identity),
+      dedupPeek: (identity) => this.eventDedup.peek(identity),
+      dedupMark: (identity) => this.eventDedup.mark(identity),
+      canDeliver: (route) => this.deps.getDaemon(route.daemonId) !== undefined,
+      setChannelAgent: (botId, channelId, agentId) => this.deps.setChannelAgent(botId, channelId, agentId),
+      selectThreadAgent: (botId, channelId, threadTs, agentId) =>
+        this.selectThreadAgent(botId, channelId, threadTs, agentId),
+      reportBotUserId: (botId, botUserId) => this.router.setBotUserId(botId, botUserId),
+      publicRelayUrl: () => this.publicRelayUrl,
+      webAppUrl: () => this.webAppUrl,
+      clock: { now: () => this.deps.clock.now() },
+      log: this.deps.log
+    }
+  }
+
+  /** Bots a plugin derived from the CP's deployment snapshot: the CP holds no row for them, so they route and report nothing. */
+  private readonly deploymentBots = new Set<string>()
+  /** The relay pool's public origin from the latest deployment snapshot. */
+  private publicRelayUrl: string | undefined
+  private webAppUrl: string | undefined
+  /** The host a deployment-owned ingest gets: every forward is refused and every report to the CP is dropped. */
+  private get deploymentHost(): RelayIngressHost {
+    return (this.deploymentHostMemo ??= {
+      ...this.ingressHost,
+      forward: async () => 'refused',
+      forwardStrict: async () => rejected('rejected'),
+      forwardAction: async (msg) => ({ msgId: msg.msgId, accepted: false, reason: 'offline' }),
+      reportChannels: () => {},
+      reportRevoked: () => {},
+      reportCredentialCheck: () => {},
+      reportTenant: () => {},
+      setChannelAgent: () => {},
+      selectThreadAgent: () => {}
+    })
+  }
+  private deploymentHostMemo?: RelayIngressHost
+  private hostFor(botId: string): RelayIngressHost {
+    return this.deploymentBots.has(botId) ? this.deploymentHost : this.ingressHost
+  }
+
+  /** Replace the deployment-owned assignments with those the plugins derive from `snapshot`; run on every registration, as bot assignments are replayed then too. */
+  async applyDeploymentSnapshot(snapshot: RcDeploymentConfig | undefined): Promise<void> {
+    this.publicRelayUrl = snapshot?.publicRelayUrl
+    this.webAppUrl = snapshot?.webAppUrl
+    const next = new Map<string, BotAssignment>()
+    for (const { plugin } of this.ingressPlugins.values()) {
+      for (const a of plugin.deploymentAssignments?.(snapshot) ?? []) next.set(a.botId, a)
+    }
+    for (const botId of [...this.deploymentBots]) {
+      if (next.has(botId)) continue
+      await this.unassign(botId)
+      this.deploymentBots.delete(botId)
+    }
+    for (const a of next.values()) {
+      this.deploymentBots.add(a.botId)
+      await this.assign(a)
+    }
+  }
+
+  /** Event-identity dedup — the CORE-owned table of §8's split (the plugin
+   *  mints the identity). One table serves every platform's pool; identities
+   *  are platform-prefixed by construction (their envelope fields differ). */
+  private get eventDedup(): SlackEventDedup {
+    return (this.eventDedupMemo ??= new SlackEventDedup(this.deps.clock))
+  }
+  private eventDedupMemo?: SlackEventDedup
+
+  /** Bounded-loss counters (per bot) — messages dropped because no daemon connection. */
+  private readonly dropped = new Map<string, number>()
+  /** Thread-assign reports dropped because the CP link wasn't READY, keyed
+   *  `botId\0sessionKey` (latest target wins). Re-emitted on reconnect via
+   *  {@link flushPendingReports}; without this a report lost during a CP blip would
+   *  never persist and un-mentioned follow-ups on other pods would drop permanently. */
+  private readonly pendingReports = new Map<string, RcThreadAssign>()
+  private readonly pendingParticipantReports = new Map<string, RcThreadParticipant>()
+  /** Latest bot-level channel snapshot dropped while the CP link was down. A full
+   *  snapshot supersedes any older one for the same bot. */
+  private readonly pendingChannelReports = new Map<string, RcBotChannels>()
+  /** Revocation reports the CP link wasn't up for, keyed by botId (one bot revokes
+   *  once; a later report for the same bot supersedes). Unlike the other queues
+   *  this one is not merely an optimization: Slack already acked the HTTP event
+   *  and will never redeliver it, and no CP-side probe can discover a dead token,
+   *  so a dropped report leaves the console showing an uninstalled app as active
+   *  forever. Flushed on READY by {@link flushPendingReports}. */
+  private readonly pendingRevokedReports = new Map<string, RcBotRevoked>()
+  /** The latest unacknowledged credential check per bot, replayed across reconnects until the CP replies. */
+  private readonly pendingCredentialChecks = new Map<string, RcBotCredentialCheck>()
+  /** Learned tenant keys (`botId\0tenantId`) the CP has not acknowledged yet; at-least-once, the CP deduplicates. */
+  private readonly pendingTenantReports = new Map<string, RcBotTenant>()
+  /** The last check this relay reported per bot since its (re)assign or CP registration (`revision\0result\0code`), so only a change is sent. */
+  private readonly lastCredentialChecks = new Map<string, string>()
+  /** Each pooled ingest's next periodic credential probe. */
+  private readonly credentialProbeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** §14.3 notices already answered (`botId:msgId`), so a message's second event copy on this pod posts nothing more. */
+  private readonly gatedNoticesSent = new Set<string>()
+  /** Per-conversation direct-report latch (`botId:channel`) — scoped to the CURRENT
+   *  bot assignment. Rows belong to the installs of that moment. */
+  private readonly observedConversationsReported = new Set<string>()
+
+  private clearConversationReportLatches(botId: string): void {
+    const prefix = `${botId}:`
+    for (const k of [...this.observedConversationsReported]) {
+      if (k.startsWith(prefix)) this.observedConversationsReported.delete(k)
+    }
+  }
+
+  /**
+   * @param plugins The platform set this manager serves. Defaults to the static
+   *   registry — production never passes it. Tests inject a synthetic platform
+   *   to prove the lifecycle is registry-driven rather than slack+feishu-shaped,
+   *   which is the only way to catch an F2/F3/F4 regression: a suite built from
+   *   the two real platforms passes against the hand-named version too.
+   */
+  constructor(
+    private readonly deps: RelayIngressManagerDeps,
+    plugins: readonly RelayPlatformIngressPlugin[] = relayIngressPlugins
+  ) {
+    this.ingressPlugins = new Map(
+      plugins.map((plugin) => [
+        plugin.platformId,
+        { plugin, pool: new IngressPool<RelayBotIngress>(plugin.platformId), demux: new DemuxIndex() }
+      ])
+    )
+    this.routeForward = createRouteForwarder({
+      ingress: {
+        hostFor: (botId, channel) => this.router.evaluationDaemonIdFor(botId, channel),
+        routed: (botId, msg) => this.router.routedConversationFor(botId, msg),
+        targetFor: (botId, agentId, channel) => this.router.agentTarget(botId, agentId, channel)
+      },
+      daemons: (daemonId) => this.deps.getDaemon(daemonId),
+      sendWithRendezvous: (daemon, rd, botId, context) => this.sendWithRendezvous(daemon, rd, botId, context),
+      log: this.deps.log
+    })
+  }
+
+  private readonly routeForward: RouteForward
+
+  /** `rd/route` from an evaluation host: deliver one frozen target of its selection (message-intake.md §6 step 6). */
+  async handleRoute(fromDaemonId: string, route: RdRoute): Promise<RdRouteAck> {
+    return await this.routeForward(fromDaemonId, route)
+  }
+
+  /** `rd/platform/request`: a provider call for a bot the requesting daemon serves, answered by the bot's platform plugin; anything else is refused. */
+  async handlePlatformRequest(fromDaemonId: string, req: RdPlatformRequest): Promise<RdPlatformReply> {
+    const plugin = this.ingressPlugins.get(req.platformId)?.plugin
+    if (!plugin?.daemonRequest) return { outcome: 'refused', reason: 'unsupported' }
+    // This relay's assignments may trail another's or the CP's, so both refusals are worth a retry elsewhere or later.
+    const assignment = this.deploymentBots.has(req.botId) ? undefined : this.router.get(req.botId)
+    if (!assignment || assignment.platform !== req.platformId)
+      return { outcome: 'refused', reason: 'unknown_bot', retryable: true }
+    if (!assignment.members.some((m) => m.daemonId === fromDaemonId))
+      return { outcome: 'refused', reason: 'not_member', retryable: true }
+    return await plugin.daemonRequest(assignment, req.payload)
+  }
+
+  /** `rd/route/report` from the host: the owner (only where none exists) and admitted participants, via the CP legs. */
+  applyRouteReport(fromDaemonId: string, report: RdRouteReport): RdRouteReportAck {
+    const { botId, sessionKey, channel } = report
+    if (this.router.evaluationDaemonIdFor(botId, channel) !== fromDaemonId)
+      return { accepted: false, reason: 'not_host' }
+    let ownerReported: string | undefined
+    if (report.owner) {
+      const owner = this.router.agentTarget(botId, report.owner.agentId, channel)
+      if (owner && !this.router.peekAffinity(botId, sessionKey)) {
+        this.router.setAffinity(botId, sessionKey, owner)
+        // The CP's thread-assign handler also records the owner as a participant.
+        this.report({ botId, sessionKey, agentId: owner.agentId, daemonId: owner.daemonId })
+        ownerReported = owner.agentId
+      } else if (owner) {
+        this.router.setParticipant(botId, sessionKey, owner)
+        this.reportParticipant(botId, sessionKey, owner)
+      }
+    }
+    for (const participant of report.participants) {
+      if (participant.agentId === ownerReported || participant.agentId === report.owner?.agentId) continue
+      const current = this.router.agentTarget(botId, participant.agentId, channel)
+      if (!current) continue
+      this.router.setParticipant(botId, sessionKey, current)
+      this.reportParticipant(botId, sessionKey, current)
+    }
+    return { accepted: true }
+  }
+
+  /** The one copy of a routed human message, to its evaluation host with the constraint and directory. */
+  private async forwardRoutedToHost(
+    botId: string,
+    msg: WireNormalizedMessage,
+    sidecar: RelayIngressSidecar | undefined,
+    routed: { decisionId: string; evaluationDaemonId: string },
+    strict: boolean
+  ): Promise<RelayAdmission> {
+    const sessionKey = sessionKeyOf(msg)
+    // Counted as the bounded loss it is for `forward`; the strict verdict says whether a resend can still land.
+    const drop = (why: string, verdict: RelayAdmission): RelayAdmission => {
+      const n = (this.dropped.get(botId) ?? 0) + 1
+      this.dropped.set(botId, n)
+      this.deps.log.warn(`relay-ingress(${botId}): routed ${msg.msgId} dropped — ${why} (dropped ${n})`)
+      return verdict
+    }
+    // A reply in a thread this relay knows nobody in asks the CP first, so its participants constrain it.
+    if (this.router.routedThreadNeedsLookup(botId, msg)) {
+      let lookup: Awaited<ReturnType<RelayIngressManagerDeps['lookupThread']>>
+      try {
+        lookup = await this.deps.lookupThread({ botId, sessionKey })
+      } catch {
+        return drop('thread lookup unavailable', retry('not_ready')) // §10.2 bounded loss; a mention re-anchors the thread.
+      }
+      for (const participant of lookup.participants) {
+        const current = this.router.agentTarget(botId, participant.agentId, msg.channel)
+        if (current && current.daemonId === participant.daemonId) this.router.setParticipant(botId, sessionKey, current)
+      }
+      if (lookup.target) this.router.seedLookupTarget(botId, sessionKey, lookup.target)
+      if (!lookup.target && lookup.participants.length === 0) this.router.rememberNoAffinity(botId, sessionKey)
+    }
+    const host = this.deps.getDaemon(routed.evaluationDaemonId)
+    // Never per-candidate delivery: an unavailable host is backpressure, not permission to classify elsewhere.
+    if (!host) return drop(`evaluation host ${routed.evaluationDaemonId} is not on this relay`, retry('offline'))
+    if (!host.supports(DECISION_ROUTING_V1_FEATURE))
+      return drop(`host ${routed.evaluationDaemonId} predates routing`, rejected('unsupported'))
+    if (strict && !host.supports(RD_IM_ADMISSION_V1))
+      return drop(`host ${routed.evaluationDaemonId} predates strict admission`, rejected('unsupported'))
+    const carrier = this.router.hostCarrier(botId, msg.channel, routed.evaluationDaemonId)
+    if (!carrier) return drop(`no member of this bot on host ${routed.evaluationDaemonId}`, rejected('not_member'))
+    const assignment = this.router.get(botId)
+    const namesBot = explicitlyAddressesBot(assignment, msg)
+    const relayId = this.deps.selfRelayId()
+    const rd: RdMsgIm = {
+      source: 'im',
+      agentId: carrier.agentId,
+      sessionKey,
+      msgId: msg.msgId,
+      botId,
+      integrationId: carrier.integrationId,
+      chatId: msg.channel,
+      payload: msg,
+      ...(sidecar?.searchActionToken ? { searchActionToken: sidecar.searchActionToken } : {}),
+      decisionId: routed.decisionId,
+      trustedRouteVia: namesBot || msg.isDm ? 'mention' : 'implicit',
+      trustedRouting: {
+        evaluationDaemonId: routed.evaluationDaemonId,
+        decisionId: routed.decisionId,
+        constraint: this.router.routedConstraint(botId, msg),
+        candidates: this.router.routedCandidates(botId, msg.channel),
+        ...(relayId ? { relayId } : {})
+      }
+    }
+    try {
+      const ack = await this.sendWithRendezvous(host, rd, botId, `relay-ingress(${botId}) routed`)
+      if (!ack.accepted) this.deps.log.warn(`relay-ingress(${botId}): host refused routed ${msg.msgId} (${ack.reason})`)
+      return (strict ? strictAdmissionFrom : bestEffortAdmissionFrom)(ack)
+    } catch (err) {
+      return drop(`forward to host failed: ${(err as Error).message}`, retry('offline'))
+    }
+  }
+
+  /** Emit a thread-assign report; on a non-READY CP link stash it for retry. */
+  private report(m: RcThreadAssign): void {
+    const key = `${m.botId}\u0000${m.sessionKey}`
+    if (this.deps.reportThreadAssign(m)) {
+      this.pendingReports.delete(key)
+    } else {
+      if (this.pendingReports.size >= MAX_PENDING_REPORTS) this.pendingReports.clear()
+      this.pendingReports.set(key, m)
+    }
+  }
+
+  private reportParticipant(botId: string, sessionKey: string, target: RouteTarget): void {
+    const report: RcThreadParticipant = {
+      botId,
+      sessionKey,
+      agentId: target.agentId,
+      daemonId: target.daemonId
+    }
+    const key = `${botId}\u0000${sessionKey}\u0000${target.agentId}`
+    if (this.deps.reportThreadParticipant(report)) this.pendingParticipantReports.delete(key)
+    else {
+      if (this.pendingParticipantReports.size >= MAX_PENDING_REPORTS) this.pendingParticipantReports.clear()
+      this.pendingParticipantReports.set(key, report)
+    }
+  }
+
+  private reportHumanParticipant(
+    botId: string,
+    sessionKey: string,
+    channel: string,
+    primary: RouteTarget | null,
+    target: RouteTarget
+  ): void {
+    // A non-auto primary is persisted by the legacy owner report, whose CP handler
+    // also records it as a participant. Auto channels deliberately skip owner
+    // affinity, so their participant membership still needs its own durable report.
+    if (
+      primary?.agentId === target.agentId &&
+      primary.daemonId === target.daemonId &&
+      !this.router.channelAutoOwned(botId, channel)
+    ) {
+      return
+    }
+    this.reportParticipant(botId, sessionKey, target)
+  }
+
+  private reportChannels(m: RcBotChannels): void {
+    if (this.deps.reportBotChannels(m)) this.pendingChannelReports.delete(m.botId)
+    else this.pendingChannelReports.set(m.botId, m)
+  }
+
+  /** Backoff timer re-driving unacknowledged revocations and credential checks on a READY link; armed while either queue is non-empty. */
+  private ackRetryTimer: ReturnType<typeof setTimeout> | undefined
+  private ackRetryDelayMs = ACK_RETRY_INITIAL_MS
+
+  /** Report a revocation and keep it queued until the CP ACKNOWLEDGES the commit.
+   *  Queued FIRST, cleared only on the ack: a send the socket accepted is not
+   *  evidence the CP persisted anything, and this report has no other source. */
+  private reportRevoked(m: RcBotRevoked): void {
+    // Arrival order must not choose the sole durable report: Slack lifecycle
+    // events are unordered, so a DELAYED pre-reinstall event can land while the
+    // current generation's report sits queued on a transient failure. Letting it
+    // replace the entry would hand the queue to a report whose terminal
+    // `applied:false` then clears it — losing the live revocation entirely. An
+    // older report is also worthless on its own: the newer queued one subsumes
+    // it, and the CP's fence would refuse it anyway.
+    const queued = this.pendingRevokedReports.get(m.botId)
+    if (queued && isOlderRevokeReport(m, queued)) {
+      this.deps.log.warn(
+        `relay-ingress(${m.botId}): dropping out-of-order revoke report (an at-least-as-new one is queued)`
+      )
+      return
+    }
+    this.pendingRevokedReports.set(m.botId, m)
+    void this.deps
+      .reportBotRevoked(m)
+      .then((committed) => {
+        // Clear ONLY when the queued entry is still exactly the report this ack
+        // answers. A reinstall + second revoke can replace the entry while this
+        // one is in flight — deleting by botId alone would erase that NEWER
+        // report, and with it the only signal its dead credential ever produces.
+        if (committed && this.pendingRevokedReports.get(m.botId) === m) {
+          this.pendingRevokedReports.delete(m.botId)
+          this.resetAckRetryIfDrained()
+        }
+      })
+      .catch(() => {
+        /* stays queued — the finally below arms the retry */
+      })
+      .finally(() => this.armAckRetry())
+  }
+
+  /** Report a probe answer that does not revoke, once per change for the probed revision, and keep it queued until the CP replies. */
+  private reportCredentialCheck(botId: string, check: RelayCredentialCheck, credentialRevision?: number): void {
+    // The CP fences a check on its revision, and an older CP would refuse the frame outright.
+    if (credentialRevision === undefined || !this.deps.credentialCheckSupported()) return
+    const held = this.router.get(botId)
+    // An unassigned bot, or an older ingest's late probe of a replaced credential, describes nothing this relay serves.
+    if (!held || (held.credentialRevision !== undefined && held.credentialRevision > credentialRevision)) return
+    const key = `${credentialRevision}\u0000${check.result}\u0000${check.result === 'rejected' ? check.code : ''}`
+    if (this.lastCredentialChecks.get(botId) === key) return
+    this.lastCredentialChecks.set(botId, key)
+    const m: RcBotCredentialCheck =
+      check.result === 'rejected'
+        ? { botId, credentialRevision, result: 'rejected', code: check.code, observedAtMs: check.observedAtMs }
+        : { botId, credentialRevision, result: 'ok', observedAtMs: check.observedAtMs }
+    this.pendingCredentialChecks.set(botId, m)
+    this.sendCredentialCheck(m)
+  }
+
+  /** Send one queued check; any CP reply (applied or not) settles it, while a missing one leaves it for the retry. */
+  private sendCredentialCheck(m: RcBotCredentialCheck): void {
+    if (!this.deps.credentialCheckSupported()) {
+      // A CP that stopped advertising checks gets none; its bot-assign replay re-probes under the fallback.
+      if (this.pendingCredentialChecks.get(m.botId) === m) this.pendingCredentialChecks.delete(m.botId)
+      this.resetAckRetryIfDrained()
+      return
+    }
+    void this.deps
+      .reportBotCredentialCheck(m)
+      .then((settled) => {
+        // Clear only this exact check: a newer one may have replaced it while this one was in flight.
+        if (settled && this.pendingCredentialChecks.get(m.botId) === m) {
+          this.pendingCredentialChecks.delete(m.botId)
+          this.resetAckRetryIfDrained()
+        }
+      })
+      .catch(() => {
+        /* stays queued — the finally below arms the retry */
+      })
+      .finally(() => this.armAckRetry())
+  }
+
+  /** Report a learned tenant key once and keep it queued until the CP replies; a CP without the feature gets none. */
+  private reportTenant(m: RcBotTenant): void {
+    if (!this.deps.tenantReportSupported()) return
+    const key = `${m.botId}\u0000${m.tenantId}`
+    if (this.pendingTenantReports.has(key)) return
+    this.pendingTenantReports.set(key, m)
+    this.sendTenantReport(key, m)
+  }
+
+  /** Send one queued tenant report; any CP reply settles it, while a missing one leaves it for the retry. */
+  private sendTenantReport(key: string, m: RcBotTenant): void {
+    if (!this.deps.tenantReportSupported()) {
+      this.pendingTenantReports.delete(key)
+      this.resetAckRetryIfDrained()
+      return
+    }
+    void this.deps
+      .reportBotTenant(m)
+      .then((settled) => {
+        if (settled && this.pendingTenantReports.get(key) === m) {
+          this.pendingTenantReports.delete(key)
+          this.resetAckRetryIfDrained()
+        }
+      })
+      .catch(() => {
+        /* stays queued — the finally below arms the retry */
+      })
+      .finally(() => this.armAckRetry())
+  }
+
+  private ackQueuesDrained(): boolean {
+    return (
+      this.pendingRevokedReports.size === 0 &&
+      this.pendingCredentialChecks.size === 0 &&
+      this.pendingTenantReports.size === 0
+    )
+  }
+
+  private resetAckRetryIfDrained(): void {
+    if (this.ackQueuesDrained()) this.ackRetryDelayMs = ACK_RETRY_INITIAL_MS
+  }
+
+  /** Arm the READY-link retry for whatever is still queued: one timer, bounded backoff, disarmed by drained queues and reset by `onReady`'s flush. */
+  private armAckRetry(): void {
+    if (this.ackRetryTimer || this.ackQueuesDrained()) return
+    const delay = this.ackRetryDelayMs
+    this.ackRetryDelayMs = Math.min(this.ackRetryDelayMs * 2, ACK_RETRY_MAX_MS)
+    this.ackRetryTimer = setTimeout(() => {
+      this.ackRetryTimer = undefined
+      for (const [, m] of [...this.pendingRevokedReports]) this.reportRevoked(m)
+      for (const [, m] of [...this.pendingCredentialChecks]) this.sendCredentialCheck(m)
+      for (const [key, m] of [...this.pendingTenantReports]) this.sendTenantReport(key, m)
+    }, delay)
+    // Never hold the process open for a retry timer.
+    this.ackRetryTimer.unref?.()
+  }
+
+  /** Arm `botId`'s next periodic credential probe `delayMs` from now; each run re-arms at the interval ± 10% before probing. */
+  private armCredentialProbe(botId: string, ingest: RelayBotIngress, delayMs: number): void {
+    const timer = setTimeout(() => {
+      if (this.credentialProbeTimers.get(botId) !== timer) return
+      this.armCredentialProbe(botId, ingest, this.credentialProbeDelay())
+      ingest.probeCredential?.().catch((err: unknown) => {
+        this.deps.log.warn(`relay-ingress(${botId}): credential probe failed: ${(err as Error).message}`)
+      })
+    }, delayMs)
+    // Never hold the process open for a probe.
+    timer.unref?.()
+    this.credentialProbeTimers.set(botId, timer)
+  }
+
+  private get credentialProbeIntervalMs(): number {
+    return this.deps.credentialProbeIntervalMs ?? CREDENTIAL_PROBE_INTERVAL_MS
+  }
+
+  /** The gap between two periodic probes of one bot: the interval ± 10%. */
+  private credentialProbeDelay(): number {
+    const random = this.deps.random ?? Math.random
+    return this.credentialProbeIntervalMs * (1 - CREDENTIAL_PROBE_JITTER + 2 * CREDENTIAL_PROBE_JITTER * random())
+  }
+
+  private clearCredentialProbe(botId: string): void {
+    const timer = this.credentialProbeTimers.get(botId)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    this.credentialProbeTimers.delete(botId)
+  }
+
+  /** On every CP registration (the client's onReady): re-emit each report queue, stopping at the first frame that still can't be sent, and reset the check latch. */
+  flushPendingReports(): void {
+    for (const [key, m] of [...this.pendingReports]) {
+      if (!this.deps.reportThreadAssign(m)) break
+      this.pendingReports.delete(key)
+    }
+    for (const [key, m] of [...this.pendingParticipantReports]) {
+      if (!this.deps.reportThreadParticipant(m)) break
+      this.pendingParticipantReports.delete(key)
+    }
+    for (const [botId, snapshot] of [...this.pendingChannelReports]) {
+      if (!this.deps.reportBotChannels(snapshot)) break
+      this.pendingChannelReports.delete(botId)
+    }
+    // Replayed AS OBSERVED — `credentialRevision`/`eventAtMs` still describe the
+    // generation that was live when Slack sent the event, which is exactly what
+    // the CP's fence needs after an outage that spanned a re-install. Async: each
+    // entry clears only when the CP acknowledges the commit, and a fresh link
+    // resets the READY-retry backoff.
+    this.ackRetryDelayMs = ACK_RETRY_INITIAL_MS
+    for (const [, m] of [...this.pendingRevokedReports]) this.reportRevoked(m)
+    for (const [, m] of [...this.pendingCredentialChecks]) this.sendCredentialCheck(m)
+    for (const [key, m] of [...this.pendingTenantReports]) this.sendTenantReport(key, m)
+    // The CP keeps one observation row per relay, and a sweep during an outage drops it with the relayId, so every bot reports afresh.
+    this.lastCredentialChecks.clear()
+  }
+
+  /** `rc/bot-assign` — (re)load the routing table + (re)build the bot's HTTP ingest. */
+  async assign(a: BotAssignment): Promise<void> {
+    const heldRevision = this.router.get(a.botId)?.credentialRevision
+    if (heldRevision !== undefined && a.credentialRevision !== undefined && a.credentialRevision < heldRevision) return
+    // A full (re)assignment can mean new installs. Stale report latches would starve
+    // a later install of its own configurable direct row.
+    this.clearConversationReportLatches(a.botId)
+    // The first probe after every (re)assign reports; a queued check of an older credential is moot.
+    this.lastCredentialChecks.delete(a.botId)
+    const queuedCheck = this.pendingCredentialChecks.get(a.botId)
+    if (queuedCheck && a.credentialRevision !== undefined && queuedCheck.credentialRevision < a.credentialRevision) {
+      this.pendingCredentialChecks.delete(a.botId)
+    }
+    this.router.upsert(a)
+    // Rebuild the ingest (secrets or transport may have rotated). Idempotent.
+    await this.stopIngest(a.botId)
+    if (this.router.get(a.botId) !== a) return
+    this.forgetDemux(a.botId)
+
+    // §8 plugin registry: the platform's plugin validates the assignment shape
+    // and builds the per-bot ingest; the demux index derives the identity scope
+    // from the assignment itself. An unregistered platform is refused with the
+    // same warn-and-skip the old else arm carried.
+    const entry = this.ingressPlugins.get(a.platform)
+    if (!entry) {
+      this.deps.log.warn(`relay-ingress(${a.botId}): platform '${a.platform}' ingest not yet supported (milestone C)`)
+      return
+    }
+    const ingest = entry.plugin.buildIngest(a, this.hostFor(a.botId))
+    if (!ingest) return
+    entry.pool.set(a.botId, ingest)
+    entry.demux.indexAssign(a.botId, {
+      ...(a.apiAppId ? { appId: a.apiAppId } : {}),
+      ...(a.teamId ? { tenantId: a.teamId } : {}),
+      ...(a.tenantIds ? { tenantIds: a.tenantIds } : {})
+    })
+    // The first periodic probe lands at a random point in the first interval, so a pod never probes every bot at once.
+    if (ingest.probeCredential) {
+      this.armCredentialProbe(a.botId, ingest, this.credentialProbeIntervalMs * (this.deps.random ?? Math.random)())
+    }
+    await (ingest as { start?: () => Promise<void> }).start?.()
+  }
+
+  /** `rc/routes` — hot-update routes/members/default WITHOUT re-opening the ingest. */
+  updateRoutes(botId: string, patch: RoutesPatch): void {
+    // A changed install set needs a fresh fan-out so every member gets the row.
+    const prev = (this.router.get(botId)?.agents ?? []).map((agent) => agent.integrationId ?? agent.agentId).sort()
+    const next = (patch.agents ?? []).map((agent) => agent.integrationId ?? agent.agentId).sort()
+    if (prev.length !== next.length || !prev.every((id, index) => id === next[index])) {
+      this.clearConversationReportLatches(botId)
+    }
+    this.router.updateRoutes(botId, patch)
+  }
+
+  /** `rc/bot-unassign` — drop the routes + close the ingest. */
+  async unassign(botId: string, credentialRevision?: number): Promise<void> {
+    // A revocation stamps the generation it revoked. If this pod already holds a
+    // NEWER assignment, the release describes a credential that has since been
+    // replaced — the CP decided and broadcast in that order, and a re-install's
+    // assign can overtake it. Dropping the stale release here is what keeps a
+    // live ingest alive; an unstamped release (transport flip, uninstall, last
+    // install removed) is unconditional as before.
+    const held = this.router.get(botId)?.credentialRevision
+    if (credentialRevision !== undefined && held !== undefined && held > credentialRevision) {
+      this.deps.log.warn(`relay-ingress(${botId}): ignoring stale unassign (rev ${credentialRevision} < held ${held})`)
+      return
+    }
+    this.clearConversationReportLatches(botId)
+    this.forgetDemux(botId)
+    this.router.remove(botId)
+    this.pendingCredentialChecks.delete(botId)
+    this.lastCredentialChecks.delete(botId)
+    await this.stopIngest(botId)
+  }
+
+  /** `rc/assign` — durable thread affinity seed. */
+  setAffinity(botId: string, sessionKey: string, tgt: RouteTarget): void {
+    this.router.setAffinity(botId, sessionKey, tgt)
+  }
+
+  /** `rc/participant-assign` — durable conversation-member seed. */
+  setParticipant(botId: string, sessionKey: string, tgt: RouteTarget): void {
+    this.router.setParticipant(botId, sessionKey, tgt)
+  }
+
+  /**
+   * §8 verify → handle: demux one inbound HTTP delivery to its bot,
+   * authenticate through the platform plugin, and hand the TYPED verified
+   * product to the plugin's handler. `undefined` ⇒ no assigned bot owns the
+   * delivery (the route answers 401).
+   *
+   * Core drives the ladder — assignment-derived index fast paths (composite
+   * exact first, then app-only), then the bounded scan the assignment's
+   * identity scope permits: a tenant-scoped bot may only serve its own tenant,
+   * because same-secret siblings would all verify and the envelope tenant id
+   * is the ONLY discriminator. The plugin owns the cryptography and everything
+   * after authentication.
+   */
+  async handleInbound(
+    platformId: string,
+    rawBody: Buffer,
+    body: unknown,
+    headers: Record<string, string | string[] | undefined>
+  ): Promise<HandledDelivery | undefined> {
+    const entry = this.ingressPlugins.get(platformId)
+    if (!entry) return undefined
+    const { plugin, pool, demux } = entry
+    const now = this.deps.clock.now()
+    const hints = plugin.extractDemuxHints(rawBody, body, headers)
+    const tryCandidate = async (botId: string | undefined) => {
+      const ingest = botId ? pool.get(botId) : undefined
+      if (!ingest || !this.tenantFencePasses(botId!, hints.tenantId)) return undefined
+      const verified = await plugin.verify(ingest, rawBody, body, headers, now)
+      return verified === undefined ? undefined : { botId: botId!, ingest, verified }
+    }
+    // Composite fast path — assign-derived, so a hit is exact (still verified).
+    let hit = hints.appId && hints.tenantId ? await tryCandidate(demux.resolve(hints)) : undefined
+    hit ??= hints.appId ? await tryCandidate(demux.resolve({ appId: hints.appId })) : undefined
+    if (!hit) {
+      for (const [botId, ingest] of pool.entries()) {
+        if (!this.tenantFencePasses(botId, hints.tenantId)) continue
+        const verified = await plugin.verify(ingest, rawBody, body, headers, now)
+        if (verified !== undefined) {
+          // Learn only the app-only mapping; the index itself refuses a
+          // tenant-scoped bot (registry.test.ts), keeping the invariant even if
+          // a future call site forgets this assignment check. What a learned
+          // entry can serve is bounded by the fence above, which is re-applied
+          // on every resolve through `tryCandidate`.
+          const owner = this.router.get(botId)
+          if (hints.appId && owner?.teamId === undefined && owner?.tenantIds === undefined)
+            demux.learn(hints.appId, botId)
+          hit = { botId, ingest, verified }
+          break
+        }
+      }
+    }
+    if (!hit) return undefined
+    return entry.plugin.handle(hit.ingest, hit.verified, this.hostFor(hit.botId))
+  }
+
+  /**
+   * The ingress tenant fence (ingress-tenant-fence.md §3): may a delivery from
+   * `deliveryTenant` be attributed to this bot at all?
+   *
+   * `plugin.verify` proves a delivery was signed with an app's signing secret —
+   * NOT that it came from the workspace this assignment belongs to. Those are
+   * different questions whenever one app's credentials live in two
+   * organizations, and a signature scan answers only the first. So every rung
+   * of the ladder asks this one before it accepts a candidate.
+   *
+   * The fence refuses only a PROVABLE mismatch — both sides must know a tenant
+   * (§3.3). An assignment whose tenant was never captured keeps today's
+   * behaviour and converges once the CP's identity reconciler backfills it; a
+   * delivery naming no tenant keeps today's behaviour too, and cannot be
+   * steered at a chosen victim in the first place.
+   */
+  private tenantFencePasses(botId: string, deliveryTenant: string | undefined): boolean {
+    const assignment = this.router.get(botId)
+    // Distributed install (`teamId` set): STRICT — same-app siblings share the
+    // signing secret, the envelope tenant id is the only discriminator, and a
+    // delivery that names no tenant has no safe owner among them. This arm
+    // preserves the pre-fence scan guard's fail-closed semantics exactly.
+    if (assignment?.teamId !== undefined) return assignment.teamId === deliveryTenant
+    // A customer row of a multi-tenant app (google-chat-integration.md §10.4): the same strict arm over every key it is known by.
+    if (assignment?.tenantIds !== undefined)
+      return deliveryTenant !== undefined && assignment.tenantIds.includes(deliveryTenant)
+    // Every other install kind (`workspaceId` when captured): refuse only a
+    // PROVABLE mismatch — both sides must know a tenant (§3.3 fail-open arms:
+    // an uncaptured identity keeps today's behaviour until the reconciler
+    // backfills it; a tenant-less delivery keeps today's behaviour too).
+    const workspace = assignment?.workspaceId
+    if (workspace === undefined || deliveryTenant === undefined) return true
+    return workspace === deliveryTenant
+  }
+
+  /** Make the inline selector effective for the current Slack thread immediately.
+   *  The CP channel-owner update remains the durable/default side of the same choice;
+   *  local affinity closes the gap for ordinary, un-mentioned follow-up messages. */
+  private selectThreadAgent(botId: string, channelId: string, threadTs: string, agentId: string): void {
+    const route = this.router.targetForAgentId(botId, agentId)
+    if (!route) {
+      this.deps.log.warn(`relay-ingress(${botId}): ignored stale thread-agent selection for agent ${agentId}`)
+      return
+    }
+    const sessionKey = sessionKeyOf({ channel: channelId, thread: threadTs })
+    this.router.setChannelOwner(botId, channelId, route)
+    this.router.setAffinity(botId, sessionKey, route)
+    this.deps.setChannelAgent(botId, channelId, agentId)
+    // Report the explicit Switch-agent so the CP persists + broadcasts the new owner.
+    this.report({ botId, sessionKey, agentId: route.agentId, daemonId: route.daemonId })
+  }
+
+  /** Close every ingest (relay shutdown) — across every REGISTERED platform,
+   *  not the union of two named pools (audit F4). */
+  async stopAll(): Promise<void> {
+    if (this.ackRetryTimer) {
+      clearTimeout(this.ackRetryTimer)
+      this.ackRetryTimer = undefined
+    }
+    for (const botId of [...this.credentialProbeTimers.keys()]) this.clearCredentialProbe(botId)
+    const bots = new Set<string>()
+    for (const { pool } of this.ingressPlugins.values()) for (const [botId] of pool.entries()) bots.add(botId)
+    await Promise.all([...bots].map((id) => this.stopIngest(id)))
+  }
+
+  /** The bot's live ingest, found through its ASSIGNMENT's platform entry —
+   *  the §8 read that replaced "which map the bot lives in" acting as the
+   *  platform test. Undefined when the bot has no assignment or no built ingest. */
+  private ingestFor(botId: string): RelayBotIngress | undefined {
+    const platform = this.router.get(botId)?.platform
+    const entry = platform ? this.ingressPlugins.get(platform) : undefined
+    return entry?.pool.get(botId)
+  }
+
+  /**
+   * Tear `botId`'s ingest down wherever it lives (audit F2).
+   *
+   * EVERY pool is asked rather than the one its assignment names, and that is
+   * required, not defensive: `unassign` removes the routing entry BEFORE
+   * calling this, so by now there is no assignment left to look the platform up
+   * from. It is also what the two hand-named pools did, in this same order.
+   *
+   * Per pool the order is unchanged — drop the entry FIRST, then stop — so a
+   * concurrent inbound delivery can never demux onto an ingest that is closing.
+   * "Nothing to stop, only to drop" stopped being core's business here: it is
+   * `RelayBotIngress.stop()`'s, and a pure decoder implements it as a no-op.
+   */
+  /**
+   * Send one pre-addressed item, honouring the activation rendezvous: a daemon
+   * that does not hold the target agent's duty answers `not_holder` naming the
+   * member that does, and the trigger is re-sent there ONCE (design §4.4). The
+   * msgId is reused verbatim so the true holder's own dedup still protects
+   * against a double delivery, and a second refusal terminates rather than
+   * chasing a stale ledger.
+   *
+   * Messages AND platform interactions ride it: both are addressed from the same
+   * routing projection, so a button click goes stale exactly the way an
+   * un-mentioned follow-up does.
+   *
+   * A refusal this cannot resolve — no holder named, the holder not connected
+   * to THIS relay, or the redirect target refusing in turn — is a genuinely
+   * dropped trigger, counted like any other drop. There is deliberately no
+   * claim of a retry behind it: HTTP ingress has already acknowledged and
+   * deduplicated the provider callback by this point, so nothing upstream will
+   * present the message again. Bounding that window is the CP's job (the
+   * ledger's vacancy sweep), not the router's.
+   */
+  private async sendWithRendezvous(
+    daemon: RelayDaemonConnection,
+    rd: RdMsg,
+    botId: string,
+    context: string
+  ): Promise<RdAck> {
+    const ack = await daemon.sendMsg(rd)
+    if (ack.accepted || ack.reason !== RD_ACK_NOT_HOLDER) return ack
+    const holderId = ack.holderDaemonId
+    if (!holderId) return this.dropUnrouted(botId, `${context}: not_holder named no duty holder`, ack)
+    const holder = this.deps.getDaemon(holderId)
+    if (!holder) return this.dropUnrouted(botId, `${context}: duty holder ${holderId} is not on this relay`, ack)
+    this.deps.log.info(`${context}: re-routing to duty holder ${holderId}`)
+    const second = await holder.sendMsg(rd)
+    if (!second.accepted && second.reason === RD_ACK_NOT_HOLDER) {
+      return this.dropUnrouted(botId, `${context}: duty holder ${holderId} refused in turn`, second)
+    }
+    return second
+  }
+
+  /** Count and log a trigger the rendezvous could not place. */
+  private dropUnrouted(botId: string, message: string, ack: RdAck): RdAck {
+    const n = (this.dropped.get(botId) ?? 0) + 1
+    this.dropped.set(botId, n)
+    this.deps.log.warn(`${message} (dropped ${n})`)
+    return ack
+  }
+
+  private async stopIngest(botId: string): Promise<void> {
+    this.clearCredentialProbe(botId)
+    for (const { pool } of this.ingressPlugins.values()) {
+      const cur = pool.get(botId)
+      if (!cur) continue
+      pool.delete(botId)
+      await cur.stop()
+    }
+  }
+
+  /** Drop every demux entry for `botId`, through the registry rather than a
+   *  hand list of two (audit F3). A surviving composite entry is exactly the
+   *  cross-tenant delivery hazard {@link DemuxIndex} exists to prevent, so no
+   *  platform may be left out of the sweep; `forget` evicts BOTH the composite
+   *  entry and every app-only entry pointing at the bot. */
+  private forgetDemux(botId: string): void {
+    for (const { demux } of this.ingressPlugins.values()) demux.forget(botId)
+  }
+
+  private isAgentBotMessage(botId: string, msg: import('@agentconnect.md/protocol').WireNormalizedMessage): boolean {
+    // The sender's platform APP identity is the capability signal: only
+    // platforms whose normalizers attribute one (Slack's api_app_id) can be
+    // checked against the CP's agent-bot index, and the index lookup itself is
+    // platform-keyed — a platform with no entries answers false (fail closed).
+    const appId = msg.sender.appId
+    if (!msg.sender.isBot || !appId) return false
+    return (
+      this.router
+        .get(botId)
+        ?.agents.some((agent) => this.deps.isAgentBotApp(agent.agentId, msg.platform, msg.channel, appId)) ?? false
+    )
+  }
+
+  /**
+   * The §6 ladder for an AgentConnect-authored platform message, on the relay side
+   * (send-message-routing-rework.md §4, §4.1 step 4, §6, §8.2).
+   *
+   * It is separate from `forward` because every author→target edge carries additional
+   * security and loop-control state: verified authorship, directional policy, one hop,
+   * and a durable activation claim. Ordinary arbitration may nominate a primary, but it
+   * does not bound delivery: existing participants and newly joined mention matches are
+   * forwarded independently, including when they live on different daemons. The paired
+   * `toAgent + channel` observation remains the only exact-target exception.
+   *
+   * Anything not routable is dropped rather than forwarded. The relay holds no transcript
+   * — "transcript only" is a daemon-side state — and §5.7 already has the target
+   * reconstruct preceding text through the ordinary thread-history catch-up path.
+   */
+  private async forwardVerifiedAgentMessage(
+    botId: string,
+    msg: import('@agentconnect.md/protocol').WireNormalizedMessage,
+    sidecar?: RelayIngressSidecar
+  ): Promise<void> {
+    const claim = msg.agentAuthorship
+    const drop = (why: string): void => {
+      this.deps.log.debug(`relay-ingress(${botId}): agent-authored ${msg.msgId} not routed (${why})`)
+    }
+    // Only a FINAL event routes: a streaming post may hold a prefix of the answer (§5.4).
+    if (!claim || claim.deliveryState !== 'final') return drop('not a finalized response')
+    const appId = msg.sender.appId
+    if (!appId) return drop('no sending app identity')
+    // §4 condition 3 — the claimed author must be one of the agents THIS app represents
+    // in THIS conversation. A shared app backs several agents, so "the app is ours" alone
+    // would let one of its tenants author messages as any of the others.
+    if (!this.deps.isAgentBotApp(claim.authorAgentId, msg.platform, msg.channel, appId)) {
+      return drop(`author ${claim.authorAgentId} is not backed by app ${appId} here`)
+    }
+    // §4.1 rule 1 — an unverifiable source depth is never coerced to zero; that would
+    // hand a runaway mention chain a fresh loop-protection budget on every hop.
+    if (!Number.isInteger(claim.hopCount) || claim.hopCount < 0) return drop('unverifiable source hop depth')
+    // §4.1 step 4 — the relay performs the identical addition and cap check the daemon
+    // would, ONCE, and forwards the result. The target terminal-verifies its range and
+    // installs it WITHOUT incrementing again.
+    const trustedDeliveryHopCount = claim.hopCount + 1
+    if (hasReachedAgentCallHopLimit(trustedDeliveryHopCount)) {
+      return drop(`hop_limit: ${claim.hopCount} + 1 reaches ${MAX_AGENT_CALL_HOPS}`)
+    }
+    // The recipient set the author resolved is NOT consulted for delivery: a verified
+    // agent message goes to whoever this bot's ordinary arbitration selects, the author
+    // excluded. `arbitrate` normally stops bot traffic at the explicit-mention rung; a
+    // VERIFIED author is a known participant with a checked policy, not anonymous bot
+    // traffic, so it is allowed past.
+    //
+    // Selecting by mention made delivery depend on resolving a `<@U…>` through the
+    // collaboration directory, so an unresolvable token silenced the conversation rather
+    // than merely costing precision. Peers are meant to see what was said and judge for
+    // themselves; every edge below is still checked against this relay's own snapshot.
+    //
+    // ONE exception, and it is not an address: the visible half of a paired
+    // `toAgent + channel` send. Its target came from the tool call as an agent id, never
+    // from parsing text, and the rendezvous only converges when this observation and the
+    // internal wake name the SAME target — arbitration could pick the channel's default
+    // or thread owner instead, recording the observation against an agent the wake never
+    // mentions and stranding both halves. The daemon path special-cases it identically.
+    const paired = claim.agentCallDeliveryId !== undefined
+    let deliveries: Array<{ targetAgentId: string; routeVia: 'mention' | 'implicit' }>
+    if (paired) {
+      const targets = claim.mentionedAgentIds
+      if (targets.length === 0) return drop('paired agent call named no agent')
+      deliveries = targets.map((targetAgentId) => ({ targetAgentId, routeVia: 'mention' }))
+    } else {
+      const primary = this.router.routeAgentAuthored(botId, msg, claim.authorAgentId)
+      deliveries = this.router
+        .conversationTargets(
+          botId,
+          msg,
+          primary,
+          claim.authorAgentId,
+          claim.mentionedAgentIds,
+          (target) => this.reportParticipant(botId, sessionKeyOf(msg), target),
+          (target) => this.deps.admitsAgentCall(claim.authorAgentId, target.agentId)
+        )
+        .map(({ target, via }) => ({ targetAgentId: target.agentId, routeVia: via }))
+      if (deliveries.length === 0) return drop('no participant admitted for this bot')
+    }
+
+    for (const { targetAgentId, routeVia } of deliveries) {
+      // Every author→target edge is checked independently and against the RELAY's own
+      // snapshot, regardless of whether arbitration, participation, or a join found it.
+      const route = this.router.agentTarget(botId, targetAgentId, msg.channel)
+      if (!route) {
+        drop(`target ${targetAgentId} is not a member of this bot`)
+        continue
+      }
+      const pairedSelfObservation = paired && claim.authorAgentId === targetAgentId
+      if (!pairedSelfObservation && !this.deps.admitsAgentCall(claim.authorAgentId, targetAgentId)) {
+        drop(`call policy excludes ${claim.authorAgentId} -> ${targetAgentId}`)
+        continue
+      }
+      const daemon = this.deps.getDaemon(route.daemonId)
+      if (!daemon) {
+        const n = (this.dropped.get(botId) ?? 0) + 1
+        this.dropped.set(botId, n)
+        this.deps.log.warn(`relay-ingress(${botId}): daemon ${route.daemonId} offline — dropped (total ${n})`)
+        continue
+      }
+      // §8.4, fail closed: a daemon that predates `trustedRouteVia` reads every
+      // agent-authored delivery as an explicit mention, which CLEARS a `!stop` mute.
+      // Forwarding an implicit continuation to it during a mixed-version rollout would
+      // silently disable the one control a human has over a runaway exchange. Refusing
+      // degrades to the pre-change behavior instead, which is merely less conversational.
+      if (routeVia === 'implicit' && !daemon.supports(RD_AGENT_IMPLICIT_ROUTING_V1)) {
+        drop(`daemon ${route.daemonId} predates implicit agent routing`)
+        continue
+      }
+      const rd: RdMsgIm = {
+        source: 'im',
+        agentId: route.agentId,
+        sessionKey: sessionKeyOf(msg),
+        // Namespace by target: one visible post may address several agents, and each is
+        // its own delivery. A shared msgId would make the target daemons' dedup collapse
+        // them into one and silently drop every recipient but the first.
+        msgId: `${msg.msgId}#${route.agentId}`,
+        botId,
+        integrationId: route.integrationId,
+        chatId: msg.channel,
+        payload: msg,
+        // Beside the payload, never inside it: the target persists `payload` to its durable
+        // inbox, and this is a credential (see RelayIngressSidecar).
+        ...(sidecar?.searchActionToken ? { searchActionToken: sidecar.searchActionToken } : {}),
+        // §8.2: the relay's MINTED assertions, outside `payload` so the target can always
+        // tell them apart from the provider fields it must not trust.
+        trustedFromAgentId: claim.authorAgentId,
+        trustedResponseId: claim.responseId,
+        trustedRecipientAgentIds: [route.agentId],
+        ...(claim.agentCallDeliveryId ? { trustedAgentCallDeliveryId: claim.agentCallDeliveryId } : {}),
+        trustedDeliveryHopCount,
+        // The target cannot re-derive this: it sees one pre-addressed agent either way.
+        // Without it every implicit continuation would arrive looking like an explicit
+        // mention and would clear a `!stop` mute.
+        trustedRouteVia: routeVia
+      }
+      try {
+        await this.sendWithRendezvous(daemon, rd, botId, `relay-ingress(${botId})`)
+        this.deps.log.info(
+          `relay-ingress(${botId}): agent-authored mention ${claim.authorAgentId} -> ${route.agentId} (hop ${trustedDeliveryHopCount})`
+        )
+      } catch (err) {
+        const n = (this.dropped.get(botId) ?? 0) + 1
+        this.dropped.set(botId, n)
+        this.deps.log.warn(
+          `relay-ingress(${botId}): forward to ${route.daemonId} failed: ${(err as Error).message} (dropped ${n})`
+        )
+      }
+    }
+  }
+
+  /** Arbitrate + forward one message to its daemons (never throws); `retry` when no target took it and a resend can still land. */
+  private async forward(
+    botId: string,
+    msg: WireNormalizedMessage,
+    sidecar?: RelayIngressSidecar
+  ): Promise<RelayForwardOutcome> {
+    const outcome = await this.arbitrateAndForward(botId, msg, sidecar, false)
+    if (outcome === 'refused') return 'refused'
+    return outcome.disposition === 'retry' ? 'retry' : 'accepted'
+  }
+
+  /** {@link forward} with the daemon's strict verdict: the same ladder, gated per target on `im-admission-v1`. */
+  private async forwardStrict(
+    botId: string,
+    msg: WireNormalizedMessage,
+    sidecar?: RelayIngressSidecar
+  ): Promise<RelayAdmission> {
+    const outcome = await this.arbitrateAndForward(botId, msg, sidecar, true)
+    return outcome === 'refused' ? rejected('rejected') : outcome
+  }
+
+  /** The one ladder behind both host verdicts: `refused` is the §6.2 grant withdrawal, everything else a strict verdict. */
+  private async arbitrateAndForward(
+    botId: string,
+    msg: WireNormalizedMessage,
+    sidecar: RelayIngressSidecar | undefined,
+    strict: boolean
+  ): Promise<RelayAdmission | 'refused'> {
+    // send-message-routing-rework.md §2.3/§6: agent-authored traffic takes its OWN
+    // ladder and never continues into the human one. Handled BEFORE arbitration for the
+    // same reason the blanket filter used to be: an agent's platform copy must not mutate
+    // thread affinity or produce a CP assignment report on its way through.
+    if (this.isAgentBotMessage(botId, msg)) {
+      await this.forwardVerifiedAgentMessage(botId, msg, sidecar)
+      return rejected('rejected')
+    }
+    const sessionKey = sessionKeyOf(msg)
+    const assignment = this.router.get(botId)
+    const hasGatedMembers = (assignment?.gatedAgentIds?.length ?? 0) > 0
+    // Direct-conversation discovery must NOT depend on arbitration: every install
+    // needs its own visible trigger row, whether the message routes or not.
+    // A group DM is discovered the same way — Slack never lists one as membership, so
+    // an unreported one could never be enabled. It is only ever *addressed* by mention,
+    // so unlike a DM it is reported only when it names THIS bot: `mentionedBots` also
+    // holds the humans and other apps named in the same message.
+    const namesThisBot = explicitlyAddressesBot(assignment, msg)
+    const addressesBot = msg.isDm || (msg.isGroupDm === true && namesThisBot)
+    if (addressesBot && !msg.sender.isBot) await this.reportObservedConversation(botId, msg)
+    // A By decision routed conversation: every eligible human message goes once to its evaluation host.
+    const routed = this.router.routedConversationFor(botId, msg)
+    if (routed) {
+      const command = parseCommand(commandText(msg, assignment?.botUserId ? [assignment.botUserId] : []))
+      // Commands, !queue included, are never judged (message-intake §5 step 2); they take the command path.
+      if (!command) return await this.forwardRoutedToHost(botId, msg, sidecar, routed, strict)
+      return await this.forwardRoutedCommand(botId, msg, sidecar, routed.decisionId, namesThisBot, strict)
+    }
+    const prior = this.router.peekAffinity(botId, sessionKey)
+    const arbitration = this.router.routeResult(botId, msg)
+    // Terminal (linear-integration.md §6.2): the channel's default moved off the gated
+    // agent this session is bound to, so the follow-up is refused rather than handed to
+    // the new default — a single-writer session must not gain a second runtime. Nothing
+    // below the affinity rung runs, including the CP backstop and the gating notice.
+    if (arbitration.kind === 'refused') {
+      this.deps.log.debug(`relay-ingress(${botId}): refused ${msg.msgId} in ${sessionKey} — ${arbitration.reason}`)
+      return 'refused'
+    }
+    let tgt: RouteTarget | null = arbitration.kind === 'target' ? arbitration.target : null
+    // Third-party bots retain their strict explicit-mention-only behavior. Participant
+    // fan-out is for humans and verified AgentConnect authors; treating an arbitrary bot
+    // like a person in the room would let one mention wake unrelated joined agents.
+    let conversationTargets =
+      msg.sender.isBot && tgt
+        ? [{ target: tgt, via: 'mention' as const }]
+        : this.router.conversationTargets(botId, msg, tgt, undefined, [], (target) =>
+            this.reportHumanParticipant(botId, sessionKey, msg.channel, tgt, target)
+          )
+    if (tgt) {
+      // Report leg: first route of this thread, or the arbitrated owner changed —
+      // EXCEPT for an `auto`-owned channel, where every message (incl. follow-ups)
+      // re-resolves via the channel rung on any pod, so the binding is never consulted
+      // (reporting it would only amplify writes + grow shared_thread_agent unboundedly).
+      const changed = !prior || prior.agentId !== tgt.agentId || prior.daemonId !== tgt.daemonId
+      if (changed && !this.router.channelAutoOwned(botId, msg.channel)) {
+        this.report({ botId, sessionKey, agentId: tgt.agentId, daemonId: tgt.daemonId })
+      }
+    }
+    if (!tgt && conversationTargets.length === 0) {
+      // §14.3: an addressed message nothing could place answers with the notice wherever the agent is Off or not enabled.
+      const muted = this.router.channelMuted(botId, msg.channel)
+      const off = this.router.channelOff(botId, msg.channel)
+      // A bot with gated members speaks in unrouted places too; any bot speaks in an Off place, but not in a held decision's.
+      const speaks = off || (hasGatedMembers && !muted)
+      if (!msg.sender.isBot && speaks) {
+        const mentioned = assignment?.botUserId !== undefined && msg.mentionedBots.includes(assignment.botUserId)
+        if (msg.isDm || mentioned) {
+          // Without an egress facet (Feishu, Teams) the owning daemon posts the notice and drops: the sole gated install, or in an Off place the sole install.
+          if (!this.ingestFor(botId)?.egress)
+            tgt = this.router.soleGatedTarget(botId) ?? (off ? this.router.soleTarget(botId) : undefined) ?? null
+          if (!tgt) {
+            await this.noticeGatedUnrouted(botId, msg)
+            return rejected('off')
+          }
+        }
+      }
+      // Backstop leg: only a real un-mentioned threaded follow-up is worth a CP lookup.
+      if (!tgt) {
+        if (!this.router.isUnmentionedThreadFollowup(botId, msg)) return rejected('rejected')
+        let lookup: Awaited<ReturnType<RelayIngressManagerDeps['lookupThread']>>
+        try {
+          lookup = await this.deps.lookupThread({ botId, sessionKey })
+        } catch {
+          return retry('not_ready') // CP down — drop (bounded loss); a mention re-anchors the thread.
+        }
+        for (const participant of lookup.participants) {
+          const current = this.router.agentTarget(botId, participant.agentId, msg.channel)
+          if (current && current.daemonId === participant.daemonId) {
+            this.router.setParticipant(botId, sessionKey, current)
+          }
+        }
+        if (!lookup.target && lookup.participants.length === 0) {
+          this.router.rememberNoAffinity(botId, sessionKey)
+          return rejected('rejected')
+        }
+        // Seeded from the CP — do NOT report it back (it came from the CP).
+        if (lookup.target) {
+          if (!this.router.seedLookupTarget(botId, sessionKey, lookup.target)) return rejected('rejected')
+          const seeded = this.router.routeResult(botId, msg)
+          if (seeded.kind === 'refused') {
+            this.deps.log.debug(`relay-ingress(${botId}): refused ${msg.msgId} in ${sessionKey} — ${seeded.reason}`)
+            return 'refused'
+          }
+          tgt = seeded.kind === 'target' ? seeded.target : null
+        }
+        conversationTargets = msg.sender.isBot
+          ? tgt
+            ? [{ target: tgt, via: 'mention' }]
+            : []
+          : this.router.conversationTargets(botId, msg, tgt, undefined, [], (target) =>
+              this.reportHumanParticipant(botId, sessionKey, msg.channel, tgt, target)
+            )
+        if (!tgt && conversationTargets.length === 0) return rejected('rejected')
+      }
+    }
+    // A single-owner route is only the compatibility/reporting primary. Delivery is to
+    // every participant, including joined agents on other daemons. Each copy carries its
+    // own trusted cause so a human mention clears only the named target's `!stop`; peers
+    // hearing the same body remain implicit even though it contains that mention token.
+    if (conversationTargets.length === 0 && tgt) {
+      conversationTargets = msg.sender.isBot
+        ? [{ target: tgt, via: 'mention' }]
+        : this.router.conversationTargets(botId, msg, tgt, undefined, [], (target) =>
+            this.reportHumanParticipant(botId, sessionKey, msg.channel, tgt, target)
+          )
+      // Receive-only Feishu may intentionally hand an explicitly addressed Off event to
+      // its sole gated daemon even though that target has no servable route. The daemon
+      // records discovery and posts the notice; its terminal gate still prevents a turn.
+      if (conversationTargets.length === 0) conversationTargets = [{ target: tgt, via: 'mention' }]
+    }
+    // A By decision conversation: every delivery names its Decision, and only a daemon that can hold it receives one.
+    const decisionId = this.router.decisionIdFor(botId, msg.channel)
+    const verdicts: RelayAdmission[] = []
+    const verdictOf = strict ? strictAdmissionFrom : bestEffortAdmissionFrom
+    for (const { target: participant, via } of conversationTargets) {
+      const daemon = this.deps.getDaemon(participant.daemonId)
+      if (!daemon) {
+        const n = (this.dropped.get(botId) ?? 0) + 1
+        this.dropped.set(botId, n)
+        this.deps.log.warn(`relay-ingress(${botId}): daemon ${participant.daemonId} offline — dropped (total ${n})`)
+        verdicts.push(retry('offline'))
+        continue
+      }
+      if (decisionId && !daemon.supports(DECISION_TRIGGER_V1_FEATURE)) {
+        this.deps.log.debug(`relay-ingress(${botId}): daemon ${participant.daemonId} predates decision-trigger-v1`)
+        verdicts.push(rejected('unsupported'))
+        continue
+      }
+      if (
+        via === 'implicit' &&
+        (conversationTargets.length > 1 || namesThisBot) &&
+        !daemon.supports(RD_AGENT_IMPLICIT_ROUTING_V1)
+      ) {
+        this.deps.log.debug(`relay-ingress(${botId}): daemon ${participant.daemonId} predates per-target routing cause`)
+        verdicts.push(rejected('unsupported'))
+        continue
+      }
+      // Fail closed: an older daemon's `accepted` never proves admission, so the strict path does not send to it at all.
+      if (strict && !daemon.supports(RD_IM_ADMISSION_V1)) {
+        this.deps.log.debug(`relay-ingress(${botId}): daemon ${participant.daemonId} predates strict admission`)
+        verdicts.push(rejected('unsupported'))
+        continue
+      }
+      const rd: RdMsgIm = {
+        source: 'im',
+        agentId: participant.agentId,
+        sessionKey: sessionKeyOf(msg),
+        msgId: conversationTargets.length > 1 ? `${msg.msgId}#${participant.agentId}` : msg.msgId,
+        botId,
+        integrationId: participant.integrationId,
+        chatId: msg.channel,
+        payload: msg,
+        ...(sidecar?.searchActionToken ? { searchActionToken: sidecar.searchActionToken } : {}),
+        ...(decisionId ? { decisionId } : {}),
+        trustedRouteVia: via
+      }
+      try {
+        verdicts.push(verdictOf(await this.sendWithRendezvous(daemon, rd, botId, `relay-ingress(${botId})`)))
+      } catch (err) {
+        const n = (this.dropped.get(botId) ?? 0) + 1
+        this.dropped.set(botId, n)
+        this.deps.log.warn(
+          `relay-ingress(${botId}): forward to ${participant.daemonId} failed: ${(err as Error).message} (dropped ${n})`
+        )
+        verdicts.push(retry('offline'))
+      }
+    }
+    return aggregateAdmission(verdicts)
+  }
+
+  /** A control command in a routed conversation reaches the owner and remembered participants, and joins nobody. */
+  private async forwardRoutedCommand(
+    botId: string,
+    msg: WireNormalizedMessage,
+    sidecar: RelayIngressSidecar | undefined,
+    decisionId: string,
+    namesThisBot: boolean,
+    strict: boolean
+  ): Promise<RelayAdmission> {
+    const sessionKey = sessionKeyOf(msg)
+    const targets = new Map<string, RouteTarget>()
+    const owner = this.router.peekAffinity(botId, sessionKey) ?? this.router.channelDecisionOwner(botId, msg.channel)
+    const ownerTarget = owner ? this.router.agentTarget(botId, owner.agentId, msg.channel) : null
+    if (ownerTarget) targets.set(ownerTarget.agentId, ownerTarget)
+    for (const t of this.router.conversationParticipants(botId, sessionKey, msg.channel)) targets.set(t.agentId, t)
+    const verdicts: RelayAdmission[] = []
+    const verdictOf = strict ? strictAdmissionFrom : bestEffortAdmissionFrom
+    for (const target of targets.values()) {
+      const daemon = this.deps.getDaemon(target.daemonId)
+      if (
+        !daemon ||
+        !daemon.supports(DECISION_TRIGGER_V1_FEATURE) ||
+        (strict && !daemon.supports(RD_IM_ADMISSION_V1))
+      ) {
+        this.deps.log.debug(`relay-ingress(${botId}): command for ${target.agentId} not deliverable`)
+        verdicts.push(daemon ? rejected('unsupported') : retry('offline'))
+        continue
+      }
+      const rd: RdMsgIm = {
+        source: 'im',
+        agentId: target.agentId,
+        sessionKey,
+        msgId: targets.size > 1 ? `${msg.msgId}#${target.agentId}` : msg.msgId,
+        botId,
+        integrationId: target.integrationId,
+        chatId: msg.channel,
+        payload: msg,
+        ...(sidecar?.searchActionToken ? { searchActionToken: sidecar.searchActionToken } : {}),
+        decisionId,
+        trustedRouteVia: namesThisBot ? 'mention' : 'implicit'
+      }
+      try {
+        verdicts.push(verdictOf(await this.sendWithRendezvous(daemon, rd, botId, `relay-ingress(${botId})`)))
+      } catch (err) {
+        this.deps.log.warn(`relay-ingress(${botId}): command forward failed: ${(err as Error).message}`)
+        verdicts.push(retry('offline'))
+      }
+    }
+    return aggregateAdmission(verdicts)
+  }
+
+  /**
+   * Surface one human direct conversation to the CP as an incremental
+   * `kind:'im'` / `kind:'mpim'` report, fanned to every install with its visibility-
+   * appropriate default. Fires for every human DM, routed or not, and for an addressed
+   * group DM; latched per conversation per relay
+   * lifetime (the CP upsert is idempotent, this only bounds chatter — a relay restart
+   * re-reports harmlessly). Channel rows need no report here — membership snapshots
+   * already carry them, and neither of these kinds appears in one.
+   */
+  private async reportObservedConversation(botId: string, msg: WireNormalizedMessage): Promise<void> {
+    const latch = `${botId}:${msg.channel}`
+    if (this.observedConversationsReported.has(latch)) return
+    // A group DM's counterpart is the room, not the sender, so it carries no name here.
+    const name = msg.isDm ? await this.ingestFor(botId)?.egress?.lookupUserName(msg.sender.id) : undefined
+    const sent = this.deps.reportBotConversation({
+      botId,
+      conversation: {
+        id: msg.channel,
+        ...(name ? { name } : {}),
+        // Who the row is with (§14.8) — a 1:1 DM's whole human membership, and what lets
+        // the CP seed a gated install's row On for a member the agent is already shared with.
+        ...(msg.isDm ? { dmUserId: msg.sender.id } : {}),
+        kind: msg.isDm ? 'im' : 'mpim'
+      }
+    })
+    // Latch only a delivered report — a CP-link-down drop retries on the next DM.
+    if (sent) this.observedConversationsReported.add(latch)
+  }
+
+  /** §14.3: the notice for an explicitly addressed, unroutable message — the bot must never look silently broken. */
+  private async noticeGatedUnrouted(botId: string, msg: WireNormalizedMessage): Promise<void> {
+    // A channel mention's two event copies may land on different pods, so only the bot's authority pod answers one; a DM has one copy.
+    const authority = this.router.get(botId)?.noticeAuthority
+    if (!msg.isDm && (!authority || authority !== this.deps.selfRelayId())) return
+    const key = `${botId}:${msg.msgId}`
+    if (this.gatedNoticesSent.has(key)) return
+    // No egress facet (a receive-only ingress): the caller first tried the sole target daemon, so nothing posts here.
+    const egress = this.ingestFor(botId)?.egress
+    if (!egress) return
+    this.gatedNoticesSent.add(key)
+    if (this.gatedNoticesSent.size > GATED_NOTICE_LATCH_LIMIT)
+      this.gatedNoticesSent.delete(this.gatedNoticesSent.values().next().value!)
+    try {
+      await egress.notice(
+        msg.channel,
+        '🔒 This agent isn’t enabled in this conversation. Ask an admin to enable it in the AgentConnect console.',
+        msg.isDm ? undefined : msg.thread
+      )
+    } catch (err) {
+      this.gatedNoticesSent.delete(key)
+      this.deps.log.warn(
+        `relay-ingress(${botId}): gating notice failed in ch=${msg.channel}: ${(err as Error).message}`
+      )
+    }
+  }
+
+  /**
+   * The Stop-only bound-target lookup (§8 directory.resolveBoundTarget,
+   * linear-integration.md §9.3). Bot-scoped and grant-blind: it answers with the
+   * runtime that HOLDS the session or with nobody, and never arbitrates — a miss
+   * resolving to the channel's current default would put a second daemon on a
+   * single-writer feed. The CP leg is the ordinary pull-on-miss backstop in `stop`
+   * mode, which makes the CP's own answer grant-blind too.
+   */
+  private async resolveBoundTarget(botId: string, sessionKey: string): Promise<RouteTarget | undefined> {
+    const placed = (candidate: RouteTarget | undefined): RouteTarget | undefined =>
+      candidate && this.deps.getDaemon(candidate.daemonId) ? candidate : undefined
+    const local = placed(this.router.boundTarget(botId, sessionKey))
+    if (local) return local
+    let lookup: Awaited<ReturnType<RelayIngressManagerDeps['lookupThread']>>
+    try {
+      lookup = await this.deps.lookupThread({ botId, sessionKey, mode: 'stop' })
+    } catch {
+      return undefined // CP down — nobody, rather than a guess at the holder.
+    }
+    if (!lookup.target) return undefined
+    // Cached back through the same validation a memory hit takes, so a second stop on
+    // the same session costs no CP round trip.
+    const seeded = this.router.seedLookupTarget(botId, sessionKey, lookup.target)
+    return placed(seeded?.integrationId ? seeded : undefined)
+  }
+
+  /**
+   * CORE-owned resolution of bare conversation coordinates to a routable target
+   * (§8 directory.resolveTarget): live thread affinity, then channel owner, then
+   * the default agent — with the mute and gating fences applied at every rung.
+   * Extracted verbatim from the Slack message-shortcut forwarder when it moved
+   * into its plugin; the ladder is platform-free arbitration policy.
+   */
+  private resolveConversationTarget(
+    botId: string,
+    coords: { channelId: string; threadTs?: string }
+  ): RouteTarget | undefined {
+    const sessionKey = sessionKeyOf({ channel: coords.channelId, thread: coords.threadTs })
+    const assignment = this.router.get(botId)
+    if (!assignment) return undefined
+    // A channel switched Off takes no shortcut either — the modal it opens acts on a
+    // session in a conversation the operator has silenced.
+    if (assignment.mutedChannels?.includes(coords.channelId)) return undefined
+    const allowedInChannel = (agentId: string): boolean =>
+      !assignment.gatedAgentIds?.includes(agentId) ||
+      assignment.routes.some((route) => route.agentId === agentId && route.scope?.channel === coords.channelId)
+    const affinity = coords.threadTs ? this.router.peekAffinity(botId, sessionKey) : undefined
+    const affinityRoute =
+      affinity && allowedInChannel(affinity.agentId)
+        ? this.router.targetForAgent(botId, affinity.agentId, affinity.integrationId)
+        : undefined
+    const channelOwner = this.router.channelOwner(botId, coords.channelId)
+    return (
+      affinityRoute ??
+      (channelOwner && allowedInChannel(channelOwner)
+        ? this.router.targetForAgentId(botId, channelOwner)
+        : undefined) ??
+      (assignment.defaultAgentId && allowedInChannel(assignment.defaultAgentId)
+        ? this.router.targetForAgentId(botId, assignment.defaultAgentId)
+        : undefined)
+    )
+  }
+}

@@ -1,0 +1,152 @@
+// DutyRecomputeSweep — keeps the duty ledger's membership projection derived
+// from reality: every tick it walks a slice of orgs (keyset rotation), recomputes
+// connected components from the org's agents and Integration rows, applies the plan.
+// The sweep only WRITES THE LEDGER — grants, re-grants after a merge, and
+// supersessions all reach daemons through the next heartbeat's lease exchange,
+// so no delivery mechanism exists here to duplicate or race it.
+import { computeDutyComponents, planDutyReconcile, toExistingDutyGroups } from './dutyGroup.js'
+import type { DutyGroupRepo } from '../persistence/ports.js'
+import { OrgId } from '../domain/ids.js'
+import type { Clock, TimerHandle } from '../domain/clock.js'
+
+export interface DutyRecomputeConfig {
+  /** How often a slice of orgs is recomputed. */
+  intervalMs: number
+  /** Orgs handled per tick — the rotation wraps when a slice comes back short. */
+  orgsPerTick: number
+  /** Renewal horizon for re-grants applied inside the reconcile. */
+  leaseMs: number
+  /** Coalescing window for {@link DutyRecomputeSweep.kick}: a burst of writes to
+   *  one org (an install touching several rows) costs one recompute. */
+  kickDelayMs: number
+}
+
+export interface DutyRecomputeLog {
+  warn(obj: unknown, msg?: string): void
+  error(obj: unknown, msg?: string): void
+}
+
+export class DutyRecomputeSweep {
+  private timer: TimerHandle | undefined
+  private stopped = false
+  private cursor: string | null = null
+  private readonly kicked = new Set<string>()
+  private kickTimer: TimerHandle | undefined
+  // Recomputes already fired — awaited by settle(), since stop() cancels timers, not running work.
+  private readonly inFlight = new Set<Promise<unknown>>()
+
+  constructor(
+    private readonly repo: Pick<
+      DutyGroupRepo,
+      'listDutyOrgs' | 'computeInputs' | 'applyReconcile' | 'vacateIneligible' | 'getByIds'
+    >,
+    private readonly clock: Clock,
+    private readonly cfg: DutyRecomputeConfig,
+    private readonly log?: DutyRecomputeLog,
+    /** Re-converges the routing projections when the fence moves a group's holder. Absent
+     *  (tests / no pool) ⇒ no convergence, the pre-duty behavior. */
+    private readonly routing?: { kick(agentIds: Iterable<string>): void }
+  ) {}
+
+  start(): void {
+    this.stopped = false
+    this.arm()
+  }
+
+  stop(): void {
+    this.stopped = true
+    if (this.timer !== undefined) {
+      this.clock.clearTimeout(this.timer)
+      this.timer = undefined
+    }
+    if (this.kickTimer !== undefined) {
+      this.clock.clearTimeout(this.kickTimer)
+      this.kickTimer = undefined
+    }
+    this.kicked.clear()
+  }
+
+  /** Await recomputes already fired — the shutdown counterpart to stop(), so Prisma is not disconnected mid-write. */
+  async settle(): Promise<void> {
+    await Promise.allSettled([...this.inFlight])
+  }
+
+  // Fire-and-forget, but never unobserved: shutdown and tests settle on these.
+  private track(work: Promise<unknown>): void {
+    this.inFlight.add(work)
+    void work.finally(() => this.inFlight.delete(work))
+  }
+
+  /**
+   * Recompute one org promptly instead of waiting for its rotation slice — the
+   * ledger's inputs just changed (an integration, a cron's enabled flag, a bot
+   * credential, a placement move). Fire-and-forget and coalescing: callers on
+   * the request path never await it, and a burst against one org collapses into
+   * a single recompute. The rotation remains the backstop, so a dropped kick
+   * costs latency, never correctness.
+   */
+  kick(orgId: string): void {
+    if (this.stopped) return
+    this.kicked.add(orgId)
+    if (this.kickTimer !== undefined) return
+    this.kickTimer = this.clock.setTimeout(() => {
+      this.kickTimer = undefined
+      const orgs = [...this.kicked]
+      this.kicked.clear()
+      for (const org of orgs) {
+        this.track(
+          this.recomputeOrg(org).catch((err) => this.log?.error({ err, orgId: org }, 'duty recompute kick failed'))
+        )
+      }
+    }, this.cfg.kickDelayMs)
+  }
+
+  private arm(): void {
+    this.timer = this.clock.setTimeout(() => {
+      this.track(
+        this.tick()
+          .catch((err) => this.log?.error({ err }, 'duty recompute sweep failed'))
+          .finally(() => {
+            if (!this.stopped) this.arm()
+          })
+      )
+    }, this.cfg.intervalMs)
+  }
+
+  /** One rotation slice; exported for tests. Returns the number of orgs handled. */
+  async tick(): Promise<number> {
+    const orgs = await this.repo.listDutyOrgs(this.cursor, this.cfg.orgsPerTick)
+    this.cursor = orgs.length < this.cfg.orgsPerTick ? null : (orgs[orgs.length - 1] ?? null)
+    for (const orgId of orgs) {
+      try {
+        await this.recomputeOrg(orgId)
+      } catch (err) {
+        // One org's failure must not starve the rest of the rotation.
+        this.log?.error({ err, orgId }, 'duty recompute failed for org')
+      }
+    }
+    return orgs.length
+  }
+
+  async recomputeOrg(orgId: string): Promise<void> {
+    const { edges, agents } = await this.repo.computeInputs(OrgId(orgId))
+    const components = computeDutyComponents(edges, agents)
+    const now = new Date(this.clock.now())
+    await this.repo.applyReconcile(
+      OrgId(orgId),
+      (existing) => planDutyReconcile(toExistingDutyGroups(existing, now), components),
+      { now, leaseMs: this.cfg.leaseMs }
+    )
+    // Unconditional: this is the placement fence, not a soak-phase switch. A lease whose holder
+    // may no longer hold the group is wrong under every grant policy, and the sweep is the only
+    // place that notices — `renewHeld` renews by holder alone and would keep it alive forever.
+    const vacated = await this.repo.vacateIneligible(OrgId(orgId))
+    if (vacated.length > 0) {
+      this.log?.warn({ orgId, groupIds: vacated }, 'duty leases vacated: the holder is no longer eligible')
+      // A vacated lease is a holder change like any other: whatever addressed the old holder has
+      // to stop, or ingress keeps arriving at a member that no longer serves the agent.
+      const groups = await this.repo.getByIds(vacated)
+      this.routing?.kick(groups.flatMap((g) => g.members.filter((m) => m.kind === 'agent').map((m) => m.refId)))
+    }
+  }
+}

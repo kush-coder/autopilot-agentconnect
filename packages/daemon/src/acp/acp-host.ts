@@ -1,0 +1,1428 @@
+import {
+  client as createClientApp,
+  methods,
+  ndJsonStream,
+  type ClientConnection,
+  type ContentBlock,
+  type AuthMethod,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
+  type McpServer,
+  type RequestPermissionRequest,
+  type RequestPermissionResponse,
+  type SessionConfigOption,
+  type SessionUpdate,
+  type StopReason,
+  type Usage
+} from '@agentclientprotocol/sdk/unstable'
+import {
+  HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED,
+  HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED,
+  type McpTransportCapabilities
+} from '@agentconnect.md/protocol'
+import type { RuntimeDef } from '../config/config-schema.js'
+import {
+  augmentClaudeEfforts,
+  claudeInnerSandboxSettings,
+  CLAUDE_DISALLOWED_BUILTIN_TOOLS,
+  isClaudeRuntimeDef,
+  type ClaudeInnerSandboxSettings,
+  type ClaudeProtectedSettings,
+  ULTRACODE_EFFORT
+} from '../runtime-defs/claude-runtime.js'
+import { isCodexRuntimeDef, runtimeExecutableHints } from '../runtime-defs/executable-hints.js'
+import { isOpenCodeRuntime, openCodeConfigWithClaudeInstructions } from '../runtime-defs/opencode-runtime.js'
+import {
+  codexConfigWithGuardianPolicy,
+  codexConfigWithMcpStartupGrace,
+  codexConfigWithProjectDocFallback,
+  codexConfigWithUserInputTool,
+  codexGuardianOperatorPolicy
+} from '../runtimes/codex-config.js'
+import {
+  LocalDriver,
+  type AcpSandboxLaunch,
+  type SpawnDriver,
+  type CodehostSpawn,
+  type ProviderSpawn,
+  type SpawnFile,
+  type SpawnedRuntime
+} from './spawn-driver.js'
+import type { HostKey } from './host-key.js'
+import type { Logger } from '../log.js'
+import { accountAppIsolation } from './account-apps.js'
+import { STEERING_METHOD, parseSteeringOutcome, steeringRequestParams, steeringSupported } from './steering.js'
+import type { SteeringIdleBehavior, SteeringOutcome } from './steering.js'
+import { RuntimeSessionFailure, SESSION_FAILURE_CAPABILITIES, sessionFailureFromMeta } from './session-failure.js'
+import { customInstructionsMeta, customInstructionsSupported } from './session-instructions.js'
+
+// Full ACP v1 preserves elicitation, usage, and session lifecycle extensions.
+export type {
+  SessionConfigOption,
+  SessionConfigSelectGroup,
+  SessionConfigSelectOption
+} from '@agentclientprotocol/sdk/unstable'
+
+const PROTOCOL_VERSION = 1
+
+/** A session/load may replay the historical conversation stream. Keep that off
+ *  platform transports, but preserve latest-wins metadata needed to converge the
+ *  local/CP session projection after a restart. The command list is one of those:
+ *  the adapter advertises it after the replay, and it is the only advertisement a
+ *  resumed session ever makes. */
+export function shouldForwardUpdateDuringLoad(update: SessionUpdate): boolean {
+  return (
+    update.sessionUpdate === 'session_info_update' ||
+    update.sessionUpdate === 'usage_update' ||
+    update.sessionUpdate === 'available_commands_update'
+  )
+}
+
+/** A runtime's advertised model selector, distilled from ACP session config options. */
+export interface ModelOptions {
+  /** The model id currently selected for the session (the agent's default). */
+  current?: string
+  /** Selectable model ids (group structure flattened away). */
+  models: string[]
+}
+
+/** A runtime's advertised reasoning-effort selector (ACP `thought_level`), distilled
+ *  from session config options and augmented with the synthetic `ultracode`/`max`
+ *  entries on Claude runtimes (they aren't `thought_level` select values — see
+ *  {@link ULTRACODE_EFFORT} / {@link claudeSessionMeta}). */
+export interface EffortOptions {
+  /** The effort level currently selected on the session (per the `thought_level`
+   *  select's currentValue) — note a `_meta`-driven `ultracode` won't appear here. */
+  current?: string
+  /** Selectable effort levels (group structure flattened; synthetic entries appended). */
+  efforts: string[]
+}
+
+/** A runtime's advertised permission/approval mode selector (ACP `mode`). Values are
+ *  runtime-owned (`default` / `plan` on Claude, `agent` / `read-only` on Codex). */
+export interface PermissionModeOptions {
+  /** The permission mode currently selected for the session. */
+  current?: string
+  /** Selectable permission mode values (group structure flattened away). */
+  modes: string[]
+}
+
+export type AcpPermissionPolicyEvent =
+  | { kind: 'requested' }
+  | {
+      kind: 'resolved'
+      source: 'resolver' | 'fallback'
+      fallbackReason?: 'no_resolver' | 'resolver_undefined' | 'resolver_error'
+      response: RequestPermissionResponse
+    }
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return value
+  const object = value as object
+  if (seen.has(object)) return value
+  seen.add(object)
+  for (const key of Reflect.ownKeys(object)) deepFreeze(Reflect.get(object, key), seen)
+  return Object.freeze(value)
+}
+
+function immutablePermissionSnapshot<T>(value: T): T | undefined {
+  try {
+    return deepFreeze(structuredClone(value))
+  } catch {
+    return undefined
+  }
+}
+
+/** A runtime's advertised fast-mode toggle (ACP `model_config` on/off select). The
+ *  option only exists once a fast-capable model is selected, so `null` means the
+ *  current model offers no fast toggle. */
+export interface FastModeOption {
+  /** Whether fast mode is currently on (the select's currentValue === "on"). */
+  current: boolean
+}
+
+/**
+ * Desired per-session runtime config, applied through ACP session config
+ * options (`session/set_config_option`) right after `session/new` /
+ * `session/load`. This is the only channel a runtime like claude-acp accepts
+ * for reasoning effort — there is no env var or spawn flag for it; the model
+ * additionally has env fallbacks some runtimes read (see cp-overlay.ts).
+ */
+export interface SessionConfigPrefs {
+  /** Model id, matched against the option tagged `category: "model"`. */
+  model?: string
+  /** Effort level, matched against the option tagged `category: "thought_level"`. */
+  reasoningEffort?: string
+  /** Fast mode, matched against the option tagged `category: "model_config"` —
+   *  both claude-acp (id "fast") and codex-acp (id "fast-mode") advertise it
+   *  there, as an on/off `select` (we don't opt into boolean config options).
+   *  The option only exists when the selected model supports fast mode, so an
+   *  unsupported combination degrades to a logged skip. undefined ⇒ don't touch. */
+  fastMode?: boolean
+  /** Runtime permission/approval mode, matched against the option tagged
+   *  `category: "mode"`. Values are runtime-owned (`default` / `plan` on
+   *  claude-acp, `agent` / `read-only` on codex-acp, etc.). */
+  permissionMode?: string
+  /** Optional host-level instruction seed, layered before per-session standing context on supported runtimes. */
+  systemPrompt?: string
+  /** The agent's operator-authored instructions, handed to Codex's Guardian as trusted policy. */
+  operatorInstructions?: string
+}
+
+// The launch shape lives with the driver that consumes it; re-exported here because
+// this module is where callers have always imported it from.
+export type { AcpSandboxLaunch, SpawnDriver, SpawnedRuntime } from './spawn-driver.js'
+export type { SteeringIdleBehavior, SteeringOutcome } from './steering.js'
+
+/** The `session/set_config_option` call that applies a desired value, or the reason none is needed. */
+export type ConfigSelectionPlan = { configId: string; value: string } | { current: true } | { skip: string }
+
+/**
+ * Distill the human-actionable reason from a failed ACP request. Adapters wrap
+ * their runtime's own message in a JSON-RPC error whose `message` is often just
+ * the generic title — codex-acp reports quota exhaustion as code -32603
+ * "Internal error" with the real text ("You've hit your usage limit. Visit … or
+ * try again at 7:01 PM.") under `error.data.message` — so prefer that detail
+ * over a bare title, and append it when a specific message carries extra data.
+ * Non-RequestError failures fall back to the plain Error message.
+ *
+ * Both texts are first stripped of the decoration Codex puts around a provider's own error
+ * (`undecorateRuntimeError`): what reaches the person is the sentence the provider wrote.
+ */
+export function turnFailureReason(err: unknown): string {
+  const e = err as { message?: unknown; data?: { message?: unknown } } | null | undefined
+  const raw = typeof e?.message === 'string' && e.message.trim() ? e.message.trim() : String(err)
+  const msg = undecorateRuntimeError(raw)
+  const detail = typeof e?.data?.message === 'string' ? undecorateRuntimeError(e.data.message.trim()) : ''
+  if (!detail || msg.includes(detail)) return msg
+  // The SDK's generic titles (RequestError statics) add nothing over the
+  // runtime's own text; any more specific message keeps both.
+  const generic =
+    /^(parse error|invalid request|invalid params|internal error|request cancelled|authentication required|resource not found)$/i
+  return generic.test(msg) ? detail : `${msg}: ${detail}`
+}
+
+// A configured model rejection must not trigger an unrelated session or MCP fallback.
+export class ModelSelectionError extends Error {
+  constructor(model: string, cause: unknown) {
+    super(`Could not select model "${model}": ${turnFailureReason(cause)}`, { cause })
+    this.name = 'ModelSelectionError'
+  }
+}
+
+/** The runtime no longer knows the prompted session; retrying cannot help (#1915). */
+export function isRuntimeSessionGone(err: unknown): boolean {
+  const e = err as { code?: unknown; data?: { sessionId?: unknown } } | null | undefined
+  if (e?.code === -32002 && typeof e.data?.sessionId === 'string') return true
+  return failureSignals(err).some((signal) => /\bsession not found\b/i.test(signal))
+}
+
+/** Unwrap known runtime decorations, preserving the provider's sentence or a status when no body was supplied. */
+export function undecorateRuntimeError(text: string): string {
+  const t = text.trim()
+  const codex = /^unexpected status (\d{3})(?: [A-Za-z][A-Za-z '-]*)?: ([\s\S]*?)(?:, url: \S+)?$/.exec(t)
+  if (codex) {
+    const inner = codex[2]!.trim()
+    return inner || `unexpected status ${codex[1]}`
+  }
+  const claude =
+    /^(?:Failed to authenticate\. |Please run \/login (?:·|\u00b7) )?API Error: (?:(\d{3})(?: |$))?([\s\S]*)$/.exec(t)
+  if (claude) {
+    const inner = claude[2]!.trim()
+    return (inner !== 'status code (no body)' && inner) || (claude[1] ? `API error ${claude[1]}` : text)
+  }
+  const harness = /^turn failed: ([\s\S]+)$/.exec(t)
+  if (harness) return undecorateRuntimeError(harness[1]!)
+  return text
+}
+
+/** Machine-stable classification for a failed ACP turn. Keep the default conservative:
+ * callers only relax reporting for a provider limit or revoked credential that
+ * we can identify from a structured adapter code or narrow provider-authored
+ * message. In particular, an ordinary transient `rate_limit_error` or generic
+ * "sign in again" text remains `turn_failed`.
+ */
+export type TurnFailureCode =
+  typeof HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED | typeof HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED | 'turn_failed'
+
+const PROVIDER_QUOTA_CODES = new Set([
+  'billinghardlimitreached',
+  'creditbalancetoolow',
+  'creditsexhausted',
+  'insufficientquota',
+  'nocreditsremaining',
+  'outofcredits',
+  'planlimitreached',
+  'quotaexhausted',
+  'usagelimitexceeded',
+  'usagelimitreached'
+])
+
+const PROVIDER_QUOTA_MESSAGES = [
+  // A spend limit is a quota, not a transient rate limit, however the provider phrases the
+  // possessive in between: "You've hit your org's monthly spend limit".
+  /\b(?:you(?:'|’)ve|you have) hit your\b[\s\S]{0,60}\b(?:usage|spend) limit\b/i,
+  /\b(?:usage|spend) limit (?:has been )?(?:reached|exceeded)\b/i,
+  /\b(?:you(?:'|’)ve|you have) hit your limit\b[\s\S]{0,120}\bresets?\b/i,
+  /\b(?:credit|credits) balance (?:is )?(?:too low|depleted|exhausted)\b/i,
+  /\b(?:insufficient|not enough|no) (?:api )?credits?(?: (?:remaining|available))?\b/i,
+  /\b(?:out of|exhausted) (?:api )?credits?\b/i,
+  /\bexceeded your current quota\b/i,
+  /\b(?:billing|plan|account) quota (?:has been )?(?:reached|exceeded|exhausted)\b/i
+]
+
+/**
+ * Provider auth error TYPES and CODES, as the providers themselves emit them.
+ *
+ * Deliberately not HTTP status numbers. An earlier revision matched a nested numeric 401/403
+ * and that was wrong in a way worth remembering: `K8sApiError` and `GithubHttpError` both
+ * carry a numeric `status`, and `turnFailureCode` sees failures from far beyond the model
+ * call — so a Kubernetes RBAC denial would have told the user their provider credentials
+ * needed attention. A type like `authentication_error` cannot arrive from an unrelated layer,
+ * so it identifies the provider without needing to prove provenance separately.
+ *
+ * `permissionerror` and `unauthenticated` are deliberately absent for the same reason the
+ * status numbers are: this repository's own shim rejection reason IS `unauthenticated`, and
+ * `failureSignals` collects `reason` — so including it would classify our own handshake
+ * refusal as a provider credential problem. Only codes a provider alone emits belong here.
+ */
+const PROVIDER_AUTH_CODES = new Set(['authenticationerror', 'invalidapikey', 'apikeyinvalid', 'invalidauthentication'])
+
+const PROVIDER_AUTH_MESSAGES = [
+  /\brefresh token was revoked\b/i,
+  /\baccess token could not be refreshed\b[\s\S]{0,160}\b(?:log out|sign out) and sign in again\b/i,
+  // claude-agent-acp with an expired-but-present OAuth credential: the SDK fails
+  // the refresh and the adapter surfaces it as a -32603 internal error with this
+  // exact wording (a FRESH logged-out credential rejects -32000 instead).
+  /\boauth session expired and could not be refreshed\b/i,
+  // Anthropic and OpenAI both say this verbatim when the key itself is rejected.
+  /\binvalid x-api-key\b/i,
+  /\bincorrect api key provided\b/i,
+  /\b(?:invalid|missing) (?:api )?(?:key|credentials)\b/i,
+  /\bno auth credentials found\b/i,
+  // Gemini's documented envelope: the message is phrased the other way round from every
+  // other provider's, and its reason lives in a `details` array.
+  /\bapi key not valid\b/i
+]
+
+// Claude Code's own wording when another process holds, or died holding, its OAuth refresh lock.
+const OAUTH_REFRESH_CONTENTION = /\banother claude code process is refreshing it\b/i
+
+/** Whether a turn failed only because Claude Code's OAuth refresh lock was contended — transient, unlike a dead login. */
+export function isOAuthRefreshContention(err: unknown): boolean {
+  return OAUTH_REFRESH_CONTENTION.test(failureSignals(err).join('\n'))
+}
+
+/** Collect the small family of fields ACP adapters and provider SDKs use to
+ * wrap an upstream error. The depth/seen guards tolerate nested `error.data`
+ * and `cause` shapes without recursively inspecting an arbitrary request body.
+ */
+function failureSignals(value: unknown, depth = 0, seen = new Set<object>()): string[] {
+  if (typeof value === 'string') return value.trim() ? [value.trim()] : []
+  if (!value || typeof value !== 'object' || depth >= 5 || seen.has(value)) return []
+  seen.add(value)
+  const out: string[] = []
+  // Providers put structured error detail in arrays — Gemini's `details[].reason` among them —
+  // so an array must be walked rather than treated as a leaf object.
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 20)) out.push(...failureSignals(entry, depth + 1, seen))
+    return out
+  }
+  for (const key of [
+    'message',
+    'code',
+    'type',
+    'reason',
+    'codexErrorInfo',
+    'errorInfo',
+    'errorType',
+    'error_type',
+    'error',
+    'data',
+    'details',
+    'cause'
+  ]) {
+    try {
+      out.push(...failureSignals(Reflect.get(value, key), depth + 1, seen))
+    } catch {
+      // A hostile/custom error getter must not replace the original turn error.
+    }
+  }
+  return out
+}
+
+export function turnFailureCode(err: unknown): TurnFailureCode {
+  if (err instanceof RuntimeSessionFailure) {
+    if (err.category === 'access') return HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED
+    if (err.category === 'limit' && err.actions.length === 0) return HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED
+  }
+  const signals = failureSignals(err)
+  if (signals.some((signal) => PROVIDER_QUOTA_CODES.has(signal.toLowerCase().replace(/[^a-z0-9]/g, '')))) {
+    return HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED
+  }
+  if (signals.some((signal) => PROVIDER_AUTH_CODES.has(signal.toLowerCase().replace(/[^a-z0-9]/g, '')))) {
+    return HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED
+  }
+  const message = signals.join('\n')
+  if (PROVIDER_AUTH_MESSAGES.some((pattern) => pattern.test(message))) {
+    return HOOK_REPORT_REASON_PROVIDER_AUTH_REQUIRED
+  }
+  return PROVIDER_QUOTA_MESSAGES.some((pattern) => pattern.test(message))
+    ? HOOK_REPORT_REASON_PROVIDER_QUOTA_EXHAUSTED
+    : 'turn_failed'
+}
+
+/** Resolve `desired` for the `category` select: send it, it is already `current`, or `skip` (not offered). */
+export function planConfigSelection(
+  configOptions: SessionConfigOption[] | null | undefined,
+  category: string,
+  desired: string
+): ConfigSelectionPlan {
+  const opt = configOptions?.find((o) => o.category === category && o.type === 'select')
+  if (!opt || opt.type !== 'select') return { skip: `runtime advertises no ${category} selector` }
+  const values = opt.options.flatMap((o) => ('group' in o ? o.options : [o])).map((o) => o.value)
+  if (!values.includes(desired)) {
+    return { skip: `value "${desired}" not offered (available: ${values.join(', ')})` }
+  }
+  if (opt.currentValue === desired) return { current: true }
+  return { configId: opt.id, value: desired }
+}
+
+// ULTRACODE_EFFORT now lives in claude-runtime.ts (with the shared Claude predicate
+// and effort augmentation); re-exported here so existing importers keep working.
+export { ULTRACODE_EFFORT }
+
+/** The session `_meta` sent to a Claude runtime on session/new and session/load
+ *  (`_meta.claudeCode.options` is spread into the SDK `query()` options layer), or
+ *  undefined off Claude runtimes. Five things ride on it:
+ *
+ *  - `thinking`: recent models default `thinking.display` to "omitted" — thinking
+ *    blocks stream signature-only with empty text, so the ACP wrapper never emits
+ *    `agent_thought_chunk` and the transcript loses its reasoning rows. Request
+ *    "summarized" (the fullest display the API offers) so thoughts reach the stream.
+ *  - `settings`: for a sandboxed parent, the SDK's highest-precedence flag tier
+ *    reasserts protected Anthropic profile selection after workspace settings merge;
+ *    effort "ultracode" additionally carries the session-scoped flags the effort
+ *    select can't reach. The adapter's CLAUDE_MODEL_CONFIG fallback is preserved in
+ *    the protected settings because supplying `options.settings` replaces it.
+ *  - `options.sandbox` (only when the ACP runtime already has an outer
+ *    AgentConnect sandbox): enables Claude's native Bash sandbox fail-closed and
+ *    denies its sandboxed commands the provider credentials the parent can read.
+ *  - `disallowedTools`: suppresses Claude Code's built-in agent-teams `SendMessage`,
+ *    which collides with `mcp__agentconnect__sendMessage` (#800) and can DELIVER
+ *    session-private content to unrelated co-located sessions (#998). Sent on every
+ *    Claude session — AgentConnect owns all inter-session messaging for its sessions.
+ *  - `systemPrompt` (top-level, sibling of `claudeCode`): the agent's system-prompt
+ *    seed PLUS, on a fresh session, the agent's memory index (standing context, not a
+ *    user turn — see SessionManager). We send it as `{ append }` so it layers ON TOP
+ *    of claude-acp's `claude_code` preset (keeping the coding scaffolding) rather than
+ *    replacing it. Honored by claude-agent-acp #91; older runtimes ignore the unknown
+ *    `_meta` key. This is the only channel for the system prompt — ACP session/new has
+ *    no such field, and other runtimes have no equivalent yet (see cp-overlay.ts). */
+/** The Claude SDK lifecycle subtypes the daemon's background-task lease needs, as
+ *  `SDKMessageFilter`s for claude-agent-acp's `emitRawSDKMessages` (matched by
+ *  `type`+`subtype`). Deliberately NOT `true`: the unfiltered feed is a firehose
+ *  (every stream_event / assistant chunk / hook). Requested on every Claude session
+ *  via {@link claudeSessionMeta}; adapters < 0.59.0 ignore the unknown `_meta` field. */
+export const SDK_LIFECYCLE_FILTERS = [
+  { type: 'system', subtype: 'session_state_changed' },
+  { type: 'system', subtype: 'background_tasks_changed' },
+  { type: 'system', subtype: 'task_started' },
+  { type: 'system', subtype: 'task_updated' },
+  { type: 'system', subtype: 'task_notification' }
+] as const
+
+export interface AcpToolSandbox {
+  /** Credential paths available to the trusted runtime but denied to model-authored tools. */
+  protectedCredentialRoots: string[]
+  /** Permit model-authored tools to use the daemon-provided Unix socket channels. */
+  allowModelToolUnixSockets?: boolean
+  /** Pin parent-only profile selection after Claude merges workspace-controlled settings. */
+  claudeProtectedSettings?: ClaudeProtectedSettings
+  /** Writable mount targets reopened in the runtime-native tool sandbox. */
+  sharedWriteRoots?: string[]
+  /** The runtime's private state (a session HOME's `.claude`): model-authored tools may read it, never change it. */
+  readOnlyStateRoots?: string[]
+}
+
+interface ClaudeSessionSettings {
+  env?: ClaudeProtectedSettings['env']
+  plansDirectory?: string
+  permissions?: { deny: string[] }
+  modelOverrides?: unknown
+  availableModels?: unknown
+  ultracode?: true
+  enableWorkflows?: true
+}
+
+export function claudeSessionMeta(
+  reasoningEffort: string | undefined,
+  isClaudeRuntime: boolean,
+  systemPrompt?: string,
+  memoryAppend?: string,
+  protectedCredentialRoots?: readonly string[],
+  protectedSettings?: ClaudeProtectedSettings,
+  allowModelToolUnixSockets = false,
+  extraDisallowedTools: readonly string[] = [],
+  sharedWriteRoots: readonly string[] = [],
+  readOnlyStateRoots: readonly string[] = [],
+  model?: string
+):
+  | {
+      claudeCode: {
+        options: {
+          model?: string
+          thinking: { type: 'adaptive'; display: 'summarized' }
+          disallowedTools: readonly string[]
+          settings?: ClaudeSessionSettings
+          sandbox?: ClaudeInnerSandboxSettings
+        }
+        emitRawSDKMessages: ReadonlyArray<{ type: string; subtype: string }>
+      }
+      systemPrompt?: { append: string }
+    }
+  | undefined {
+  if (!isClaudeRuntime) return undefined
+  // Append the system prompt and memory together, omitting an empty result.
+  const append = [systemPrompt, memoryAppend].filter(Boolean).join('\n\n')
+  const ultracode = reasoningEffort === ULTRACODE_EFFORT
+  // Claude uses gitignore patterns with // for absolute paths; cover the root and its descendants.
+  const rules = (roots: readonly string[] | undefined, tools: readonly string[]): string[] =>
+    [...new Set(roots)].flatMap((root) => {
+      const pattern = `/${root.replace(/\/+$/, '').replace(/[\\*?[\] ]/g, (char) => `\\${char}`)}`
+      return tools.flatMap((tool) => [`${tool}(${pattern})`, `${tool}(${pattern}/**)`])
+    })
+  // Credentials are neither read nor changed; the runtime's own state is read back (its saved tool results, its
+  // synced skills) but never changed, so the model cannot plant settings or hooks the trusted parent would load.
+  const deny = [...rules(protectedCredentialRoots, ['Read', 'Edit']), ...rules(readOnlyStateRoots, ['Edit'])]
+  const settings: ClaudeSessionSettings = {
+    ...(protectedSettings ?? {}),
+    // Claude requires custom plans inside the workspace; its default HOME/.claude/plans is protected above.
+    ...(deny.length > 0 ? { permissions: { deny }, plansDirectory: './.claude/plans' } : {}),
+    ...(ultracode ? { ultracode: true, enableWorkflows: true } : {})
+  }
+  return {
+    claudeCode: {
+      options: {
+        // Select before SDK initialization so a resumed model keeps its context suffix in the picker.
+        ...(model ? { model } : {}),
+        thinking: { type: 'adaptive', display: 'summarized' },
+        // Suppress built-in cross-session messaging through the SDK options (#998).
+        disallowedTools: [...CLAUDE_DISALLOWED_BUILTIN_TOOLS, ...extraDisallowedTools],
+        ...(protectedCredentialRoots
+          ? {
+              sandbox: claudeInnerSandboxSettings(
+                protectedCredentialRoots,
+                allowModelToolUnixSockets,
+                sharedWriteRoots,
+                readOnlyStateRoots
+              )
+            }
+          : {}),
+        ...(protectedSettings || ultracode || deny.length > 0 ? { settings } : {})
+      },
+      emitRawSDKMessages: SDK_LIFECYCLE_FILTERS
+    },
+    ...(append ? { systemPrompt: { append } } : {})
+  }
+}
+
+/**
+ * Extract the model selector from a session's `configOptions`. ACP models are an
+ * (experimental) session config option tagged `category: "model"`, `type:
+ * "select"`; the selectable values (optionally grouped) are the model list.
+ * Returns null when the agent advertises no model selector.
+ */
+export function modelOptionsFrom(configOptions: SessionConfigOption[] | null | undefined): ModelOptions | null {
+  const model = configOptions?.find((o) => o.category === 'model' && o.type === 'select')
+  if (!model || model.type !== 'select') return null
+  // `options` is either a flat SelectOption[] or a SelectGroup[]; flatten groups.
+  const models = model.options.flatMap((o) => ('group' in o ? o.options : [o])).map((o) => o.value)
+  return { current: model.currentValue, models }
+}
+
+/**
+ * Extract the reasoning-effort selector from a session's `configOptions` (ACP
+ * `category: "thought_level"`, `type: "select"`). Effort support is per-model: a runtime
+ * only advertises this select for models that support effort (e.g. Opus/Sonnet, not
+ * Haiku), so a missing/empty selector means the CURRENT model has no effort → returns
+ * null and the picker is hidden. When the model DOES support effort, Claude runtimes get
+ * the synthetic `max`/`ultracode` entries appended if not already offered (see
+ * {@link ULTRACODE_EFFORT}) — never fabricated for a model that lacks effort entirely.
+ */
+export function effortOptionsFrom(
+  configOptions: SessionConfigOption[] | null | undefined,
+  isClaudeRuntime: boolean
+): EffortOptions | null {
+  const opt = configOptions?.find((o) => o.category === 'thought_level' && o.type === 'select')
+  if (!opt || opt.type !== 'select') return null
+  const advertised = opt.options.flatMap((o) => ('group' in o ? o.options : [o])).map((o) => o.value)
+  if (advertised.length === 0) return null
+  // The current model supports effort — Claude additionally allows `max` (session-only)
+  // and `ultracode` (xhigh + workflow orchestration), which aren't `thought_level` values.
+  const efforts = isClaudeRuntime ? augmentClaudeEfforts(advertised) : advertised
+  return { current: opt.currentValue, efforts }
+}
+
+/**
+ * Extract the permission/approval mode selector from a session's `configOptions` (ACP
+ * `category: "mode"`, `type: "select"`). Returns null when the runtime exposes no mode
+ * selector.
+ */
+export function permissionModeOptionsFrom(
+  configOptions: SessionConfigOption[] | null | undefined
+): PermissionModeOptions | null {
+  const opt = configOptions?.find((o) => o.category === 'mode' && o.type === 'select')
+  if (!opt || opt.type !== 'select') return null
+  const modes = opt.options.flatMap((o) => ('group' in o ? o.options : [o])).map((o) => o.value)
+  return { current: opt.currentValue, modes }
+}
+
+/**
+ * Extract the fast-mode toggle from a session's `configOptions` (ACP `category:
+ * "model_config"`, `type: "select"` with on/off values). Returns null when the current
+ * model advertises no fast toggle.
+ */
+export function fastOptionFrom(configOptions: SessionConfigOption[] | null | undefined): FastModeOption | null {
+  const opt = configOptions?.find((o) => o.category === 'model_config' && o.type === 'select')
+  if (!opt || opt.type !== 'select') return null
+  return { current: opt.currentValue === 'on' }
+}
+
+export class AcpHost {
+  private spawned?: SpawnedRuntime
+  private conn?: ClientConnection
+  // Only sessions created or loaded by this host have a trusted runtime working directory.
+  private live = new Map<string, string>()
+  private toolContexts = new Map<string, string>()
+  // sessionIds currently mid-load: `session/load` makes the agent REPLAY its whole
+  // history via session/update, which we must NOT forward to the platform (it would
+  // re-post the entire conversation). Cleared when the load resolves.
+  private loadingSessions = new Set<string>()
+  // whether the agent advertised the `loadSession` capability at initialize.
+  private canLoad = false
+  // whether the agent accepts repository roots in addition to the session cwd.
+  // This is capability-gated because older ACP adapters reject the field.
+  private canUseAdditionalDirectories = false
+  private canDelete = false
+  private canClose = false
+  // In-flight session/close requests, so a reload of the same id waits for the runtime to release it.
+  private closing = new Map<string, Promise<void>>()
+  // whether the agent advertised mid-turn steering (`_meta.steering.supported`) at initialize.
+  private canSteer = false
+  // prompt content-block variants the agent opted into at initialize. text +
+  // resource_link are always baseline; image/audio/embeddedContext are gated.
+  private promptCaps: { image?: boolean; audio?: boolean; embeddedContext?: boolean } = {}
+  // Selectors from the most recent session/new|load|set, distilled from the reconciled
+  // config options. Populated by refreshOptionCaches(); read via modelOptions() /
+  // effortOptions() / fastModeOption(). null ⇒ the runtime advertised no such selector.
+  private lastModelOptions: ModelOptions | null = null
+  private lastEffortOptions: EffortOptions | null = null
+  private lastPermissionModeOptions: PermissionModeOptions | null = null
+  private lastFastOption: FastModeOption | null = null
+  // The most recent reconciled config-option set per live session, cached so a
+  // mid-session `set_config_option` (e.g. setSessionModel) can plan against the
+  // current options without a round-trip. Updated on new/load and each set.
+  private sessionConfigs = new Map<string, SessionConfigOption[] | null | undefined>()
+  // ACP protocol version the agent negotiated at initialize (it echoes the version
+  // we requested if supported, else downgrades to its own latest). Read via
+  // acpProtocolVersion(); undefined until start() completes the handshake.
+  private negotiatedProtocolVersion?: number
+  // Optional MCP transports the agent opted into at initialize (stdio is the ACP
+  // baseline and always accepted). null until the handshake completes; the
+  // unstable `acp` transport flag is deliberately ignored. Read via mcpCapabilities().
+  private mcpCaps: McpTransportCapabilities | null = null
+  private agentAuthMethods: AuthMethod[] = []
+  private canUseCustomInstructions = false
+  private canUseCodexSessionProfiles = false
+  // The ACP agent's self-reported identity from the `initialize` response
+  // (`agentInfo`: name/title/version) — the ACTUAL running adapter version (e.g.
+  // claude-agent-acp 0.59.0), as opposed to the registry's declared version.
+  // undefined until the handshake completes or if the agent reports none. Read via
+  // acpAgentInfo().
+  private agentInfo?: { name: string; title?: string; version?: string }
+
+  constructor(
+    private runtime: RuntimeDef,
+    private opts: {
+      onUpdate: (sessionId: string, update: SessionUpdate) => void
+      /**
+       * Interactive permission policy for ACP `session/request_permission`. When set,
+       * the daemon renders the options to the user (e.g. a Slack card) and resolves
+       * with their choice. Omitted (or throwing / returning undefined) falls back to
+       * the non-interactive auto-allow below — so a platform with no interactive
+       * surface, or a resolver that fails, never hangs the turn.
+       */
+      onPermission?: (
+        sessionId: string,
+        params: RequestPermissionRequest
+      ) => Promise<RequestPermissionResponse | undefined>
+      /** Metadata-only observer for the actual permission-policy result. It receives
+       *  immutable snapshots; failures/mutation attempts cannot change the policy. */
+      onPermissionEvent?: (sessionId: string, params: RequestPermissionRequest, event: AcpPermissionPolicyEvent) => void
+      /**
+       * Structured-input policy for ACP `elicitation/create` (form and url mode). When set, the
+       * daemon renders the form to the user (e.g. a Slack select/buttons card) and
+       * resolves with their choice. Omitted / throwing / returning undefined falls back
+       * to declining the elicitation — the spec has agents handle `decline` — so a
+       * platform with no interactive surface, or an unrenderable form, never hangs.
+       */
+      onElicit?: (sessionId: string, params: CreateElicitationRequest) => Promise<CreateElicitationResponse | undefined>
+      /**
+       * ACP `elicitation/complete` — the agent reporting that a URL-mode flow finished. It
+       * carries only an `elicitationId` (no sessionId), so the consumer keys off that alone,
+       * and it is advisory: it may never arrive, and one for an unknown id is ignored.
+       */
+      onElicitComplete?: (elicitationId: string) => void
+      /**
+       * Raw Claude SDK lifecycle messages, forwarded by claude-agent-acp ≥ 0.59.0 as
+       * the `_claude/sdkMessage` ext-notification (opt-in via `emitRawSDKMessages`, see
+       * {@link SDK_LIFECYCLE_FILTERS}). Feeds the daemon's background-task lease so an
+       * idle host with in-flight background work is not reclaimed. `message` is passed
+       * through untyped — the consumer parses defensively (unknown shapes are ignored),
+       * so a future event-shape change degrades to the plain-TTL behavior rather than
+       * breaking. Never fires for non-Claude runtimes or adapters that don't forward it.
+       */
+      onSdkLifecycle?: (sessionId: string, message: unknown) => void
+      /**
+       * Services the REQUEST-scoped elicitations of the auth/config phase (no sessionId), which
+       * {@link onElicit} deliberately declines because they map to no live turn. Set only by an
+       * interactive caller — a daemon session has no reader for a question its turn cannot carry.
+       */
+      onAuthElicit?: (params: CreateElicitationRequest) => Promise<CreateElicitationResponse | undefined>
+      /**
+       * Advertises `auth.terminal`, letting the agent offer auth methods the CLIENT completes by
+       * re-launching the agent program interactively. Per the spec a client may claim this only
+       * when it can reproduce that invocation on a real terminal, so a daemon session never does.
+       */
+      authTerminalCapable?: boolean
+      env?: Record<string, string>
+      /** Files `env` points at, written by the driver in the runtime's own filesystem before start. */
+      files?: SpawnFile[]
+      /** Directories the driver empties there before writing `files`. */
+      clearDirs?: string[]
+      /** The credential-proxy env a shim driver swaps in once its shim serves `codehost`. */
+      codehost?: CodehostSpawn
+      /** The provider-key env a shim driver swaps in once its shim serves `provider`. */
+      provider?: ProviderSpawn
+      /** Disposable compatibility probes suppress raw child stderr so a harness
+       * cannot print credential material or host paths outside our sanitizer. */
+      suppressChildStderr?: boolean
+      /** Defaults to true. Runtime-home launches pass a complete, sanitized env so
+       *  AcpHost must not merge the daemon's HOME/XDG/cache paths back into it. */
+      inheritProcessEnv?: boolean
+      configPrefs?: SessionConfigPrefs
+      /** ACP-registry / config id of this runtime, used to isolate account-bound
+       *  connectors at spawn (see account-apps.ts). Omitted ⇒ command/args fallback. */
+      runtimeId?: string
+      /** Whether to suppress account-bound cloud apps/connectors at spawn. Defaults
+       *  to true; daemon config may explicitly opt out for all runtimes on the host. */
+      isolateAccountApps?: boolean
+      /** Optional host SRT wrapper; external drivers provide their own process boundary. */
+      sandbox?: AcpSandboxLaunch
+      /** Native tool policy applied inside either an SRT wrapper or a VM. */
+      toolSandbox?: AcpToolSandbox
+      codexSessionPermissionProfiles?: (directories: readonly string[]) => Promise<Record<string, unknown> | undefined>
+      /** Called once when the owned adapter process reaches terminal exit. The
+       *  delegated host manager uses this to tear down its fenced cell. */
+      onTerminal?: () => void
+      /** Where the runtime runs. Defaults to a child process of this daemon; a
+       *  cluster driver launches it in a sandbox pod and carries ACP over the
+       *  network, leaving everything below this line unchanged. */
+      driver?: SpawnDriver
+      /** The host this runtime serves, handed to the driver so a cluster launch claims that host's pod. */
+      hostKey?: HostKey
+      log?: Logger
+    }
+  ) {}
+
+  /** A Claude Code runtime — the one predicate lives in claude-runtime.ts, shared with the model-catalog path. */
+  private isClaudeRuntime(): boolean {
+    return isClaudeRuntimeDef(this.runtime)
+  }
+
+  async start(): Promise<void> {
+    if (this.spawned) throw new Error('AcpHost: already started')
+    const env: NodeJS.ProcessEnv = {
+      ...(this.opts.inheritProcessEnv === false ? {} : process.env),
+      ...Object.fromEntries(this.runtime.env.map((e) => [e.name, e.value])),
+      ...(this.opts.env ?? {})
+    }
+    // Account-app isolation defaults on even for direct AcpHost callers. When on,
+    // apply the overrides AFTER all caller env is merged so nothing can accidentally
+    // re-enable them. A daemon-level opt-out deliberately leaves env/argv untouched.
+    const appIsolation = accountAppIsolation(this.opts.runtimeId, this.runtime, env)
+    const isolateAccountApps = this.opts.isolateAccountApps !== false
+    if (isolateAccountApps) {
+      Object.assign(env, appIsolation.env)
+      if (appIsolation.warning) this.opts.log?.warn(appIsolation.warning)
+      if (appIsolation.status === 'disabled')
+        this.opts.log?.info(`acp: disabled account-bound apps/connectors for ${appIsolation.runtime}`)
+    } else if (appIsolation.status === 'disabled' || appIsolation.status === 'no-switch') {
+      const detail =
+        appIsolation.status === 'no-switch' && appIsolation.warning
+          ? ` — ${appIsolation.warning.replace(/^acp: /, '')}`
+          : ''
+      this.opts.log?.warn(
+        `acp: account-app isolation disabled by daemon config for ${appIsolation.runtime}; ` +
+          `signed-in account apps/connectors may be inherited${detail}`
+      )
+    }
+    if (isOpenCodeRuntime(this.opts.runtimeId, this.runtime)) {
+      try {
+        env.OPENCODE_CONFIG_CONTENT = openCodeConfigWithClaudeInstructions(env.OPENCODE_CONFIG_CONTENT)
+      } catch (err) {
+        this.opts.log?.warn(`acp: leaving OpenCode without CLAUDE.md instructions — ${(err as Error).message}`)
+      }
+    }
+    const isCodex = this.opts.runtimeId === 'codex-acp' || isCodexRuntimeDef(this.runtime)
+    // Codex offers `request_user_input` only when configured on; enable it exactly when this host services session elicitations.
+    if (this.opts.onElicit && isCodex) {
+      try {
+        env.CODEX_CONFIG = codexConfigWithUserInputTool(env.CODEX_CONFIG)
+      } catch (err) {
+        this.opts.log?.warn(`acp: leaving Codex's request_user_input tool off — ${(err as Error).message}`)
+      }
+    }
+    // Codex leaves an MCP server still starting after 1 s out of the turn, so a remote server misses the first turn.
+    if (isCodex) {
+      try {
+        env.CODEX_CONFIG = codexConfigWithMcpStartupGrace(env.CODEX_CONFIG)
+      } catch (err) {
+        this.opts.log?.warn(`acp: leaving Codex's MCP startup grace at its default — ${(err as Error).message}`)
+      }
+      try {
+        env.CODEX_CONFIG = codexConfigWithProjectDocFallback(env.CODEX_CONFIG)
+      } catch (err) {
+        this.opts.log?.warn(`acp: leaving Codex without a CLAUDE.md fallback — ${(err as Error).message}`)
+      }
+      // Standing instructions reach Codex as developer messages, which its Guardian never sees, so it gets the operator's own copy.
+      const guardianPolicy = codexGuardianOperatorPolicy(this.opts.configPrefs?.operatorInstructions)
+      if (guardianPolicy) {
+        try {
+          env.CODEX_CONFIG = codexConfigWithGuardianPolicy(env.CODEX_CONFIG, guardianPolicy)
+        } catch (err) {
+          this.opts.log?.warn(
+            `acp: leaving Codex's Guardian without the operator instructions — ${(err as Error).message}`
+          )
+        }
+      }
+    }
+    // The memory-backend env arrives in `opts.env` from memoryProviderFor at spawn; a host built without it keeps the runtime's default memory.
+    // appendArgs carries any account-app-isolation flags (e.g. Copilot's
+    // --disable-builtin-mcps) that must reach the adapter as CLI args.
+    const spawnArgs = [...this.runtime.args, ...(isolateAccountApps ? appIsolation.appendArgs : [])]
+    const driver = this.opts.driver ?? new LocalDriver({ log: this.opts.log })
+    const hints = runtimeExecutableHints(this.runtime)
+    const spawned = await driver.launch({
+      command: this.runtime.command,
+      args: spawnArgs,
+      env: env as Record<string, string>,
+      // Resolving a hint belongs to the driver: only it knows the filesystem the runtime sees.
+      ...(hints.length > 0 ? { hints } : {}),
+      ...(this.opts.files?.length ? { files: this.opts.files } : {}),
+      ...(this.opts.clearDirs?.length ? { clearDirs: this.opts.clearDirs } : {}),
+      ...(this.opts.codehost ? { codehost: this.opts.codehost } : {}),
+      ...(this.opts.provider ? { provider: this.opts.provider } : {}),
+      ...(this.opts.suppressChildStderr !== undefined ? { suppressChildStderr: this.opts.suppressChildStderr } : {}),
+      ...(this.opts.sandbox ? { sandbox: this.opts.sandbox } : {}),
+      ...(this.opts.hostKey ? { hostKey: this.opts.hostKey } : {})
+    })
+    this.spawned = spawned
+    spawned.onExit(() => {
+      // Clearing the handle lets stop() early-return instead of waiting on an exit
+      // that already fired.
+      if (this.spawned === spawned) this.spawned = undefined
+      try {
+        this.opts.onTerminal?.()
+      } catch (err) {
+        this.opts.log?.debug(`acp: terminal observer failed: ${(err as Error).message}`)
+      }
+    })
+    const stream = ndJsonStream(spawned.toAgent, spawned.fromAgent)
+
+    const self = this
+    // fs read/write handlers are intentionally omitted (we advertise fs:false);
+    // the SDK auto-replies method-not-found if the agent ever calls them.
+    this.conn = createClientApp({ name: 'agentconnect' })
+      .onNotification(methods.client.session.update, (ctx) => {
+        // Drop historical conversation/tool chunks replayed by session/load, but
+        // keep metadata such as restored titles and usage snapshots.
+        if (self.loadingSessions.has(ctx.params.sessionId) && !shouldForwardUpdateDuringLoad(ctx.params.update)) return
+        self.opts.onUpdate(ctx.params.sessionId, ctx.params.update)
+      })
+      .onRequest(methods.client.session.requestPermission, async (ctx) => {
+        const observedParams = self.opts.onPermissionEvent ? immutablePermissionSnapshot(ctx.params) : undefined
+        const policyParams = observedParams ?? ctx.params
+        const observe = (event: AcpPermissionPolicyEvent): void => {
+          if (!observedParams || !self.opts.onPermissionEvent) return
+          const snapshot = immutablePermissionSnapshot(event)
+          if (!snapshot) return
+          try {
+            self.opts.onPermissionEvent(ctx.params.sessionId, observedParams, snapshot)
+          } catch (err) {
+            self.opts.log?.debug(`acp: onPermissionEvent(${event.kind}) failed: ${(err as Error).message}`)
+          }
+        }
+        observe({ kind: 'requested' })
+        // Interactive policy first: ask the user via the platform (Slack card, …).
+        // Any failure — no resolver, an unsupported surface, a thrown error, or an
+        // undefined result — falls through to the auto-allow default so the turn can
+        // never hang on a permission prompt.
+        let fallbackReason: 'no_resolver' | 'resolver_undefined' | 'resolver_error' = 'no_resolver'
+        if (self.opts.onPermission) {
+          try {
+            const res = await self.opts.onPermission(ctx.params.sessionId, policyParams)
+            if (res) {
+              observe({ kind: 'resolved', source: 'resolver', response: res })
+              return res
+            }
+            fallbackReason = 'resolver_undefined'
+          } catch (err) {
+            fallbackReason = 'resolver_error'
+            self.opts.log?.debug(`acp: onPermission failed, auto-allowing: ${(err as Error).message}`)
+          }
+        }
+        // Fallback: auto-allow the first allow option (no interactive resolution).
+        const allow = policyParams.options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always')
+        const optionId = (allow ?? policyParams.options[0])?.optionId
+        const response: RequestPermissionResponse = {
+          outcome: optionId ? { outcome: 'selected', optionId } : { outcome: 'cancelled' }
+        }
+        observe({ kind: 'resolved', source: 'fallback', fallbackReason, response })
+        return response
+      })
+      .onRequest(methods.client.elicitation.create, async (ctx) => {
+        // Structured input (choice/boolean forms). Delegate to the platform policy; on
+        // any failure — no resolver, unsupported surface/form, or a thrown error — decline
+        // so the agent's turn never hangs (agents are expected to handle `decline`).
+        // Only session-scoped elicitations map to a live turn; request-scoped ones
+        // (auth/config phase, no session) have no sessionId — decline those.
+        const sessionId = (ctx.params as { sessionId?: string }).sessionId
+        if (!sessionId && self.opts.onAuthElicit) {
+          try {
+            const res = await self.opts.onAuthElicit(ctx.params)
+            if (res) return res
+          } catch (err) {
+            self.opts.log?.debug(`acp: onAuthElicit failed, declining: ${(err as Error).message}`)
+          }
+        }
+        if (self.opts.onElicit && sessionId) {
+          try {
+            const res = await self.opts.onElicit(sessionId, ctx.params)
+            if (res) return res
+          } catch (err) {
+            self.opts.log?.debug(`acp: onElicit failed, declining: ${(err as Error).message}`)
+          }
+        }
+        return { action: 'decline' }
+      })
+      .onNotification(methods.client.elicitation.complete, (ctx) => {
+        // Advisory settlement for a URL-mode elicitation the user already consented to; the
+        // ACP request resolved at consent, so nothing is waiting on this.
+        const id = ctx.params?.elicitationId
+        if (typeof id === 'string' && id && self.opts.onElicitComplete) {
+          try {
+            self.opts.onElicitComplete(id)
+          } catch (err) {
+            self.opts.log?.debug(`acp: onElicitComplete failed: ${(err as Error).message}`)
+          }
+        }
+      })
+      // Claude SDK lifecycle feed (claude-agent-acp ≥ 0.59.0). Params are
+      // `{ sessionId, message }`; the message is passed through untyped and parsed
+      // defensively by the consumer. Parser is a passthrough — validation lives in
+      // onSdkLifecycle so an unexpected shape degrades gracefully, never throws here.
+      .onNotification(
+        '_claude/sdkMessage',
+        { parse: (p: unknown) => p as { sessionId?: string; message?: unknown } },
+        (ctx) => {
+          const sessionId = ctx.params?.sessionId
+          if (sessionId && self.opts.onSdkLifecycle) self.opts.onSdkLifecycle(sessionId, ctx.params.message)
+        }
+      )
+      .connect(stream)
+
+    const init = await this.conn.agent.request(methods.agent.initialize, {
+      protocolVersion: PROTOCOL_VERSION,
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        _meta: SESSION_FAILURE_CAPABILITIES,
+        // Advertise form-based elicitation so runtimes may ask structured questions
+        // (choice/boolean), and URL-based so credential/OAuth/payment flows take the seam the
+        // spec reserves for them instead of a form that would carry the secret through chat.
+        // Unrenderable forms and surfaces without a consent card are declined gracefully by
+        // the onElicit fallback above.
+        elicitation: { form: {}, url: {} },
+        ...(this.opts.authTerminalCapable ? { auth: { terminal: true } } : {})
+      }
+    })
+    this.negotiatedProtocolVersion = init.protocolVersion
+    this.agentAuthMethods = init.authMethods ?? []
+    this.canLoad = init.agentCapabilities?.loadSession ?? false
+    this.canUseAdditionalDirectories = init.agentCapabilities?.sessionCapabilities?.additionalDirectories != null
+    this.canUseCustomInstructions = customInstructionsSupported(init._meta)
+    this.canUseCodexSessionProfiles =
+      (init._meta?.codex as { sessionPermissionProfiles?: unknown } | undefined)?.sessionPermissionProfiles === true
+    this.canDelete = init.agentCapabilities?.sessionCapabilities?.delete != null
+    this.canClose = init.agentCapabilities?.sessionCapabilities?.close != null
+    this.promptCaps = init.agentCapabilities?.promptCapabilities ?? {}
+    this.canSteer = steeringSupported(init._meta)
+    const mcp = init.agentCapabilities?.mcpCapabilities
+    this.mcpCaps = {
+      http: mcp?.http ?? false,
+      sse: mcp?.sse ?? false
+    }
+    // agentInfo is optional per the ACP spec; keep only the fields we surface.
+    this.agentInfo = init.agentInfo
+      ? {
+          name: init.agentInfo.name,
+          title: init.agentInfo.title ?? undefined,
+          version: init.agentInfo.version ?? undefined
+        }
+      : undefined
+    this.opts.log?.debug(
+      `acp: agent initialized (${this.agentInfo?.name ?? 'agent'}${this.agentInfo?.version ? ` v${this.agentInfo.version}` : ''}, loadSession=${this.canLoad}, additionalDirectories=${this.canUseAdditionalDirectories}, steering=${this.canSteer}, prompt caps: image=${!!this.promptCaps.image} audio=${!!this.promptCaps.audio} embeddedContext=${!!this.promptCaps.embeddedContext}, mcp: http=${this.mcpCaps.http} sse=${this.mcpCaps.sse})`
+    )
+  }
+
+  /** Whether the agent advertised support for a gated prompt content-block kind.
+   *  `text` and `resource_link` are baseline and always return true. */
+  promptSupports(kind: 'image' | 'audio' | 'embeddedContext'): boolean {
+    return Boolean(this.promptCaps[kind])
+  }
+
+  /** Whether standing context has a native instruction channel instead of an inline user-prompt block. */
+  usesMetaSystemPrompt(): boolean {
+    return this.isClaudeRuntime() || this.canUseCustomInstructions
+  }
+
+  /** Whether `session/load` applies the native standing instructions it carries; custom instructions apply only when a thread starts. */
+  appliesSystemPromptOnLoad(): boolean {
+    return this.isClaudeRuntime()
+  }
+
+  private async sessionMeta(
+    effortOverride?: string,
+    systemPrompt?: string,
+    systemAppend?: string,
+    extraDisallowedTools: readonly string[] = [],
+    directories: readonly string[] = []
+  ) {
+    const claudeMeta = claudeSessionMeta(
+      effortOverride ?? this.opts.configPrefs?.reasoningEffort,
+      this.isClaudeRuntime(),
+      systemPrompt,
+      systemAppend,
+      this.opts.toolSandbox?.protectedCredentialRoots,
+      this.opts.toolSandbox?.claudeProtectedSettings,
+      this.opts.toolSandbox?.allowModelToolUnixSockets,
+      extraDisallowedTools,
+      this.opts.toolSandbox?.sharedWriteRoots,
+      this.opts.toolSandbox?.readOnlyStateRoots,
+      this.opts.configPrefs?.model
+    )
+    const meta =
+      claudeMeta ?? (this.canUseCustomInstructions ? customInstructionsMeta(systemPrompt, systemAppend) : undefined)
+    const permissionProfiles = await this.opts.codexSessionPermissionProfiles?.(directories)
+    if (!permissionProfiles) return meta
+    if (!this.canUseCodexSessionProfiles)
+      throw new Error('Codex adapter must support session permission profiles; update the runtime')
+    return { ...meta, codex: { permissionProfiles } }
+  }
+
+  /** A runtime that rejects non-empty session mcpServers gets [] instead of a failed session — covers every creator. */
+  private clampSessionMcpServers(mcpServers: McpServer[]): McpServer[] {
+    if (this.runtime.sessionMcpServers !== 'unsupported' || mcpServers.length === 0) return mcpServers
+    this.opts.log?.debug(`acp: dropping ${mcpServers.length} session MCP server(s) — the runtime rejects them`)
+    return []
+  }
+
+  /** Create a session with native standing instructions; announce synchronously before configuration can emit updates. */
+  async newSession(
+    cwd: string,
+    mcpServers: McpServer[] = [],
+    effortOverride?: string,
+    systemAppend?: string,
+    additionalDirectories: string[] = [],
+    announce?: (sessionId: string) => void,
+    extraDisallowedTools: readonly string[] = []
+  ): Promise<string> {
+    const _meta = await this.sessionMeta(
+      effortOverride,
+      this.opts.configPrefs?.systemPrompt,
+      systemAppend,
+      extraDisallowedTools,
+      [cwd, ...additionalDirectories]
+    )
+    const activeAdditionalDirectories = this.canUseAdditionalDirectories ? additionalDirectories : []
+    const res = await this.conn!.agent.request(methods.agent.session.new, {
+      cwd,
+      ...(activeAdditionalDirectories.length > 0 ? { additionalDirectories: activeAdditionalDirectories } : {}),
+      mcpServers: this.clampSessionMcpServers(mcpServers),
+      ...(_meta ? { _meta } : {})
+    })
+    announce?.(res.sessionId)
+    this.live.set(res.sessionId, cwd)
+    try {
+      const configOptions = await this.applySessionConfig(res.sessionId, res.configOptions)
+      this.refreshOptionCaches(configOptions)
+      this.sessionConfigs.set(res.sessionId, configOptions)
+    } catch (err) {
+      this.discardSession(res.sessionId)
+      throw err
+    }
+    return res.sessionId
+  }
+
+  /** Apply model first, then dependent preferences; a rejected model stops session setup. */
+  private async applySessionConfig(
+    sessionId: string,
+    initial: SessionConfigOption[] | null | undefined
+  ): Promise<SessionConfigOption[] | null | undefined> {
+    let options = initial
+    // ultracode rides session metadata and forces xhigh; it is not a thought_level select value.
+    const ultracode = this.isClaudeRuntime() && this.opts.configPrefs?.reasoningEffort === ULTRACODE_EFFORT
+    const fastMode = this.opts.configPrefs?.fastMode
+    const prefs: Array<[category: string, desired: string | undefined]> = [
+      ['model', this.opts.configPrefs?.model],
+      ['mode', this.opts.configPrefs?.permissionMode],
+      ['thought_level', ultracode ? undefined : this.opts.configPrefs?.reasoningEffort],
+      // The runtime advertises fast mode only after selecting a capable model.
+      ['model_config', fastMode === undefined ? undefined : fastMode ? 'on' : 'off']
+    ]
+    for (const [category, desired] of prefs) {
+      if (!desired) continue
+      try {
+        options = (await this.selectSessionConfig(sessionId, options, category, desired)) ?? options
+      } catch (err) {
+        if (err instanceof ModelSelectionError) throw err
+        this.opts.log?.warn(`acp: failed to set session config ${category}="${desired}": ${turnFailureReason(err)}`)
+      }
+    }
+    return options
+  }
+
+  /** Re-derive the model / effort / mode / fast selector caches from a reconciled option set. */
+  private refreshOptionCaches(configOptions: SessionConfigOption[] | null | undefined): void {
+    this.lastModelOptions = modelOptionsFrom(configOptions)
+    this.lastEffortOptions = effortOptionsFrom(configOptions, this.isClaudeRuntime())
+    this.lastPermissionModeOptions = permissionModeOptionsFrom(configOptions)
+    this.lastFastOption = fastOptionFrom(configOptions)
+  }
+
+  /** The model selector for one live session, or the most recently reconciled
+   *  selector when no session is supplied (runtime probing/backward compatibility). */
+  modelOptions(sessionId?: string): ModelOptions | null {
+    if (sessionId !== undefined) return modelOptionsFrom(this.sessionConfigs.get(sessionId))
+    return this.lastModelOptions
+  }
+
+  /** The last reconciled RAW config options for one live session, exactly as the
+   *  runtime advertised them — no synthetic augmentation, no filtering (the model
+   *  catalog caches raw efforts; augmentation happens at report time). undefined
+   *  when the session isn't known here or the runtime advertised no options. */
+  sessionConfigOptions(sessionId: string): SessionConfigOption[] | undefined {
+    return this.sessionConfigs.get(sessionId) ?? undefined
+  }
+
+  /** The reasoning-effort selector (incl. synthetic ultracode/max on Claude runtimes)
+   *  from the most recent session/new|load, or null if none is offered. */
+  effortOptions(): EffortOptions | null {
+    return this.lastEffortOptions
+  }
+
+  /** The permission/approval mode selector for one live session, or the most recently
+   *  reconciled selector when no session is supplied. */
+  permissionModeOptions(sessionId?: string): PermissionModeOptions | null {
+    if (sessionId !== undefined) return permissionModeOptionsFrom(this.sessionConfigs.get(sessionId))
+    return this.lastPermissionModeOptions
+  }
+
+  /** The fast-mode toggle from the most recent session/new|load, or null if the current
+   *  model offers no fast mode. */
+  fastModeOption(): FastModeOption | null {
+    return this.lastFastOption
+  }
+
+  /** Reconcile a selection with the runtime; model requests must succeed when a selector exists. */
+  private async selectSessionConfig(
+    sessionId: string,
+    options: SessionConfigOption[] | null | undefined,
+    category: string,
+    value: string
+  ): Promise<SessionConfigOption[] | undefined> {
+    const plan = planConfigSelection(options, category, value)
+    // Already in effect is success: read-only gates re-assert a mode the session may already hold (#2774).
+    if ('current' in plan) return options ?? undefined
+    if ('skip' in plan) {
+      const models = category === 'model' ? modelOptionsFrom(options) : null
+      if (models && models.current !== value) throw new ModelSelectionError(value, new Error(plan.skip))
+      this.opts.log?.debug(`acp: set ${category}="${value}" on ${sessionId} not applied — ${plan.skip}`)
+      return undefined
+    }
+    try {
+      const res = await this.conn!.agent.request(methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: plan.configId,
+        value: plan.value
+      })
+      if (category === 'model' && modelOptionsFrom(res.configOptions)?.current !== value) {
+        throw new Error('The runtime did not confirm the requested model')
+      }
+      this.opts.log?.info(`acp: session ${sessionId} ${category} set to "${value}"`)
+      return res.configOptions
+    } catch (err) {
+      if (category === 'model') throw new ModelSelectionError(value, err)
+      throw err
+    }
+  }
+
+  /** Apply a live selection and refresh caches; true once the value is in effect, false when it is not offered. */
+  private async setSessionConfig(sessionId: string, category: string, value: string): Promise<boolean> {
+    if (!this.live.has(sessionId)) return false
+    const options = await this.selectSessionConfig(sessionId, this.sessionConfigs.get(sessionId), category, value)
+    if (!options) return false
+    this.sessionConfigs.set(sessionId, options)
+    this.refreshOptionCaches(options)
+    return true
+  }
+
+  /** Switch the model of an already-running session (ACP `model` select) — the
+   *  mid-session counterpart of the model applied at new/load. */
+  async setSessionModel(sessionId: string, model: string): Promise<boolean> {
+    return this.setSessionConfig(sessionId, 'model', model)
+  }
+
+  /** Switch the reasoning effort of an already-running session (ACP `thought_level`
+   *  select). Returns false for `ultracode` — it isn't a select value and can only ride
+   *  session `_meta` at new/load, so the caller relies on the override being re-applied
+   *  when the session is next (re)created or resumed. */
+  async setSessionEffort(sessionId: string, effort: string): Promise<boolean> {
+    if (effort === ULTRACODE_EFFORT) return false
+    return this.setSessionConfig(sessionId, 'thought_level', effort)
+  }
+
+  /** Switch the permission/approval mode of an already-running session (ACP `mode`
+   *  select). Values are runtime-owned and validated against the advertised options. */
+  async setSessionPermissionMode(sessionId: string, mode: string): Promise<boolean> {
+    return this.setSessionConfig(sessionId, 'mode', mode)
+  }
+
+  /** Toggle fast mode on an already-running session (ACP `model_config` on/off select).
+   *  False when the current model offers no fast toggle. */
+  async setSessionFastMode(sessionId: string, on: boolean): Promise<boolean> {
+    return this.setSessionConfig(sessionId, 'model_config', on ? 'on' : 'off')
+  }
+
+  /** The ACP protocol version negotiated at initialize, or undefined before the
+   *  handshake completed. Used by the runtime probe to report ACP coverage. */
+  /** Login methods the agent advertised at `initialize`, in its own order. */
+  authMethods(): AuthMethod[] {
+    return this.agentAuthMethods
+  }
+
+  /** Run the agent's own login for one advertised method. `terminal` methods are the CLIENT's to
+   *  run as an interactive process, and the spec forbids passing them here. */
+  async authenticate(methodId: string): Promise<void> {
+    const method = this.agentAuthMethods.find((entry) => entry.id === methodId)
+    if (method && 'type' in method && method.type === 'terminal') {
+      throw new Error(`auth method "${methodId}" is completed by the client, not by \`authenticate\``)
+    }
+    await this.conn!.agent.request(methods.agent.authenticate, { methodId })
+  }
+
+  acpProtocolVersion(): number | undefined {
+    return this.negotiatedProtocolVersion
+  }
+
+  /** The ACP agent's self-reported identity (`agentInfo` from `initialize`): the
+   *  actual running adapter name/version (e.g. claude-agent-acp 0.59.0), not the
+   *  registry's declared version. undefined before the handshake or if the agent
+   *  reports none. */
+  acpAgentInfo(): { name: string; title?: string; version?: string } | undefined {
+    return this.agentInfo
+  }
+
+  /** The optional MCP transports the agent advertised at initialize (stdio is
+   *  baseline and always accepted; the unstable `acp` flag is ignored). null
+   *  before the handshake completed. Feeds the runtime probe's transport gating. */
+  mcpCapabilities(): McpTransportCapabilities | null {
+    return this.mcpCaps
+  }
+
+  /** True iff THIS agent process created or loaded `sessionId` in its current lifetime. */
+  hasSession(sessionId: string): boolean {
+    return this.live.has(sessionId)
+  }
+
+  sessionToolContext(sessionId: string): string | undefined {
+    return this.toolContexts.get(sessionId)
+  }
+
+  setSessionToolContext(sessionId: string, fingerprint: string): void {
+    this.toolContexts.set(sessionId, fingerprint)
+  }
+
+  /** The working directory this host supplied to session/new or session/load. */
+  sessionCwd(sessionId: string): string | undefined {
+    return this.live.get(sessionId)
+  }
+
+  /** True while a session/load is in flight — the session is this host's, but `live` does not hold it
+   *  yet. A caller identifying "is this session mine" from an update must accept this window too, or
+   *  it depends on whether the adapter emits before or after the load response. */
+  isLoadingSession(sessionId: string): boolean {
+    return this.loadingSessions.has(sessionId)
+  }
+
+  /** Force the next exact-session turn through session/load/new so a rotated
+   * session-scoped MCP descriptor is installed before another prompt. */
+  forgetSession(sessionId: string): void {
+    this.live.delete(sessionId)
+    this.loadingSessions.delete(sessionId)
+    this.sessionConfigs.delete(sessionId)
+    this.toolContexts.delete(sessionId)
+  }
+
+  /** Whether the agent advertised the `loadSession` capability (session/load is usable). */
+  loadSupported(): boolean {
+    return this.canLoad
+  }
+
+  /** Whether the agent advertised support for ACP session/delete. */
+  deleteSupported(): boolean {
+    return this.canDelete
+  }
+
+  /** Whether the agent advertised support for ACP session/close. */
+  closeSupported(): boolean {
+    return this.canClose
+  }
+
+  /** Restore history and pass MCP servers and native instructions to the adapter; a failed load falls back to newSession. */
+  async loadSession(
+    sessionId: string,
+    cwd: string,
+    mcpServers: McpServer[] = [],
+    effortOverride?: string,
+    systemAppend?: string,
+    additionalDirectories: string[] = [],
+    extraDisallowedTools: readonly string[] = []
+  ): Promise<void> {
+    this.loadingSessions.add(sessionId)
+    try {
+      await this.closing.get(sessionId)
+      const _meta = await this.sessionMeta(
+        effortOverride,
+        systemAppend ?? this.opts.configPrefs?.systemPrompt,
+        undefined,
+        extraDisallowedTools,
+        [cwd, ...additionalDirectories]
+      )
+      const activeAdditionalDirectories = this.canUseAdditionalDirectories ? additionalDirectories : []
+      const res = await this.conn!.agent.request(methods.agent.session.load, {
+        sessionId,
+        cwd,
+        ...(activeAdditionalDirectories.length > 0 ? { additionalDirectories: activeAdditionalDirectories } : {}),
+        mcpServers: this.clampSessionMcpServers(mcpServers),
+        ...(_meta ? { _meta } : {})
+      })
+      this.live.set(sessionId, cwd)
+      // Re-apply config prefs: ACP sessions restore their own last model/effort,
+      // which may predate a CP-side agent edit.
+      const configOptions = await this.applySessionConfig(sessionId, res.configOptions)
+      // Refresh the selectors from the reconciled options — a resumed session must
+      // report its own model/effort/fast, not stale ones from the last session/new (or
+      // null if this process never created one). Mirrors newSession().
+      this.refreshOptionCaches(configOptions)
+      this.sessionConfigs.set(sessionId, configOptions)
+      this.opts.log?.info(`acp: resumed session ${sessionId} via session/load`)
+    } catch (err) {
+      this.discardSession(sessionId)
+      this.opts.log?.debug(`acp: session/load failed for ${sessionId}: ${turnFailureReason(err)}`)
+      throw err
+    } finally {
+      this.loadingSessions.delete(sessionId)
+    }
+  }
+
+  /** Drive one prompt; managed Codex usage is a per-prompt delta, and a typed terminal failure rejects. */
+  async prompt(sessionId: string, blocks: ContentBlock[]): Promise<{ stopReason: StopReason; usage?: Usage }> {
+    const res = await this.conn!.agent.request(methods.agent.session.prompt, { sessionId, prompt: blocks })
+    const failure = sessionFailureFromMeta(res._meta)
+    if (failure) throw failure
+    return { stopReason: res.stopReason, usage: res.usage ?? undefined }
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    await this.conn!.agent.notify(methods.agent.session.cancel, { sessionId })
+  }
+
+  /** Whether the runtime accepts `_session/steering` — read once from `initialize`. */
+  steeringSupported(): boolean {
+    return this.canSteer
+  }
+
+  /** Inject `blocks` into a session's RUNNING turn over `_session/steering`. `failed` when the
+   *  runtime never advertised steering or the session is not live here, otherwise the runtime's
+   *  own outcome; a transport error propagates so the caller can fall back to queueing. */
+  async steer(
+    sessionId: string,
+    blocks: ContentBlock[],
+    opts: { idleBehavior?: SteeringIdleBehavior } = {}
+  ): Promise<SteeringOutcome> {
+    if (!this.canSteer || !this.live.has(sessionId)) return 'failed'
+    const res = await this.conn!.agent.request<unknown>(
+      STEERING_METHOD,
+      steeringRequestParams(sessionId, blocks, opts.idleBehavior)
+    )
+    const outcome = parseSteeringOutcome(res)
+    this.opts.log?.debug(`acp: steer into ${sessionId} → ${outcome}`)
+    return outcome
+  }
+
+  /** Delete persisted adapter state when supported, then release local ownership. */
+  async deleteSession(sessionId: string): Promise<boolean> {
+    if (!this.canDelete) return false
+    await this.conn!.agent.request(methods.agent.session.delete, { sessionId })
+    this.forgetSession(sessionId)
+    return true
+  }
+
+  /** End a live session's runtime resources (its `claude` child) but keep its history loadable; false when unsupported or not live here. */
+  async closeSession(sessionId: string): Promise<boolean> {
+    if (!this.canClose || !this.live.has(sessionId)) return false
+    // Forget before the request goes out, so a turn admitted meanwhile reloads instead of prompting a closing session.
+    this.forgetSession(sessionId)
+    const request = this.conn!.agent.request(methods.agent.session.close, { sessionId }).then(() => undefined)
+    const settled = request.catch(() => undefined)
+    this.closing.set(sessionId, settled)
+    try {
+      await request
+    } finally {
+      if (this.closing.get(sessionId) === settled) this.closing.delete(sessionId)
+    }
+    return true
+  }
+
+  /** Forget a failed setup locally without deleting persisted adapter state. */
+  discardSession(sessionId: string): void {
+    this.live.delete(sessionId)
+    this.sessionConfigs.delete(sessionId)
+    this.toolContexts.delete(sessionId)
+  }
+
+  /** Stop the adapter child: stdin EOF + SIGTERM, then escalate to SIGKILL if it
+   *  hasn't exited within `deadlineMs` (a buggy/hung agent must never block daemon
+   *  shutdown or an idle reap). Signals target the child's process group (it is
+   *  spawned detached) so they reach the real adapter behind an npx wrapper too.
+   *  Idempotent — the child handle is cleared up front so a concurrent stop (drain
+   *  + reconcile racing) is a no-op rather than a double-kill. */
+  async stop(deadlineMs = 5000, eofGraceMs = 0): Promise<void> {
+    const spawned = this.spawned
+    if (!spawned) return
+    this.spawned = undefined
+    await spawned.stop(deadlineMs, eofGraceMs)
+  }
+}

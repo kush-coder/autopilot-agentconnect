@@ -1,0 +1,248 @@
+import Fastify from 'fastify'
+import { describe, expect, it, vi } from 'vitest'
+import { LogtoApiError } from '../../github/logto-identity.js'
+import type { HttpDeps } from '../deps.js'
+import { installZod } from '../plugins/zod.js'
+import { meSocialIdentityRoutes } from './me-social-identities.js'
+
+describe('my social identities routes', () => {
+  it('resolves a connector id and unlinks under the OIDC subject', async () => {
+    const identity = {
+      socialConnectorIdFor: vi.fn(async () => 'google-connector'),
+      linkSocialIdentity: vi.fn(async () => undefined),
+      unlinkSocialIdentity: vi.fn(async () => undefined)
+    }
+    const deps = {
+      logtoIdentity: identity,
+      config: { PUBLIC_WEB_URL: 'https://app.example.test' }
+    } as unknown as HttpDeps
+    const app = Fastify()
+    installZod(app)
+    app.decorate('oidcAuth', async (req) => {
+      req.oidcSubject = 'logto-user'
+    })
+    await app.register(meSocialIdentityRoutes(deps))
+
+    try {
+      const connector = await app.inject({ method: 'GET', url: '/me/social-identities/connectors/google' })
+      expect(connector.statusCode).toBe(200)
+      expect(connector.json()).toEqual({ connectorId: 'google-connector' })
+      expect(identity.socialConnectorIdFor).toHaveBeenCalledWith('google')
+
+      // The `direct` link runs server-side, and the callback URI comes from
+      // config — never from the caller, who could otherwise point the provider
+      // response somewhere else.
+      const linked = await app.inject({
+        method: 'POST',
+        url: '/me/social-identities',
+        payload: {
+          connectorId: 'google-connector',
+          connectorData: { code: 'c', redirectUri: 'https://attacker.example.test/callback' }
+        }
+      })
+      expect(linked.statusCode).toBe(200)
+      expect(identity.linkSocialIdentity).toHaveBeenCalledWith('logto-user', 'google-connector', {
+        code: 'c',
+        redirectUri: 'https://app.example.test/auth/social/callback'
+      })
+
+      const unlinked = await app.inject({ method: 'DELETE', url: '/me/social-identities/google' })
+      expect(unlinked.statusCode).toBe(204)
+      expect(identity.unlinkSocialIdentity).toHaveBeenCalledWith('logto-user', 'google')
+
+      identity.unlinkSocialIdentity.mockRejectedValueOnce(
+        new LogtoApiError('the last social sign-in method cannot be removed', 409, false, 'LAST_SOCIAL_IDENTITY')
+      )
+      const lastIdentity = await app.inject({ method: 'DELETE', url: '/me/social-identities/github' })
+      expect(lastIdentity.statusCode).toBe(409)
+      expect(lastIdentity.json()).toMatchObject({
+        code: 'LAST_SOCIAL_IDENTITY',
+        message: 'connect another sign-in method before removing this one'
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('maps "identity already in use" to a 409 the console can explain, never the 502 fallback', async () => {
+    // The 502 fallback is replaced by the edge (Cloudflare) with a CORS-less
+    // error page, so the browser reports a CORS failure instead of the conflict.
+    const identity = {
+      linkSocialIdentity: vi.fn(async () => {
+        throw new LogtoApiError('identity already in use', 422, false, 'user.identity_already_in_use')
+      })
+    }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/me/social-identities',
+        payload: { connectorId: 'github-connector', connectorData: { code: 'c' } }
+      })
+      expect(res.statusCode).toBe(409)
+      expect(res.json()).toMatchObject({
+        code: 'user.identity_already_in_use',
+        message: 'this social account is already linked to another user'
+      })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('maps other Logto 422s to the 400 "authorization invalid" answer', async () => {
+    const identity = {
+      linkSocialIdentity: vi.fn(async () => {
+        throw new LogtoApiError('connector session not found', 422, false, 'session.verification_session_not_found')
+      })
+    }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/me/social-identities',
+        payload: { connectorId: 'github-connector', connectorData: { code: 'c' } }
+      })
+      expect(res.statusCode).toBe(400)
+      expect(res.json()).toMatchObject({ code: 'SOCIAL_AUTHORIZATION_INVALID' })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('accepts slack as a linkable target, matching the console provider list', async () => {
+    // The console offers Slack, so this route must resolve it. It gates on shape
+    // and on the tenant having the connector — never on its own provider list.
+    const identity = { socialConnectorIdFor: vi.fn(async () => 'slack-connector') }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/connectors/slack' })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({ connectorId: 'slack-connector' })
+      expect(identity.socialConnectorIdFor).toHaveBeenCalledWith('slack')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('lets the console announce a link that landed outside the CP', async () => {
+    // Linking runs browser -> provider, so this is the only signal the CP gets
+    // that its cached copy is behind.
+    const identity = { forgetUser: vi.fn() }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'POST', url: '/me/social-identities/refresh' })
+      expect(res.statusCode).toBe(204)
+      expect(identity.forgetUser).toHaveBeenCalledWith('logto-user')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('fails closed on an unknown target when the deployment sets no list', async () => {
+    // With no list configured the schema does not second-guess the target; the
+    // tenant does, one step later. That is the fail-closed point, not a catalog
+    // in this file duplicating the console's.
+    const identity = {
+      socialConnectorIdFor: vi.fn(async () => {
+        throw new LogtoApiError('social connector not found', 404, false)
+      })
+    }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/connectors/facebook' })
+      expect(res.statusCode).toBe(404)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('rejects a target that is not a connector slug at all', async () => {
+    const identity = { socialConnectorIdFor: vi.fn(async () => 'nope') }
+    const app = await slackApp({ logtoIdentity: identity } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/connectors/Not%20A%20Target' })
+      expect(res.statusCode).toBe(400)
+      expect(identity.socialConnectorIdFor).not.toHaveBeenCalled()
+    } finally {
+      await app.close()
+    }
+  })
+})
+
+/** A routes-only app whose oidcAuth stamps a fixed subject. */
+async function slackApp(partial: Partial<HttpDeps>, config: Record<string, unknown> = {}) {
+  const deps = {
+    ...partial,
+    config: { PUBLIC_WEB_URL: 'https://app.example.test', ...config }
+  } as unknown as HttpDeps
+  const app = Fastify()
+  installZod(app)
+  app.decorate('oidcAuth', async (req) => {
+    req.oidcSubject = 'logto-user'
+  })
+  await app.register(meSocialIdentityRoutes(deps))
+  return app
+}
+
+describe('GET /me/social-identities/slack', () => {
+  it('returns the workspace identity behind the caller’s subject', async () => {
+    const slackIdentityFor = vi.fn(async () => ({
+      teamId: 'T0EXAMPLE1',
+      userId: 'U0EXAMPLE1',
+      teamName: 'Example Workspace'
+    }))
+    const app = await slackApp({ logtoIdentity: { slackIdentityFor } } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/slack' })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({
+        linked: true,
+        teamId: 'T0EXAMPLE1',
+        userId: 'U0EXAMPLE1',
+        teamName: 'Example Workspace'
+      })
+      expect(slackIdentityFor).toHaveBeenCalledWith('logto-user')
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('reports "not linked" for an account that never connected Slack', async () => {
+    const app = await slackApp({
+      logtoIdentity: { slackIdentityFor: vi.fn(async () => null) }
+    } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/slack' })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toEqual({ linked: false })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('503s when the deployment cannot resolve identities, like its siblings', async () => {
+    const app = await slackApp({} as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/slack' })
+      expect(res.statusCode).toBe(503)
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('502s when the provider is unreachable, rather than claiming "not linked"', async () => {
+    const app = await slackApp({
+      logtoIdentity: {
+        slackIdentityFor: vi.fn(async () => {
+          throw new LogtoApiError('logto unreachable', 0, true)
+        })
+      }
+    } as unknown as HttpDeps)
+    try {
+      const res = await app.inject({ method: 'GET', url: '/me/social-identities/slack' })
+      expect(res.statusCode).toBe(502)
+    } finally {
+      await app.close()
+    }
+  })
+})

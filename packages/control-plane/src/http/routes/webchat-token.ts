@@ -1,0 +1,657 @@
+/**
+ * `http/routes/webchat-token.ts` — mints the short-lived browser webchat token
+ * (shared-bot-relay.md §10, milestone A4).
+ *
+ *   POST /orgs/:orgId/agents/:agentId/webchat/token → { token, relayUrl, conversationId, expiresAt }
+ *
+ * The console calls this (authenticated as the human, org-scoped) BEFORE dialing the
+ * relay pool: the CP checks the caller can view the agent, registers or verifies the
+ * conversation's owner, then mints a token bound to
+ * {userId, user, agentId, orgId, conversationId}. The browser dials `relayUrl` with that
+ * token; the relay verifies it via `rc/verify(webchat-token)` and bridges to the agent's
+ * daemon. This is the ONLY authentication the relay path needs — the CP never sees content.
+ */
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
+import {
+  continuableOrigin,
+  continuableSession,
+  coordinatorConversationId,
+  originKindOf,
+  WEBCHAT_MULTI_AGENT_FEATURE
+} from '@agentconnect.md/protocol'
+import type { AgentRecord, SessionMetaRecord } from '../../persistence/ports.js'
+import { MAX_CONVERSATION_PEERS, platformIdentities, type ConversationPeerClaim } from '../../registry/webchatToken.js'
+import type { ZodTypeProvider } from '../plugins/zod.js'
+import type { HttpDeps } from '../deps.js'
+import { AgentId, SessionId, type OrgId } from '../../domain/ids.js'
+import type { ResolvableAgent } from '../../orchestrator/placementResolver.js'
+import { canContinueSession, canView } from '../../authorization/policy.js'
+import { makeSessionAccessResolver } from '../session-access.js'
+import { continuationAudience, continuationParentId } from '../../domain/continuation-audience.js'
+import { resolveContinuationHost } from '../session-continuation.js'
+import { ctxOf, orgOf } from '../rbac.js'
+import { autoSessionModeRefusal } from '../decision-access.js'
+import { ErrorDto } from '../dto/index.js'
+import { webchatAuthorIdentity } from '../../registry/agentChatKeyVerification.js'
+import { everyTurnReachesItsContent as turnsReachContent } from '../../registry/webchatVerification.js'
+import { Tag } from '../plugins/openapi.js'
+import { WebchatProtocol, WebchatAttachmentDto, webchatAttachment } from '../webchat-attachment.js'
+
+type ErrorBody = z.infer<typeof ErrorDto>
+
+const Params = z.object({ orgId: z.string(), agentId: z.string().uuid() })
+const Body = z
+  .object({
+    protocol: WebchatProtocol.optional(),
+    // Resume an existing conversation; omitted ⇒ the CP mints a fresh id.
+    conversationId: z.string().uuid().optional(),
+    // The caller's private coordinator conversation with the agent, created on first use (auto-session-mode.md §10).
+    coordinator: z.boolean().optional()
+  })
+  .refine((b) => !(b.coordinator && b.conversationId !== undefined), {
+    message: 'a coordinator conversation is named by its agent, not by conversationId'
+  })
+const WebchatTokenDto = WebchatAttachmentDto.extend({
+  token: z.string(),
+  relayUrl: z.string(),
+  conversationId: z.string(),
+  // The token's own `exp`; a caller reuses the token until then instead of minting per turn.
+  expiresAt: z.string().datetime(),
+  // A coordinator conversation's current session, which the console opens it on once it has one.
+  sessionId: z.string().optional()
+})
+
+const ConversationParams = z.object({ orgId: z.string() })
+const AddAgentParams = z.object({ orgId: z.string(), conversationId: z.string().uuid() })
+const AddAgentBody = z.object({ agentId: z.string().uuid() })
+const RemoveAgentParams = AddAgentParams.extend({ agentId: z.string().uuid() })
+const ConversationParticipantsDto = z.object({
+  participants: z.array(z.object({ agentId: z.string(), primary: z.boolean().optional() }))
+})
+const WEBCHAT_ROSTER_CAP = 8
+// Exactly one of the two: `agentIds` creates (roster fixed at creation, first
+// entry = primary, webchat-multi-agents.md §3.1), `conversationId` resumes.
+const ConversationBody = z
+  .object({
+    protocol: WebchatProtocol.optional(),
+    conversationId: z.string().uuid().optional(),
+    agentIds: z.array(z.string().uuid()).min(1).max(8).optional()
+  })
+  .refine((b) => (b.conversationId === undefined) !== (b.agentIds === undefined), {
+    message: 'provide exactly one of conversationId (resume) or agentIds (create)'
+  })
+
+export function webchatTokenRoutes(deps: HttpDeps) {
+  return async function webchatTokenRoutesPlugin(app: FastifyInstance): Promise<void> {
+    const r = app.withTypeProvider<ZodTypeProvider>()
+    const sessionAccess = makeSessionAccessResolver(deps)
+
+    /** The other agents' sessions of a hook session's merged conversation the caller may continue, under the same gates as this mint and the detail read's `canContinue` (#2500). */
+    const hookConversationPeers = async (
+      req: FastifyRequest,
+      s: SessionMetaRecord
+    ): Promise<ConversationPeerClaim[]> => {
+      if (originKindOf(s.platform ?? '') !== 'hook' || !s.platform || s.channel === null || s.thread === null) return []
+      const ctx = ctxOf(req)
+      const orgAgents = await deps.repos.agent.list(orgOf(req))
+      const agentIds = orgAgents.map((a) => a.id)
+      const scoped = await sessionAccess.forQuery(req, { agentIds })
+      const viewer = { role: ctx.role, identitySet: [...scoped.identitySet], externalAccess: scoped.externalAccess }
+      const key = { platform: s.platform, tenantScope: s.tenantScope, channel: s.channel, thread: s.thread }
+      const members = (await deps.repos.session.listConversationMembers({ agentIds, viewer }, key)).filter(
+        (m) => m.agentId !== s.agentId
+      )
+      if (members.length === 0) return []
+      const access = await sessionAccess.forSessions(req, members)
+      const agentsById = new Map(orgAgents.map((a) => [a.id as string, a]))
+      const peers: ConversationPeerClaim[] = []
+      for (const m of members) {
+        // Newest first, so a conversation larger than a verdict can carry keeps its most recently active members.
+        if (peers.length >= MAX_CONVERSATION_PEERS) break
+        if (!canContinueSession(m, ctx, access.identitySet, access.externalAccess)) continue
+        if (m.contentPurgedAt || !continuableOrigin(m.platform ?? '')) continue
+        const peerAgent = agentsById.get(m.agentId)
+        if (!peerAgent || !canView(peerAgent, ctx)) continue
+        if (!(await resolveContinuationHost(deps, m, peerAgent)).ok) continue
+        peers.push({
+          sessionId: m.id,
+          ...(m.visibility === 'private' && m.ownerIdentity ? { privateOwnerIdentity: m.ownerIdentity } : {})
+        })
+      }
+      return peers
+    }
+
+    /** The identity the token attests: the handle names transcript lines and session branches, so the full name beats the sign-in address. */
+    const authorIdentity = (userId: string, email: string | undefined) =>
+      webchatAuthorIdentity(
+        { users: deps.repos.user, ...(deps.iconStore ? { iconStore: deps.iconStore } : {}) },
+        userId,
+        email
+      )
+
+    /** The first roster agent whose serving daemon does not advertise multi-agent webchat, or
+     *  undefined when every one of them does. The daemon comes from the resolver — the same
+     *  answer `rc/verify` will reach — because a pool agent's row names no machine at all. */
+    const firstWithoutMultiAgent = async (roster: readonly ResolvableAgent[]): Promise<string | undefined> => {
+      for (const agent of roster) {
+        const daemonId = await deps.placementResolver.dispatchDaemon(agent)
+        const daemon = daemonId ? deps.daemonConns.get(daemonId) : undefined
+        if (!daemon?.capabilities?.features?.includes(WEBCHAT_MULTI_AGENT_FEATURE)) return agent.id
+      }
+      return undefined
+    }
+
+    /** Mint-time fence (webchat-multi-agents.md §10.2): a resume requires the
+     *  owner to currently `canView` EVERY participant, not only the primary —
+     *  losing access to one restricted member revokes the whole conversation,
+     *  since the minted token exposes and targets the full roster. */
+    const allParticipantsViewable = async (
+      conversationId: string,
+      orgId: OrgId,
+      ctx: ReturnType<typeof ctxOf>
+    ): Promise<boolean> => {
+      const roster = await deps.repos.webchatConversation.participants(orgId, conversationId)
+      for (const p of roster) {
+        const member = await deps.repos.agent.get(orgId, p.agentId)
+        if (!member || !canView(member, ctx)) return false
+      }
+      return true
+    }
+
+    /** Who may RESUME a conversation: its owner always; anyone else under the same `session.continue` policy an
+     *  integration-origin session gets — EVERY participant's current session visible to them and a non-viewer
+     *  role, private sessions owner-only. A participant with no session yet (before the first turn, or a peer a
+     *  targeted turn skipped) has nothing to judge, and the socket would let the caller target it into a session
+     *  that is default-private to the owner — so any missing slot keeps the conversation the owner's. Unknown
+     *  and foreign ids read as null, exactly like a refusal. */
+    const resumableBy = async (
+      req: Parameters<typeof ctxOf>[0] & { principal?: { userId: string } },
+      conversationId: string
+    ): Promise<{ primaryAgentId: AgentId; currentSessionIds: Array<SessionId | null> } | null> => {
+      const binding = await deps.repos.webchatConversation.resumeBinding(conversationId, orgOf(req))
+      if (!binding) return null
+      const resumable = { primaryAgentId: binding.primaryAgentId, currentSessionIds: binding.currentSessionIds }
+      if (binding.ownerUserId === req.principal!.userId) return resumable
+      const ids = binding.currentSessionIds.filter((id): id is SessionId => id !== null)
+      if (ids.length === 0 || ids.length !== binding.currentSessionIds.length) return null
+      const sessions = await Promise.all(ids.map((id) => deps.repos.session.get(orgOf(req), id)))
+      const rows = sessions.filter((s) => s !== null)
+      if (rows.length !== sessions.length) return null
+      const access = await sessionAccess.forSessions(req, rows)
+      const ctx = ctxOf(req)
+      return rows.every((s) => canContinueSession(s, ctx, access.identitySet, access.externalAccess)) ? resumable : null
+    }
+
+    const contentReach = {
+      sessions: deps.repos.session,
+      agents: deps.repos.agent,
+      placement: deps.placementResolver,
+      memberSets: deps.repos.memberSet
+    }
+    const everyTurnReachesItsContent = (orgId: OrgId, currentSessionIds: Array<SessionId | null>) =>
+      turnsReachContent(contentReach, orgId, currentSessionIds)
+    const AHP_UNAVAILABLE = {
+      error: 'Service Unavailable',
+      statusCode: 503,
+      message: 'AHP attachment is not available for every participant'
+    }
+    const AGENT_MOVED = { error: 'Conflict', statusCode: 409, message: 'the agent moved since this conversation ran' }
+
+    /** A member's private coordinator conversation with an agent (auto-session-mode.md §10): one per organization, member and agent, created on first use and the member's alone. */
+    const mintCoordinator = async (
+      principal: { userId: string; email?: string },
+      agent: AgentRecord,
+      relayUrl: string,
+      protocol: WebchatProtocol | undefined
+    ): Promise<{ code: 200; body: z.infer<typeof WebchatTokenDto> } | { code: 404 | 409; body: ErrorBody }> => {
+      const refusal = await autoSessionModeRefusal(deps, agent)
+      if (refusal) return { code: 409, body: { error: 'Conflict', statusCode: 409, message: refusal } }
+      if (protocol === 'ahp') {
+        const message = 'a coordinator conversation runs over legacy webchat'
+        return { code: 409, body: { error: 'Conflict', statusCode: 409, message } }
+      }
+      const { userId } = principal
+      const conversationId = coordinatorConversationId(agent.orgId, userId, agent.id)
+      const existing = await deps.repos.webchatConversation.resumeBinding(conversationId, agent.orgId)
+      if (existing && (existing.ownerUserId !== userId || existing.primaryAgentId !== agent.id)) {
+        return { code: 404, body: { error: 'Not Found', statusCode: 404, message: 'conversation not found' } }
+      }
+      if (existing && !(await everyTurnReachesItsContent(agent.orgId, existing.currentSessionIds))) {
+        return { code: 409, body: AGENT_MOVED }
+      }
+      if (!existing) {
+        await deps.repos.webchatConversation.ensure({ conversationId, userId, agentId: agent.id, orgId: agent.orgId })
+      }
+      const { token, expiresAt } = await deps.webchatTokens.mint({
+        protocol: 'legacy',
+        userId,
+        ...(await authorIdentity(userId, principal.email)),
+        agentId: agent.id,
+        orgId: agent.orgId,
+        conversationId
+      })
+      const sessionId = existing?.currentSessionIds[0] ?? undefined
+      return {
+        code: 200,
+        body: {
+          token,
+          relayUrl,
+          conversationId,
+          expiresAt: expiresAt.toISOString(),
+          protocol: 'legacy',
+          ...(sessionId ? { sessionId } : {})
+        }
+      }
+    }
+
+    r.post(
+      '/agents/:agentId/webchat/token',
+      {
+        preHandler: app.humanAuth,
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Mint a webchat token',
+          description:
+            'Mints a short-lived token the browser presents to the relay pool to start or resume a playground webchat session with this agent. A resume is allowed for the conversation owner, and for any non-viewer member who may continue every session it currently stands on (org-visible sessions; private ones stay owner-only). A resume answers 409 once an agent’s next turn would reach a machine that does not hold its session. With `coordinator`, the token is for the caller’s private conversation with the agent’s coordinator, created on first use and answered with its current session; it needs a daemon that reads Auto and the legacy webchat protocol.',
+          operationId: 'mintWebchatToken',
+          params: Params,
+          body: Body,
+          response: { 200: WebchatTokenDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const relayUrl = deps.config.PUBLIC_RELAY_URL
+        if (!relayUrl) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'webchat relay pool not configured' })
+        }
+        // Cross-org id OR a restricted agent the caller can't see both read as absent.
+        const agent = await deps.repos.agent.get(orgOf(req), AgentId(req.params.agentId))
+        if (!agent || !canView(agent, ctxOf(req))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        }
+        const userId = req.principal!.userId
+        if (req.body.coordinator) {
+          const minted = await mintCoordinator(req.principal!, agent, relayUrl, req.body.protocol)
+          return reply.code(minted.code).send(minted.body)
+        }
+        const conversationId = req.body.conversationId?.toLowerCase() ?? randomUUID()
+        const binding = { conversationId, userId, agentId: agent.id, orgId: agent.orgId }
+        if (req.body.conversationId) {
+          // The asserted agent must be the conversation's primary on this per-agent path, so a resume's bound agent is `:agentId`, which humanAuth already fenced on the key's selection.
+          const resumable = await resumableBy(req, conversationId)
+          if (
+            resumable?.primaryAgentId !== agent.id ||
+            !(await allParticipantsViewable(conversationId, agent.orgId, ctxOf(req)))
+          ) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'conversation not found' })
+          }
+          if (!(await everyTurnReachesItsContent(agent.orgId, resumable.currentSessionIds))) {
+            return reply.code(409).send(AGENT_MOVED)
+          }
+        }
+        const attachment = await webchatAttachment(deps, {
+          orgId: agent.orgId,
+          primaryAgentId: agent.id,
+          conversationId,
+          protocol: req.body.protocol,
+          ...(req.body.conversationId ? {} : { agentIds: [agent.id] })
+        })
+        if (!attachment) return reply.code(503).send(AHP_UNAVAILABLE)
+        if (!req.body.conversationId) await deps.repos.webchatConversation.create(binding)
+        const { token, expiresAt } = await deps.webchatTokens.mint({
+          protocol: attachment.protocol,
+          userId,
+          ...(await authorIdentity(userId, req.principal!.email)),
+          agentId: agent.id,
+          orgId: agent.orgId,
+          conversationId
+        })
+        return reply.send({ token, relayUrl, conversationId, expiresAt: expiresAt.toISOString(), ...attachment })
+      }
+    )
+
+    // Session-targeted mint (webchat-cross-integration-continuation.md §6.2/§9): the target is resolved at verify time, never claimed by the browser.
+    r.post(
+      '/sessions/:sessionId/webchat/token',
+      {
+        preHandler: app.humanAuth,
+        schema: {
+          tags: [Tag.Sessions],
+          summary: 'Mint a session-continuation webchat token',
+          description:
+            'Mints a short-lived token the browser presents to the relay pool to continue an existing session from the console composer — a chat thread (the human turn is mirrored back to it), a hook-origin session such as a GitHub or GitLab event, whose only surface is the console, or a task (a delegated task’s page, or a webchat coordinator’s task, whose message is a reply in the thread it holds), which whoever may continue its owning session continues console-only. Requires continuation authorization, un-purged content, a daemon that can still serve the session content (its recorder, or a live member of the shared store it was written to), and continuation-capable daemon and relay pool.',
+          operationId: 'mintWebchatSessionToken',
+          params: z.object({ orgId: z.string(), sessionId: z.string() }),
+          body: z.object({ protocol: WebchatProtocol.optional() }).nullish(),
+          response: { 200: WebchatTokenDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const relayUrl = deps.config.PUBLIC_RELAY_URL
+        if (!relayUrl) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'webchat relay pool not configured' })
+        }
+        const refuse = (code: 403 | 404 | 409 | 503, message: string) =>
+          reply.code(code).send({
+            error:
+              code === 403
+                ? 'Forbidden'
+                : code === 404
+                  ? 'Not Found'
+                  : code === 409
+                    ? 'Conflict'
+                    : 'Service Unavailable',
+            statusCode: code,
+            message
+          })
+        const s = await deps.repos.session.get(orgOf(req), SessionId(req.params.sessionId))
+        if (!s) return refuse(404, 'session not found')
+        const ctx = ctxOf(req)
+        // A task is continued by whoever may continue its owning session (auto-session-mode.md §10).
+        const parentId = continuationParentId(s)
+        const audience = continuationAudience(
+          s,
+          parentId ? await deps.repos.session.get(orgOf(req), SessionId(parentId)) : null
+        )
+        const access = await sessionAccess.forSessions(req, [audience ?? s])
+        if (!audience || !canContinueSession(audience, ctx, access.identitySet, access.externalAccess)) {
+          return refuse(403, 'not authorized to continue this session')
+        }
+        if (s.contentPurgedAt) return refuse(409, 'session content was purged')
+        if (!continuableSession(s)) return refuse(409, 'this session cannot be continued')
+        const agent = await deps.repos.agent.get(orgOf(req), s.agentId)
+        if (!agent || !canView(agent, ctx)) return refuse(404, 'session not found')
+        const host = await resolveContinuationHost(deps, s, agent)
+        if (!host.ok) {
+          return refuse(
+            409,
+            host.reason === 'agent_moved'
+              ? 'the agent moved since this session ran'
+              : host.reason === 'daemon_offline'
+                ? 'the session host is offline'
+                : 'session continuation is not available yet'
+          )
+        }
+        const userId = req.principal!.userId
+        const { conversationId } = await deps.repos.webchatConversation.upsertSessionTargeted(
+          { orgId: agent.orgId, agentId: agent.id, userId },
+          s.id
+        )
+        const conversationPeers = await hookConversationPeers(req, s)
+        // The author's own accounts on the session's platform, so the daemon can address them there (the access check resolved them).
+        const userIdentities = platformIdentities(s.platform, access.identitySet)
+        const ahpSelected = (req.body?.protocol ?? deps.config.WEBCHAT_PROTOCOL ?? 'legacy') === 'ahp'
+        const peerSessions = ahpSelected
+          ? await Promise.all(
+              conversationPeers.map((peer) => deps.repos.session.get(orgOf(req), SessionId(peer.sessionId)))
+            )
+          : []
+        if (peerSessions.some((peer) => !peer)) return refuse(409, 'conversation participant unavailable')
+        const attachment = await webchatAttachment(deps, {
+          orgId: agent.orgId,
+          primaryAgentId: agent.id,
+          conversationId,
+          protocol: req.body?.protocol,
+          agentIds: [agent.id, ...peerSessions.map((peer) => peer!.agentId)]
+        })
+        if (!attachment) return reply.code(503).send(AHP_UNAVAILABLE)
+        const { token, expiresAt } = await deps.webchatTokens.mint({
+          protocol: attachment.protocol,
+          userId,
+          ...(await authorIdentity(userId, req.principal!.email)),
+          agentId: agent.id,
+          orgId: agent.orgId,
+          conversationId,
+          ...(audience.visibility === 'private' && audience.ownerIdentity
+            ? { privateSessionOwnerIdentity: audience.ownerIdentity }
+            : {}),
+          ...(conversationPeers.length > 0 ? { conversationPeers } : {}),
+          ...(userIdentities.length > 0 ? { userIdentities } : {})
+        })
+        return reply.send({ token, relayUrl, conversationId, expiresAt: expiresAt.toISOString(), ...attachment })
+      }
+    )
+
+    // Conversation-scoped mint (webchat-multi-agents.md §6.2): creates a
+    // conversation with its full roster in one call, or resumes an existing one
+    // by id alone. The token claims stay primary-shaped — the relay resolves the
+    // roster at verification time from the durable participant rows.
+    r.post(
+      '/webchat/conversations/token',
+      {
+        preHandler: app.humanAuth,
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Mint a conversation webchat token',
+          description:
+            'Mints a short-lived token the browser presents to the relay pool. Pass `agentIds` (first entry is the primary) to create a conversation — the roster is fixed at creation — or `conversationId` to resume one — as its owner, or as any non-viewer member who may continue every session it currently stands on (org-visible sessions; private ones stay owner-only). A resume answers 409 once an agent’s next turn would reach a machine that does not hold its session. Creating with more than one agent requires every selected agent to be placed on a daemon that supports multi-agent webchat.',
+          operationId: 'mintWebchatConversationToken',
+          params: ConversationParams,
+          body: ConversationBody,
+          response: { 200: WebchatTokenDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const relayUrl = deps.config.PUBLIC_RELAY_URL
+        if (!relayUrl) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'webchat relay pool not configured' })
+        }
+        const userId = req.principal!.userId
+        const orgId = req.orgCtx!.orgId
+
+        if (req.body.conversationId) {
+          const conversationId = req.body.conversationId.toLowerCase()
+          const resumable = await resumableBy(req, conversationId)
+          if (!resumable) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'conversation not found' })
+          }
+          // EVERY participant must still be viewable — the minted token exposes
+          // and targets the full roster, so losing access to one restricted
+          // member revokes resume for the whole conversation.
+          const primary = await deps.repos.agent.get(orgOf(req), resumable.primaryAgentId)
+          if (
+            !primary ||
+            primary.orgId !== orgId ||
+            !canView(primary, ctxOf(req)) ||
+            !(await allParticipantsViewable(conversationId, orgId, ctxOf(req)))
+          ) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'conversation not found' })
+          }
+          if (!(await everyTurnReachesItsContent(orgId, resumable.currentSessionIds))) {
+            return reply.code(409).send(AGENT_MOVED)
+          }
+          const attachment = await webchatAttachment(deps, {
+            orgId,
+            primaryAgentId: primary.id,
+            conversationId,
+            protocol: req.body.protocol
+          })
+          if (!attachment) return reply.code(503).send(AHP_UNAVAILABLE)
+          const { token, expiresAt } = await deps.webchatTokens.mint({
+            protocol: attachment.protocol,
+            userId,
+            ...(await authorIdentity(userId, req.principal!.email)),
+            agentId: primary.id,
+            orgId,
+            conversationId
+          })
+          return reply.send({ token, relayUrl, conversationId, expiresAt: expiresAt.toISOString(), ...attachment })
+        }
+
+        const agentIds = [...new Set(req.body.agentIds!)]
+        const agents = []
+        for (const id of agentIds) {
+          const agent = await deps.repos.agent.get(orgOf(req), AgentId(id))
+          if (!agent || !canView(agent, ctxOf(req))) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+          }
+          agents.push(agent)
+        }
+        if (agents.length > 1) {
+          // Capability gate at creation (webchat-multi-agents.md §6.3): every
+          // selected agent's daemon must advertise multi-agent webchat support.
+          const ungated = await firstWithoutMultiAgent(agents)
+          if (ungated) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: `agent ${ungated} is not on a daemon that supports multi-agent conversations`
+            })
+          }
+        }
+        const conversationId = randomUUID()
+        const [primary, ...members] = agents
+        const attachment = await webchatAttachment(deps, {
+          orgId,
+          primaryAgentId: primary!.id,
+          conversationId,
+          protocol: req.body.protocol,
+          agentIds
+        })
+        if (!attachment) return reply.code(503).send(AHP_UNAVAILABLE)
+        await deps.repos.webchatConversation.create(
+          { conversationId, userId, agentId: primary!.id, orgId },
+          members.map((a) => a.id)
+        )
+        const { token, expiresAt } = await deps.webchatTokens.mint({
+          protocol: attachment.protocol,
+          userId,
+          ...(await authorIdentity(userId, req.principal!.email)),
+          agentId: primary!.id,
+          orgId,
+          conversationId
+        })
+        return reply.send({ token, relayUrl, conversationId, expiresAt: expiresAt.toISOString(), ...attachment })
+      }
+    )
+
+    // The roster a join or removal answers with; the browser then reconnects so a fresh rc/verify refreshes the relay's cache.
+    const rosterReply = async (orgId: OrgId, conversationId: string) => {
+      const roster = await deps.repos.webchatConversation.participants(orgId, conversationId)
+      return {
+        participants: roster.map((p) => ({ agentId: p.agentId, ...(p.role === 'primary' ? { primary: true } : {}) }))
+      }
+    }
+
+    // Mid-conversation join (§3.1): growing past one participant suspends the delegated admin MCP (§10.3).
+    r.post(
+      '/webchat/conversations/:conversationId/agents',
+      {
+        preHandler: app.humanAuth,
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Add an agent to a webchat conversation',
+          description:
+            'Adds a participant agent to a conversation owned by the authenticated user (mid-conversation join). The agent must be viewable and placed on a daemon that supports multi-agent webchat — as must every existing participant. Idempotent for an agent already in the roster.',
+          operationId: 'addWebchatConversationAgent',
+          params: AddAgentParams,
+          body: AddAgentBody,
+          response: { 200: ConversationParticipantsDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const userId = req.principal!.userId
+        const orgId = req.orgCtx!.orgId
+        const conversationId = req.params.conversationId.toLowerCase()
+        const owned = await deps.repos.webchatConversation.ownedBy(conversationId, orgId, userId)
+        if (!owned) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'conversation not found' })
+        }
+        // A member's coordinator conversation is theirs with one agent (auto-session-mode.md §10).
+        if (conversationId === coordinatorConversationId(orgId, userId, owned.primaryAgentId)) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'a coordinator conversation has a fixed participant' })
+        }
+        // A session-targeted conversation has exactly one participant — no
+        // roster growth (webchat-cross-integration-continuation.md §6.2).
+        const target = await deps.repos.webchatConversation.target(conversationId)
+        if (target?.targetSessionId) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'a session continuation has a fixed participant' })
+        }
+        const agent = await deps.repos.agent.get(orgOf(req), AgentId(req.body.agentId))
+        if (!agent || !canView(agent, ctxOf(req))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        }
+        const roster = await deps.repos.webchatConversation.participants(orgId, conversationId)
+        const respond = async () => reply.send(await rosterReply(orgId, conversationId))
+        if (roster.some((p) => p.agentId === agent.id)) return respond()
+        if (roster.length >= WEBCHAT_ROSTER_CAP) {
+          return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: 'conversation is full' })
+        }
+        // Every participant of a multi-agent conversation — the new agent AND
+        // the existing roster — must sit on a capability-advertising daemon
+        // (webchat-multi-agents.md §6.3, enforced at each growth point).
+        const rosterAgents = [agent]
+        for (const p of roster) {
+          const existing = await deps.repos.agent.get(orgOf(req), p.agentId)
+          if (existing) rosterAgents.push(existing)
+        }
+        const ungated = await firstWithoutMultiAgent(rosterAgents)
+        if (ungated) {
+          return reply.code(409).send({
+            error: 'Conflict',
+            statusCode: 409,
+            message: `agent ${ungated} is not on a daemon that supports multi-agent conversations`
+          })
+        }
+        await deps.repos.webchatConversation.addParticipant(orgId, conversationId, agent.id, userId)
+        return respond()
+      }
+    )
+
+    // Member removal (§3.1a): the primary stays, and a removed member keeps its earlier posts in the transcript.
+    r.delete(
+      '/webchat/conversations/:conversationId/agents/:agentId',
+      {
+        preHandler: app.humanAuth,
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Remove an agent from a webchat conversation',
+          description:
+            'Removes a non-primary participant agent from a conversation owned by the authenticated user. The removed agent receives no further turns or context from the conversation; its earlier replies stay in the history. The primary agent cannot be removed. Idempotent for an agent that is not in the roster.',
+          operationId: 'removeWebchatConversationAgent',
+          params: RemoveAgentParams,
+          response: { 200: ConversationParticipantsDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const userId = req.principal!.userId
+        const orgId = req.orgCtx!.orgId
+        const conversationId = req.params.conversationId.toLowerCase()
+        const owned = await deps.repos.webchatConversation.ownedBy(conversationId, orgId, userId)
+        if (!owned) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'conversation not found' })
+        }
+        const target = await deps.repos.webchatConversation.target(conversationId)
+        if (target?.targetSessionId) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'a session continuation has a fixed participant' })
+        }
+        const outcome = await deps.repos.webchatConversation.removeParticipant(
+          orgId,
+          conversationId,
+          AgentId(req.params.agentId.toLowerCase()),
+          userId
+        )
+        if (outcome === 'primary') {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'cannot remove the primary agent' })
+        }
+        return reply.send(await rosterReply(orgId, conversationId))
+      }
+    )
+  }
+}

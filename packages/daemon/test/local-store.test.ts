@@ -1,0 +1,4993 @@
+import { describe, it, expect } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import pgDriver from 'pg'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import type { NoteProjectionRow } from '../src/gitlab/note-projection.js'
+import {
+  LocalStore,
+  sessionKey,
+  type SessionRecord,
+  type StoreDatabase,
+  type TranscriptEntry,
+  OBSERVATION_SWEEP_INSERTS,
+  SCHEMA_VERSION,
+  transcriptPromptText
+} from '../src/store/local-store.js'
+import { SqliteAsyncDatabase } from '../src/store/sqlite-async-database.js'
+import { PostgresAsyncDatabase } from '../src/store/postgres-async-database.js'
+import { memoryStoreDatabase, openTestStore, usingPostgresStore } from './store-support.js'
+
+/** The admission a session-internal row (tool / plan / card) always carries — its own sender's
+ *  session, keyed exactly as {@link readScope} keys a `createNew` conversation. */
+export const admitted = <T extends { sender: string; channel: string; thread: string }>(
+  e: T
+): T & { admission: { agentId: string; sessionKey: string } } => ({
+  ...e,
+  admission: { agentId: e.sender, sessionKey: `k:${e.channel}:${e.thread}:${e.sender}` }
+})
+
+/** One session's transcript read scope. In a `createNew` conversation the coordinate IS the
+ *  physical thread, so a scope built this way reads exactly what `(channel, thread)` used to. */
+export const readScope = (
+  transcriptChannel: string,
+  coordinate: string,
+  agentId: string,
+  sessionKey = `k:${transcriptChannel}:${coordinate}:${agentId}`
+) => ({ transcriptChannel, coordinate, sessionKey, agentId })
+
+/** True in the `store-postgres` project, where every store below is the real pool store. */
+const pg = usingPostgresStore()
+
+async function store(): Promise<LocalStore> {
+  return await openTestStore({ path: join(mkdtempSync(join(tmpdir(), 'ac-db-')), 'local.sqlite') })
+}
+
+it('pins a Decision model once, independently of manual overrides and subsequent session updates', async () => {
+  const s = await store()
+  const row = {
+    key: 'model-decision',
+    agentId: 'bot-a',
+    platform: 'webchat',
+    channel: 'conversation',
+    thread: 'thread',
+    acpSessionId: 'acp-1',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1
+  }
+  await s.upsertSession(row)
+  const target = { runtime: 'claude', model: 'model-capable', effort: 'high', permissionMode: 'plan', fastMode: false }
+  await s.pinDecisionModel(row.key, target)
+  await s.pinDecisionModel(row.key, { runtime: 'claude', model: 'model-standard', effort: 'low', fastMode: true })
+  await s.setModelOverride(row.key, 'model-manual')
+  await s.clearRuntimeConfigOverrides(row.agentId)
+  await s.upsertSession({ ...row, updatedAt: 2 })
+  expect((await s.getSession(row.key))?.decisionModel).toBe(JSON.stringify(target))
+  expect(await s.getModelOverride(row.key)).toBeUndefined()
+  await s.close()
+})
+
+// A turn's model is recorded with the runtime it ran on, so a later runtime change cannot re-pair it.
+it('records a turn’s runtime and observed model as one pair, which later upserts keep', async () => {
+  const s = await store()
+  const row = {
+    key: 'observed-turn',
+    agentId: 'bot-a',
+    platform: 'webchat',
+    channel: 'conversation',
+    thread: 'thread',
+    acpSessionId: 'acp-1',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1
+  }
+  await s.upsertSession(row)
+  expect(await s.getObservedTurn(row.key)).toBeUndefined()
+  await s.setObservedTurn(row.key, 'runtime-a', 'model-a')
+  await s.upsertSession({ ...row, updatedAt: 2 })
+  expect(await s.getObservedTurn(row.key)).toEqual({ runtime: 'runtime-a', model: 'model-a' })
+  await s.setObservedTurn(row.key, 'runtime-b', null)
+  expect(await s.getObservedTurn(row.key)).toEqual({ runtime: 'runtime-b', model: null })
+  expect(await s.getObservedModel(row.key)).toBeNull()
+  await s.close()
+})
+
+// multi-repository-workspaces.md decision 20: what lets retention judge a session's on-demand clones whatever the rows say later.
+it('records once that a session was handed an on-demand clone directory, which later upserts keep', async () => {
+  const s = await store()
+  const row = {
+    key: 'on-demand-clones',
+    agentId: 'bot-a',
+    platform: 'webchat',
+    channel: 'conversation',
+    thread: 'thread',
+    acpSessionId: 'acp-1',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1,
+    workspaceIsolation: 'shared' as const
+  }
+  await s.upsertSession(row)
+  expect((await s.getSession(row.key))?.onDemandClones ?? null).toBeNull()
+
+  await s.markSessionOnDemandClones(row.key)
+  await s.markSessionOnDemandClones(row.key)
+  await s.upsertSession({ ...row, state: 'closed', updatedAt: 2 })
+
+  expect((await s.getSession(row.key))?.onDemandClones).toBe(1)
+  expect((await s.listExpiredSessions(10)).map((rec) => [rec.key, rec.onDemandClones])).toEqual([[row.key, 1]])
+  // A key with no row is a no-op, never a row of its own.
+  await s.markSessionOnDemandClones('never-opened')
+  expect(await s.getSession('never-opened')).toBeUndefined()
+  await s.close()
+})
+
+// multi-repository-workspaces.md decision 19: the repositories the selector chose, pinned once per session and held against the retire sweep.
+it('pins a session’s selected repositories once, and lists what an agent’s sessions still hold', async () => {
+  const s = await store()
+  const row = {
+    key: 'selected',
+    agentId: 'bot-a',
+    platform: 'webchat',
+    channel: 'conversation',
+    thread: 'thread',
+    acpSessionId: 'acp-1',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1
+  }
+  const infra = { provider: 'github' as const, repoFullName: 'acme/infra', repoId: '42' }
+  const tools = { provider: 'github' as const, repoFullName: 'example-co/tools', repoId: '900' }
+  await s.upsertSession(row)
+  expect((await s.getSession(row.key))?.selectedRepos ?? null).toBeNull()
+
+  await s.pinSelectedRepos(row.key, [infra])
+  await s.pinSelectedRepos(row.key, [tools])
+  await s.upsertSession({ ...row, state: 'closed', updatedAt: 2 })
+  expect(JSON.parse((await s.getSession(row.key))!.selectedRepos!)).toEqual([infra])
+
+  await s.upsertSession({ ...row, key: 'other', thread: 'thread-2' })
+  await s.pinSelectedRepos('other', [infra, tools])
+  await s.upsertSession({ ...row, key: 'elsewhere', agentId: 'bot-b', thread: 'thread-3' })
+  await s.pinSelectedRepos('elsewhere', [{ ...tools, repoId: '901' }])
+  const held = await s.listSelectedRepos('bot-a')
+  expect(held).toHaveLength(2)
+  expect(held).toEqual(expect.arrayContaining([infra, tools]))
+  expect(await s.listSelectedRepos('bot-c')).toEqual([])
+  // A key with no row is a no-op, never a row of its own.
+  await s.pinSelectedRepos('never-opened', [infra])
+  expect(await s.getSession('never-opened')).toBeUndefined()
+  await s.close()
+})
+
+/** A second handle on the same durable store — a daemon restart, not a new store. */
+async function reopen(path: string): Promise<LocalStore> {
+  return await openTestStore(path)
+}
+
+/** Every agent a shared-store test names belongs to one org unless the test says otherwise. */
+const oneOrg = () => 'org-1'
+
+/** Two pool members over ONE database — what the shared Postgres schema is during a rollout. */
+async function sharedMembers(first: string, second: string): Promise<[LocalStore, LocalStore]> {
+  const database = pg ? undefined : memoryStoreDatabase()
+  return [
+    await openTestStore({ database, shared: true, ownerId: first, orgForAgent: oneOrg }),
+    await openTestStore({ database, shared: true, ownerId: second, orgForAgent: oneOrg })
+  ]
+}
+
+/** Undo the v15 approval-DM columns, so a fixture looks like a store an older daemon wrote. */
+const dropApprovalDmColumns = (db: DatabaseSync): void => {
+  for (const column of ['resolvedBy', 'resolvedByName', 'notifyIntegrationId', 'notifyChannel', 'notifyTs'])
+    db.exec(`ALTER TABLE permission_requests DROP COLUMN ${column}`)
+}
+
+/** A store from before v16 has no platform standing block on its sessions. */
+const dropPlatformStanding = (db: DatabaseSync): void => {
+  db.exec('ALTER TABLE sessions DROP COLUMN platformStanding')
+}
+
+/** A store from before v20 records no birth verdict on its sessions. */
+const dropBirthVerdict = (db: DatabaseSync): void => {
+  db.exec('ALTER TABLE sessions DROP COLUMN executorDaemonId')
+  db.exec('ALTER TABLE sessions DROP COLUMN stayedHomeReason')
+}
+
+/** A pre-v23 store has no durable code-host output target. */
+const dropCodeHostReplyTarget = (db: DatabaseSync): void => {
+  db.exec('ALTER TABLE sessions DROP COLUMN originCodeHostReplyTarget')
+  db.exec('ALTER TABLE inbox DROP COLUMN codeHostReplyTarget')
+}
+
+/** Undo the v17 gate re-key, so a fixture's session_gates looks like the one an older daemon wrote. */
+const revertSessionGateKey = (db: DatabaseSync): void => {
+  db.exec('DROP TABLE session_gates')
+  db.exec(`CREATE TABLE session_gates (
+    agentId TEXT NOT NULL, acpSessionId TEXT NOT NULL, localExcluded INTEGER NOT NULL DEFAULT 1,
+    cpPrivate INTEGER, cpRev INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER, PRIMARY KEY (agentId, acpSessionId)
+  )`)
+}
+
+/** Undo the v24 channel record, so a fixture looks like the transcript a v23 daemon wrote:
+ *  `thread` NOT NULL, the dedup index on the full key, and a (channel, thread, ts, agent) delivery table. */
+const revertTranscriptAdmissions = (db: DatabaseSync): void => {
+  db.exec('ALTER TABLE sessions DROP COLUMN decisionModel')
+  db.exec(`
+    DROP INDEX transcript_channel_seq;
+    DROP INDEX transcript_text_ts;
+    DROP INDEX transcript_channel_event_time;
+    DROP INDEX transcript_channel_revision;
+    DROP INDEX transcript_recipient_session;
+    DROP TABLE transcript_recipient;
+    CREATE TABLE transcript_recipient (
+      orgId TEXT NOT NULL DEFAULT '',
+      channel TEXT NOT NULL, thread TEXT NOT NULL, ts TEXT NOT NULL, agentId TEXT NOT NULL,
+      PRIMARY KEY (orgId, channel, thread, ts, agentId)
+    );
+    CREATE TABLE transcript_v23 (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      orgId TEXT NOT NULL DEFAULT '',
+      channel TEXT NOT NULL, thread TEXT NOT NULL, ts TEXT,
+      sender TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+      tool_call_id TEXT, body TEXT, recipient TEXT, eventTimeUs INTEGER,
+      attachmentsJson TEXT, quoteJson TEXT, trustedAgentBot INTEGER, revision INTEGER NOT NULL DEFAULT 0,
+      postId TEXT
+    );
+    DROP TABLE transcript;
+    ALTER TABLE transcript_v23 RENAME TO transcript;
+    CREATE INDEX transcript_thread_seq ON transcript (orgId, channel, thread, seq);
+    CREATE UNIQUE INDEX transcript_text_ts ON transcript (orgId, channel, thread, ts) WHERE kind = 'text';
+    CREATE UNIQUE INDEX transcript_agent_tool_call
+      ON transcript (orgId, channel, thread, sender, tool_call_id) WHERE tool_call_id IS NOT NULL;
+    CREATE INDEX transcript_app_card ON transcript (tool_call_id) WHERE kind = 'app';
+    CREATE INDEX transcript_thread_event_time ON transcript (orgId, channel, thread, eventTimeUs DESC, seq DESC);
+    CREATE INDEX transcript_thread_revision ON transcript (orgId, channel, thread, revision);
+  `)
+}
+
+/** Undo the v11 transcript fence, so a fixture looks like a store an older daemon wrote. */
+const dropTranscriptOrg = (db: DatabaseSync): void => {
+  revertTranscriptAdmissions(db)
+  db.exec(`
+    DROP INDEX transcript_app_card;
+    DROP INDEX transcript_thread_seq;
+    DROP INDEX transcript_text_ts;
+    DROP INDEX transcript_agent_tool_call;
+    DROP INDEX transcript_thread_event_time;
+    DROP INDEX transcript_thread_revision;
+    ALTER TABLE transcript DROP COLUMN orgId;
+    DROP TABLE transcript_recipient;
+    CREATE TABLE transcript_recipient (
+      channel TEXT NOT NULL, thread TEXT NOT NULL, ts TEXT NOT NULL, agentId TEXT NOT NULL,
+      PRIMARY KEY (channel, thread, ts, agentId)
+    );
+    CREATE INDEX transcript_thread_seq ON transcript (channel, thread, seq);
+    CREATE UNIQUE INDEX transcript_text_ts ON transcript (channel, thread, ts) WHERE kind = 'text';
+    CREATE UNIQUE INDEX transcript_agent_tool_call
+      ON transcript (channel, thread, sender, tool_call_id) WHERE tool_call_id IS NOT NULL;
+    CREATE INDEX transcript_app_card ON transcript (tool_call_id) WHERE kind = 'app';
+    CREATE INDEX transcript_thread_event_time ON transcript (channel, thread, eventTimeUs DESC, seq DESC);
+    CREATE INDEX transcript_thread_revision ON transcript (channel, thread, revision);
+  `)
+}
+
+it('binds the first parent reply target once and carries a separate publication fence in the report inbox', async () => {
+  const s = await store()
+  const parent = {
+    key: 'parent',
+    agentId: 'bot-a',
+    platform: 'hook',
+    channel: 'github:123',
+    thread: '42',
+    acpSessionId: 'acp-parent',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1,
+    originSessionId: 'origin'
+  }
+  await s.upsertSession(parent)
+  const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
+  await s.bindSessionOriginReplyTarget('parent', 'other-origin', target)
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBeNull()
+  await s.bindSessionOriginReplyTarget('parent', 'origin', target)
+  await s.bindSessionOriginReplyTarget('parent', 'origin', 'null')
+  await s.upsertSession({ ...parent, updatedAt: 2 })
+  expect((await s.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
+  await s.upsertSession({ ...parent, key: 'private-child' })
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', 'null')
+  await s.bindSessionOriginReplyTarget('private-child', 'origin', target)
+  expect((await s.getSession('private-child'))?.originCodeHostReplyTarget).toBe('null')
+  await s.appendInbox({
+    id: 'report',
+    sessionKey: 'parent',
+    agentId: 'bot-a',
+    msg: '{}',
+    enqueuedAt: '1',
+    codeHostReplyTarget: target,
+    posterPublishState: 'not_started'
+  })
+  expect(await s.updateInboxHookState('report', null, 'in_flight')).toBe(true)
+  expect(await s.listInboxBySessionKeyFifo()).toMatchObject([
+    { codeHostReplyTarget: target, hookContext: null, posterPublishState: 'in_flight' }
+  ])
+  await s.close()
+})
+
+describe.skipIf(pg)('LocalStore schema versioning', () => {
+  const userVersion = (path: string): number => {
+    const db = new DatabaseSync(path)
+    const v = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    db.close()
+    return v
+  }
+
+  it('stamps a freshly created store with the current schema version', async () => {
+    // A new database gets the whole schema from the CREATE block, so it must skip
+    // the upgrade list outright rather than replay it.
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-fresh-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    expect(userVersion(path)).toBeGreaterThanOrEqual(1)
+  })
+
+  it('reopens an existing store without rewriting its version', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-reopen-')), 'local.sqlite')
+    const first = await LocalStore.open(path)
+    await first.appendTranscript({ channel: 'C1', thread: 'T', ts: '1', sender: 'U1', kind: 'text', text: 'hello' })
+    await first.close()
+    const stamped = userVersion(path)
+
+    const second = await LocalStore.open(path)
+    expect((await second.threadTranscript('C1', 'T')).map((r) => r.text)).toEqual(['hello'])
+    await second.close()
+    expect(userVersion(path)).toBe(stamped)
+  })
+
+  it('upgrades v22 sessions without inventing code-host authority and preserves a newly bound target on reopen', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v22-')), 'local.sqlite')
+    const initial = await LocalStore.open(path)
+    await initial.upsertSession({
+      key: 'parent',
+      agentId: 'bot-a',
+      platform: 'hook',
+      channel: 'github:123',
+      thread: '42',
+      transportScope: 'github:123',
+      acpSessionId: 'acp-parent',
+      originSessionId: 'origin',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await initial.close()
+    const legacy = new DatabaseSync(path)
+    dropCodeHostReplyTarget(legacy)
+    revertTranscriptAdmissions(legacy)
+    legacy.exec('PRAGMA user_version = 22')
+    legacy.close()
+    const upgraded = await LocalStore.open(path)
+    const parent = (await upgraded.getSession('parent'))!
+    expect(parent.originCodeHostReplyTarget).toBeNull()
+    const target = JSON.stringify({ provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 })
+    await upgraded.bindSessionOriginReplyTarget('parent', 'origin', target)
+    await upgraded.upsertSession({ ...parent, updatedAt: 2 })
+    await upgraded.close()
+    const restarted = await LocalStore.open(path)
+    expect((await restarted.getSession('parent'))?.originCodeHostReplyTarget).toBe(target)
+    await restarted.close()
+  })
+
+  it('adds permission ownership, recovery ownership and per-owner routing when upgrading a v1 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v1-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE permission_requests DROP COLUMN ownerId')
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    revertSessionGateKey(old)
+    old.exec('DROP INDEX session_metadata_outbox_attempt')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN failedAttempts')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN nextAttemptAt')
+    old.exec('ALTER TABLE dreams DROP COLUMN ownerId')
+    old.exec('ALTER TABLE webchat_mcp_grant_ledger DROP COLUMN ownerId')
+    old.exec('ALTER TABLE inbox DROP COLUMN reportOwnerId')
+    old.exec('ALTER TABLE inbox DROP COLUMN reportClaimedAt')
+    old.exec('ALTER TABLE cron_runs DROP COLUMN definition')
+    old.exec('ALTER TABLE session_purges DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_purges DROP COLUMN claimedAt')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN claimedAt')
+    dropTranscriptOrg(old)
+    old.exec('ALTER TABLE sessions DROP COLUMN sessionId')
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    old.exec('PRAGMA user_version = 1')
+    old.close()
+
+    await (await LocalStore.open(path)).close()
+
+    const upgraded = new DatabaseSync(path)
+    const columnsOf = (table: string): string[] =>
+      (upgraded.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((column) => column.name)
+    const columns = columnsOf('permission_requests')
+    const outboxColumns = columnsOf('session_metadata_outbox')
+    const dreamColumns = columnsOf('dreams')
+    const grantColumns = columnsOf('webchat_mcp_grant_ledger')
+    const inboxColumns = columnsOf('inbox')
+    const cronColumns = columnsOf('cron_runs')
+    const purgeColumns = columnsOf('session_purges')
+    upgraded.close()
+    expect(columns).toContain('ownerId')
+    // Approval decisions record who decided; a DM card handle survives a restart (§5.4/§6.1).
+    expect(columns).toEqual(
+      expect.arrayContaining(['resolvedBy', 'resolvedByName', 'notifyIntegrationId', 'notifyChannel', 'notifyTs'])
+    )
+    // Session-metadata snapshots are leased per pool member too (#1023).
+    expect(outboxColumns).toEqual(expect.arrayContaining(['failedAttempts', 'nextAttemptAt', 'ownerId', 'claimedAt']))
+    // Recovery ownership: a pool member must be able to tell its own rows from a peer's.
+    expect(dreamColumns).toContain('ownerId')
+    expect(grantColumns).toContain('ownerId')
+    expect(inboxColumns).toEqual(expect.arrayContaining(['reportOwnerId', 'reportClaimedAt']))
+    // A stamp is only comparable to a fire of the same schedule definition (#1031).
+    expect(cronColumns).toContain('definition')
+    // Purge receipts are leased per pool member (#1032).
+    expect(purgeColumns).toEqual(expect.arrayContaining(['ownerId', 'claimedAt']))
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it.skipIf(pg)('never persists the CP routing map on a shared store, and still does on an owned one', async () => {
+    // One row and many members: each member's save used to erase every other member's, and each
+    // boot hydrated whichever map was written last — a foreign `routingEpoch` with it. A shared
+    // member now writes nothing and reads nothing, so it starts from an empty map at epoch 0.
+    const database = new DatabaseSync(join(mkdtempSync(join(tmpdir(), 'ac-schema-shared-')), 'local.sqlite'))
+    const backing = SqliteAsyncDatabase.adopt(database)
+    const first = await LocalStore.open({ database: backing, shared: true, ownerId: 'member-1', orgForAgent: oneOrg })
+    const second = await LocalStore.open({ database: backing, shared: true, ownerId: 'member-2', orgForAgent: oneOrg })
+
+    await first.setCpRouting(1, '{"a":[]}', '[]')
+    await second.setCpRouting(9, '{"b":[]}', '[{"kind":"global"}]')
+    expect(await first.getCpRouting()).toBeUndefined()
+    expect(await second.getCpRouting()).toBeUndefined()
+    // Not even a row to leak: `ownerId` is a process incarnation, so any partition key a member
+    // could write here would be abandoned on its next restart.
+    expect(database.prepare('SELECT COUNT(*) AS n FROM cp_routing').get()).toMatchObject({ n: 0 })
+    database.close()
+
+    // An exclusively owned store is untouched: it is the one store where the row survives a restart.
+    const solo = await store()
+    await solo.setCpRouting(4, '{"solo":[]}', '[{"kind":"global"}]')
+    expect(await solo.getCpRouting()).toMatchObject({ routingEpoch: 4, assignments: '{"solo":[]}' })
+    await solo.close()
+  })
+
+  it('re-keys the capture gate by agent when upgrading a v5 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v5-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE session_gates')
+    old.exec(`CREATE TABLE session_gates (
+      acpSessionId TEXT PRIMARY KEY, localExcluded INTEGER NOT NULL DEFAULT 1,
+      cpPrivate INTEGER, cpRev INTEGER NOT NULL DEFAULT 0, updatedAt INTEGER
+    )`)
+    old.exec(`INSERT INTO sessions (key, agentId, acpSessionId) VALUES
+      ('a', 'bot-a', 'acp-1'), ('b', 'bot-b', 'acp-2'), ('c', 'bot-c', 'acp-2')`)
+    old.exec(`INSERT INTO session_gates (acpSessionId, localExcluded, cpPrivate, cpRev) VALUES
+      ('acp-1', 1, 0, 4), ('acp-2', 0, 0, 7), ('acp-orphan', 0, 0, 1)`)
+    old.exec('ALTER TABLE cron_runs DROP COLUMN definition')
+    old.exec('ALTER TABLE session_purges DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_purges DROP COLUMN claimedAt')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN claimedAt')
+    dropTranscriptOrg(old)
+    old.exec('ALTER TABLE sessions DROP COLUMN sessionId')
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    old.exec('PRAGMA user_version = 5')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // Attributable: the CP verdict follows the one agent that held the id, filed under its session key.
+    expect(await upgraded.isCaptureExcluded('bot-a', 'a')).toBe(false)
+    // Held by two agents: the stored verdict was never attributable to either, so
+    // both start from the fail-closed state and wait for their own CP push.
+    expect(await upgraded.isCaptureExcluded('bot-b', 'b')).toBe(true)
+    expect(await upgraded.isCaptureExcluded('bot-c', 'c')).toBe(true)
+    expect(await upgraded.applyCpCaptureGate('bot-b', 'b', false, 1)).toBe('applied')
+    expect(await upgraded.isCaptureExcluded('bot-b', 'b')).toBe(false)
+    expect(await upgraded.isCaptureExcluded('bot-c', 'c')).toBe(true)
+    await upgraded.close()
+
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('re-keys the runtime catalog cache on its owning member when upgrading a v7 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v7-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec(`
+      DROP TABLE runtime_catalog_meta;
+      DROP TABLE runtime_model_catalog;
+      CREATE TABLE runtime_catalog_meta (
+        runtimeId TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, source TEXT NOT NULL, defaultModel TEXT,
+        permissionModes TEXT, defaultPermissionMode TEXT, complete INTEGER NOT NULL DEFAULT 0,
+        modelsHash TEXT, observedAt INTEGER NOT NULL
+      );
+      CREATE TABLE runtime_model_catalog (
+        runtimeId TEXT NOT NULL, modelId TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        capsJson TEXT NOT NULL, observedAt INTEGER NOT NULL, PRIMARY KEY (runtimeId, modelId)
+      );
+      INSERT INTO runtime_catalog_meta (runtimeId, fingerprint, source, complete, observedAt)
+        VALUES ('claude', 'fp-1', 'acp', 1, 100);
+      INSERT INTO runtime_model_catalog (runtimeId, modelId, fingerprint, capsJson, observedAt)
+        VALUES ('claude', 'opus', 'fp-1', '{}', 100);
+    `)
+    old.exec('ALTER TABLE session_purges DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_purges DROP COLUMN claimedAt')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN ownerId')
+    old.exec('ALTER TABLE session_metadata_outbox DROP COLUMN claimedAt')
+    dropTranscriptOrg(old)
+    old.exec('ALTER TABLE sessions DROP COLUMN sessionId')
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    revertSessionGateKey(old)
+    old.exec('PRAGMA user_version = 7')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // Pre-upgrade rows name no member, so no member can honestly claim them; the next
+    // probe refills the cache this one owns.
+    expect(await upgraded.getRuntimeCatalogMeta('claude')).toBeUndefined()
+    expect(await upgraded.listRuntimeModelCaps()).toEqual([])
+    await upgraded.close()
+
+    const after = new DatabaseSync(path)
+    const metaColumns = after.prepare('PRAGMA table_info(runtime_catalog_meta)').all() as { name: string; pk: number }[]
+    const capColumns = after.prepare('PRAGMA table_info(runtime_model_catalog)').all() as { name: string; pk: number }[]
+    after.close()
+    const primaryKey = (columns: { name: string; pk: number }[]): string[] =>
+      columns
+        .filter((column) => column.pk > 0)
+        .sort((a, b) => a.pk - b.pk)
+        .map((column) => column.name)
+    expect(primaryKey(metaColumns)).toEqual(['ownerId', 'runtimeId'])
+    expect(primaryKey(capColumns)).toEqual(['ownerId', 'runtimeId', 'modelId'])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('backfills a v11 store with the outward id its sessions were already reported under', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v11-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN sessionId')
+    old.exec(`INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+      VALUES ('k1', 'bot-a', 'slack', 'C1', 'T1', 'acp-1', 'idle', 100)`)
+    // A session that never launched has no id to inherit — it gets one when it next needs one.
+    old.exec(`INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+      VALUES ('k2', 'bot-a', 'slack', 'C1', 'T2', NULL, 'idle', 100)`)
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    revertSessionGateKey(old)
+    revertTranscriptAdmissions(old)
+    old.exec('PRAGMA user_version = 11')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // The control plane already knows this session by its ACP id: renaming it would orphan the row.
+    expect((await upgraded.getSession('k1'))?.sessionId).toBe('acp-1')
+    expect((await upgraded.getSessionByOutwardId('acp-1'))?.key).toBe('k1')
+    expect((await upgraded.getSession('k2'))?.sessionId).toBeNull()
+    expect(await upgraded.ensureOutwardSessionId('k2', 'bot-a')).toMatch(/^[0-9a-f-]{36}$/)
+    await upgraded.close()
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  // The regression that made `directDestination` reachable on fresh databases only: the step was
+  // appended to SCHEMA_MIGRATIONS without bumping SCHEMA_VERSION, so `upgradeSchema` stopped short
+  // of it and every established store failed at query time instead of at boot.
+  it('adds directDestination to a v12 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v12-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    old.exec(`INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+      VALUES ('k1', 'bot-a', 'slack', 'C1', 'T1', 'acp-1', 'idle', 100)`)
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    revertSessionGateKey(old)
+    revertTranscriptAdmissions(old)
+    old.exec('PRAGMA user_version = 12')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // The read path that broke: every dispatch resolves a session's classification.
+    expect(await upgraded.getSessionClassification('bot-a', 'acp-1')).toEqual({})
+    await upgraded.setSessionClassification('k1', { sourceBindingKind: 'external', directDestination: true })
+    expect(await upgraded.getSessionClassification('bot-a', 'acp-1')).toMatchObject({ directDestination: true })
+    await upgraded.close()
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('refuses a store written by a newer daemon WITHOUT touching it first', async () => {
+    // Rolling a daemon back must fail loudly: this build cannot know what the newer
+    // schema did, so "upgrading" it would corrupt more than it fixed. The refusal
+    // has to land before any DDL — the CREATE block is IF NOT EXISTS, but on a
+    // newer store "not exists" is the wrong question, and re-adding this version's
+    // objects is exactly the damage the refusal exists to prevent.
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-future-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const setup = new DatabaseSync(path)
+    // Stand in for an object this build would happily recreate.
+    setup.exec('DROP TABLE transcript')
+    setup.exec('PRAGMA user_version = 9999')
+    setup.close()
+
+    await expect(LocalStore.open(path)).rejects.toThrow(/newer than this daemon understands/)
+
+    const after = new DatabaseSync(path)
+    const rebuilt = after
+      .prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'transcript'")
+      .get() as { n: number }
+    const version = after.prepare('PRAGMA user_version').get() as { user_version: number }
+    after.close()
+    expect(rebuilt.n).toBe(0) // the CREATE block never ran
+    expect(version.user_version).toBe(9999) // and the version was not rewritten
+  })
+})
+
+describe('transcript text-row body', () => {
+  it('lands with the first write, or upgrades in place when an observer row won the insert', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-body-')), 'local.sqlite')
+    const s = await LocalStore.open(path)
+    const body = JSON.stringify({ prompt: 'P', linear: { issue: { identifier: 'ENG-1' } } })
+    // Observer first (no body), then the ingest that carries it: the body is added, nothing else moves.
+    await s.appendTranscript({ channel: 'C', thread: 'T', ts: '1', sender: 'u', kind: 'text', text: 'hi' })
+    await s.appendTranscript({ channel: 'C', thread: 'T', ts: '1', sender: 'u', kind: 'text', text: 'hi', body })
+    // A second body never replaces the first.
+    await s.appendTranscript({
+      channel: 'C',
+      thread: 'T',
+      ts: '1',
+      sender: 'u',
+      kind: 'text',
+      text: 'hi',
+      body: '{"prompt":"other"}'
+    })
+    // Ingest first: the body rides the insert itself.
+    await s.appendTranscript({ channel: 'C', thread: 'T', ts: '2', sender: 'u', kind: 'text', text: 'yo', body })
+    const rows = await s.transcriptSince(readScope('C', 'T', 'u'), null)
+    expect(rows.map((r) => [r.ts, r.text, r.body])).toEqual([
+      ['1', 'hi', body],
+      ['2', 'yo', body]
+    ])
+    await s.close()
+  })
+})
+
+describe('LocalStore', () => {
+  it('keeps every agent reply in a thread, and lets a finalization refresh its own text', async () => {
+    // The production failure this pins: a response finalization used to reach the
+    // transcript with the literal ts `'final'` (a `:final` msgId suffix that
+    // `transcriptCoords` read as the ts). The UNIQUE index is (channel, thread, ts) and
+    // does NOT include the recipient, so only the FIRST agent reply in a thread survived
+    // — every later one was silently dropped by INSERT OR IGNORE. In a multi-agent Slack
+    // thread that means an agent sees exactly one peer message, ever.
+    const s = await store()
+    const row = (ts: string, text: string, extra: Record<string, unknown> = {}) => ({
+      channel: 'slack:C1',
+      thread: '100.1',
+      ts,
+      sender: 'bot-a',
+      recipient: 'bot-b',
+      kind: 'text' as const,
+      text,
+      ...extra
+    })
+    await s.appendTranscript(row('100.2', '1'))
+    await s.appendTranscript(row('100.3', '3'))
+    await s.appendTranscript(row('100.4', '7'))
+
+    const texts = async () => (await s.threadTranscript('slack:C1', '100.1')).map((r) => r.text)
+    expect(await texts()).toEqual(['1', '3', '7'])
+
+    // A finalization lands on its OWN post's coordinates and upgrades the text in place —
+    // the post can hold a streamed prefix, and a text row has no other update path.
+    await s.appendTranscript(row('100.4', '7 (complete)', { authoritative: true }))
+    expect(await texts()).toEqual(['1', '3', '7 (complete)'])
+
+    // Without that marker a re-observation must never rewrite an existing row.
+    await s.appendTranscript(row('100.4', 'stale replay'))
+    expect(await texts()).toEqual(['1', '3', '7 (complete)'])
+    await s.close()
+  })
+
+  it('upserts and reads back a session record', async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C1', '100.1', 'bot-a')
+    await s.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: '100.1',
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    const got = await s.getSession(key)
+    expect(got?.agentId).toBe('bot-a')
+    expect(got?.state).toBe('idle')
+    await s.close()
+  })
+
+  it('persists only explicitly pending session snapshots and fences stale ACKs', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-session-outbox-')), 'local.sqlite')
+    const first = await reopen(path)
+    await first.upsertSession({
+      key: sessionKey('slack', 'C1', '100.1', 'bot-a'),
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: '100.1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+
+    // Enrichment alone never turns an existing historical row into replay work.
+    expect(await first.saveSessionMetadataSnapshot('bot-a', 'acp-1', '{"phase":"plan"}', false, 1)).toBeUndefined()
+    expect(await first.hasPendingSessionMetadata()).toBe(false)
+
+    expect(await first.saveSessionMetadataSnapshot('bot-a', 'acp-1', '{"phase":"start"}', true, 2)).toBe(1)
+    await first.close()
+
+    const restored = await reopen(path)
+    expect(await restored.nextSessionMetadataSnapshot()).toMatchObject({
+      agentId: 'bot-a',
+      sessionId: 'acp-1',
+      revision: 1,
+      snapshot: '{"phase":"start"}',
+      failedAttempts: 0,
+      nextAttemptAt: null
+    })
+
+    expect(await restored.recordSessionMetadataSnapshotFailure('bot-a', 'acp-1', 1, 100)).toEqual({
+      failedAttempts: 1,
+      nextAttemptAt: 100
+    })
+    expect(await restored.nextSessionMetadataSnapshot(99)).toBeUndefined()
+    expect(await restored.nextSessionMetadataAttemptAt()).toBe(100)
+    await restored.close()
+
+    const deferred = await reopen(path)
+    expect(await deferred.pendingSessionMetadataSnapshot('bot-a', 'acp-1')).toMatchObject({
+      failedAttempts: 1,
+      nextAttemptAt: 100
+    })
+
+    // A newer projection replaces the payload and revision. Its predecessor's
+    // delayed ACK cannot delete it.
+    expect(await deferred.saveSessionMetadataSnapshot('bot-a', 'acp-1', '{"phase":"end"}', false, 3)).toBe(2)
+    expect(await deferred.acknowledgeSessionMetadataSnapshot('bot-a', 'acp-1', 1)).toBe(false)
+    expect(await deferred.nextSessionMetadataSnapshot()).toMatchObject({
+      revision: 2,
+      snapshot: '{"phase":"end"}',
+      failedAttempts: 0,
+      nextAttemptAt: null
+    })
+    expect(await deferred.acknowledgeSessionMetadataSnapshot('bot-a', 'acp-1', 2)).toBe(true)
+    expect(await deferred.hasPendingSessionMetadata()).toBe(false)
+    await deferred.close()
+  })
+
+  it('does not recursively mine dream execution sessions as dream sources', async () => {
+    const s = await store()
+    await s.upsertSession({
+      key: sessionKey('slack', 'C1', 'T1', 'bot-a'),
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: 'source-session',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await s.upsertSession({
+      key: sessionKey('dream', 'memory', 'drm-1', 'bot-a'),
+      agentId: 'bot-a',
+      platform: 'dream',
+      channel: 'memory',
+      thread: 'drm-1',
+      acpSessionId: 'dream-session',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 2
+    })
+
+    // A source is named the way the dream will report it — outwardly (§1.1), since the citation
+    // becomes durable provenance the console reads back.
+    const outward = (await s.getSession(sessionKey('slack', 'C1', 'T1', 'bot-a')))!.sessionId
+    expect(outward).not.toBe('source-session')
+    expect(await s.dreamSessionSources('bot-a', 20)).toEqual([
+      { sessionId: outward, key: sessionKey('slack', 'C1', 'T1', 'bot-a'), channel: 'C1', thread: 'T1', updatedAt: 1 }
+    ])
+    await s.close()
+  })
+
+  it('skips, on request, exactly the dream sources the capture gate excludes, before the limit', async () => {
+    const s = await store()
+    const key = (thread: string) => sessionKey('slack', 'C1', thread, 'bot-a')
+    // Newest first: the excluded sessions are the newest, so a filter after the limit would return nothing.
+    const threads = ['cp-org', 'open', 'local-private', 'cp-private', 'no-gate', 'other-agent-gate']
+    for (const [i, thread] of threads.entries()) {
+      await s.upsertSession({
+        key: key(thread),
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread,
+        acpSessionId: `acp-${thread}`,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: i + 1
+      })
+    }
+    await s.setLocalCaptureGate('bot-a', key('open'), false)
+    await s.setLocalCaptureGate('bot-a', key('local-private'), true)
+    await s.setLocalCaptureGate('bot-a', key('cp-private'), false)
+    expect(await s.applyCpCaptureGate('bot-a', key('cp-private'), true, 1)).toBe('applied')
+    await s.setLocalCaptureGate('bot-a', key('cp-org'), true)
+    expect(await s.applyCpCaptureGate('bot-a', key('cp-org'), false, 1)).toBe('applied')
+    // A gate row keyed to another agent never opens this agent's session.
+    await s.setLocalCaptureGate('bot-b', key('other-agent-gate'), false)
+
+    expect((await s.dreamSessionSources('bot-a', 20)).map((r) => r.thread)).toEqual([...threads].reverse())
+    const open: string[] = []
+    for (const thread of [...threads].reverse())
+      if (!(await s.isCaptureExcluded('bot-a', key(thread)))) open.push(thread)
+    expect(open).toEqual(['open', 'cp-org'])
+    expect((await s.dreamSessionSources('bot-a', 20, { skipPrivate: true })).map((r) => r.thread)).toEqual(open)
+    expect((await s.dreamSessionSources('bot-a', 1, { skipPrivate: true })).map((r) => r.thread)).toEqual(['open'])
+    await s.close()
+  })
+
+  it('skips, on request, dream sources in a DM, a group DM, or a place not known to be open', async () => {
+    const s = await store()
+    const sessions = [
+      { platform: 'slack', channel: 'C-public', thread: 'shared' },
+      { platform: 'slack', channel: 'G-group', thread: 'group-dm' },
+      { platform: 'slack', channel: 'C-private', thread: 'private-channel' },
+      // Nothing known yet, as right after a restart.
+      { platform: 'slack', channel: 'C-unknown', thread: 'undetermined' },
+      // Not a place at all.
+      { platform: 'github', channel: 'example-org/example-repo', thread: 'review' },
+      // A webchat conversation its owner made org-visible.
+      { platform: 'webchat', channel: 'conv-1', thread: 'webchat' }
+    ]
+    for (const [i, { platform, channel, thread }] of sessions.entries()) {
+      const key = sessionKey(platform, channel, thread, 'bot-a')
+      await s.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform,
+        channel,
+        thread,
+        acpSessionId: `acp-${thread}`,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: i + 1
+      })
+      await s.setLocalCaptureGate('bot-a', key, false)
+    }
+    await s.setSessionClassification(sessionKey('slack', 'G-group', 'group-dm', 'bot-a'), {
+      conversationKind: 'group_dm'
+    })
+    const threads = async (opts?: Parameters<LocalStore['dreamSessionSources']>[2]) =>
+      (await s.dreamSessionSources('bot-a', 20, opts)).map((r) => r.thread)
+    const everything = ['webchat', 'review', 'undetermined', 'private-channel', 'group-dm', 'shared']
+    expect(await threads()).toEqual(everything)
+    expect(await threads({ skipPrivate: true })).toEqual(everything.filter((t) => t !== 'group-dm'))
+    const places = { platforms: ['slack', 'webchat'], open: ['C-public', 'C-public'] }
+    expect(await threads({ skipPrivate: true, places })).toEqual(['review', 'shared'])
+    expect(await threads({ skipPrivate: true, places: { ...places, open: [] } })).toEqual(['review'])
+    // Places ride only with skipPrivate.
+    expect(await threads({ places })).toEqual(everything)
+    await s.close()
+  })
+
+  it('returns transcript entries strictly after a marker, ordered by ts', async () => {
+    const s = await store()
+    await s.appendTranscript({ channel: 'C1', thread: '100.1', ts: '100.2', sender: 'U1', kind: 'text', text: 'first' })
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: '100.1',
+      ts: '100.3',
+      sender: 'U2',
+      kind: 'text',
+      text: 'second'
+    })
+    await s.appendTranscript({ channel: 'C1', thread: '100.1', ts: '100.4', sender: 'U1', kind: 'text', text: 'third' })
+    const gap = await s.transcriptSince(readScope('C1', '100.1', 'bot-a'), '100.2')
+    expect(gap.map((e) => e.text)).toEqual(['second', 'third'])
+    const all = await s.transcriptSince(readScope('C1', '100.1', 'bot-a'), null)
+    expect(all).toHaveLength(3)
+    await s.close()
+  })
+
+  it('an elicitation card is one upserted row the replay never returns', async () => {
+    const s = await store()
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '1', sender: 'U1', kind: 'text', text: 'ask' })
+    const card = { requestId: 'elicit-1', message: 'Which branch?', options: [{ value: 'main', label: 'main' }] }
+    await s.upsertElicit(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '2',
+        sender: 'bot',
+        text: card.message,
+        body: JSON.stringify(card)
+      })
+    )
+    // The settlement rewrites the SAME row rather than appending a second one below the reply.
+    await s.upsertElicit(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '2',
+        sender: 'bot',
+        text: card.message,
+        body: JSON.stringify({ ...card, outcome: 'accepted', answerLabel: 'main' })
+      })
+    )
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '3', sender: 'bot', kind: 'text', text: 'answer' })
+
+    // The card is read-only history: the runtime already had its answer over ACP, so re-feeding
+    // the row as conversation would ask the same question again.
+    expect((await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null)).map((e) => e.text)).toEqual(['ask', 'answer'])
+    const rows = (await s.threadTranscript('C1', 'T')) as { kind: string; text: string; body?: string | null }[]
+    expect(rows.map((r) => [r.kind, r.text])).toEqual([
+      ['text', 'ask'],
+      ['elicit', 'Which branch?'],
+      ['text', 'answer']
+    ])
+    expect(JSON.parse(rows[1]!.body!)).toEqual({ ...card, outcome: 'accepted', answerLabel: 'main' })
+    await s.close()
+  })
+
+  it('an app card is one row keyed by its card id, re-readable by that id after a restart', async () => {
+    const s = await store()
+    const card = {
+      appId: 'app-1',
+      title: 'Token balances',
+      toolName: 'charts__balances',
+      server: 'charts',
+      conversationId: 'C1',
+      html: '<p>chart</p>'
+    }
+    const row = { channel: 'C1', thread: 'T', ts: '2', sender: 'bot', appId: 'app-1', text: card.title }
+    await s.upsertApp(admitted({ ...row, body: JSON.stringify(card) }))
+    // The settlement rewrites the SAME row: one card is one row, whatever happened to it.
+    await s.upsertApp(admitted({ ...row, body: JSON.stringify({ ...card, outcome: 'expired' }) }))
+    const rows = (await s.threadTranscript('C1', 'T')) as { kind: string; text: string }[]
+    expect(rows.map((r) => [r.kind, r.text])).toEqual([['app', 'Token balances']])
+
+    // Found by the card id ALONE — the only name a reloaded view knows itself by, and what makes
+    // the card revivable once the process that opened it is gone.
+    const found = await s.getAppCard('app-1')
+    expect(found).toMatchObject({ channel: 'C1', thread: 'T', ts: '2', sender: 'bot' })
+    expect(JSON.parse(found!.body)).toEqual({ ...card, outcome: 'expired' })
+    expect(await s.getAppCard('app-2')).toBeUndefined()
+
+    // Read-only history, exactly as an elicitation card is: the model already had the tool result.
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '3', sender: 'bot', kind: 'text', text: 'done' })
+    expect((await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null)).map((e) => e.text)).toEqual(['done'])
+    await s.close()
+  })
+
+  it('replay returns only text rows; the full activity log returns all kinds in order', async () => {
+    const s = await store()
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '1', sender: 'U1', kind: 'text', text: 'ask' })
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '2', sender: 'bot', kind: 'reasoning', text: 'hmm' })
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '3', sender: 'bot', kind: 'tool', text: 'Read x' })
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '4', sender: 'bot', kind: 'text', text: 'answer' })
+
+    // §8.5 replay: conversational text only
+    expect((await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null)).map((e) => e.text)).toEqual(['ask', 'answer'])
+    // Web UI: every kind, insertion order
+    expect((await s.threadTranscript('C1', 'T')).map((r) => [r.kind, r.text])).toEqual([
+      ['text', 'ask'],
+      ['reasoning', 'hmm'],
+      ['tool', 'Read x'],
+      ['text', 'answer']
+    ])
+    await s.close()
+  })
+
+  it('round-trips per-cron last-run stamps with their definition (latest-wins)', async () => {
+    const s = await store()
+    expect(await s.cronRun('bot-a:daily')).toBeUndefined()
+    await s.setCronLastRun('bot-a:daily', 1000, 'def-1')
+    await s.setCronLastRun('bot-a:daily', 2000, 'def-2')
+    await s.setCronLastRun('bot-b:weekly', 1500, 'def-1')
+    expect(await s.cronRun('bot-a:daily')).toEqual({ lastRunAt: 2000, definition: 'def-2' })
+    expect(await s.cronRun('bot-b:weekly')).toEqual({ lastRunAt: 1500, definition: 'def-1' })
+    await s.close()
+  })
+
+  it('claims a catch-up only for the definition the stamp was written under', async () => {
+    const s = await store()
+    await s.setCronLastRun('bot-a:daily', 1000, 'def-1')
+    await s.setDreamLastRun('bot-a', 1000, 'def-1')
+    // A definition that has moved on cannot claim the moment the old one left behind.
+    expect(await s.claimCronCatchUp('bot-a:daily', 2000, 3000, 'def-2')).toBe(false)
+    expect(await s.claimDreamCatchUp('bot-a', 2000, 3000, 'def-2')).toBe(false)
+    expect(await s.cronRun('bot-a:daily')).toEqual({ lastRunAt: 1000, definition: 'def-1' })
+    // The same definition claims once; the loser of the race sees a stamp past the occurrence.
+    expect(await s.claimCronCatchUp('bot-a:daily', 2000, 3000, 'def-1')).toBe(true)
+    expect(await s.claimCronCatchUp('bot-a:daily', 2000, 3000, 'def-1')).toBe(false)
+    expect(await s.claimDreamCatchUp('bot-a', 2000, 3000, 'def-1')).toBe(true)
+    expect(await s.claimDreamCatchUp('bot-a', 2000, 3000, 'def-1')).toBe(false)
+    // Never claimed for a schedule that has never stamped a run.
+    expect(await s.claimCronCatchUp('bot-b:weekly', 2000, 3000, 'def-1')).toBe(false)
+    await s.close()
+  })
+
+  it("enumerates and drops one agent's stamp keys without matching a neighbour", async () => {
+    const s = await store()
+    await s.setCronLastRun('bot-a:daily', 1000, 'def-1')
+    await s.setCronLastRun('bot-a:weekly', 1000, 'def-1')
+    // A prefix match must be exact: an agent id is not a LIKE pattern, and a longer id that merely
+    // starts with this one is a different agent.
+    await s.setCronLastRun('bot-ab:daily', 1000, 'def-1')
+    await s.setCronLastRun('bot%:daily', 1000, 'def-1')
+    expect((await s.cronRunKeys('bot-a')).sort()).toEqual(['bot-a:daily', 'bot-a:weekly'])
+    expect(await s.cronRunKeys('bot%')).toEqual(['bot%:daily'])
+    await s.deleteCronRun('bot-a:weekly')
+    expect(await s.cronRunKeys('bot-a')).toEqual(['bot-a:daily'])
+    await s.close()
+  })
+
+  it('stores a bounded editor approval history and expires live requests after restart', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-permission-')), 'local.sqlite')
+    const s = await reopen(path)
+    await s.createPermissionRequest({
+      id: 'request-1',
+      agentId: 'bot-a',
+      sessionId: 'session-1',
+      createdAt: 100,
+      requesterId: 'user-1',
+      requesterName: 'Ada',
+      command: 'Bash: pnpm test',
+      status: 'pending',
+      resolvedAt: null
+    })
+    await s.createPermissionRequest({
+      id: 'request-2',
+      agentId: 'bot-a',
+      sessionId: 'session-1',
+      createdAt: 200,
+      requesterId: 'user-2',
+      requesterName: 'Lin',
+      command: 'Edit: app.ts',
+      status: 'pending',
+      resolvedAt: null
+    })
+
+    expect(await s.resolvePermissionRequest('bot-a', 'request-2', 'allowed', 250)).toBe(true)
+    expect(await s.resolvePermissionRequest('bot-a', 'request-2', 'denied', 300)).toBe(false)
+    expect(await s.listPermissionRequests('bot-a')).toMatchObject([
+      { id: 'request-1', status: 'pending', resolvedAt: null },
+      { id: 'request-2', status: 'allowed', resolvedAt: 250 }
+    ])
+    await s.close()
+
+    const reopened = await reopen(path)
+    expect(await reopened.listPermissionRequests('bot-a')).toMatchObject([
+      { id: 'request-2', status: 'allowed', resolvedAt: 250 },
+      { id: 'request-1', status: 'expired' }
+    ])
+    await reopened.close()
+  })
+
+  it('records the decider and hands an orphaned DM card handle out exactly once', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-approval-dm-')), 'local.sqlite')
+    const s = await reopen(path)
+    const request = (id: string) => ({
+      id,
+      agentId: 'bot-a',
+      sessionId: 'session-1',
+      createdAt: 100,
+      requesterId: 'user-1',
+      requesterName: 'Ada',
+      command: 'Bash: pnpm test',
+      status: 'pending' as const,
+      resolvedAt: null
+    })
+    await s.createPermissionRequest(request('request-1'))
+    await s.createPermissionRequest(request('request-2'))
+
+    // The handle lands only while the row is still pending.
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-1', 'int-1', 'D111', '1.100')).toBe(true)
+    expect(
+      await s.resolvePermissionRequest('bot-a', 'request-1', 'allowed', 250, {
+        resolvedBy: 'slack:T1:U1',
+        resolvedByName: 'Ada'
+      })
+    ).toBe(true)
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-1', 'int-1', 'D111', '1.200')).toBe(false)
+    expect(await s.listPermissionRequests('bot-a')).toMatchObject([
+      { id: 'request-2', status: 'pending', resolvedBy: null },
+      { id: 'request-1', status: 'allowed', resolvedBy: 'slack:T1:U1', resolvedByName: 'Ada' }
+    ])
+
+    // A pending row's card is live — never handed to the orphan sweep.
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-2', 'int-1', 'D222', '2.100')).toBe(true)
+    expect(await s.takeOrphanedPermissionNotices('int-1')).toMatchObject([
+      { id: 'request-1', notifyChannel: 'D111', notifyTs: '1.100', resolvedByName: 'Ada' }
+    ])
+    // Handed out once: the handle is cleared with the take.
+    expect(await s.takeOrphanedPermissionNotices('int-1')).toEqual([])
+
+    // A restart expires the pending row and its still-set handle becomes the orphan.
+    await s.close()
+    const reopened = await reopen(path)
+    expect(await reopened.takeOrphanedPermissionNotices('int-1')).toMatchObject([
+      { id: 'request-2', status: 'expired', notifyChannel: 'D222' }
+    ])
+    await reopened.clearPermissionRequestNotify('bot-a', 'request-2')
+    await reopened.close()
+  })
+
+  it('keeps the editor DM beside a card on its own handle and hands each orphan out exactly once', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-beside-dm-')), 'local.sqlite')
+    const s = await reopen(path)
+    const request = (id: string) => ({
+      id,
+      agentId: 'bot-a',
+      sessionId: 'acp-sub-1',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: 'Butler',
+      command: 'Write src/app.ts',
+      status: 'pending' as const,
+      resolvedAt: null
+    })
+    await s.createPermissionRequest(request('request-1'))
+    await s.createPermissionRequest(request('request-2'))
+
+    // The card in the conversation and the DM beside it each keep a handle, and only while pending.
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-1', 'int-1', 'C1', '1.100')).toBe(true)
+    expect(await s.setPermissionRequestBeside('bot-a', 'request-1', 'int-1', 'D111', '1.200')).toBe(true)
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-2', 'int-1', 'C1', '2.100')).toBe(true)
+    expect(await s.setPermissionRequestBeside('bot-a', 'request-2', 'int-1', 'D222', '2.200')).toBe(true)
+    expect(await s.resolvePermissionRequest('bot-a', 'request-1', 'allowed', 250)).toBe(true)
+    expect(await s.setPermissionRequestBeside('bot-a', 'request-1', 'int-1', 'D111', '1.300')).toBe(false)
+    expect(await s.takeOrphanedPermissionNotices('int-2')).toEqual([])
+    const orphans = await s.takeOrphanedPermissionNotices('int-1')
+    expect(orphans.map((o) => [o.id, o.notifyChannel, o.notifyTs]).sort()).toEqual([
+      ['request-1', 'C1', '1.100'],
+      ['request-1', 'D111', '1.200']
+    ])
+    expect(await s.takeOrphanedPermissionNotices('int-1')).toEqual([])
+
+    // A cleared DM handle leaves the card's to the sweep; a restart expires the row.
+    await s.clearPermissionRequestBeside('bot-a', 'request-2')
+    await s.close()
+    const reopened = await reopen(path)
+    expect(await reopened.takeOrphanedPermissionNotices('int-1')).toMatchObject([
+      { id: 'request-2', status: 'expired', notifyChannel: 'C1', notifyTs: '2.100' }
+    ])
+    await reopened.close()
+  })
+
+  it('keeps a sub-session notice handle beside the DM card’s and hands an orphan out exactly once', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-subsession-notice-')), 'local.sqlite')
+    const s = await reopen(path)
+    const request = (id: string) => ({
+      id,
+      agentId: 'bot-a',
+      sessionId: 'acp-sub-1',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: 'Butler',
+      command: 'Write src/app.ts',
+      status: 'pending' as const,
+      resolvedAt: null
+    })
+    await s.createPermissionRequest(request('request-1'))
+    await s.createPermissionRequest(request('request-2'))
+
+    // The notice and the editor DM each keep their own handle, and only while the row is pending.
+    expect(await s.setPermissionRequestNotice('bot-a', 'request-1', 'int-1', 'C1', '1.100')).toBe(true)
+    expect(await s.setPermissionRequestNotify('bot-a', 'request-1', 'int-1', 'D111', '1.200')).toBe(true)
+    expect(await s.resolvePermissionRequest('bot-a', 'request-1', 'allowed', 250)).toBe(true)
+    expect(await s.setPermissionRequestNotice('bot-a', 'request-1', 'int-1', 'C1', '1.300')).toBe(false)
+    expect(await s.setPermissionRequestNotice('bot-a', 'request-2', 'int-1', 'C1', '2.100')).toBe(true)
+    expect(await s.takeOrphanedSubsessionNotices('int-2')).toEqual([])
+    expect(await s.takeOrphanedSubsessionNotices('int-1')).toMatchObject([
+      {
+        id: 'request-1',
+        agentId: 'bot-a',
+        sessionId: 'acp-sub-1',
+        status: 'allowed',
+        noticeChannel: 'C1',
+        noticeTs: '1.100'
+      }
+    ])
+    expect(await s.takeOrphanedSubsessionNotices('int-1')).toEqual([])
+    // Taking the notice leaves the DM card's handle to its own sweep.
+    expect(await s.takeOrphanedPermissionNotices('int-1')).toMatchObject([{ id: 'request-1', notifyTs: '1.200' }])
+
+    // A restart expires the pending row and its notice becomes the orphan.
+    await s.close()
+    const reopened = await reopen(path)
+    expect(await reopened.takeOrphanedSubsessionNotices('int-1')).toMatchObject([
+      { id: 'request-2', status: 'expired', noticeTs: '2.100' }
+    ])
+    await reopened.close()
+  })
+
+  it('tracks channel-intro state per (agent, platform, channel) and integration seeding', async () => {
+    const s = await store()
+    expect(await s.channelIntroSet('bot-a', 'slack')).toEqual(new Set())
+    expect(await s.isChannelIntroSeeded('int-1')).toBe(false)
+
+    await s.markChannelIntro('bot-a', 'slack', 'C1', null) // adopted as silent baseline
+    await s.markChannelIntro('bot-a', 'slack', 'C2', 123) // introduced-in
+    await s.markChannelIntroSeeded('int-1', 100)
+
+    expect(await s.channelIntroSet('bot-a', 'slack')).toEqual(new Set(['C1', 'C2']))
+    expect(await s.isChannelIntroSeeded('int-1')).toBe(true)
+    // Scoped: another agent / platform / integration is unaffected.
+    expect(await s.channelIntroSet('bot-b', 'slack')).toEqual(new Set())
+    expect(await s.channelIntroSet('bot-a', 'telegram')).toEqual(new Set())
+    expect(await s.isChannelIntroSeeded('int-2')).toBe(false)
+
+    // Idempotent: re-marking never duplicates or overwrites the original row.
+    await s.markChannelIntro('bot-a', 'slack', 'C1', 999)
+    await s.markChannelIntroSeeded('int-1', 999)
+    expect(await s.channelIntroSet('bot-a', 'slack')).toEqual(new Set(['C1', 'C2']))
+    await s.close()
+  })
+
+  it('supports both latest-wins and per-turn token accounting', async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+    await s.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await s.addTokenUsage(key, { totalTokens: 12, inputTokens: 10, outputTokens: 2 })
+    await s.addTokenUsage(key, { totalTokens: 9, inputTokens: 7, outputTokens: 2, cachedReadTokens: 3 })
+    expect(await s.getUsage(key)).toMatchObject({
+      totalTokens: 21,
+      inputTokens: 17,
+      outputTokens: 4,
+      cachedReadTokens: 3
+    })
+    await s.setTokenUsage(key, { totalTokens: 30, inputTokens: 24, outputTokens: 6 })
+    expect(await s.getUsage(key)).toMatchObject({ totalTokens: 30, inputTokens: 24, outputTokens: 6 })
+    await s.close()
+  })
+
+  it('accumulates fallback cost and lets a runtime snapshot replace it', async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+    await s.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    expect(await s.addCost(key, 0.1, 'USD')).toBe(true)
+    expect(await s.addCost(key, 0.2, 'USD')).toBe(true)
+    expect((await s.getUsage(key)).costAmount).toBeCloseTo(0.3)
+    expect((await s.getUsage(key)).costCurrency).toBe('USD')
+    expect(await s.addCost(key, 0.4, 'EUR')).toBe(false)
+
+    await s.setUsageSnapshot(key, { costAmount: 0.25, costCurrency: 'USD' })
+    expect(await s.getUsage(key)).toMatchObject({ costAmount: 0.25, costCurrency: 'USD' })
+    await s.close()
+  })
+
+  it.skipIf(pg)('keeps an increment a concurrent writer would otherwise have erased', async () => {
+    // The pool shape: two members touch one session across a handover. `usage` is one JSON blob, so
+    // a plain read-merge-write silently drops whichever writer commits first. The compare-and-set
+    // notices and re-merges instead.
+    const database = new DatabaseSync(join(mkdtempSync(join(tmpdir(), 'ac-usage-race-')), 'local.sqlite'))
+    const backing = SqliteAsyncDatabase.adopt(database)
+    const peer = await LocalStore.open({ database: backing, shared: true, ownerId: 'member-2', orgForAgent: oneOrg })
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+
+    // Slip the peer's whole write in between our read and our compare-and-set, exactly once.
+    let raced = false
+    const racing: StoreDatabase = {
+      exec: (sql) => backing.exec(sql),
+      close: () => backing.close(),
+      batch: (statements) => backing.batch(statements),
+      transaction: (fn) => backing.transaction(fn),
+      query: async (sql, params) => {
+        const result = await backing.query(sql, params)
+        if (sql.startsWith('SELECT usage FROM sessions') && !raced) {
+          raced = true
+          await peer.addTokenUsage(key, { totalTokens: 5 })
+        }
+        return result
+      }
+    }
+    const member = await LocalStore.open({ database: racing, shared: true, ownerId: 'member-1', orgForAgent: oneOrg })
+    await member.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+
+    await member.addTokenUsage(key, { totalTokens: 10 })
+
+    expect(raced).toBe(true)
+    // 15, not 10: the peer's 5 survived our write instead of being overwritten by it.
+    expect(await peer.getUsage(key)).toMatchObject({ totalTokens: 15 })
+    database.close()
+  })
+})
+
+describe('LocalStore session/transcript read-back (session/list, session/history)', () => {
+  const seed = async (s: LocalStore, key: string, agentId: string, acpSessionId: string | null, updatedAt: number) =>
+    await s.upsertSession({
+      key,
+      agentId,
+      platform: 'slack',
+      channel: 'C1',
+      thread: key,
+      acpSessionId,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt
+    })
+
+  it('listSessions excludes null-acpSessionId rows, filters by agent, orders updatedAt DESC', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    await seed(s, 'k2', 'bot-a', 'acp-2', 300)
+    await seed(s, 'k3', 'bot-a', null, 999) // never launched → no acp id → excluded
+    await seed(s, 'k4', 'bot-b', 'acp-4', 200)
+    // all agents: newest first, null acp dropped
+    expect((await s.listSessions()).map((r) => r.acpSessionId)).toEqual(['acp-2', 'acp-4', 'acp-1'])
+    // scoped to bot-a
+    expect((await s.listSessions('bot-a')).map((r) => r.acpSessionId)).toEqual(['acp-2', 'acp-1'])
+    await s.close()
+  })
+
+  it('getSessionByAcpId returns the row on hit and undefined on miss', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    expect((await s.getSessionByAcpId('acp-1'))?.key).toBe('k1')
+    expect(await s.getSessionByAcpId('nope')).toBeUndefined()
+    await s.close()
+  })
+
+  it('getSessionByAcpIdForAgent disambiguates runtime-local session ids', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'shared-acp-id', 100)
+    await seed(s, 'k2', 'bot-b', 'shared-acp-id', 200)
+    expect((await s.getSessionByAcpIdForAgent('bot-a', 'shared-acp-id'))?.key).toBe('k1')
+    expect((await s.getSessionByAcpIdForAgent('bot-b', 'shared-acp-id'))?.key).toBe('k2')
+    expect(await s.getSessionByAcpIdForAgent('bot-c', 'shared-acp-id')).toBeUndefined()
+    await s.close()
+  })
+
+  it('mints one outward id per slot, before the session row and across every later upsert', async () => {
+    const s = await store()
+    // A credential is issued before the turn writes the session, so the id must exist first.
+    const minted = await s.ensureOutwardSessionId('k1', 'bot-a')
+    expect(minted).toMatch(/^[0-9a-f-]{36}$/)
+    expect(await s.ensureOutwardSessionId('k1', 'bot-a')).toBe(minted)
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    // The session proper landing on the skeleton row keeps the id the credential already carries.
+    expect((await s.getSession('k1'))?.sessionId).toBe(minted)
+    await seed(s, 'k1', 'bot-a', 'acp-rebuilt', 200)
+    // A rebuilt ACP hop is a new runtime instance of the SAME session: outward id unchanged.
+    expect((await s.getSession('k1'))?.sessionId).toBe(minted)
+    // A slot the daemon never issued a credential for gets its id from the upsert itself.
+    await seed(s, 'k2', 'bot-a', 'acp-2', 100)
+    const other = (await s.getSession('k2'))!.sessionId
+    expect(other).toMatch(/^[0-9a-f-]{36}$/)
+    expect(other).not.toBe(minted)
+    await s.close()
+  })
+
+  it('a pre-session mint stages itself, leaving no half-built session behind', async () => {
+    const s = await store()
+    // The pool also issues credentials for keys that never become sessions at all.
+    const internal = await s.ensureOutwardSessionId('internal:memory:bot-a', 'bot-a')
+    expect(await s.getSession('internal:memory:bot-a')).toBeUndefined()
+    expect(await s.listSessions()).toEqual([])
+    expect(await s.ensureOutwardSessionId('internal:memory:bot-a', 'bot-a')).toBe(internal)
+
+    // A real slot mints the same way, and the turn's own insert adopts it — coordinates and all.
+    const minted = await s.ensureOutwardSessionId('k1', 'bot-a')
+    expect(await s.getSession('k1')).toBeUndefined()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    expect(await s.getSession('k1')).toMatchObject({
+      sessionId: minted,
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'k1'
+    })
+    await s.close()
+  })
+
+  it('settles on the session row when a full insert lands mid-mint', async () => {
+    const s = await store()
+    // The interleaving the staging table makes possible: the mint reads no session, the turn's
+    // own insert commits with an id of its own (the stage it would have adopted did not exist
+    // yet), and only then does the mint stage its. Answering with the stage would split one
+    // session's identity — credential under one name, metadata and usage under another.
+    const reads: string[] = []
+    const realGet = (s as any).db.prepare.bind((s as any).db)
+    ;(s as any).db.prepare = (sql: string) => {
+      const stmt = realGet(sql)
+      if (!sql.startsWith('SELECT sessionId FROM sessions')) return stmt
+      return {
+        ...stmt,
+        get: async (...args: unknown[]) => {
+          const row = await stmt.get(...args)
+          reads.push(sql)
+          // Exactly once, between the mint's first read and its stage, the turn writes the row.
+          if (reads.length === 1) await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+          return row
+        }
+      }
+    }
+    const minted = await s.ensureOutwardSessionId('k1', 'bot-a')
+    ;(s as any).db.prepare = realGet
+    const row = (await s.getSession('k1'))!.sessionId
+    expect(minted).toBe(row)
+    // ...and the stage is settled onto it, so the next ask cannot revive the losing name.
+    expect(await s.ensureOutwardSessionId('k1', 'bot-a')).toBe(row)
+    await s.close()
+  })
+
+  it('a purged slot does not hand its identity to the next session on the same key', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    const first = (await s.getSession('k1'))!.sessionId
+    expect(await s.deleteSession('k1', { reason: 'retention', at: 1_000 })).toBe(true)
+    // The receipt just reported `first` as purged; reusing it would resurrect a dead row upstream.
+    await seed(s, 'k1', 'bot-a', 'acp-2', 200)
+    expect((await s.getSession('k1'))!.sessionId).not.toBe(first)
+    await s.close()
+  })
+
+  it('a record that outlives its session keeps the name it was written with', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    const outward = (await s.getSession('k1'))!.sessionId!
+    // What a durable record (a dream, an advertisement) stores at write time.
+    const written = (await s.dreamSessionSources('bot-a', 10))[0]!.sessionId
+    expect(written).toBe(outward)
+
+    // Retention takes the session AND the staging row with it, so nothing can map acp → outward
+    // any more. A record that had resolved at READ time would answer with a different id from
+    // here on; one written with the outward name does not change.
+    expect(await s.deleteSession('k1', { reason: 'retention', at: 1_000 })).toBe(true)
+    expect(await s.getSessionByOutwardId(outward)).toBeUndefined()
+    expect(written).toBe(outward)
+    await s.close()
+  })
+
+  it('getSessionByOutwardId resolves the outward id, and falls back to the ACP one', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    const outward = (await s.getSession('k1'))!.sessionId!
+    expect((await s.getSessionByOutwardId(outward))?.key).toBe('k1')
+    expect((await s.getSessionByOutwardId(outward, 'bot-a'))?.key).toBe('k1')
+    // Scoped to the agent that owns it, so a peer cannot read another org's session.
+    expect(await s.getSessionByOutwardId(outward, 'bot-b')).toBeUndefined()
+    // A caller still holding the runtime's name — or a CP row written before v12 — still lands.
+    expect((await s.getSessionByOutwardId('acp-1'))?.key).toBe('k1')
+    expect(await s.getSessionByOutwardId('nope')).toBeUndefined()
+    await s.close()
+  })
+
+  it('trigger and initiator are first-wins across upserts and survive state-only rewrites', async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+    await s.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1,
+      triggeredBy: 'U-FIRST',
+      initiator: JSON.stringify({ name: 'Alex', commitAuthors: [] })
+    })
+    // A later turn cannot replace the opener or its public attribution.
+    await s.upsertSession({
+      ...(await s.getSession(key))!,
+      state: 'prompting',
+      updatedAt: 2,
+      triggeredBy: 'U-SECOND',
+      initiator: JSON.stringify({ name: 'Dana', commitAuthors: [] })
+    })
+    expect((await s.getSession(key))?.triggeredBy).toBe('U-FIRST')
+    expect(JSON.parse((await s.getSession(key))!.initiator!)).toEqual({ name: 'Alex', commitAuthors: [] })
+    expect((await s.listSessions('bot-a'))[0]?.triggeredBy).toBe('U-FIRST')
+    await s.close()
+  })
+
+  it('setSessionTitle: latest wins, null clears, survives upserts; unknown key is a no-op', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    expect((await s.getSession('k1'))?.title).toBeNull() // fresh rows have no title
+    await s.setSessionTitle('k1', 'Fix the deploy script')
+    expect((await s.listSessions('bot-a'))[0]?.title).toBe('Fix the deploy script')
+    await s.setSessionTitle('k1', 'Fix the deploy script (renamed)')
+    expect((await s.getSession('k1'))?.title).toBe('Fix the deploy script (renamed)')
+    // a session-state upsert (e.g. a new turn) must not clear the title
+    await s.upsertSession({ ...(await s.getSession('k1'))!, state: 'prompting', updatedAt: 200 })
+    expect((await s.getSession('k1'))?.title).toBe('Fix the deploy script (renamed)')
+    // ACP semantics: an explicit null clears
+    await s.setSessionTitle('k1', null)
+    expect((await s.getSession('k1'))?.title).toBeNull()
+    // unknown key: no row created
+    await s.setSessionTitle('slack:C1:none:x', 'ghost')
+    expect(await s.getSession('slack:C1:none:x')).toBeUndefined()
+    await s.close()
+  })
+
+  it('modelOverride: undefined until set, then persists across state upserts; unknown key no-op', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    expect(await s.getModelOverride('k1')).toBeUndefined()
+    await s.setModelOverride('k1', 'opus-4.8')
+    expect(await s.getModelOverride('k1')).toBe('opus-4.8')
+    // a later turn's state-only upsert must not drop the override
+    await s.upsertSession({ ...(await s.getSession('k1'))!, state: 'prompting', updatedAt: 200 })
+    expect(await s.getModelOverride('k1')).toBe('opus-4.8')
+    await s.setModelOverride('slack:C1:none:x', 'ghost')
+    expect(await s.getModelOverride('slack:C1:none:x')).toBeUndefined()
+    await s.close()
+  })
+
+  it('permissionModeOverride: undefined until set, then persists across state upserts; unknown key no-op', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    expect(await s.getPermissionModeOverride('k1')).toBeUndefined()
+    await s.setPermissionModeOverride('k1', 'plan')
+    expect(await s.getPermissionModeOverride('k1')).toBe('plan')
+    // a later turn's state-only upsert must not drop the override
+    await s.upsertSession({ ...(await s.getSession('k1'))!, state: 'prompting', updatedAt: 200 })
+    expect(await s.getPermissionModeOverride('k1')).toBe('plan')
+    await s.setPermissionModeOverride('slack:C1:none:x', 'ghost')
+    expect(await s.getPermissionModeOverride('slack:C1:none:x')).toBeUndefined()
+    await s.close()
+  })
+
+  it('clears every chat-authored runtime override without clearing output mode', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'acp-1', 100)
+    await s.setModelOverride('k1', 'opus-4.8')
+    await s.setEffortOverride('k1', 'high')
+    await s.setPermissionModeOverride('k1', 'plan')
+    await s.setFastModeOverride('k1', true)
+    await s.setOutputModeOverride('k1', 'high')
+
+    await s.clearRuntimeConfigOverrides('bot-a')
+
+    expect(await s.getModelOverride('k1')).toBeUndefined()
+    expect(await s.getEffortOverride('k1')).toBeUndefined()
+    expect(await s.getPermissionModeOverride('k1')).toBeUndefined()
+    expect(await s.getFastModeOverride('k1')).toBeUndefined()
+    expect(await s.getOutputModeOverride('k1')).toBe('high')
+    await s.close()
+  })
+
+  it('display names: latest-wins upsert, batch lookup returns only known ids', async () => {
+    const s = await store()
+    await s.setDisplayName('C1', 'general', 1)
+    await s.setDisplayName('U1', 'Dana Reyes', 1)
+    await s.setDisplayName('C1', 'general-renamed', 2)
+    const names = await s.getDisplayNames(['C1', 'U1', 'U-unknown'])
+    expect(names.get('C1')).toBe('general-renamed')
+    expect(names.get('U1')).toBe('Dana Reyes')
+    expect(names.has('U-unknown')).toBe(false)
+    expect((await s.getDisplayNames([])).size).toBe(0)
+    await s.close()
+  })
+
+  it('profile avatars: latest-wins upsert, batch lookup returns only known ids', async () => {
+    const s = await store()
+    await s.setProfileAvatar('slack:one', 'bad', 'not-a-url', 1)
+    await s.setProfileAvatar('slack:one', 'U1', 'https://avatars.example.test/old.png', 1)
+    await s.setProfileAvatar('slack:one', 'U1', 'https://avatars.example.test/new.png', 2)
+    await s.setProfileAvatar('slack:two', 'U1', 'https://avatars.example.test/other.png', 2)
+    const avatars = await s.getProfileAvatars('slack:one', ['U1', 'U-unknown'])
+    expect(avatars.get('U1')).toBe('https://avatars.example.test/new.png')
+    expect(avatars.has('U-unknown')).toBe(false)
+    expect((await s.getProfileAvatars('slack:two', ['U1'])).get('U1')).toBe('https://avatars.example.test/other.png')
+    expect((await s.getProfileAvatars('slack:one', ['bad'])).size).toBe(0)
+    expect((await s.getProfileAvatars('slack:one', [])).size).toBe(0)
+    await s.close()
+  })
+
+  it('channel scopes: latest-wins, batch lookup returns only known ids', async () => {
+    const s = await store()
+    await s.setChannelScope('T1', { parentId: 'C1' }, 1)
+    await s.setChannelScope('T2', { parentId: 'C1' }, 2)
+    // A moved thread re-parents (latest-wins).
+    await s.setChannelScope('T1', { parentId: 'C2' }, 3)
+    const scopes = await s.getChannelScopes(['T1', 'T2', 'unknown'])
+    expect(scopes.get('T1')).toEqual({ parentId: 'C2' })
+    expect(scopes.get('T2')).toEqual({ parentId: 'C1' })
+    expect(scopes.has('unknown')).toBe(false)
+    // An empty note writes no row at all.
+    await s.setChannelScope('T9', {}, 4)
+    expect((await s.getChannelScopes(['T9'])).size).toBe(0)
+    expect((await s.getChannelScopes([])).size).toBe(0)
+    await s.close()
+  })
+
+  it('connection conversations: newest first, bounded per scope, another scope left alone', async () => {
+    const s = await store()
+    const scope = 'msteams:example-scope'
+    const other = 'msteams:other-scope'
+    await s.saveConnectionConversation(other, 'c0', '{}', 1, 2)
+    await s.saveConnectionConversation(scope, 'c1', '{"n":1}', 10, 2)
+    await s.saveConnectionConversation(scope, 'c2', '{"n":2}', 20, 2)
+    // A rewrite refreshes the row's place, so the next insert evicts the other one.
+    await s.saveConnectionConversation(scope, 'c1', '{"n":3}', 30, 2)
+    await s.saveConnectionConversation(scope, 'c3', '{"n":4}', 40, 2)
+    expect(await s.connectionConversations(scope, 10)).toEqual([
+      { id: 'c3', facts: '{"n":4}' },
+      { id: 'c1', facts: '{"n":3}' }
+    ])
+    expect(await s.connectionConversations(scope, 1)).toEqual([{ id: 'c3', facts: '{"n":4}' }])
+    expect(await s.connectionConversations(other, 10)).toEqual([{ id: 'c0', facts: '{}' }])
+    expect(await s.connectionConversations('msteams:unknown-scope', 10)).toEqual([])
+    await s.close()
+  })
+
+  it('observedChannels/observedUsers: distinct per physical bot, newest-first, name-joined', async () => {
+    const s = await store()
+    const sess = async (
+      key: string,
+      platform: string,
+      channel: string,
+      triggeredBy: string,
+      updatedAt: number,
+      transportScope: string | null = 'bot-scope-a'
+    ) =>
+      await s.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform,
+        channel,
+        thread: 't',
+        transportScope,
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        triggeredBy,
+        updatedAt
+      })
+    await sess('k1', 'telegram', '-100', 'U1', 1)
+    await sess('k2', 'telegram', '55', 'U1', 3) // same user, newer; distinct channel
+    await sess('k3', 'telegram', '-100', 'U2', 2) // same channel as k1, newer than k1
+    await sess('k4', 'slack', 'C9', 'U9', 5) // different platform — excluded
+    await sess('k5', 'telegram', '-999', 'U9', 9, 'bot-scope-b') // different physical bot — excluded
+    await sess('k6', 'telegram', '-legacy', 'U8', 8, null) // legacy unknown bot — excluded
+    await s.setDisplayName('-100', 'team chat', 1)
+    await s.setDisplayName('55', '@bob', 1)
+
+    const chans = await s.observedChannels('bot-a', 'telegram', 'bot-scope-a')
+    // Distinct channels, newest-first by their latest session (55@3 before -100@2), names joined.
+    expect(chans).toEqual([
+      { id: '55', name: '@bob' },
+      { id: '-100', name: 'team chat' }
+    ])
+    // Slack session's channel is not in the Telegram set.
+    expect((await chans).find((c) => c.id === 'C9')).toBeUndefined()
+
+    const users = await s.observedUsers('bot-a', 'telegram', 'bot-scope-a')
+    expect(users).toEqual([
+      { id: 'U1', name: null }, // U1's latest session @3 (no display name → null)
+      { id: 'U2', name: null }
+    ])
+    expect(await s.observedUsers('bot-a', 'discord', 'bot-scope-a')).toEqual([])
+    await s.close()
+  })
+
+  it('transcriptPage returns newest-first, paginates via beforeSeq, and reports hasMore', async () => {
+    const s = await store()
+    // seq is AUTOINCREMENT → insertion order 1..4
+    for (const ts of ['1', '2', '3', '4']) {
+      await s.appendTranscript({ channel: 'C1', thread: 'T', ts, sender: 'U', kind: 'text', text: `m${ts}` })
+    }
+    // A title-tool row persisted by an older daemon is internal housekeeping. It must
+    // not consume page slots or surface after that daemon upgrades.
+    await s.insertToolCall(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '5',
+        sender: 'bot-a',
+        toolCallId: 'title-tool',
+        title: 'mcp.agentconnect.setSessionTitle',
+        body: JSON.stringify({
+          toolCallId: 'title-tool',
+          rawInput: { server: 'agentconnect', tool: 'setSessionTitle', arguments: { title: 'Hidden' } }
+        })
+      })
+    )
+    // newest page of 2: seq 4,3 (DESC), more older rows remain
+    const page1 = await s.transcriptPage('C1', 'T', null, 2)
+    expect(page1.rows.map((r) => r.text)).toEqual(['m4', 'm3'])
+    expect(page1.hasMore).toBe(true)
+    // next page strictly older than seq 3: seq 2,1 — last page, no more
+    const lowest = page1.rows[page1.rows.length - 1]!.seq
+    const page2 = await s.transcriptPage('C1', 'T', lowest, 2)
+    expect(page2.rows.map((r) => r.text)).toEqual(['m2', 'm1'])
+    expect(page2.hasMore).toBe(false)
+    // beforeSeq is exclusive (seq >= beforeSeq excluded)
+    expect((await s.transcriptPage('C1', 'T', 2, 10)).rows.map((r) => r.text)).toEqual(['m1'])
+    await s.close()
+  })
+
+  it('keeps a session-local tool id isolated between agents sharing a thread', async () => {
+    // ACP tool ids are session-local, so two agents in one thread may legitimately
+    // reuse one — the transcript_agent_tool_call index is unique per SENDER, not
+    // thread-wide, or one agent's tool body would overwrite the other's.
+    const s = await store()
+    const toolCallId = 'session-local-tc'
+    const aBody = JSON.stringify({ toolCallId, rawOutput: 'agent-a output' })
+    const bInitial = JSON.stringify({ toolCallId, rawOutput: 'agent-b partial' })
+    const bFinal = JSON.stringify({ toolCallId, rawOutput: 'agent-b final' })
+    await s.insertToolCall(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '1',
+        sender: 'bot-a',
+        toolCallId,
+        title: 'agent-a tool',
+        body: aBody
+      })
+    )
+    await s.insertToolCall(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '2',
+        sender: 'bot-b',
+        toolCallId,
+        title: 'agent-b tool',
+        body: bInitial
+      })
+    )
+    await s.updateToolCall('C1', 'T', 'bot-b', toolCallId, { title: 'agent-b done', body: bFinal })
+
+    expect(await s.getToolBodyForAgent(readScope('C1', 'T', 'bot-a'), toolCallId)).toBe(aBody)
+    expect(await s.getToolBodyForAgent(readScope('C1', 'T', 'bot-b'), toolCallId)).toBe(bFinal)
+    await s.close()
+  })
+
+  it('keeps a session-local tool id isolated between successive sessions at ONE physical thread', async () => {
+    // In append mode the statusThread does not move across `!new`, so a successor session of the
+    // SAME agent can reuse an ACP tool id: identity carries sessionScope, or the successor's
+    // insert is dedup'd away onto the retired session's row and its updates overwrite it.
+    const s = await store()
+    const toolCallId = 'reused-tc'
+    const retired = { agentId: 'bot-a', sessionKey: 'k:C1:T:bot-a:1' }
+    const successor = { agentId: 'bot-a', sessionKey: 'k:C1:T:bot-a:2' }
+    const row = (admission: { agentId: string; sessionKey: string }, ts: string, body: string) => ({
+      channel: 'C1',
+      thread: 'T',
+      ts,
+      sender: 'bot-a',
+      toolCallId,
+      title: 'Bash',
+      body,
+      admission
+    })
+    await s.insertToolCall(row(retired, '1', '{"rawOutput":"retired"}'))
+    await s.updateToolCall(
+      'C1',
+      'T',
+      'bot-a',
+      toolCallId,
+      { title: 'Bash', body: '{"rawOutput":"retired done"}' },
+      retired.sessionKey
+    )
+    await s.insertToolCall(row(successor, '2', '{"rawOutput":"successor"}'))
+    await s.updateToolCall(
+      'C1',
+      'T',
+      'bot-a',
+      toolCallId,
+      { title: 'Bash', body: '{"rawOutput":"successor done"}' },
+      successor.sessionKey
+    )
+    await s.flushToolCallWrites()
+
+    // Two rows, one per session — the successor's insert is NOT swallowed by the retired row.
+    const tools = (await s.threadTranscript('C1', 'T')).filter((r) => r.kind === 'tool')
+    expect(tools).toHaveLength(2)
+    // And each session's update landed on its own row.
+    expect(await s.getToolBodyForAgent(readScope('C1', 'T', 'bot-a', retired.sessionKey), toolCallId)).toBe(
+      '{"rawOutput":"retired done"}'
+    )
+    expect(await s.getToolBodyForAgent(readScope('C1', 'T', 'bot-a', successor.sessionKey), toolCallId)).toBe(
+      '{"rawOutput":"successor done"}'
+    )
+    await s.close()
+  })
+
+  it('transcriptPageForAgent scopes to what THAT agent received or produced (no peer cross-talk)', async () => {
+    const s = await store()
+    // Delivered to bot-a + bot-a's own reply.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '1',
+      sender: 'U1',
+      recipient: 'bot-a',
+      admission: { agentId: 'bot-a', sessionKey: 'k:C1:T:bot-a' },
+      kind: 'text',
+      text: 'to-a'
+    })
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '2', sender: 'bot-a', kind: 'text', text: 'a-reply' })
+    // Delivered to bot-b + bot-b's own reply.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '3',
+      sender: 'U1',
+      recipient: 'bot-b',
+      admission: { agentId: 'bot-b', sessionKey: 'k:C1:T:bot-b' },
+      kind: 'text',
+      text: 'to-b'
+    })
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '4', sender: 'bot-b', kind: 'text', text: 'b-reply' })
+    // bot-b's PRIVATE reasoning (sender=bot-b, no recipient) — must NOT leak into bot-a's view.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '5',
+      sender: 'bot-b',
+      kind: 'reasoning',
+      text: 'b-thinks'
+    })
+    // bot-a owns this legacy row, so the agent scope alone would include it. The
+    // internal-housekeeping filter must still remove it from console history.
+    await s.insertToolCall(
+      admitted({
+        channel: 'C1',
+        thread: 'T',
+        ts: '6',
+        sender: 'bot-a',
+        toolCallId: 'title-tool',
+        title: 'mcp.agentconnect.setSessionTitle',
+        body: JSON.stringify({ toolCallId: 'title-tool' })
+      })
+    )
+
+    expect(
+      (await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-a'), null, 50)).rows.map((r) => r.text).reverse()
+    ).toEqual(['to-a', 'a-reply'])
+    expect(
+      (await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-b'), null, 50)).rows.map((r) => r.text).reverse()
+    ).toEqual(['to-b', 'b-reply', 'b-thinks'])
+    await s.close()
+  })
+
+  it('transcriptPageForAgent shows a shared message to EVERY agent it was delivered to (dedup survival)', async () => {
+    const s = await store()
+    // A shared thread message both agents catch up on. The second append dedups on
+    // (channel, ts), so the row keeps recipient='bot-a' — but bot-b's ADMISSION is still
+    // written beside it, which is what keeps the message in bot-b's view.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '1',
+      sender: 'U1',
+      recipient: 'bot-a',
+      admission: { agentId: 'bot-a', sessionKey: 'k:C1:T:bot-a' },
+      kind: 'text',
+      text: 'shared'
+    })
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '1',
+      sender: 'U1',
+      recipient: 'bot-b',
+      admission: { agentId: 'bot-b', sessionKey: 'k:C1:T:bot-b' },
+      kind: 'text',
+      text: 'shared'
+    })
+
+    expect((await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-a'), null, 50)).rows.map((r) => r.text)).toEqual([
+      'shared'
+    ])
+    expect((await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-b'), null, 50)).rows.map((r) => r.text)).toEqual([
+      'shared'
+    ])
+    // A third agent it was never delivered to does not see it.
+    expect((await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-c'), null, 50)).rows.map((r) => r.text)).toEqual(
+      []
+    )
+    await s.close()
+  })
+
+  it('does not pull in a peer non-text row that shares a ts with a delivered text message', async () => {
+    const s = await store()
+    // A text message delivered to bot-a at ts='7'.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '7',
+      sender: 'U1',
+      recipient: 'bot-a',
+      admission: { agentId: 'bot-a', sessionKey: 'k:C1:T:bot-a' },
+      kind: 'text',
+      text: 'to-a'
+    })
+    // A peer's PRIVATE reasoning sharing ts='7' (internal rows are not ts-deduped). The
+    // admission joins on `seq`, which no two rows share, so it cannot pull this one in.
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '7',
+      sender: 'bot-b',
+      kind: 'reasoning',
+      text: 'b-secret'
+    })
+
+    const aRows = (await s.transcriptPageForAgent(readScope('C1', 'T', 'bot-a'), null, 50)).rows
+    expect(aRows.map((r) => r.text)).toEqual(['to-a'])
+    expect(aRows.some((r) => r.text === 'b-secret')).toBe(false)
+    await s.close()
+  })
+})
+
+describe('LocalStore session lifecycle (§7.3/#111/#118)', () => {
+  const seed = async (s: LocalStore, key: string, agentId: string, state: SessionRecord['state'], updatedAt: number) =>
+    await s.upsertSession({
+      key,
+      agentId,
+      platform: 'slack',
+      channel: 'C1',
+      thread: key,
+      acpSessionId: 'acp-' + key,
+      state,
+      lastDeliveredTs: null,
+      updatedAt
+    })
+
+  it('setSessionState transitions an existing row and stamps updatedAt', async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+    await seed(s, key, 'bot-a', 'prompting', 100)
+    await s.setSessionState(key, 'idle', 500)
+    const got = await s.getSession(key)
+    expect(got?.state).toBe('idle')
+    expect(got?.updatedAt).toBe(500)
+    // unknown key is a no-op (row created later by the SessionManager)
+    await s.setSessionState('slack:C1:none:x', 'idle', 1)
+    expect(await s.getSession('slack:C1:none:x')).toBeUndefined()
+    await s.close()
+  })
+
+  it('agentLastActivityTs is the max updatedAt across an agent non-closed sessions', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'idle', 100)
+    await seed(s, 'k2', 'bot-a', 'prompting', 300)
+    await seed(s, 'k3', 'bot-b', 'idle', 999)
+    expect(await s.agentLastActivityTs('bot-a')).toBe(300)
+    expect(await s.agentLastActivityTs('nobody')).toBeNull()
+    // a closed session no longer counts toward activity
+    await s.setSessionState('k2', 'closed', 300)
+    expect(await s.agentLastActivityTs('bot-a')).toBe(100)
+    await s.close()
+  })
+
+  it('agentSharedLastActivityTs leaves out isolated sessions, whose traffic runs in pods of their own', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'idle', 100)
+    await s.upsertSession({ ...(await s.getSession('k1'))!, workspaceIsolation: 'shared' })
+    await seed(s, 'k2', 'bot-a', 'idle', 200)
+    await seed(s, 'k3', 'bot-a', 'idle', 900)
+    await s.upsertSession({ ...(await s.getSession('k3'))!, workspaceIsolation: 'session' })
+    // A row no turn has decided yet counts as shared, as the agent-wide clock always did.
+    expect(await s.agentSharedLastActivityTs('bot-a')).toBe(200)
+    expect(await s.agentLastActivityTs('bot-a')).toBe(900)
+    await s.setSessionState('k2', 'closed', 200)
+    expect(await s.agentSharedLastActivityTs('bot-a')).toBe(100)
+    expect(await s.agentSharedLastActivityTs('nobody')).toBeNull()
+    await s.close()
+  })
+
+  it('agentSessionActivity lists the agent’s open sessions, most recently active first', async () => {
+    const s = await store()
+    await seed(s, 'k1', 'bot-a', 'idle', 100)
+    await seed(s, 'k2', 'bot-a', 'idle', 900)
+    await seed(s, 'k3', 'bot-a', 'idle', 500)
+    await seed(s, 'k4', 'bot-b', 'idle', 999)
+    expect(await s.agentSessionActivity('bot-a')).toEqual([
+      { key: 'k2', updatedAt: 900 },
+      { key: 'k3', updatedAt: 500 },
+      { key: 'k1', updatedAt: 100 }
+    ])
+    await s.setSessionState('k2', 'closed', 900)
+    expect((await s.agentSessionActivity('bot-a')).map((row) => row.key)).toEqual(['k3', 'k1'])
+    expect(await s.agentSessionActivity('nobody')).toEqual([])
+    await s.close()
+  })
+
+  it('setSessionMuted persists a cold !stop tombstone across reopen and later session creation', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-mute-')), 'local.sqlite')
+    let s = await reopen(path)
+    const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+    expect(await s.getSession(key)).toBeUndefined()
+    expect(await s.isSessionMuted(key)).toBe(false)
+    await s.setSessionMuted(key, true)
+    expect(await s.isSessionMuted(key)).toBe(true)
+    expect(await s.getSession(key)).toBeUndefined()
+    await s.close()
+
+    // A daemon restart before SessionManager creates the row must retain the mute.
+    s = await reopen(path)
+    expect(await s.isSessionMuted(key)).toBe(true)
+    // Creating/upserting the actual session mirrors but never overwrites the tombstone.
+    await seed(s, key, 'bot-a', 'idle', 100)
+    expect((await s.getSession(key))?.muted).toBe(1)
+    await seed(s, key, 'bot-a', 'prompting', 200)
+    expect(await s.isSessionMuted(key)).toBe(true)
+    await s.setSessionMuted(key, false)
+    expect(await s.isSessionMuted(key)).toBe(false)
+    await s.close()
+
+    const reopened = await reopen(path)
+    expect(await reopened.isSessionMuted(key)).toBe(false)
+    expect((await reopened.getSession(key))?.muted).toBe(0)
+    await reopened.close()
+  })
+
+  it('closeIdleSessions closes only idle rows past the TTL, leaving prompting alone', async () => {
+    const s = await store()
+    await seed(s, 'old-idle', 'bot-a', 'idle', 100)
+    await seed(s, 'fresh-idle', 'bot-a', 'idle', 900)
+    await seed(s, 'old-prompting', 'bot-a', 'prompting', 100) // a live turn keeps the thread open
+    const closed = await s.closeIdleSessions(1000, 500) // cutoff = 500
+    expect((await closed).map((r) => r.key)).toEqual(['old-idle'])
+    expect(closed[0]).toMatchObject({
+      key: 'old-idle',
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'old-idle',
+      acpSessionId: 'acp-old-idle'
+    })
+    expect((await s.getSession('old-idle'))?.state).toBe('closed')
+    expect((await s.getSession('fresh-idle'))?.state).toBe('idle')
+    expect((await s.getSession('old-prompting'))?.state).toBe('prompting')
+    await s.close()
+  })
+
+  it('hasOpenSessionInChannel sees a channel open until its last session closes', async () => {
+    const s = await store()
+    await seed(s, 'first', 'bot-a', 'idle', 100)
+    await seed(s, 'second', 'bot-b', 'prompting', 100)
+    await s.closeIdleSessions(1000, 500)
+    expect(await s.hasOpenSessionInChannel('slack', 'C1')).toBe(true)
+    expect(await s.hasOpenSessionInChannel('webchat', 'C1')).toBe(false)
+    await s.setSessionState('second', 'idle', 100)
+    await s.closeIdleSessions(1000, 500)
+    expect(await s.hasOpenSessionInChannel('slack', 'C1')).toBe(false)
+    await s.close()
+  })
+
+  it('lists rows left mid-turn, and releases one only while it is still the row that was read (#2245)', async () => {
+    const s = await store()
+    await seed(s, 'old-prompting', 'bot-a', 'prompting', 100)
+    await seed(s, 'old-resuming', 'bot-a', 'resuming', 100)
+    await seed(s, 'old-cancelling', 'bot-a', 'cancelling', 100)
+    await seed(s, 'fresh-prompting', 'bot-a', 'prompting', 900)
+    await seed(s, 'old-idle', 'bot-a', 'idle', 100)
+    const rows = await s.listAbandonedTurnSessions(500)
+    expect(rows.map((r) => r.key).sort()).toEqual(['old-cancelling', 'old-prompting', 'old-resuming'])
+    expect(rows.find((r) => r.key === 'old-prompting')?.platform).toBe('slack')
+    // A turn that took the row since it was read wins.
+    await s.setSessionState('old-resuming', 'prompting', 950)
+    expect(await s.releaseAbandonedTurnSession('old-resuming', 'resuming', 100)).toBe(false)
+    expect(await s.releaseAbandonedTurnSession('old-prompting', 'prompting', 100)).toBe(true)
+    const released = await s.getSession('old-prompting')
+    expect(released?.state).toBe('idle')
+    expect(Number(released?.updatedAt)).toBe(100)
+    expect((await s.getSession('old-resuming'))?.state).toBe('prompting')
+    await s.close()
+  })
+
+  it('closeIdleSessions spares a session the isExempt predicate keeps (background work in flight)', async () => {
+    const s = await store()
+    await seed(s, 'busy', 'bot-a', 'idle', 100) // idle + past TTL, but has live background work
+    await seed(s, 'done', 'bot-a', 'idle', 100) // idle + past TTL, quiescent
+    // Exempt the one whose acpSessionId is still working.
+    const closed = await s.closeIdleSessions(1000, 500, (_agentId, acpSessionId) => acpSessionId === 'acp-busy')
+    expect(closed.map((r) => r.key)).toEqual(['done'])
+    expect((await s.getSession('busy'))?.state).toBe('idle') // spared
+    expect((await s.getSession('done'))?.state).toBe('closed') // closed as usual
+    await s.close()
+  })
+
+  it('openSessionAgents excludes closed rows; closedSessionAgents returns exactly them', async () => {
+    const s = await store()
+    // Seed with real (channel, thread) coords — the shared `seed` above stores
+    // thread=key, which would defeat a per-thread query.
+    const put = async (agentId: string, thread: string, state: 'idle' | 'closed') =>
+      await s.upsertSession({
+        key: sessionKey('slack', 'C1', thread, agentId),
+        agentId,
+        platform: 'slack',
+        channel: 'C1',
+        thread,
+        acpSessionId: `acp-${agentId}-${thread}`,
+        state,
+        lastDeliveredTs: null,
+        updatedAt: 100
+      })
+    // Two agents once active in thread T1; plus a live session in T2 (scoping check).
+    await put('bot-a', 'T1', 'idle')
+    await put('bot-b', 'T1', 'idle')
+    await put('bot-a', 'T2', 'idle')
+    expect((await s.openSessionAgents('C1', 'T1')).sort()).toEqual(['bot-a', 'bot-b'])
+    expect(await s.closedSessionAgents('C1', 'T1')).toEqual([])
+
+    await s.setSessionState(sessionKey('slack', 'C1', 'T1', 'bot-a'), 'closed', 200)
+    expect(await s.openSessionAgents('C1', 'T1')).toEqual(['bot-b'])
+    expect(await s.closedSessionAgents('C1', 'T1')).toEqual(['bot-a'])
+
+    await s.setSessionState(sessionKey('slack', 'C1', 'T1', 'bot-b'), 'closed', 200)
+    expect(await s.openSessionAgents('C1', 'T1')).toEqual([])
+    expect((await s.closedSessionAgents('C1', 'T1')).sort()).toEqual(['bot-a', 'bot-b'])
+    // T2 stays live and unaffected.
+    expect(await s.openSessionAgents('C1', 'T2')).toEqual(['bot-a'])
+    expect(await s.closedSessionAgents('C1', 'T2')).toEqual([])
+    await s.close()
+  })
+})
+
+describe('LocalStore session retention GC (#485)', () => {
+  const seed = async (
+    s: LocalStore,
+    key: string,
+    state: 'idle' | 'prompting' | 'cancelling' | 'resuming' | 'closed',
+    updatedAt: number,
+    acpSessionId: string | null = 'acp-' + key
+  ) =>
+    await s.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: key,
+      acpSessionId,
+      state,
+      lastDeliveredTs: null,
+      updatedAt
+    })
+
+  it('listExpiredSessions returns idle/closed rows past the cutoff oldest-first, including unbound ones', async () => {
+    const s = await store()
+    await seed(s, 'old-closed', 'closed', 200)
+    await seed(s, 'older-idle', 'idle', 100)
+    await seed(s, 'never-bound', 'closed', 150, null) // no ACP id, still a candidate (may own a worktree)
+    await seed(s, 'fresh-closed', 'closed', 900)
+    await seed(s, 'old-prompting', 'prompting', 100) // live turn — never a candidate
+    await seed(s, 'old-resuming', 'resuming', 100) // re-attaching — never a candidate
+    expect((await s.listExpiredSessions(500)).map((r) => r.key)).toEqual(['older-idle', 'never-bound', 'old-closed'])
+    await s.close()
+  })
+
+  it('markSessionRetentionKept stamps only the row that was judged', async () => {
+    const s = await store()
+    await seed(s, 'kept', 'idle', 100)
+    await seed(s, 'moved-on', 'idle', 100)
+    await seed(s, 'live', 'prompting', 100)
+    expect(await s.markSessionRetentionKept('kept', 100, 5_000, 8_600_000)).toBe(true)
+    expect(await s.getSession('kept')).toMatchObject({ retentionKeptAt: 5_000, retentionRecheckAt: 8_600_000 })
+    // A turn since the judgement moved `updatedAt`, so the keep no longer describes the row.
+    await seed(s, 'moved-on', 'idle', 200)
+    expect(await s.markSessionRetentionKept('moved-on', 100, 5_000, 8_600_000)).toBe(false)
+    expect(await s.markSessionRetentionKept('live', 100, 5_000, 8_600_000)).toBe(false)
+    expect((await s.getSession('moved-on'))?.retentionKeptAt ?? null).toBeNull()
+    // A later upsert leaves the stamp alone.
+    await seed(s, 'kept', 'closed', 100)
+    expect((await s.listExpiredSessions(500)).find((r) => r.key === 'kept')).toMatchObject({
+      retentionKeptAt: 5_000,
+      retentionRecheckAt: 8_600_000
+    })
+    await s.close()
+  })
+
+  it('sessionHasPendingInboxRows counts admitted work, not terminal hook receipts', async () => {
+    const s = await store()
+    // A completed hook receipt (dedup row) must not pin the session forever —
+    // hook-triggered review sessions are exactly what #485 collects.
+    await s.appendInbox({
+      id: 'receipt',
+      sessionKey: 'k',
+      agentId: 'bot-a',
+      msg: '{}',
+      completedAt: 50,
+      enqueuedAt: '0000000001'
+    })
+    expect(await s.sessionHasPendingInboxRows('k')).toBe(false)
+    await s.appendInbox({ id: 'queued', sessionKey: 'k', agentId: 'bot-a', msg: '{}', enqueuedAt: '0000000002' })
+    expect(await s.sessionHasPendingInboxRows('k')).toBe(true)
+    await s.close()
+  })
+
+  it('deleteSession removes the row and its mute/inbox/gate/permission cascades, keeping transcripts', async () => {
+    const s = await store()
+    await seed(s, 'gone', 'closed', 100)
+    await s.setSessionMuted('gone', true)
+    await s.setLocalCaptureGate('bot-a', 'gone', true)
+    await s.appendInbox({ id: 'm1', sessionKey: 'gone', agentId: 'bot-a', msg: '{}', enqueuedAt: '0000000001' })
+    // An unacknowledged terminal hook report is an outbox toward the CP and must
+    // survive the session delete (same rule as removeInboxByAgentId).
+    await s.appendInbox({
+      id: 'm1-report',
+      sessionKey: 'gone',
+      agentId: 'bot-a',
+      msg: '{}',
+      completedAt: 90,
+      terminalReport: '{"outcome":"done"}',
+      enqueuedAt: '0000000002'
+    })
+    await s.createPermissionRequest({
+      id: 'p1',
+      agentId: 'bot-a',
+      sessionId: 'acp-gone',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: null,
+      command: 'rm -rf /tmp/x',
+      status: 'pending',
+      resolvedAt: null
+    })
+    // ACP session ids are runtime-local: another agent's identically named
+    // session must keep its permission history.
+    await s.createPermissionRequest({
+      id: 'p2',
+      agentId: 'bot-b',
+      sessionId: 'acp-gone',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: null,
+      command: 'ls',
+      status: 'pending',
+      resolvedAt: null
+    })
+    // Thread history is (channel, thread)-scoped and shared — it must survive.
+    await s.appendTranscript({ channel: 'C1', thread: 'gone', ts: '1.1', sender: 'u1', kind: 'text', text: 'hello' })
+    expect(await s.sessionHasPendingInboxRows('gone')).toBe(true)
+
+    expect(await s.deleteSession('gone')).toBe(true)
+
+    expect(await s.getSession('gone')).toBeUndefined()
+    expect(await s.isSessionMuted('gone')).toBe(false)
+    expect(await s.sessionHasPendingInboxRows('gone')).toBe(false)
+    expect((await s.listInboxBySessionKeyFifo()).map((r) => r.id)).toEqual(['m1-report'])
+    expect(await s.listPermissionRequests('bot-a')).toEqual([])
+    expect((await s.listPermissionRequests('bot-b')).map((r) => r.id)).toEqual(['p2'])
+    // The gate row is gone: an unknown session falls back to excluded-by-default.
+    expect((await s.transcriptSince(readScope('C1', 'gone', 'bot-a'), null)).map((r) => r.text)).toEqual(['hello'])
+    // Idempotent: a second delete (or an unknown key) reports false, not an error.
+    expect(await s.deleteSession('gone')).toBe(false)
+    await s.close()
+  })
+
+  it('deleteSession drops only the deleted agent gate for a shared ACP id', async () => {
+    const s = await store()
+    // ACP session ids are runtime-local: bot-a and bot-b can both hold `acp-shared`.
+    const put = async (key: string, agentId: string) =>
+      await s.upsertSession({
+        key,
+        agentId,
+        platform: 'slack',
+        channel: 'C1',
+        thread: key,
+        acpSessionId: 'acp-shared',
+        state: 'closed',
+        lastDeliveredTs: null,
+        updatedAt: 100
+      })
+    await put('a', 'bot-a')
+    await put('b', 'bot-b')
+    await s.setLocalCaptureGate('bot-a', 'a', false) // capture open (not excluded)
+    await s.setLocalCaptureGate('bot-b', 'b', false)
+
+    // bot-a's session expires: its own gate goes, bot-b's is untouched.
+    expect(await s.deleteSession('a')).toBe(true)
+    expect(await s.isCaptureExcluded('bot-a', 'a')).toBe(true) // no row ⇒ excluded-by-default
+    expect(await s.isCaptureExcluded('bot-b', 'b')).toBe(false)
+
+    expect(await s.deleteSession('b')).toBe(true)
+    expect(await s.isCaptureExcluded('bot-b', 'b')).toBe(true)
+    await s.close()
+  })
+
+  it('deleteSession leaves unrelated sessions and their dependents alone', async () => {
+    const s = await store()
+    await seed(s, 'gone', 'closed', 100)
+    await seed(s, 'kept', 'closed', 100)
+    await s.setSessionMuted('kept', true)
+    await s.appendInbox({ id: 'm2', sessionKey: 'kept', agentId: 'bot-a', msg: '{}', enqueuedAt: '0000000002' })
+    await s.deleteSession('gone')
+    expect(await s.getSession('kept')).toBeDefined()
+    expect(await s.isSessionMuted('kept')).toBe(true)
+    expect(await s.sessionHasPendingInboxRows('kept')).toBe(true)
+    await s.close()
+  })
+
+  it('deleteSession records the CP-owed purge receipt in the same transaction', async () => {
+    const s = await store()
+    await seed(s, 'gone', 'closed', 100)
+    // A session that never bound an ACP id was never reported to the CP, so there
+    // is no metadata row to mark and no receipt to keep.
+    await seed(s, 'unbound', 'closed', 100, null)
+
+    // The receipt addresses the session by its outward id, not the ACP hop's.
+    const outward = (await s.getSession('gone'))!.sessionId!
+    await s.deleteSession('gone', { reason: 'retention', at: 1_700 })
+    await s.deleteSession('unbound', { reason: 'retention', at: 1_800 })
+
+    expect(await s.listSessionPurges(10, 0)).toEqual([
+      { agentId: 'bot-a', sessionId: outward, reason: 'retention', purgedAt: 1_700 }
+    ])
+    await s.close()
+  })
+
+  it('a purge receipt survives until acknowledged, and only for the reported agent', async () => {
+    const s = await store()
+    // Both rows carry the SAME outward id — the shape a v11 store leaves behind, where the
+    // backfill took each session's runtime-local ACP id. The ACK fence is the agent, not the id.
+    await s.upsertSession({
+      key: 'a',
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'a',
+      acpSessionId: 'acp-a',
+      sessionId: 'acp-a',
+      state: 'closed',
+      lastDeliveredTs: null,
+      updatedAt: 100
+    })
+    await s.upsertSession({
+      key: 'b',
+      agentId: 'bot-b',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'b',
+      acpSessionId: 'acp-a',
+      sessionId: 'acp-a',
+      state: 'closed',
+      lastDeliveredTs: null,
+      updatedAt: 100
+    })
+    await s.deleteSession('a', { reason: 'retention', at: 100 })
+    await s.deleteSession('b', { reason: 'retention', at: 200 })
+    expect(await s.listSessionPurges(10, 0)).toHaveLength(2)
+
+    await s.acknowledgeSessionPurges('bot-a', ['acp-a'])
+    expect(await s.listSessionPurges(10, 0)).toEqual([
+      { agentId: 'bot-b', sessionId: 'acp-a', reason: 'retention', purgedAt: 200 }
+    ])
+    await s.close()
+  })
+})
+
+describe('LocalStore pool-wide runtime probe claim', () => {
+  // One member per runtime image runs the probe sandbox; the rest read what it published. The
+  // store is what decides which member that is, so the race and the stale holder both settle here.
+  it('gives the claim to exactly one member, and the loser reads the winner’s answer', async () => {
+    const s = await store()
+    const claim = (memberId: string) =>
+      s.claimRuntimeImageProbe({ imageRef: 'runtime:v1', memberId, now: 1_000, staleBefore: 0 })
+    expect(await claim('member-a')).toBe(true)
+    expect(await claim('member-b')).toBe(false)
+    // Re-entrant for the holder: a retry after a transient failure is not a second member.
+    expect(await claim('member-a')).toBe(true)
+
+    expect(await s.readRuntimeImageProbe('runtime:v1')).toBeUndefined()
+    await s.publishRuntimeImageProbe({ imageRef: 'runtime:v1', payload: '{"table":{},"results":[]}', now: 2_000 })
+    expect(await s.readRuntimeImageProbe('runtime:v1')).toEqual({
+      payload: '{"table":{},"results":[]}',
+      probedAt: 2_000
+    })
+    await s.close()
+  })
+
+  it('lets another member retake a claim whose holder went away', async () => {
+    // Otherwise one member dying mid-probe leaves the whole pool advertising nothing, forever.
+    const s = await store()
+    expect(await s.claimRuntimeImageProbe({ imageRef: 'runtime:v1', memberId: 'gone', now: 1_000, staleBefore: 0 }))
+    expect(
+      await s.claimRuntimeImageProbe({ imageRef: 'runtime:v1', memberId: 'next', now: 9_000, staleBefore: 5_000 })
+    ).toBe(true)
+    await s.close()
+  })
+
+  it('keys the answer on the image, so a template bump is a different question', async () => {
+    const s = await store()
+    await s.publishRuntimeImageProbe({ imageRef: 'runtime:v1', payload: '{"v":1}', now: 1 })
+    expect(await s.readRuntimeImageProbe('runtime:v2')).toBeUndefined()
+    expect(
+      await s.claimRuntimeImageProbe({ imageRef: 'runtime:v2', memberId: 'member-a', now: 1, staleBefore: 0 })
+    ).toBe(true)
+    // And publishing the new image leaves the old row alone.
+    await s.publishRuntimeImageProbe({ imageRef: 'runtime:v2', payload: '{"v":2}', now: 2 })
+    expect((await s.readRuntimeImageProbe('runtime:v1'))?.payload).toBe('{"v":1}')
+    await s.close()
+  })
+
+  it('drops answers for images the pool stopped running long ago', async () => {
+    // One row per image tag ever deployed would otherwise accumulate for the life of the store.
+    const s = await store()
+    const year = 365 * 24 * 60 * 60_000
+    await s.publishRuntimeImageProbe({ imageRef: 'runtime:ancient', payload: '{"v":0}', now: 1 })
+    await s.publishRuntimeImageProbe({ imageRef: 'runtime:current', payload: '{"v":1}', now: year })
+    expect(await s.readRuntimeImageProbe('runtime:ancient')).toBeUndefined()
+    expect((await s.readRuntimeImageProbe('runtime:current'))?.payload).toBe('{"v":1}')
+    await s.close()
+  })
+})
+
+describe('LocalStore runtime model-catalog cache (runtime-model-catalog.md §4)', () => {
+  const meta = (runtimeId: string, fingerprint: string, observedAt = 100) => ({
+    runtimeId,
+    fingerprint,
+    source: 'acp' as const,
+    defaultModel: 'opus',
+    permissionModes: [{ value: 'default', name: 'Default' }],
+    observedAt
+  })
+  const cap = (runtimeId: string, modelId: string, observedAt = 100) => ({
+    runtimeId,
+    modelId,
+    fingerprint: 'fp-1',
+    caps: { name: modelId, efforts: [{ value: 'high', name: 'High' }], defaultEffort: 'high', fastMode: true },
+    observedAt
+  })
+
+  it('round-trips defaultPermissionMode (absent stays absent)', async () => {
+    const s = await store()
+    await s.recordRuntimeCatalogMeta({ ...meta('copilot', 'fp-1'), defaultPermissionMode: 'agent' })
+    expect((await s.getRuntimeCatalogMeta('copilot'))?.defaultPermissionMode).toBe('agent')
+    await s.recordRuntimeCatalogMeta(meta('claude', 'fp-1'))
+    expect(await s.getRuntimeCatalogMeta('claude')).not.toHaveProperty('defaultPermissionMode')
+    await s.close()
+  })
+
+  it('round-trips catalog meta and per-model capability rows', async () => {
+    const s = await store()
+    expect(await s.getRuntimeCatalogMeta('claude')).toBeUndefined()
+    expect(await s.listRuntimeCatalogMetas()).toEqual([])
+    expect(await s.listRuntimeModelCaps()).toEqual([])
+
+    await s.recordRuntimeCatalogMeta(meta('claude', 'fp-1'))
+    await s.upsertRuntimeModelCap(cap('claude', 'opus'))
+    await s.upsertRuntimeModelCap(cap('claude', 'sonnet'))
+    await s.upsertRuntimeModelCap({ ...cap('codex', 'gpt'), caps: {} })
+
+    // A phase-1 meta write is never complete and carries no modelsHash — both keys
+    // are absent (not null) on read-back.
+    expect(await s.getRuntimeCatalogMeta('claude')).toEqual({
+      runtimeId: 'claude',
+      fingerprint: 'fp-1',
+      source: 'acp',
+      defaultModel: 'opus',
+      permissionModes: [{ value: 'default', name: 'Default' }],
+      complete: false,
+      observedAt: 100
+    })
+    expect((await s.listRuntimeCatalogMetas()).map((m) => m.runtimeId)).toEqual(['claude'])
+    expect((await s.listRuntimeModelCaps('claude')).map((c) => c.modelId)).toEqual(['opus', 'sonnet'])
+    expect((await s.listRuntimeModelCaps('claude'))[0]?.caps).toEqual({
+      name: 'opus',
+      efforts: [{ value: 'high', name: 'High' }],
+      defaultEffort: 'high',
+      fastMode: true
+    })
+    // Unscoped list spans runtimes; empty caps round-trip as {}.
+    expect((await s.listRuntimeModelCaps()).map((c) => `${c.runtimeId}:${c.modelId}`)).toEqual([
+      'claude:opus',
+      'claude:sonnet',
+      'codex:gpt'
+    ])
+    expect((await s.listRuntimeModelCaps('codex'))[0]?.caps).toEqual({})
+
+    // Latest-wins upsert on (runtimeId, modelId).
+    await s.upsertRuntimeModelCap({ ...cap('claude', 'opus', 999), fingerprint: 'fp-2', caps: { fastMode: false } })
+    const opus = (await s.listRuntimeModelCaps('claude')).find((c) => c.modelId === 'opus')
+    expect(opus).toMatchObject({ fingerprint: 'fp-2', observedAt: 999 })
+    expect(opus?.caps).toEqual({ fastMode: false })
+    await s.close()
+  })
+
+  it('recordRuntimeCatalogMeta preserves complete/modelsHash on the same fingerprint, resets on change', async () => {
+    const s = await store()
+    await s.recordRuntimeCatalogMeta(meta('claude', 'fp-1'))
+    await s.markRuntimeCatalogComplete('claude', 'fp-1', 'hash-1', 200)
+    expect(await s.getRuntimeCatalogMeta('claude')).toMatchObject({
+      complete: true,
+      modelsHash: 'hash-1',
+      observedAt: 200
+    })
+
+    // A phase-1 re-write on the SAME generation must neither satisfy nor re-open the
+    // discovery gate: complete/modelsHash survive while the mutable fields update.
+    await s.recordRuntimeCatalogMeta({ ...meta('claude', 'fp-1', 300), defaultModel: 'sonnet' })
+    expect(await s.getRuntimeCatalogMeta('claude')).toMatchObject({
+      complete: true,
+      modelsHash: 'hash-1',
+      defaultModel: 'sonnet',
+      observedAt: 300
+    })
+
+    // An adapter upgrade (new fingerprint) re-opens the gate.
+    await s.recordRuntimeCatalogMeta(meta('claude', 'fp-2', 400))
+    const reset = await s.getRuntimeCatalogMeta('claude')
+    expect(reset).toMatchObject({ fingerprint: 'fp-2', complete: false, observedAt: 400 })
+    expect(reset?.modelsHash).toBeUndefined()
+    await s.close()
+  })
+
+  it('markRuntimeCatalogComplete is fenced by fingerprint (stale discovery cannot close a new generation)', async () => {
+    const s = await store()
+    await s.recordRuntimeCatalogMeta(meta('claude', 'fp-2'))
+    await s.markRuntimeCatalogComplete('claude', 'fp-1', 'stale-hash', 999) // old-generation straggler
+    expect(await s.getRuntimeCatalogMeta('claude')).toMatchObject({ complete: false, observedAt: 100 })
+    expect((await s.getRuntimeCatalogMeta('claude'))?.modelsHash).toBeUndefined()
+    await s.markRuntimeCatalogComplete('claude', 'fp-2', 'hash-2', 500)
+    expect(await s.getRuntimeCatalogMeta('claude')).toMatchObject({
+      complete: true,
+      modelsHash: 'hash-2',
+      observedAt: 500
+    })
+    // Unknown runtime: no row created.
+    await s.markRuntimeCatalogComplete('ghost', 'fp', 'h', 1)
+    expect(await s.getRuntimeCatalogMeta('ghost')).toBeUndefined()
+    await s.close()
+  })
+
+  it('pruneRuntimeModelCaps keeps only the listed ids, scoped to one runtime', async () => {
+    const s = await store()
+    for (const id of ['opus', 'sonnet', 'haiku']) await s.upsertRuntimeModelCap(cap('claude', id))
+    await s.upsertRuntimeModelCap(cap('codex', 'gpt'))
+    await s.pruneRuntimeModelCaps('claude', ['opus', 'haiku'])
+    expect((await s.listRuntimeModelCaps('claude')).map((c) => c.modelId)).toEqual(['haiku', 'opus'])
+    expect((await s.listRuntimeModelCaps('codex')).map((c) => c.modelId)).toEqual(['gpt'])
+    // An empty keep-set clears the runtime's rows entirely.
+    await s.pruneRuntimeModelCaps('claude', [])
+    expect(await s.listRuntimeModelCaps('claude')).toEqual([])
+    expect(await s.listRuntimeModelCaps('codex')).toHaveLength(1)
+    await s.close()
+  })
+
+  it('keeps two members of one shared store on independent catalogs', async () => {
+    // The rollout case: two image generations, one Postgres schema. Each member reads and
+    // writes only its own rows, so neither sees the other's fingerprint as a change.
+    const [a, b] = await sharedMembers('member-a', 'member-b')
+    await a.recordRuntimeCatalogMeta(meta('claude', 'fp-a'))
+    await a.upsertRuntimeModelCap(cap('claude', 'opus'))
+    await a.markRuntimeCatalogComplete('claude', 'fp-a', 'hash-a', 200)
+
+    await b.recordRuntimeCatalogMeta(meta('claude', 'fp-b'))
+    await b.upsertRuntimeModelCap(cap('claude', 'haiku'))
+    await b.upsertRuntimeModelCap(cap('claude', 'sonnet'))
+    await b.pruneRuntimeModelCaps('claude', ['haiku'])
+
+    // a's gate stays closed on its own generation; the prune-on-success stayed inside b.
+    expect(await a.getRuntimeCatalogMeta('claude')).toMatchObject({
+      fingerprint: 'fp-a',
+      complete: true,
+      modelsHash: 'hash-a',
+      observedAt: 200
+    })
+    expect(await b.getRuntimeCatalogMeta('claude')).toMatchObject({ fingerprint: 'fp-b', complete: false })
+    expect((await a.listRuntimeModelCaps('claude')).map((c) => c.modelId)).toEqual(['opus'])
+    expect((await b.listRuntimeModelCaps('claude')).map((c) => c.modelId)).toEqual(['haiku'])
+    // Hydration too: a member boots on its own catalog, never a peer image's.
+    expect((await a.listRuntimeCatalogMetas()).map((m) => m.fingerprint)).toEqual(['fp-a'])
+    expect((await b.listRuntimeModelCaps()).map((c) => c.modelId)).toEqual(['haiku'])
+    // And a completion from the other member cannot close a's gate on a's fingerprint.
+    await b.markRuntimeCatalogComplete('claude', 'fp-a', 'hash-a', 300)
+    expect((await b.getRuntimeCatalogMeta('claude'))?.complete).toBe(false)
+    await a.close()
+  })
+
+  it('finds a pending skill proposal behind many skill-bearing dreams', async () => {
+    // The proposed filter must be IN the query: rows whose candidates are all
+    // accepted/dismissed (or empty) must not consume the scan window, or one
+    // genuinely pending older proposal ages out permanently.
+    const s = await store()
+    const base = {
+      agentId: 'a1',
+      status: 'adopted' as const,
+      trigger: 'manual' as const,
+      sessionIds: [],
+      snapshotDigest: 'sha256:x'
+    }
+    // The pending one is the OLDEST.
+    await s.insertDream({
+      ...base,
+      dreamId: 'drm-pending',
+      createdAt: '2020-01-01T00:00:00.000Z',
+      skills: [{ name: 'deploy-staging', description: 'd', state: 'proposed' }]
+    })
+    // …buried behind 600 newer dreams that all carry skills, none pending.
+    for (let i = 0; i < 600; i++) {
+      await s.insertDream({
+        ...base,
+        dreamId: `drm-${i}`,
+        createdAt: `2026-01-01T00:00:${String(i % 60).padStart(2, '0')}.000Z`,
+        skills: [{ name: `done-${i}`, description: 'd', state: i % 2 ? 'accepted' : 'dismissed' }]
+      })
+    }
+
+    const pending = await s.pendingSkillDreams('a1', 50)
+    expect(pending.map((d) => d.dreamId)).toEqual(['drm-pending'])
+    await s.close()
+  })
+})
+
+describe('LocalStore webchat MCP grant ledger', () => {
+  const tuple = {
+    conversationId: 'conv-1',
+    agentId: 'agent-1',
+    authorityId: 'auth-1',
+    authorityGeneration: 3
+  }
+
+  it('tracks active grants and queues durable revocations', async () => {
+    const s = await store()
+    await s.recordWebchatMcpGrant({ ...tuple, now: 10 })
+    expect(await s.listDueWebchatMcpRevocations(100)).toEqual([])
+
+    await s.markWebchatMcpGrantRevoking({ ...tuple, reason: 'agent_detached', now: 20 })
+    const due = await s.listDueWebchatMcpRevocations(20)
+    expect(due).toHaveLength(1)
+    expect(due[0]).toMatchObject({ ...tuple, state: 'revoking', reason: 'agent_detached', attempts: 0 })
+
+    await s.retryWebchatMcpRevocation('conv-1', 'auth-1', 3, 500, 30)
+    expect(await s.listDueWebchatMcpRevocations(100)).toEqual([])
+    expect((await s.listDueWebchatMcpRevocations(500))[0]).toMatchObject({ attempts: 1 })
+
+    await s.clearWebchatMcpGrant('conv-1', 'auth-1', 3)
+    expect(await s.listDueWebchatMcpRevocations(10_000)).toEqual([])
+    await s.close()
+  })
+
+  it('re-provisioning cancels a queued revocation, and exact-tuple fences protect newer authorities', async () => {
+    const s = await store()
+    await s.markWebchatMcpGrantRevoking({ ...tuple, reason: 'session_expired', now: 10 })
+    // Conversation resumes: the CP re-validated the authority; the stale revoke must not fire.
+    await s.recordWebchatMcpGrant({ ...tuple, authorityGeneration: 4, now: 20 })
+    expect(await s.listDueWebchatMcpRevocations(10_000)).toEqual([])
+
+    // A late clear/downgrade for the OLD tuple must not touch the newer active row.
+    await s.clearWebchatMcpGrant('conv-1', 'auth-1', 3)
+    await s.markWebchatMcpGrantRevoking({ ...tuple, authorityGeneration: 4, reason: 'session_closed', now: 30 })
+    expect((await s.listDueWebchatMcpRevocations(30))[0]).toMatchObject({ authorityGeneration: 4 })
+    await s.close()
+  })
+
+  it('marks the leftover active grants of an exclusively owned store revoking on the startup sweep', async () => {
+    const s = await store()
+    await s.recordWebchatMcpGrant({ ...tuple, now: 10 })
+    await s.recordWebchatMcpGrant({ ...tuple, conversationId: 'conv-2', now: 10 })
+    expect(await s.markOwnedWebchatMcpGrantsRevoking('session_closed', 50)).toBe(2)
+    const due = await s.listDueWebchatMcpRevocations(50)
+    expect(due.map((r) => r.conversationId).sort()).toEqual(['conv-1', 'conv-2'])
+    expect(due.every((r) => r.reason === 'session_closed')).toBe(true)
+    await s.close()
+  })
+  it('an authoritative event time upgrades a row the derived-axis observer wrote first', async () => {
+    // Regression (merged-conversation-view.md §6): the step-1 channel record wins the INSERT over
+    // SessionManager, so an explicit eventTimeUs must upgrade the deduped row and bump its revision.
+    const s = await store()
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '4821', sender: 'U1', kind: 'text', text: 'hi' })
+    const before = (await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null))[0] as { eventTimeUs?: number }
+    expect(before.eventTimeUs).toBe(4_821_000_000)
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '4821',
+      sender: 'U1',
+      kind: 'text',
+      text: 'hi',
+      eventTimeUs: 1_754_123_458_000_000
+    })
+    const after = (await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null))[0] as { eventTimeUs?: number }
+    expect(after.eventTimeUs).toBe(1_754_123_458_000_000)
+    await s.close()
+  })
+
+  it('a later append with the fetched image upgrades the observer-written row', async () => {
+    // The observer records a platform message before the bytes are downloaded, so the
+    // authoritative append is INSERT-OR-IGNOREd — without an in-place upgrade the row's
+    // attachmentsJson stays NULL and the console shows only the `[attached: …]` label.
+    const s = await store()
+    const text = 'look\n[attached: shot.png (image/png)]'
+    await s.appendTranscript({ channel: 'C1', thread: 'T', ts: '99', sender: 'U1', kind: 'text', text })
+    await s.appendTranscript({
+      channel: 'C1',
+      thread: 'T',
+      ts: '99',
+      sender: 'U1',
+      kind: 'text',
+      text,
+      attachments: [{ name: 'shot.png', mimeType: 'image/png', data: 'aW1n' }]
+    })
+    const row = (await s.transcriptSince(readScope('C1', 'T', 'bot-a'), null))[0] as { attachmentsJson?: string | null }
+    expect(JSON.parse(row.attachmentsJson ?? 'null')).toEqual([
+      { name: 'shot.png', mimeType: 'image/png', data: 'aW1n' }
+    ])
+    await s.close()
+  })
+
+  it('finds a stored image by name, newest first, and only inside its own thread', async () => {
+    // Backs forwarding a received file: the copy kept for console replay is what gets sent on,
+    // so it has to be addressable by the name the agent read in its `[attached: …]` marker.
+    const s = await store()
+    const append = (thread: string, ts: string, data: string) =>
+      s.appendTranscript({
+        channel: 'C1',
+        thread,
+        ts,
+        sender: 'U1',
+        kind: 'text',
+        text: '[attached: shot.png (image/png)]',
+        attachments: [{ name: 'shot.png', mimeType: 'image/png', data }]
+      })
+    await append('T', '1', 'b2xk')
+    await append('T', '2', 'bmV3')
+    await append('T_OTHER', '3', 'ZWxzZQ==')
+
+    // The same name can recur in a long conversation; the latest one is what "that image" means.
+    expect((await s.transcriptAttachmentByName(readScope('C1', 'T', 'bot-a'), 'shot.png'))?.data).toBe('bmV3')
+    // A neighbouring thread's image is not addressable from here — an agent forwards only
+    // what its own conversation received.
+    expect(await s.transcriptAttachmentByName(readScope('C1', 'T_MISSING', 'bot-a'), 'shot.png')).toBeUndefined()
+    expect(await s.transcriptAttachmentByName(readScope('C1', 'T', 'bot-a'), 'other.png')).toBeUndefined()
+    await s.close()
+  })
+})
+
+describe('LocalStore recovery scope on a shared store (daemon pool)', () => {
+  // One store, many members. A member's own id is its PROCESS incarnation, so a starting
+  // member owns nothing yet — which is exactly why boot must recover nothing here.
+  const tuple = {
+    conversationId: 'conv-1',
+    agentId: 'agent-1',
+    authorityId: 'auth-1',
+    authorityGeneration: 3
+  }
+  const openDream = (dreamId: string, agentId = 'agent-1') => ({
+    dreamId,
+    agentId,
+    status: 'running' as const,
+    trigger: 'manual' as const,
+    sessionIds: [],
+    snapshotDigest: 'sha256:x',
+    createdAt: '2026-01-01T00:00:00.000Z'
+  })
+
+  const sharedPath = (): string => join(mkdtempSync(join(tmpdir(), 'ac-pool-')), 'shared.sqlite')
+  const member = async (path: string, ownerId: string): Promise<LocalStore> =>
+    await openTestStore({
+      database: SqliteAsyncDatabase.adopt(new DatabaseSync(path)),
+      shared: true,
+      ownerId,
+      orgForAgent: oneOrg
+    })
+
+  it("a starting member leaves a peer's live grant and running dream untouched", async () => {
+    const path = sharedPath()
+    const a = await member(path, 'member-a')
+    await a.recordWebchatMcpGrant({ ...tuple, now: 10 })
+    await a.insertDream(openDream('drm-a'))
+
+    // A rolling update starts a new Pod: a new owner, while A keeps serving.
+    const b = await member(path, 'member-b')
+    expect(await b.markOwnedWebchatMcpGrantsRevoking('session_closed', 50)).toBe(0)
+    expect(await b.openDreams()).toEqual([])
+    expect(await b.listDueWebchatMcpRevocations(10_000)).toEqual([])
+    expect(await a.listDueWebchatMcpRevocations(10_000)).toEqual([])
+    expect((await a.getDream('agent-1', 'drm-a'))?.status).toBe('running')
+    await a.close()
+    await b.close()
+  })
+
+  it("reclaims a former owner's rows only for the agents this member was handed", async () => {
+    const path = sharedPath()
+    const a = await member(path, 'member-a')
+    await a.recordWebchatMcpGrant({ ...tuple, now: 10 })
+    await a.insertDream(openDream('drm-a'))
+    const b = await member(path, 'member-b')
+
+    expect(await b.reclaimWebchatMcpGrants(['other-agent'], 'session_closed', 60)).toBe(0)
+    expect(await b.strandedDreams(['other-agent'])).toEqual([])
+
+    expect(await b.reclaimWebchatMcpGrants(['agent-1'], 'session_closed', 60)).toBe(1)
+    expect((await b.listDueWebchatMcpRevocations(60))[0]).toMatchObject({
+      conversationId: 'conv-1',
+      state: 'revoking',
+      ownerId: 'member-b'
+    })
+    // The queue moved with the duty: its former owner no longer drains it.
+    expect(await a.listDueWebchatMcpRevocations(10_000)).toEqual([])
+
+    const stranded = await b.strandedDreams(['agent-1'])
+    expect((await stranded).map((dream) => dream.dreamId)).toEqual(['drm-a'])
+    const failed = { ...stranded[0]!, status: 'failed' as const, endedAt: '2026-01-01T00:01:00.000Z' }
+    expect(await b.failOpenDream(failed)).toBe(true)
+    // Idempotent: the row is terminal now, so a replayed recovery writes nothing.
+    expect(await b.failOpenDream(failed)).toBe(false)
+    expect(await b.strandedDreams(['agent-1'])).toEqual([])
+    await a.close()
+    await b.close()
+  })
+
+  it("the recovery CAS keeps the outcome the dream's own runner recorded", async () => {
+    const path = sharedPath()
+    const a = await member(path, 'member-a')
+    await a.insertDream(openDream('drm-a'))
+    const b = await member(path, 'member-b')
+    const stranded = (await b.strandedDreams(['agent-1']))[0]!
+
+    // A finishes between B's read and B's write — the completion must survive.
+    await a.updateDream({ ...openDream('drm-a'), status: 'completed', endedAt: '2026-01-01T00:00:30.000Z' })
+    expect(await b.failOpenDream({ ...stranded, status: 'failed', endedAt: '2026-01-01T00:01:00.000Z' })).toBe(false)
+    expect((await a.getDream('agent-1', 'drm-a'))?.status).toBe('completed')
+    await a.close()
+    await b.close()
+  })
+
+  it('an exclusively owned store still recovers everything it left behind at boot', async () => {
+    const s = await store()
+    await s.recordWebchatMcpGrant({ ...tuple, now: 10 })
+    await s.insertDream(openDream('drm-a'))
+    expect(await s.markOwnedWebchatMcpGrantsRevoking('session_closed', 50)).toBe(1)
+    expect((await s.openDreams()).map((dream) => dream.dreamId)).toEqual(['drm-a'])
+    // There is no duty axis on a single-daemon store — boot already covered it.
+    expect(await s.strandedDreams(['agent-1'])).toEqual([])
+    expect(await s.reclaimWebchatMcpGrants(['agent-1'], 'session_closed', 60)).toBe(0)
+    await s.close()
+  })
+
+  // Purge receipts (#1032): one session_purges table for the whole pool, leased per
+  // member exactly like the hook-completion outbox — a peer's live row is never
+  // offered, claimed, or released by anyone but its owner.
+  const LEASE_MS = 2 * 60 * 1_000
+  const purged = async (s: LocalStore, key: string, agentId: string, ownerId: string, at: number): Promise<string> => {
+    await s.upsertSession({
+      key,
+      agentId,
+      platform: 'slack',
+      channel: 'C1',
+      thread: key,
+      acpSessionId: `acp-${key}`,
+      state: 'closed',
+      lastDeliveredTs: null,
+      updatedAt: 0
+    })
+    const outward = (await s.getSession(key))!.sessionId!
+    expect(await s.deleteSession(key, { reason: 'retention', at, ownerId })).toBe(true)
+    return outward
+  }
+  const ids = (rows: { sessionId: string }[]) => rows.map((row) => row.sessionId)
+
+  it("offers a pool member its own purge receipts, never a live peer's", async () => {
+    const path = sharedPath()
+    const a = await member(path, 'store-a')
+    const b = await member(path, 'store-b')
+    const fromA = await purged(a, 'from-a', 'agent-a', 'daemon-a', 1_000)
+    const fromB = await purged(b, 'from-b', 'agent-b', 'daemon-b', 1_000)
+
+    expect(ids(await a.listSessionPurges(10, 1500, 'daemon-a', ['agent-a']))).toEqual([fromA])
+    // B serves both agents and still may not touch A's row: A's claim is live.
+    expect(ids(await b.listSessionPurges(10, 1500, 'daemon-b', ['agent-a', 'agent-b']))).toEqual([fromB])
+    expect(await b.claimSessionPurges('agent-a', [fromA], 'daemon-b', 1_500)).toEqual([])
+    // Nor release it: the ACK fence is the claim holder.
+    await b.acknowledgeSessionPurges('agent-a', [fromA], 'daemon-b')
+    expect(ids(await a.listSessionPurges(10, 1500, 'daemon-a', []))).toEqual([fromA])
+    // The owner renews and settles its own row.
+    expect(await a.claimSessionPurges('agent-a', [fromA], 'daemon-a', 1_500)).toEqual([fromA])
+    await a.acknowledgeSessionPurges('agent-a', [fromA], 'daemon-a')
+    expect(await a.listSessionPurges(10, 1_500, 'daemon-a', [])).toEqual([])
+    await a.close()
+    await b.close()
+  })
+
+  it('lets the member that serves the agent take over a purge receipt after the owner claim lapses', async () => {
+    const path = sharedPath()
+    const a = await member(path, 'store-a')
+    const b = await member(path, 'store-b')
+    const fromA = await purged(a, 'from-a', 'agent-a', 'daemon-a', 1_000)
+    const lapsed = 1_000 + LEASE_MS + 1
+
+    // Still not B's to take while B does not serve the agent.
+    expect(await b.listSessionPurges(10, lapsed, 'daemon-b', ['agent-b'])).toEqual([])
+    expect(ids(await b.listSessionPurges(10, lapsed, 'daemon-b', ['agent-a']))).toEqual([fromA])
+    expect(await b.claimSessionPurges('agent-a', [fromA], 'daemon-b', lapsed)).toEqual([fromA])
+    // The takeover is exclusive: the dead owner's id no longer holds the row.
+    expect(await a.listSessionPurges(10, lapsed, 'daemon-a', [])).toEqual([])
+    expect(await a.claimSessionPurges('agent-a', [fromA], 'daemon-a', lapsed)).toEqual([])
+    await a.close()
+    await b.close()
+  })
+
+  it('a single-daemon store drains and settles every receipt unfenced', async () => {
+    const s = await store()
+    await s.upsertSession({
+      key: 'k',
+      agentId: 'agent-1',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'k',
+      acpSessionId: 'acp-k',
+      state: 'closed',
+      lastDeliveredTs: null,
+      updatedAt: 0
+    })
+    const outward = (await s.getSession('k'))!.sessionId!
+    await s.deleteSession('k', { reason: 'retention', at: 1_000 })
+    expect(ids(await s.listSessionPurges(10, 1500, 'daemon-a', []))).toEqual([outward])
+    expect(await s.claimSessionPurges('agent-1', [outward], undefined, 1_500)).toEqual([outward])
+    await s.acknowledgeSessionPurges('agent-1', [outward])
+    expect(await s.listSessionPurges(10, 1_500)).toEqual([])
+    await s.close()
+  })
+})
+
+describe('LocalStore loop guard message charge', () => {
+  it('counts a message once across agents and charges it again after its window', async () => {
+    const s = await store()
+    const limits = { windowMs: 1_000, maxTotal: 100, maxAutomatic: 1 }
+    expect((await s.recordLoopGuardTurn('slack:C1:top-level', 'post-1', 100, true, limits)).allowed).toBe(true)
+    expect(await s.recordLoopGuardTurn('slack:C1:top-level', 'post-1', 150, true, limits)).toMatchObject({
+      allowed: true,
+      automaticCount: 1
+    })
+    expect(await s.recordLoopGuardTurn('slack:C1:top-level', 'post-1', 1_200, true, limits)).toMatchObject({
+      allowed: true,
+      automaticCount: 1
+    })
+    expect(await s.recordLoopGuardTurn('slack:C1:top-level', 'post-2', 1_300, true, limits)).toMatchObject({
+      allowed: false,
+      trippedNow: true
+    })
+    await s.close()
+  })
+})
+
+describe('LocalStore activation rendezvous (send-message-routing-rework.md §3.2/§8.6)', () => {
+  const KEY = ['slack', 'scope-1', '1720000000.000100', 'agent-target'].join('\u001f')
+  const ENVELOPE = JSON.stringify({ callFrom: 'agent-author', hopCount: 3 })
+
+  it('admits an internal-wake-first pairing exactly once and replays the same child', async () => {
+    const s = await store()
+    const first = await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)
+    expect(first.dispatch).toBe(true)
+    expect(await s.admitActivation(KEY, 'child-1')).toBe(true)
+
+    // A retry of the same delivery — a redelivered wake, or replay after restart — must
+    // read back the SAME child rather than opening a second session.
+    const retry = await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)
+    expect(retry.dispatch).toBe(false)
+    expect(retry.record.state).toBe('admitted')
+    expect(retry.record.childSessionId).toBe('child-1')
+    await s.close()
+  })
+
+  it('holds a platform-first observation pending until the envelope arrives', async () => {
+    const s = await store()
+    const claimed = await s.claimActivationObservation(
+      KEY,
+      { agentCallDeliveryId: 'd-1', platformMessageId: '1720000000.000100', transcriptCoordinates: 'C1 T1' },
+      1000
+    )
+    expect(claimed.state).toBe('pending')
+    expect(claimed.callEnvelope).toBeFalsy()
+    // The precondition the design states outright: a platform-first record cannot become
+    // `admitted` until `callEnvelope` is present — the visible post carries none of the
+    // lineage, so admitting on it would fabricate the call it is supposed to accompany.
+    expect(await s.admitActivation(KEY, 'child-1')).toBe(false)
+
+    const attached = await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)
+    expect(attached.dispatch).toBe(true)
+    expect(await s.admitActivation(KEY, 'child-1')).toBe(true)
+    expect((await s.getActivation(KEY))?.state).toBe('admitted')
+    // The visible observation survives the transition, so the later half reconciles onto
+    // the same transcript row instead of duplicating the hand-off.
+    expect((await s.getActivation(KEY))?.platformMessageId).toBe('1720000000.000100')
+    await s.close()
+  })
+
+  it('is idempotent for a redelivered platform event', async () => {
+    const s = await store()
+    const obs = { agentCallDeliveryId: 'd-1', platformMessageId: 'ts-1', transcriptCoordinates: 'C1 T1' }
+    await s.claimActivationObservation(KEY, obs, 1000)
+    await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)
+    await s.admitActivation(KEY, 'child-1')
+    // Slack redelivers; the observation must not reset an admitted record.
+    await s.claimActivationObservation(KEY, obs, 1000)
+    expect((await s.getActivation(KEY))?.state).toBe('admitted')
+    expect((await s.getActivation(KEY))?.childSessionId).toBe('child-1')
+    await s.close()
+  })
+
+  it('expires an envelope-less pairing to transcript-only, and never revives it', async () => {
+    const s = await store()
+    await s.claimActivationObservation(
+      KEY,
+      { agentCallDeliveryId: 'd-1', platformMessageId: 'ts-1', transcriptCoordinates: 'C1 T1' },
+      1000
+    )
+    expect((await s.expireActivations(999)).transcriptOnly).toEqual([])
+    const expired = await s.expireActivations(1000)
+    expect(expired.transcriptOnly.map((r) => r.agentCallDeliveryId)).toEqual(['d-1'])
+    expect((await s.getActivation(KEY))?.state).toBe('transcript-only')
+
+    // A very late wake must not resurrect a delivery already reported failed — otherwise
+    // the operator sees a failure AND the target runs a turn for it anyway.
+    const late = await s.attachActivationEnvelope(KEY, ENVELOPE, 5000)
+    expect(late.dispatch).toBe(false)
+    expect((await s.getActivation(KEY))?.state).toBe('transcript-only')
+    await s.close()
+  })
+
+  it('never expires a record that already has its envelope', async () => {
+    const s = await store()
+    await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)
+    expect((await s.expireActivations(999)).transcriptOnly).toEqual([])
+    expect((await s.getActivation(KEY))?.state).toBe('pending')
+    await s.close()
+  })
+
+  it('releases — not reports — a claim left pending WITH an envelope past its TTL', async () => {
+    // The crash case. In-process, a dispatch that never admits is repaired by the
+    // admission callback; a hard crash in that window leaves the row with nobody to run
+    // it. Left alone the key is claimed forever and every retry after restart is
+    // deduplicated against a child that does not exist — exactly-once becoming never.
+    const s = await store()
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(true)
+    const sweep = await s.expireActivations(1000)
+    // Not a delivery FAILURE report: unlike the envelope-less case, nothing here says the
+    // delivery was observed and lost — only that this attempt did not finish.
+    expect(sweep.transcriptOnly).toEqual([])
+    expect(sweep.released).toBe(1)
+    expect(await s.getActivation(KEY)).toBeUndefined()
+    // …and the key is claimable again, which is the whole point.
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 5000)).dispatch).toBe(true)
+    await s.close()
+  })
+
+  it('grants the dispatch claim once, even before admission settles', async () => {
+    // Admission settles asynchronously, so "not yet admitted" is NOT "nobody is handling
+    // it". A second arrival inside that window must not also be told to dispatch, or one
+    // logical delivery wakes the target twice.
+    const s = await store()
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(true)
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(false)
+    expect((await s.getActivation(KEY))?.state).toBe('pending')
+    await s.close()
+  })
+
+  it('releases a claim whose dispatch never admitted, so a retry is a first attempt', async () => {
+    // The other half of exactly-once: a rejected turn, a persistence failure, or a crash
+    // between claim and admission would otherwise leave a claimed key with no child, and
+    // every retry would be deduplicated against it — exactly-once becoming never.
+    const s = await store()
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(true)
+    expect(await s.releaseActivation(KEY)).toBe(true)
+    expect(await s.getActivation(KEY)).toBeUndefined()
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(true)
+
+    // …but releasing never reopens a settled decision: an admitted record has a real
+    // child, and a transcript-only one was already reported as a delivery failure.
+    await s.admitActivation(KEY, 'child-1')
+    expect(await s.releaseActivation(KEY)).toBe(false)
+    expect(await s.getActivation(KEY)).toMatchObject({ state: 'admitted', childSessionId: 'child-1' })
+    await s.close()
+  })
+
+  it('reconciles a crashed claim against the durable inbox instead of guessing', async () => {
+    // A crash between claim and admission leaves two rows that look identical and need
+    // OPPOSITE answers. Releasing both would let a replayed turn be dispatched a second
+    // time; admitting both would strand a delivery that never persisted. The inbox row is
+    // the only evidence that distinguishes them.
+    const s = await store()
+    const durable = ['slack', 'scope-1', 'ts-durable', 'agent-target'].join('\u001f')
+    const lost = ['slack', 'scope-1', 'ts-lost', 'agent-target'].join('\u001f')
+    expect((await s.attachActivationEnvelope(durable, ENVELOPE, 1000, 'delivery-durable')).dispatch).toBe(true)
+    expect((await s.attachActivationEnvelope(lost, ENVELOPE, 1000, 'delivery-lost')).dispatch).toBe(true)
+    // Only the first one's turn actually reached the durable queue before the crash.
+    await s.appendInbox({
+      id: 'delivery-durable',
+      sessionKey: 'k',
+      agentId: 'bot-b',
+      msg: '{}',
+      enqueuedAt: '0000000001'
+    })
+
+    const sweep = await s.expireActivations(1000)
+    expect(sweep.transcriptOnly).toEqual([])
+    // Durably queued ⇒ startup replay will run it, so the claim COMPLETES. A later retry
+    // must be deduplicated against it, not allowed to deliver again.
+    expect((await s.getActivation(durable))?.state).toBe('admitted')
+    expect((await s.attachActivationEnvelope(durable, ENVELOPE, 5000)).dispatch).toBe(false)
+    // Never persisted ⇒ nothing will replay, so the key must become claimable again.
+    expect(sweep.released).toBe(1)
+    expect(await s.getActivation(lost)).toBeUndefined()
+    expect((await s.attachActivationEnvelope(lost, ENVELOPE, 5000, 'delivery-lost-retry')).dispatch).toBe(true)
+    await s.close()
+  })
+
+  it('releases a legacy claim that carries no dispatch id', async () => {
+    // Rows written before `dispatchId` existed cannot be reconciled. Releasing is the same
+    // answer as "never persisted" — the safe direction, since the alternative strands the
+    // key forever.
+    const s = await store()
+    expect((await s.attachActivationEnvelope(KEY, ENVELOPE, 1000)).dispatch).toBe(true)
+    expect((await s.expireActivations(1000)).released).toBe(1)
+    expect(await s.getActivation(KEY)).toBeUndefined()
+    await s.close()
+  })
+
+  it('keys separate targets of one visible post independently', async () => {
+    // §3.2: one channel-root post can address several agents; each must be admitted once,
+    // and one target's admission must not consume another's.
+    const s = await store()
+    const a = ['slack', 'scope-1', 'ts-1', 'agent-a'].join('\u001f')
+    const b = ['slack', 'scope-1', 'ts-1', 'agent-b'].join('\u001f')
+    expect((await s.attachActivationEnvelope(a, ENVELOPE, 1000)).dispatch).toBe(true)
+    expect((await s.attachActivationEnvelope(b, ENVELOPE, 1000)).dispatch).toBe(true)
+    await s.admitActivation(a, 'child-a')
+    expect((await s.getActivation(b))?.state).toBe('pending')
+    await s.close()
+  })
+})
+
+describe('sandbox generations', () => {
+  it('never hands the same number out twice for an agent, and starts each agent at 1', async () => {
+    const s = await store()
+    expect(await s.nextSandboxGeneration('agent-a')).toBe(1)
+    expect(await s.nextSandboxGeneration('agent-a')).toBe(2)
+    expect(await s.nextSandboxGeneration('agent-b')).toBe(1)
+    expect(await s.nextSandboxGeneration('agent-a')).toBe(3)
+    await s.close()
+  })
+
+  it('survives a reopen, because the sandbox pod the number fences does', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-generations-')), 'local.sqlite')
+    const first = await reopen(path)
+    expect(await first.nextSandboxGeneration('agent-a')).toBe(1)
+    await first.close()
+    const reopened = await reopen(path)
+    expect(await reopened.nextSandboxGeneration('agent-a')).toBe(2)
+    await reopened.close()
+  })
+})
+
+describe('transcript org fence on a shared store', () => {
+  const orgs: Record<string, string> = { 'agent-a': 'org-a', 'agent-b': 'org-b' }
+  const twoOrgMembers = async (): Promise<[LocalStore, LocalStore]> => {
+    const database = memoryStoreDatabase()
+    const orgForAgent = (agentId: string): string | undefined => orgs[agentId]
+    return [
+      await LocalStore.open({ database, shared: true, ownerId: 'member-1', orgForAgent }),
+      await LocalStore.open({ database, shared: true, ownerId: 'member-2', orgForAgent })
+    ]
+  }
+
+  it('keeps two orgs holding the SAME channel/thread key independent', async () => {
+    // Platform ids are unique only inside one org, so a pool store keyed on (channel, thread)
+    // alone let one org's dedup swallow another org's message, and served one org's rows to
+    // the other org's console.
+    const [a, b] = await twoOrgMembers()
+    const row = { channel: 'C1', thread: 'T1', ts: '1', sender: 'U', kind: 'text' as const }
+    const admit = (agentId: string) => ({
+      recipient: agentId,
+      admission: { agentId, sessionKey: `k:C1:T1:${agentId}` }
+    })
+    await a.appendTranscript({ ...row, ...admit('agent-a'), text: 'org A' })
+    await b.appendTranscript({ ...row, ...admit('agent-b'), text: 'org B' })
+
+    expect((await a.threadTranscript('C1', 'T1', 'agent-a')).map((r) => r.text)).toEqual(['org A'])
+    expect((await b.threadTranscript('C1', 'T1', 'agent-b')).map((r) => r.text)).toEqual(['org B'])
+    expect(
+      (await a.transcriptPageForAgent(readScope('C1', 'T1', 'agent-a'), null, 10)).rows.map((r) => r.text)
+    ).toEqual(['org A'])
+    expect(
+      (await b.transcriptPageForAgent(readScope('C1', 'T1', 'agent-b'), null, 10)).rows.map((r) => r.text)
+    ).toEqual(['org B'])
+    expect((await a.transcriptSince(readScope('C1', 'T1', 'agent-a'), null)).map((e) => e.text)).toEqual(['org A'])
+    expect(await a.firstMessageText(readScope('C1', 'T1', 'agent-a'))).toBe('org A')
+    expect(await b.firstMessageText(readScope('C1', 'T1', 'agent-b'))).toBe('org B')
+    await a.close()
+  })
+
+  it('keeps a tool call, its body and the thread revision inside one org', async () => {
+    const [a, b] = await twoOrgMembers()
+    const call = { channel: 'C1', thread: 'T1', ts: '2', toolCallId: 'call-1', title: 'Bash' }
+    await a.insertToolCall(admitted({ ...call, sender: 'agent-a', body: '{"rawInput":"A"}' }))
+    await b.insertToolCall(admitted({ ...call, sender: 'agent-b', body: '{"rawInput":"B"}' }))
+    expect(await a.getToolBodyForAgent(readScope('C1', 'T1', 'agent-a'), 'call-1')).toBe('{"rawInput":"A"}')
+    expect(await b.getToolBodyForAgent(readScope('C1', 'T1', 'agent-b'), 'call-1')).toBe('{"rawInput":"B"}')
+
+    // A peer org's update can never reach this row: the fence is in the WHERE clause.
+    await b.updateToolCall('C1', 'T1', 'agent-b', 'call-1', { title: 'Bash', body: '{"rawInput":"B2"}' })
+    expect(await a.getToolBodyForAgent(readScope('C1', 'T1', 'agent-a'), 'call-1')).toBe('{"rawInput":"A"}')
+
+    // One org's write never moves the other org's context fence for the same thread key.
+    const peerRevision = await b.threadTranscriptRevision(readScope('C1', 'T1', 'agent-b'))
+    await a.appendTranscript({ channel: 'C1', thread: 'T1', ts: '3', sender: 'agent-a', kind: 'text', text: 'A reply' })
+    expect(await b.threadTranscriptRevision(readScope('C1', 'T1', 'agent-b'))).toBe(peerRevision)
+    expect(await a.currentTranscriptRevision('agent-a')).toBe(
+      await a.threadTranscriptRevision(readScope('C1', 'T1', 'agent-a'))
+    )
+    await a.close()
+  })
+
+  it('refuses a row it cannot attribute rather than filing it where anyone may read it', async () => {
+    const [a] = await twoOrgMembers()
+    await expect(
+      a.appendTranscript({
+        channel: 'C1',
+        thread: 'T9',
+        ts: '1',
+        sender: 'U',
+        kind: 'text',
+        text: 'nobody owns this'
+      })
+    ).rejects.toThrow(/transcript organization/)
+    // A session in the thread is enough: an observed inbound is recorded before routing
+    // names a recipient, and the thread's owner is what attributes it.
+    await a.upsertSession({
+      key: sessionKey('slack', 'C1', 'T9', 'agent-a'),
+      agentId: 'agent-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T9',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await a.appendTranscript({ channel: 'C1', thread: 'T9', ts: '1', sender: 'U', kind: 'text', text: 'observed' })
+    expect((await a.threadTranscript('C1', 'T9', 'agent-a')).map((r) => r.text)).toEqual(['observed'])
+    await a.close()
+  })
+})
+
+describe('code-host note projection ledger (gitlab-com-integration.md §16)', () => {
+  const DAEMON = 'dddddddd-dddd-4ddd-8ddd-ddddddddddd1'
+  const ledgerRow = (overrides: Partial<NoteProjectionRow> = {}): NoteProjectionRow => ({
+    projectionKey: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
+    projectionId: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc1',
+    hookId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1',
+    agentId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1',
+    orgId: 'org-1',
+    provider: 'gitlab',
+    projectId: '4455667',
+    mergeRequestIid: 42,
+    headSha: 'a'.repeat(40),
+    generation: '1',
+    writeMarker: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1',
+    state: 'queued',
+    body: 'AgentConnect run — Queued',
+    noteId: '9001',
+    credentialEpoch: '2',
+    daemonId: DAEMON,
+    phase: 'in_flight',
+    ...overrides
+  })
+
+  // The projector's key fence compares its stored row against the incoming desired frame with ===,
+  // so a field that does not survive the read refuses every update after the create.
+  it('reads every field back with the value and type it was written with', async () => {
+    const s = await store()
+    const row = ledgerRow()
+    await s.beginNoteProjectionWrite(row, 1000)
+    const stored = await s.getNoteProjection(DAEMON, row.projectionKey)
+    expect(stored).toEqual(row)
+    expect(typeof stored!.mergeRequestIid).toBe('number')
+    for (const field of ['hookId', 'projectId', 'mergeRequestIid', 'headSha'] as const) {
+      expect(stored![field]).toBe(row[field])
+    }
+    await s.close()
+  })
+
+  it('replays an unsettled write with the same fields the sweep compares', async () => {
+    const s = await store()
+    const row = ledgerRow()
+    await s.recordNoteProjectionOutcome(row, 'written', undefined, 1000)
+    expect(await s.listUnsettledNoteProjections(DAEMON)).toEqual([
+      { ...row, phase: 'settled_unreported', outcome: 'written' }
+    ])
+    await s.close()
+  })
+})
+
+describe.skipIf(pg)('transcript org migration from a v10 store', () => {
+  const v10Store = async (prefix: string): Promise<string> => {
+    const path = join(mkdtempSync(join(tmpdir(), prefix)), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    dropTranscriptOrg(old)
+    old.exec(`INSERT INTO transcript (channel, thread, ts, sender, kind, text, recipient, eventTimeUs, revision)
+      VALUES ('C1', 'T1', '1', 'U', 'text', 'kept', 'agent-a', 1000000, 1)`)
+    old.exec("INSERT INTO transcript_recipient (channel, thread, ts, agentId) VALUES ('C1', 'T1', '1', 'agent-b')")
+    // The session the v24 admission backfill joins on; without it the row is correctly an observation.
+    old.exec(`INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+      VALUES ('slack:C1:T1:agent-b', 'agent-b', 'slack', 'C1', 'T1', 'acp-b', 'idle', 1)`)
+    old.exec('ALTER TABLE sessions DROP COLUMN sessionId')
+    old.exec('ALTER TABLE sessions DROP COLUMN directDestination')
+    dropApprovalDmColumns(old)
+    dropPlatformStanding(old)
+    dropBirthVerdict(old)
+    dropCodeHostReplyTarget(old)
+    revertSessionGateKey(old)
+    old.exec('PRAGMA user_version = 10')
+    old.close()
+    return path
+  }
+
+  it('backfills a store no pool shares with its single partition, keeping every row', async () => {
+    const path = await v10Store('ac-transcript-v10-')
+    const upgraded = await LocalStore.open(path)
+    expect((await upgraded.threadTranscript('C1', 'T1')).map((r) => r.text)).toEqual(['kept'])
+    // The old delivery row became an admission on the session it named, so that agent still sees it.
+    expect(
+      (
+        await upgraded.transcriptPageForAgent(readScope('C1', 'T1', 'agent-b', 'slack:C1:T1:agent-b'), null, 10)
+      ).rows.map((r) => r.text)
+    ).toEqual(['kept'])
+    await upgraded.close()
+
+    const after = new DatabaseSync(path)
+    const recipientKey = (
+      after.prepare('PRAGMA table_info(transcript_recipient)').all() as { name: string; pk: number }[]
+    )
+      .filter((column) => column.pk > 0)
+      .sort((first, second) => first.pk - second.pk)
+      .map((column) => column.name)
+    expect(recipientKey).toEqual(['seq', 'agentId'])
+    after.close()
+  })
+
+  it('drops what a shared store cannot attribute, because no org survives in its rows', async () => {
+    // Nothing here records an agent's org — the daemon learns it from the CP at runtime — so
+    // sessions → agent → org resolves to nothing and a kept row would be readable by whichever
+    // org reused the channel/thread ids.
+    const path = await v10Store('ac-transcript-v10-shared-')
+    const shared = await LocalStore.open({
+      database: SqliteAsyncDatabase.adopt(new DatabaseSync(path)),
+      shared: true,
+      ownerId: 'member-1',
+      orgForAgent: () => 'org-a'
+    })
+    expect(await shared.threadTranscript('C1', 'T1', 'agent-a')).toEqual([])
+    expect((await shared.transcriptPageForAgent(readScope('C1', 'T1', 'agent-b'), null, 10)).rows).toEqual([])
+    await shared.close()
+  })
+})
+
+// Thread affinity moved off the session row onto its own record (channel-session-mode.md
+// §6.4). The upgrade has to carry the existing rows across, or every conversation that
+// already has a session silently loses continuity — an unmentioned follow-up in a thread
+// the agent has been answering in would stop routing the moment the daemon is upgraded.
+it.skipIf(pg)('backfills thread affinity from the sessions a v20 store already has', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-affinity-migration-')), 'local.sqlite')
+  const initial = await openTestStore(path)
+  const seed = async (thread: string, agentId: string, state: 'idle' | 'closed', scope?: string): Promise<void> =>
+    await initial.upsertSession({
+      key: sessionKey('slack', 'C1', thread, agentId, scope),
+      agentId,
+      platform: 'slack',
+      channel: 'C1',
+      thread,
+      ...(scope ? { transportScope: scope } : {}),
+      acpSessionId: `acp-${agentId}`,
+      state,
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+  await seed('T1', 'bot-a', 'idle')
+  await seed('T2', 'bot-b', 'closed')
+  await seed('T3', 'bot-c', 'idle', 'scope-x')
+  await initial.close()
+
+  // Rewind to the shape a daemon without the table wrote.
+  const legacy = new DatabaseSync(path)
+  dropCodeHostReplyTarget(legacy)
+  revertTranscriptAdmissions(legacy)
+  legacy.exec('DROP TABLE thread_participation; PRAGMA user_version = 20;')
+  legacy.close()
+
+  const upgraded = await openTestStore(path)
+  expect(await upgraded.openSessionAgents('C1', 'T1')).toEqual(['bot-a'])
+  // A dormant session is the case the backfill exists for most: continuity revival is
+  // precisely what a follow-up into a TTL-closed thread depends on.
+  expect(await upgraded.closedSessionAgents('C1', 'T2')).toEqual(['bot-b'])
+  // And a scoped session keeps its scope across the COALESCE.
+  expect(await upgraded.openSessionAgents('C1', 'T3', 'scope-x')).toEqual(['bot-c'])
+  expect(await upgraded.openSessionAgents('C1', 'T3')).toEqual([])
+  await upgraded.close()
+})
+
+it('lists both agents sharing one thread, which is what keeps it mention-gated', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-affinity-two-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  for (const agentId of ['bot-a', 'bot-b'])
+    await s.upsertSession({
+      key: sessionKey('slack', 'C1', 'T1', agentId),
+      agentId,
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: `acp-${agentId}`,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+  expect((await s.openSessionAgents('C1', 'T1')).sort()).toEqual(['bot-a', 'bot-b'])
+  await s.close()
+})
+
+// `upsertSession` rewrites a session's transportScope (hydration, the corruption fence),
+// and affinity is keyed by it — so the row left at the old scope has to be retired, or a
+// lookup there keeps naming this agent for the rest of the session's life.
+it('retires the affinity row a session left at its previous transport scope', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-affinity-scope-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+  const row = {
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'T1',
+    acpSessionId: 'acp-1',
+    state: 'idle' as const,
+    lastDeliveredTs: null,
+    updatedAt: 1
+  }
+  await s.upsertSession(row)
+  expect(await s.openSessionAgents('C1', 'T1')).toEqual(['bot-a'])
+
+  await s.upsertSession({ ...row, transportScope: 'scope-x' })
+  expect(await s.openSessionAgents('C1', 'T1', 'scope-x')).toEqual(['bot-a'])
+  expect(await s.openSessionAgents('C1', 'T1')).toEqual([])
+  await s.close()
+})
+
+// Two rows written by two statements can disagree — a crash between the participation
+// write and the retirement of the row at the old scope leaves one behind. The read fences
+// on the session's own scope so that row resolves nothing, rather than letting an
+// unmentioned message through the old bot keep reaching an agent that has moved.
+// The reservation (channel-session-mode.md §3.3) is the authoritative source for an
+// `append` conversation's coordinate. What matters is that concurrent callers converge on
+// ONE value, that a rotation is exactly once per intent, and that a purge does not leave a
+// coordinate behind whose transcript is still on disk.
+// §7.2: the clear keeps the session's identity and takes its context. The cursor is what
+// separates it from the two resets that already write these fields — those null it, which
+// makes the next prompt replay the whole thread, i.e. restore exactly what a clear removes.
+it('clears a session in place, keeping its identity and moving the replay cursor', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-clear-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'T1',
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: '100.1',
+    updatedAt: 1
+  })
+  const before = await s.getSession(key)
+
+  // Pinned on the runtime id the caller read, so a turn that started meanwhile cannot be
+  // cleared out from under itself.
+  expect(await s.clearSessionContext(key, '200.0', 2, 'acp-1')).toBe(true)
+
+  const after = await s.getSession(key)
+  // Identity survives: same row, same key, same outward id — the console entry is the same.
+  expect(after?.key).toBe(key)
+  expect(after?.sessionId).toBe(before?.sessionId)
+  expect(after?.thread).toBe('T1')
+  // Context does not: the runtime session is detached and the cursor moved forward, so the
+  // next prompt replays from the clear rather than from the start of the thread.
+  expect(after?.acpSessionId).toBeNull()
+  expect(after?.lastDeliveredTs).toBe('200.0')
+  await s.close()
+})
+
+it('refuses a clear pinned on a runtime session the row no longer holds', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-clear-raced-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'T1',
+    acpSessionId: 'acp-2',
+    state: 'idle',
+    lastDeliveredTs: '100.1',
+    updatedAt: 1
+  })
+  // The command decided against `acp-1`; a turn admitted since moved the row to `acp-2`, and
+  // clearing now would cut that turn's identity out from under it.
+  expect(await s.clearSessionContext(key, '200.0', 2, 'acp-1')).toBe(false)
+  expect((await s.getSession(key))?.acpSessionId).toBe('acp-2')
+  await s.close()
+})
+
+it('reports a clear of a session that is gone rather than creating one', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-clear-missing-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  expect(await s.clearSessionContext(sessionKey('slack', 'C1', 'T1', 'bot-a'), '200.0', 2, 'acp-1')).toBe(false)
+  await s.close()
+})
+
+it('converges every concurrent resolver on one append coordinate', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const resolved = await Promise.all(
+    Array.from({ length: 8 }, (_, i) => s.resolveAppendCoordinate('bot-a', 'C1', undefined, 1000 + i))
+  )
+  expect(new Set(resolved).size).toBe(1)
+  // And it stays that value for every later message, rather than drifting with the clock.
+  expect(await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 9999)).toBe(resolved[0])
+  await s.close()
+})
+
+it('scopes the reservation to the agent, the channel and the transport', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-scope-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const a = await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 1000)
+  expect(await s.resolveAppendCoordinate('bot-b', 'C1', undefined, 2000)).not.toBe(a)
+  expect(await s.resolveAppendCoordinate('bot-a', 'C2', undefined, 3000)).not.toBe(a)
+  expect(await s.resolveAppendCoordinate('bot-a', 'C1', 'scope-x', 4000)).not.toBe(a)
+  await s.close()
+})
+
+it('rotates once for simultaneous !new commands and twice for sequential ones', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-advance-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const first = await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 1000)
+
+  // Two commands that both read `first` — the loser must not advance a second time.
+  const [x, y] = await Promise.all([
+    s.advanceAppendCoordinate('bot-a', 'C1', first, undefined, 2000),
+    s.advanceAppendCoordinate('bot-a', 'C1', first, undefined, 2001)
+  ])
+  expect(x).toBe(y)
+  expect(x).not.toBe(first)
+  expect(await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 5000)).toBe(x)
+
+  // Sequential commands each read the coordinate in force, so each one rotates.
+  const third = await s.advanceAppendCoordinate('bot-a', 'C1', x!, undefined, 3000)
+  expect(third).not.toBe(x)
+  await s.close()
+})
+
+it('rotates above the coordinate in force even when the clock went backwards', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-clock-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const first = await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 5000)
+  const second = await s.advanceAppendCoordinate('bot-a', 'C1', first, undefined, 1000)
+  expect(second).toBe('append:5001')
+  await s.close()
+})
+
+// A reservation that outlived its session would rejoin a coordinate whose transcript
+// retention deliberately left behind — the inheritance the timestamp exists to prevent.
+it('drops the reservation with the session it named, and only then', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-purge-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const coordinate = await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 1000)
+  const key = sessionKey('slack', 'C1', coordinate, 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: coordinate,
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: null,
+    updatedAt: 1
+  })
+  await s.deleteSession(key)
+  expect(await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 8000)).toBe('append:8000')
+  await s.close()
+})
+
+it('leaves a reservation a rotation already moved past when the old session is purged', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-reservation-purge-raced-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const first = await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 1000)
+  const key = sessionKey('slack', 'C1', first, 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: first,
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: null,
+    updatedAt: 1
+  })
+  const rotated = await s.advanceAppendCoordinate('bot-a', 'C1', first, undefined, 2000)
+
+  // Retention purges the session the rotation retired; the live coordinate must survive.
+  await s.deleteSession(key)
+  expect(await s.resolveAppendCoordinate('bot-a', 'C1', undefined, 8000)).toBe(rotated)
+  await s.close()
+})
+
+it('ignores an affinity row whose scope the session no longer has', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-affinity-stale-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'T1', 'bot-a', 'scope-b')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'T1',
+    transportScope: 'scope-b',
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: null,
+    updatedAt: 1
+  })
+  // The row a crash between the two writes would have left at the previous scope.
+  await s.recordThreadParticipation({
+    channel: 'C1',
+    thread: 'T1',
+    agentId: 'bot-a',
+    sessionKey: key,
+    transportScope: 'scope-a'
+  })
+  expect(await s.openSessionAgents('C1', 'T1', 'scope-a')).toEqual([])
+  await s.close()
+})
+
+it('reads thread affinity from the participation record, and drops it with the session', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-affinity-')), 'local.sqlite')
+  const s = await openTestStore(path)
+  const key = sessionKey('slack', 'C1', 'T1', 'bot-a')
+  await s.upsertSession({
+    key,
+    agentId: 'bot-a',
+    platform: 'slack',
+    channel: 'C1',
+    thread: 'T1',
+    acpSessionId: 'acp-1',
+    state: 'idle',
+    lastDeliveredTs: null,
+    updatedAt: 1
+  })
+  expect(await s.openSessionAgents('C1', 'T1')).toEqual(['bot-a'])
+  expect(await s.closedSessionAgents('C1', 'T1')).toEqual([])
+
+  // Liveness stays a property of the SESSION, not of the affinity row.
+  await s.setSessionState(key, 'closed', 2)
+  expect(await s.openSessionAgents('C1', 'T1')).toEqual([])
+  expect(await s.closedSessionAgents('C1', 'T1')).toEqual(['bot-a'])
+
+  // The record's whole meaning is the session it names, so it goes with it — and the
+  // thread reads as unowned again rather than naming an agent with nothing behind it.
+  await s.deleteSession(key)
+  expect(await s.openSessionAgents('C1', 'T1')).toEqual([])
+  expect(await s.closedSessionAgents('C1', 'T1')).toEqual([])
+  await s.close()
+})
+
+it.skipIf(pg)('upgrades a v17 store to durable memory continuations without changing existing sessions', async () => {
+  const path = join(mkdtempSync(join(tmpdir(), 'ac-memory-migration-')), 'local.sqlite')
+  const initial = await openTestStore(path)
+  await initial.putMemoryEntryContinuation('bot-a', '{}', 1000)
+  await initial.close()
+  const legacy = new DatabaseSync(path)
+  dropBirthVerdict(legacy)
+  dropCodeHostReplyTarget(legacy)
+  revertTranscriptAdmissions(legacy)
+  legacy.exec('DROP TABLE memory_entry_continuation; PRAGMA user_version = 17;')
+  legacy.close()
+  const upgraded = await openTestStore(path)
+  const token = await upgraded.putMemoryEntryContinuation('bot-a', '{"page":2}', 1000)
+  expect(await upgraded.getMemoryEntryContinuation('bot-a', token, 999)).toBe('{"page":2}')
+  await upgraded.close()
+  const check = new DatabaseSync(path)
+  expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: SCHEMA_VERSION })
+  check.close()
+})
+
+// message-intake.md §4: the transcript is a per-conversation channel record and
+// `transcript_recipient` is the per-session admission. These run on BOTH dialects.
+describe('the channel record and its admissions', () => {
+  const admissionsOf = async (s: LocalStore, sessionKeyValue: string): Promise<{ seq: number; kind: string }[]> =>
+    (await (s as unknown as { db: { prepare(sql: string): { all(...p: unknown[]): Promise<unknown[]> } } }).db
+      .prepare(
+        `SELECT tr.seq AS seq, t.kind AS kind FROM transcript_recipient tr
+           JOIN transcript t ON t.seq = tr.seq WHERE tr.sessionKey = ? ORDER BY tr.seq`
+      )
+      .all(sessionKeyValue)) as { seq: number; kind: string }[]
+
+  it('upgrades the step-1 row in place when the turn ingest appends it (message-intake.md §5 step 6)', async () => {
+    const s = await store()
+    const step1 = { channel: 'C1', thread: 'T1', ts: '1', sender: 'U1', kind: 'text' as const, text: 'do it' }
+    await s.appendTranscript(step1)
+    // What `ingestInboundTranscript` writes: the same coordinates, plus the body/postId/eventTime
+    // /attachments it alone has, plus the admission.
+    const ingest = {
+      ...step1,
+      body: JSON.stringify({ prompt: 'do it (assembled)' }),
+      postId: 'p-1',
+      eventTimeUs: 1_700_000,
+      attachments: [{ name: 'a.png', mimeType: 'image/png' as const, data: 'AA==' }],
+      recipient: 'bot-a',
+      admission: { agentId: 'bot-a', sessionKey: 'k:C1:T1:bot-a' }
+    }
+    await s.appendTranscript(ingest)
+    await s.appendTranscript(ingest)
+
+    const rows = await s.threadTranscript('C1', 'T1')
+    expect(rows).toHaveLength(1)
+    // The step-1 text wins (first writer); everything the ingest alone knows is added beside it.
+    expect(rows[0]).toMatchObject({ text: 'do it', postId: 'p-1', eventTimeUs: 1_700_000 })
+    expect(JSON.parse(rows[0]!.body!).prompt).toBe('do it (assembled)')
+    expect(rows[0]!.attachmentsJson).toContain('a.png')
+    expect(await admissionsOf(s, 'k:C1:T1:bot-a')).toHaveLength(1)
+    await s.close()
+  })
+
+  it('is one row per (orgId, channel, ts) however many agents admit it, with one admission each', async () => {
+    const s = await store()
+    const row = { channel: 'C1', thread: 'T1', ts: '1', sender: 'U1', kind: 'text' as const, text: 'shared' }
+    // Two agents at DIFFERENT coordinates — the §12 Case A shape: one row, two admissions.
+    await s.appendTranscript({ ...row, admission: { agentId: 'bot-a', sessionKey: 'k:C1:T1:bot-a' } })
+    await s.appendTranscript({
+      ...row,
+      thread: 'T1',
+      admission: { agentId: 'bot-b', sessionKey: 'k:C1:append:9:bot-b' }
+    })
+    expect((await s.threadTranscript('C1', 'T1')).map((r) => r.text)).toEqual(['shared'])
+    expect((await admissionsOf(s, 'k:C1:T1:bot-a')).length).toBe(1)
+    expect((await admissionsOf(s, 'k:C1:append:9:bot-b')).length).toBe(1)
+    // The append-coordinate session reads its row through the admission alone.
+    expect(
+      (await s.transcriptPageForAgent(readScope('C1', 'append:9', 'bot-b', 'k:C1:append:9:bot-b'), null, 10)).rows.map(
+        (r) => r.text
+      )
+    ).toEqual(['shared'])
+    await s.close()
+  })
+
+  it('records both admissions when two agents admit one message concurrently', async () => {
+    const s = await store()
+    const row = { channel: 'C2', thread: 'T2', ts: '5', sender: 'U1', kind: 'text' as const, text: 'race' }
+    await Promise.all([
+      s.appendTranscript({ ...row, admission: { agentId: 'bot-a', sessionKey: 'k:C2:T2:bot-a' } }),
+      s.appendTranscript({ ...row, admission: { agentId: 'bot-b', sessionKey: 'k:C2:T2:bot-b' } })
+    ])
+    expect((await s.threadTranscript('C2', 'T2')).length).toBe(1)
+    expect((await admissionsOf(s, 'k:C2:T2:bot-a')).length).toBe(1)
+    expect((await admissionsOf(s, 'k:C2:T2:bot-b')).length).toBe(1)
+    await s.close()
+  })
+
+  it("an agent's own output and its internal rows are one contiguous admission range", async () => {
+    const s = await store()
+    const key = 'k:C3:T3:bot-a'
+    const admission = { agentId: 'bot-a', sessionKey: key }
+    await s.appendTranscript({
+      channel: 'C3',
+      thread: 'T3',
+      ts: '1',
+      sender: 'bot-a',
+      kind: 'text',
+      text: 'hi',
+      admission
+    })
+    await s.insertToolCall({
+      channel: 'C3',
+      thread: 'T3',
+      ts: '2',
+      sender: 'bot-a',
+      toolCallId: 'tc-1',
+      title: 'Bash',
+      body: '{}',
+      admission
+    })
+    await s.appendTranscript({
+      channel: 'C3',
+      thread: 'T3',
+      ts: '3',
+      sender: 'bot-a',
+      kind: 'reasoning',
+      text: 'hmm',
+      admission
+    })
+    const rows = await admissionsOf(s, key)
+    expect(rows.map((r) => r.kind)).toEqual(['text', 'tool', 'reasoning'])
+    expect(rows.map((r) => r.seq)).toEqual([...rows].map((r) => r.seq).sort((a, b) => a - b))
+    await s.close()
+  })
+})
+
+describe('deleteSession reclaims its own rows (message-intake.md §8 rule 1)', () => {
+  it("removes the key's admissions and its internal rows, and leaves the conversational ones", async () => {
+    const s = await store()
+    const key = sessionKey('slack', 'C9', 'T9', 'bot-a')
+    const peer = sessionKey('slack', 'C9', 'T9', 'bot-b')
+    for (const [k, agentId] of [
+      [key, 'bot-a'],
+      [peer, 'bot-b']
+    ] as const)
+      await s.upsertSession({
+        key: k,
+        agentId,
+        platform: 'slack',
+        channel: 'C9',
+        thread: 'T9',
+        acpSessionId: `acp-${agentId}`,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: 1
+      })
+    const admission = { agentId: 'bot-a', sessionKey: key }
+    await s.appendTranscript({
+      channel: 'C9',
+      thread: 'T9',
+      ts: '1',
+      sender: 'U1',
+      kind: 'text',
+      text: 'ask',
+      admission
+    })
+    // Co-admitted by a peer: it belongs to both, so rule 1 must leave it alone.
+    await s.appendTranscript({
+      channel: 'C9',
+      thread: 'T9',
+      ts: '1',
+      sender: 'U1',
+      kind: 'text',
+      text: 'ask',
+      admission: { agentId: 'bot-b', sessionKey: peer }
+    })
+    await s.insertToolCall({
+      channel: 'C9',
+      thread: 'T9',
+      ts: '2',
+      sender: 'bot-a',
+      toolCallId: 'tc-1',
+      title: 'Bash',
+      body: '{}',
+      admission
+    })
+    await s.appendTranscript({
+      channel: 'C9',
+      thread: 'T9',
+      ts: '3',
+      sender: 'bot-a',
+      kind: 'reasoning',
+      text: 'hmm',
+      admission
+    })
+
+    expect(await s.deleteSession(key)).toBe(true)
+    expect((await s.threadTranscript('C9', 'T9')).map((r) => [r.kind, r.text])).toEqual([['text', 'ask']])
+    // A second call is still idempotent.
+    expect(await s.deleteSession(key)).toBe(false)
+    // The peer's admission on the shared conversational row survives.
+    expect(
+      (await s.transcriptPageForAgent(readScope('C9', 'T9', 'bot-b', peer), null, 10)).rows.map((r) => r.text)
+    ).toEqual(['ask'])
+    await s.close()
+  })
+})
+
+// message-intake.md §5 step 2: the row keeps `!queue …` as typed, the prompt is the stripped text.
+describe('transcriptPromptText', () => {
+  it('resolves same-name uploads by id only within the receiving session and retains ids in replay', async () => {
+    const s = await store()
+    const file = {
+      uploadId: randomUUID(),
+      name: 'same.png',
+      mimeType: 'image/png',
+      size: 10,
+      sha256: 'A'.repeat(43) + '='
+    }
+    const uploads = [file, ...Array.from({ length: 9 }, () => ({ ...file, uploadId: randomUUID() }))]
+    const body = JSON.stringify({ uploads })
+    await s.appendTranscript({
+      channel: 'C',
+      thread: 'T',
+      sender: 'U1',
+      ts: '1',
+      kind: 'text',
+      text: 'Look',
+      body,
+      admission: { agentId: 'bot-a', sessionKey: 'k:C:T:bot-a' }
+    })
+    for (const upload of uploads) {
+      expect(await s.transcriptUploadById(readScope('C', 'T', 'bot-a'), upload.uploadId)).toEqual(upload)
+      expect(transcriptPromptText({ kind: 'text', text: 'Look', body })).toContain(`uploadId=${upload.uploadId}`)
+    }
+    expect(await s.transcriptUploadById(readScope('C', 'OTHER', 'bot-a'), file.uploadId)).toBeUndefined()
+    expect(await s.transcriptUploadById(readScope('C', 'T', 'bot-b'), file.uploadId)).toBeUndefined()
+    await s.close()
+  })
+
+  it('strips an admitted !queue prefix from the row a step-1 write recorded', () => {
+    expect(transcriptPromptText({ kind: 'text', text: '!queue ship it' })).toBe('ship it')
+    expect(transcriptPromptText({ kind: 'text', text: 'ship it' })).toBe('ship it')
+  })
+
+  it('still prefers a persisted prompt body, which is already stripped', () => {
+    const body = JSON.stringify({ prompt: 'the assembled prompt' })
+    expect(transcriptPromptText({ kind: 'text', text: '!queue ship it', body })).toBe('the assembled prompt')
+  })
+})
+
+describe('the observation floor (message-intake.md §8 rule 2)', () => {
+  const text = (ts: number) => ({
+    channel: 'CF',
+    thread: 'TF',
+    ts: String(ts),
+    sender: 'U1',
+    kind: 'text' as const,
+    text: `m${ts}`
+  })
+
+  it('reclaims only unadmitted rows below the 100th-newest conversational row', async () => {
+    const s = await store()
+    for (let i = 1; i <= 120; i++) {
+      const admitted30 = i > 90
+      await s.appendTranscript({
+        ...text(i),
+        ...(admitted30 ? { admission: { agentId: 'bot-a', sessionKey: 'k:CF:TF:bot-a' } } : {})
+      })
+    }
+    // One ADMITTED row well below the floor must survive the sweep.
+    await s.appendTranscript({ ...text(1000), admission: { agentId: 'bot-a', sessionKey: 'k:CF:TF:bot-a' } })
+    // 121 text rows: the 100th-newest is m22, so the 21 unadmitted rows below it go.
+    const deleted = await s.sweepObservations('', 'CF')
+    expect(deleted).toBe(21)
+    const kept = (await s.threadTranscript('CF', 'TF')).map((r) => r.text)
+    expect(kept).toHaveLength(100)
+    expect(kept).toContain('m1000')
+    expect(kept).not.toContain('m1')
+    expect(kept).not.toContain('m21')
+    expect(kept).toContain('m22')
+    await s.close()
+  })
+
+  it('keeps a row that gained its admission after being written as an observation', async () => {
+    const s = await store()
+    // The step-1 row first, then the admission a target's dispatch attaches to it.
+    await s.appendTranscript(text(1))
+    await s.appendTranscript({ ...text(1), admission: { agentId: 'bot-a', sessionKey: 'k:CF:TF:bot-a' } })
+    for (let i = 2; i <= 120; i++) await s.appendTranscript(text(i))
+    await s.sweepObservations('', 'CF')
+    expect((await s.threadTranscript('CF', 'TF')).map((r) => r.text)).toContain('m1')
+    await s.close()
+  })
+
+  it('counts the floor over text rows alone, so a tool-heavy turn cannot push observations under it', async () => {
+    const s = await store()
+    for (let i = 1; i <= 50; i++) await s.appendTranscript(text(i))
+    for (let i = 0; i < 200; i++)
+      await s.insertToolCall({
+        channel: 'CF',
+        thread: 'TF',
+        ts: String(1000 + i),
+        sender: 'bot-a',
+        toolCallId: `tc-${i}`,
+        title: 'Bash',
+        body: '{}',
+        admission: { agentId: 'bot-a', sessionKey: 'k:CF:TF:bot-a' }
+      })
+    expect(await s.sweepObservations('', 'CF')).toBe(0)
+    await s.close()
+  })
+
+  it('keeps writing after the armed sweep fires with a coalesced tool write still buffered', async () => {
+    const s = await store()
+    const admission = { agentId: 'bot-a', sessionKey: 'k:CF:TF:bot-a' }
+    await s.insertToolCall({
+      channel: 'CF',
+      thread: 'TF',
+      ts: 'tc',
+      sender: 'bot-a',
+      toolCallId: 'tc-1',
+      title: 'Bash',
+      body: '{}',
+      admission
+    })
+    // Leaves a PENDING coalesced write: whatever drains it takes the transcript mutex, which the
+    // armed sweep must therefore not already be holding.
+    await s.updateToolCall('CF', 'TF', 'bot-a', 'tc-1', { title: 'Bash', body: '{"x":1}' }, admission.sessionKey)
+    for (let i = 1; i <= OBSERVATION_SWEEP_INSERTS; i++) await s.appendTranscript(text(i))
+    // The first write behind the armed sweep: a deadlock never settles this.
+    await expect(
+      Promise.race([
+        s.appendTranscript(text(OBSERVATION_SWEEP_INSERTS + 1)).then(() => 'wrote'),
+        new Promise((resolve) => setTimeout(() => resolve('stalled'), 3_000))
+      ])
+    ).resolves.toBe('wrote')
+    await s.close()
+  })
+
+  it('is a no-op for a conversation under the floor, and for one with no conversational row', async () => {
+    const s = await store()
+    for (let i = 1; i <= 10; i++) await s.appendTranscript(text(i))
+    expect(await s.sweepObservations('', 'CF')).toBe(0)
+    await s.appendTranscript({ channel: 'CG', thread: 'TG', ts: '1', sender: 'bot-a', kind: 'reasoning', text: 'x' })
+    expect(await s.sweepObservations('', 'CG')).toBe(0)
+    expect((await s.threadTranscript('CG', 'TG')).length).toBe(1)
+    await s.close()
+  })
+})
+
+// webchat-threads.md §5.5: a thread an agent took part in keeps its observations past the floor.
+describe('the observations of threads agents took part in', () => {
+  const row = (ts: string, thread: string, extra: Partial<TranscriptEntry> = {}): TranscriptEntry => ({
+    channel: 'CT',
+    thread,
+    ts,
+    sender: 'U1',
+    kind: 'text',
+    text: `m${ts}`,
+    ...extra
+  })
+  const admission = { agentId: 'bot-a', sessionKey: 'slack:CT:1:bot-a' }
+  // 120 newer Slack-style roots nobody admitted push everything older under the floor.
+  const newerRoots = async (s: LocalStore) => {
+    for (let i = 100; i < 220; i++) await s.appendTranscript(row(String(i), String(i)))
+  }
+  const texts = async (s: LocalStore, thread: string) => (await s.threadTranscript('CT', thread)).map((r) => r.text)
+
+  it('keeps every observation of a thread holding an admitted row, and sweeps a thread nobody admitted', async () => {
+    const s = await store()
+    await s.appendTranscript(row('1', '1'))
+    await s.appendTranscript(row('2', '1'))
+    await s.appendTranscript(row('3', '1', { admission, sender: 'bot-a' }))
+    await s.appendTranscript(row('4', '1'))
+    await s.appendTranscript(row('5', '5'))
+    await s.appendTranscript(row('6', '5'))
+    await newerRoots(s)
+    expect(await s.sweepObservations('', 'CT')).toBe(22)
+    expect(await texts(s, '1')).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(await texts(s, '5')).toEqual([])
+    expect(await texts(s, '100')).toEqual([])
+    expect(await texts(s, '120')).toEqual(['m120'])
+    await s.close()
+  })
+
+  it('names a webchat thread by its root post, and does not shield the conversation-wide literal thread', async () => {
+    const s = await store()
+    const root = '0f9c2b1e-5d4a-4c3b-9a8f-7e6d5c4b3a21'
+    await s.appendTranscript(row('1', root, { postId: root }))
+    await s.appendTranscript(row('2', root, { postId: '6b1d7e2f-3a4c-4d5e-8f90-a1b2c3d4e5f6', admission }))
+    await s.appendTranscript(row('3', root, { postId: '9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b' }))
+    await s.appendTranscript(row('4', 'webchat:CT', { postId: 'c1d2e3f4-a5b6-4c7d-8e9f-0a1b2c3d4e5f', admission }))
+    await s.appendTranscript(row('5', 'webchat:CT', { postId: 'd2e3f4a5-b6c7-4d8e-9f0a-1b2c3d4e5f60' }))
+    await newerRoots(s)
+    await s.sweepObservations('', 'CT')
+    expect(await texts(s, root)).toEqual(['m1', 'm2', 'm3'])
+    expect(await texts(s, 'webchat:CT')).toEqual(['m4'])
+    await s.close()
+  })
+
+  it('keeps nothing extra for a thread no root names, such as a whole room or a missing root', async () => {
+    const s = await store()
+    await s.appendTranscript(row('1', 'CT', { admission }))
+    await s.appendTranscript(row('2', 'CT'))
+    await s.appendTranscript(row('3', 'gone', { admission }))
+    await s.appendTranscript(row('4', 'gone'))
+    await s.appendTranscript({ channel: 'CT', ts: '5', sender: 'U1', kind: 'text', text: 'm5' })
+    await newerRoots(s)
+    await s.sweepObservations('', 'CT')
+    expect(await texts(s, 'CT')).toEqual(['m1'])
+    expect(await texts(s, 'gone')).toEqual(['m3'])
+    expect(await s.transcriptTextAt('CT', '5', { sender: 'U1' })).toBeUndefined()
+    await s.close()
+  })
+
+  it('sweeps the thread as before once its last admission goes with its session', async () => {
+    const s = await store()
+    await s.upsertSession({
+      key: admission.sessionKey,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'CT',
+      thread: '1',
+      acpSessionId: null,
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    } as never)
+    await s.appendTranscript(row('1', '1'))
+    await s.appendTranscript(row('2', '1', { admission }))
+    await s.appendTranscript(row('3', '1'))
+    await newerRoots(s)
+    await s.sweepObservations('', 'CT')
+    expect(await texts(s, '1')).toEqual(['m1', 'm2', 'm3'])
+    expect(await s.deleteSession(admission.sessionKey)).toBe(true)
+    expect(await s.sweepObservations('', 'CT')).toBe(3)
+    expect(await texts(s, '1')).toEqual([])
+    await s.close()
+  })
+})
+
+describe('thread reads (webchat-threads.md §8)', () => {
+  const R1 = '0f9c2b1e-5d4a-4c3b-9a8f-7e6d5c4b3a21'
+  const R2 = '6b1d7e2f-3a4c-4d5e-8f90-a1b2c3d4e5f6'
+  const R3 = '9e8d7c6b-5a4f-4e3d-8c2b-1a0f9e8d7c6b'
+  const coordinator = { agentId: 'bot-a', sessionKey: 'webchat:CV:append:c:bot-a' }
+  const task = { agentId: 'bot-a', sessionKey: `webchat:CV:${R1}:bot-a` }
+  const scope = readScope('CV', 'append:c', 'bot-a', coordinator.sessionKey)
+  const row = (ts: string, thread: string, extra: Partial<TranscriptEntry> = {}): TranscriptEntry => ({
+    channel: 'CV',
+    thread,
+    ts,
+    sender: 'U1',
+    kind: 'text',
+    text: `m${ts}`,
+    ...extra
+  })
+  // A coordinator conversation: a root, the coordinator's turn on it, a reply, its post in the thread, then a task's turn.
+  const seed = async (s: LocalStore) => {
+    await s.appendTranscript(row('1', R1, { postId: R1, admission: coordinator }))
+    await s.appendTranscript(row('2', R1, { sender: 'bot-a', postId: randomUUID(), admission: coordinator }))
+    await s.appendTranscript(row('3', R1, { kind: 'reasoning', sender: 'bot-a', admission: coordinator }))
+    await s.appendTranscript(row('4', R1, { sender: 'U2', postId: randomUUID(), admission: coordinator }))
+    await s.appendTranscript(
+      row('5', R1, { sender: 'bot-a', postId: randomUUID(), admission: coordinator, body: '{"threadPost":true}' })
+    )
+    await s.appendTranscript(row('6', R1, { sender: 'bot-a', postId: randomUUID(), admission: task }))
+    await s.appendTranscript(row('7', R1, { kind: 'reasoning', sender: 'bot-a', admission: task }))
+    await s.appendTranscript(
+      row('8', R1, { kind: 'reasoning', sender: 'bot-b', admission: { agentId: 'bot-b', sessionKey: 'peer' } })
+    )
+    await s.appendTranscript(row('9', R1, { sender: 'U3', postId: randomUUID() }))
+    await s.appendTranscript(row('10', R2, { postId: R2, admission: coordinator }))
+    await s.appendTranscript(row('11', R3, { postId: R3 }))
+  }
+
+  it('reads a thread as its record: people, posts in it, a task and observations, never the reader’s own turns', async () => {
+    const s = await store()
+    await seed(s)
+    const page = await s.threadPageForAgent(scope, R1, null, 50)
+    expect(page.rows.map((r) => r.ts).reverse()).toEqual(['1', '4', '5', '6', '7', '9'])
+    expect(page.hasMore).toBe(false)
+    const older = await s.threadPageForAgentByEventTime(scope, R1, { eventTimeUs: 6_000_000, seq: 0 }, 2)
+    expect(older.rows.map((r) => r.ts)).toEqual(['5', '4'])
+    expect(older.hasMore).toBe(true)
+    const tail = await s.threadTailForAgent(scope, R1, 0, 50)
+    expect(tail.rows.map((r) => r.ts)).toEqual(['1', '4', '5', '6', '7', '9'])
+    // Read through the task, whose coordinate is the thread, its own rows are the thread's.
+    const own = readScope('CV', R1, 'bot-a', task.sessionKey)
+    expect((await s.threadPageForAgent(own, R1, null, 50)).rows.map((r) => r.ts).reverse()).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+      '6',
+      '7',
+      '9'
+    ])
+    await s.close()
+  })
+
+  it('counts a thread’s replies, newest first, without its root or the reader’s own turns', async () => {
+    const s = await store()
+    await seed(s)
+    const stats = await s.threadReplyStats(scope, [R1, R2, R3], 2)
+    expect(stats.get(R1)).toEqual({
+      replies: 4,
+      lastEventTimeUs: 9_000_000,
+      latest: { sender: 'U3', text: 'm9' },
+      participants: ['U3', 'bot-a']
+    })
+    expect(stats.has(R2)).toBe(false)
+    expect(stats.has(R3)).toBe(false)
+    await s.close()
+  })
+
+  it('finds a root the session received, by its postId or ts, and the threads changed since a revision', async () => {
+    const s = await store()
+    await seed(s)
+    expect((await s.threadRootInSession(scope, R1))?.ts).toBe('1')
+    expect(await s.threadRootInSession(scope, R3)).toBeUndefined()
+    expect((await s.threadRootRows(scope, [R3, '4'])).map((r) => r.ts)).toEqual(['4', '11'])
+    const before = await s.currentTranscriptRevision()
+    await s.appendTranscript(row('12', R2, { sender: 'U2', postId: randomUUID() }))
+    const now = await s.currentTranscriptRevision()
+    // Only threads whose root the session received: R3's root was never admitted.
+    await s.appendTranscript(row('13', R3, { sender: 'U2', postId: randomUUID() }))
+    expect(await s.threadsChangedBetween(scope, before, await s.currentTranscriptRevision(), 20)).toEqual([
+      { thread: R2, revision: now }
+    ])
+    await s.close()
+  })
+
+  it('reads a root handed into a thread as one of its replies, while the row keeps its own thread', async () => {
+    const s = await store()
+    await seed(s)
+    const handed = randomUUID()
+    await s.appendTranscript(row('12', handed, { postId: handed, admission: coordinator }))
+    const before = await s.currentTranscriptRevision()
+    expect(await s.markTranscriptHanded({ transcriptChannel: 'CV', agentId: 'bot-a' }, handed, R1)).toBe(true)
+    expect(await s.markTranscriptHanded({ transcriptChannel: 'CV', agentId: 'bot-a' }, handed, R1)).toBe(false)
+    const marked = (await s.transcriptPage('CV', handed, null, 50, 'bot-a')).rows
+    expect(marked.map((r) => [r.ts, r.thread, r.handedTo])).toEqual([['12', handed, R1]])
+    expect((await s.threadPageForAgent(scope, R1, null, 50)).rows.map((r) => r.ts).reverse()).toEqual([
+      '1',
+      '4',
+      '5',
+      '6',
+      '7',
+      '9',
+      '12'
+    ])
+    expect((await s.threadTailForAgent(scope, R1, before, 50)).rows.map((r) => r.ts)).toEqual(['12'])
+    expect(await s.threadsChangedBetween(scope, before, await s.currentTranscriptRevision(), 20)).toEqual([
+      { thread: R1, revision: await s.currentTranscriptRevision() }
+    ])
+    const stats = await s.threadReplyStats(scope, [R1, handed], 2)
+    expect(stats.get(R1)).toMatchObject({ replies: 5, latest: { sender: 'U1', text: 'm12' } })
+    expect(stats.has(handed)).toBe(false)
+    await s.close()
+  })
+
+  it('keeps a coordinator’s posts in threads out of its roots view, and in its session history', async () => {
+    const s = await store()
+    await seed(s)
+    const texts = (rows: { ts: string | null }[]) => rows.map((r) => r.ts).reverse()
+    expect(texts((await s.transcriptPageForAgent(scope, null, 50)).rows)).toEqual(['1', '2', '3', '4', '5', '10'])
+    expect(texts((await s.transcriptPageForAgent(scope, null, 50, 'roots')).rows)).toEqual(['1', '2', '3', '4', '10'])
+    expect(texts((await s.transcriptPageForAgentByEventTime(scope, null, 50, 'roots')).rows)).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '10'
+    ])
+    expect((await s.transcriptTailForAgent(scope, 0, 50, 'roots')).rows.map((r) => r.ts)).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '10'
+    ])
+    await s.close()
+  })
+})
+
+// message-intake.md §4.3: v26 adds the verdict and release tables, created by the CREATE block on both paths.
+describe.skipIf(pg)('decision table migrations', () => {
+  const userVersion = (path: string): number => {
+    const db = new DatabaseSync(path)
+    const v = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    db.close()
+    return v
+  }
+  const tables = (path: string): string[] => {
+    const db = new DatabaseSync(path)
+    const rows = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'decision_%' ORDER BY name")
+      .all() as { name: string }[]
+    db.close()
+    return rows.map((r) => r.name)
+  }
+
+  it('creates the decision tables on a fresh store and stamps the current version', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v26-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    expect(tables(path)).toEqual([
+      'decision_api_gate_evaluation',
+      'decision_model_evaluation',
+      'decision_release',
+      'decision_verdict'
+    ])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds both tables to a v25 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v25-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE decision_verdict; DROP TABLE decision_release; PRAGMA user_version = 25')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.listPendingDecisionVerdicts()).toEqual([])
+    await upgraded.close()
+    expect(tables(path)).toEqual([
+      'decision_api_gate_evaluation',
+      'decision_model_evaluation',
+      'decision_release',
+      'decision_verdict'
+    ])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds the Source Cache tables to a v34 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v34-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE source_cache_object; DROP TABLE source_cache_usage; PRAGMA user_version = 34')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.sourceCacheUsage('org-a', 1)).toEqual({ committedBytes: 0, pendingBytes: 0 })
+    await upgraded.close()
+    const check = new DatabaseSync(path)
+    const names = check
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'source_cache_%' ORDER BY name")
+      .all() as { name: string }[]
+    check.close()
+    expect(names.map((row) => row.name)).toEqual(['source_cache_object', 'source_cache_usage'])
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds model selection history to a v31 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v31-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE decision_model_evaluation; PRAGMA user_version = 31')
+    old.close()
+    await (await LocalStore.open(path)).close()
+    expect(tables(path)).toContain('decision_model_evaluation')
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('adds API gate history to a v33 store', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v33-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('DROP TABLE decision_api_gate_evaluation; PRAGMA user_version = 33')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.listDecisionApiGateEvaluations('', 'agent', 'ai-sdk-ui', undefined, 10)).toEqual([])
+    await upgraded.close()
+    expect(tables(path)).toContain('decision_api_gate_evaluation')
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+
+  it('backfills root Decision IDs in v32 model selection history', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v32-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec(`
+      DROP TABLE decision_model_evaluation;
+      CREATE TABLE decision_model_evaluation (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        sessionId TEXT NOT NULL UNIQUE,
+        createdAt INTEGER NOT NULL,
+        summaryJson TEXT NOT NULL,
+        detailJson TEXT,
+        bodiesStrippedAt INTEGER
+      );
+      PRAGMA user_version = 32;
+    `)
+    const decisionId = '33333333-3333-4333-8333-333333333333'
+    old
+      .prepare(
+        `INSERT INTO decision_model_evaluation
+      (orgId, agentId, sessionId, createdAt, summaryJson)
+      VALUES (?, ?, ?, ?, ?)`
+      )
+      .run('', 'agent', 'session', 1, JSON.stringify({ decisionId }))
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect((await upgraded.listDecisionModelEvaluations('', 'agent', undefined, 10, decisionId)).length).toBe(1)
+    await upgraded.close()
+    expect(userVersion(path)).toBe(SCHEMA_VERSION)
+  })
+})
+
+// message-intake.md §4.3: v27 adds a router verdict's frozen target set.
+describe.skipIf(pg)('the v26 → v27 router targets column', () => {
+  it('adds targetsJson to a v26 store without touching its verdicts', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v26b-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE decision_verdict DROP COLUMN targetsJson; PRAGMA user_version = 26')
+    old.close()
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.listPendingDecisionVerdicts({ consumer: 'router' })).toEqual([])
+    await upgraded.close()
+    const check = new DatabaseSync(path)
+    const columns = (check.prepare('PRAGMA table_info(decision_verdict)').all() as { name: string }[]).map(
+      (c) => c.name
+    )
+    const version = (check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    check.close()
+    expect(columns).toContain('targetsJson')
+    expect(version).toBe(SCHEMA_VERSION)
+  })
+})
+
+// multi-repository-workspaces.md decision 20: v28 records that a session was handed an on-demand clone directory.
+describe.skipIf(pg)('the v27 → v28 on-demand clones column', () => {
+  it('adds onDemandClones to a v27 store, empty on the sessions it already holds', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v27-')), 'local.sqlite')
+    const first = await LocalStore.open(path)
+    const row = {
+      key: 'held',
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: null,
+      state: 'idle' as const,
+      lastDeliveredTs: null,
+      updatedAt: 1
+    }
+    await first.upsertSession(row)
+    await first.close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN onDemandClones; PRAGMA user_version = 27')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    expect((await upgraded.getSession(row.key))?.onDemandClones).toBeNull()
+    await upgraded.markSessionOnDemandClones(row.key)
+    expect((await upgraded.getSession(row.key))?.onDemandClones).toBe(1)
+    await upgraded.close()
+
+    const check = new DatabaseSync(path)
+    const version = (check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    check.close()
+    expect(version).toBe(SCHEMA_VERSION)
+  })
+})
+
+// multi-repository-workspaces.md decision 19: v30 records the repositories the selector chose for a session.
+describe.skipIf(pg)('the v29 → v30 selected repositories column', () => {
+  it('adds selectedRepos to a v29 store, empty on the sessions it already holds', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v29-')), 'local.sqlite')
+    const first = await LocalStore.open(path)
+    const row = {
+      key: 'held',
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: null,
+      state: 'idle' as const,
+      lastDeliveredTs: null,
+      updatedAt: 1
+    }
+    await first.upsertSession(row)
+    await first.close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN selectedRepos; PRAGMA user_version = 29')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    expect((await upgraded.getSession(row.key))?.selectedRepos).toBeNull()
+    const selected = [{ provider: 'github' as const, repoFullName: 'acme/infra', repoId: '42' }]
+    await upgraded.pinSelectedRepos(row.key, selected)
+    expect(await upgraded.listSelectedRepos('bot-a')).toEqual(selected)
+    await upgraded.close()
+
+    const check = new DatabaseSync(path)
+    const version = (check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    check.close()
+    expect(version).toBe(SCHEMA_VERSION)
+  })
+})
+
+// v31 records the runtime beside the observed model; an observation made before it keeps no runtime.
+describe.skipIf(pg)('the v30 → v31 observed runtime column', () => {
+  it('adds observedRuntime to a v30 store, leaving an earlier observation without a runtime', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-schema-v30-')), 'local.sqlite')
+    const first = await LocalStore.open(path)
+    const row = {
+      key: 'held',
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: 'T1',
+      acpSessionId: null,
+      state: 'idle' as const,
+      lastDeliveredTs: null,
+      updatedAt: 1
+    }
+    await first.upsertSession(row)
+    await first.close()
+    const old = new DatabaseSync(path)
+    old.exec(
+      "ALTER TABLE sessions DROP COLUMN observedRuntime; UPDATE sessions SET observedModel = 'model-a', observedModelSet = 1; PRAGMA user_version = 30"
+    )
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    expect(await upgraded.getObservedTurn(row.key)).toEqual({ model: 'model-a' })
+    await upgraded.setObservedTurn(row.key, 'runtime-a', 'model-b')
+    expect(await upgraded.getObservedTurn(row.key)).toEqual({ runtime: 'runtime-a', model: 'model-b' })
+    await upgraded.close()
+
+    const check = new DatabaseSync(path)
+    const version = (check.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+    check.close()
+    expect(version).toBe(SCHEMA_VERSION)
+  })
+})
+
+// message-intake.md §10. SQLite-only fixture building (raw v23 DDL), but every assertion below
+// is about the MIGRATED store, which the `store-postgres` project exercises through its own arm.
+describe.skipIf(pg)('the v23 → v24 channel-record migration', () => {
+  /** A v23 store holding: a createNew row with a live session, an append pair of one message,
+   *  an old co-daemon delivery row, and a row whose session is already gone. */
+  const v23Store = async (): Promise<string> => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-intake-v23-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    revertTranscriptAdmissions(old)
+    old.exec(`
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C1:T1:bot-a', 'bot-a', 'slack', 'C1', 'T1', 'acp-a', 'idle', 1);
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C1:T1:bot-b', 'bot-b', 'slack', 'C1', 'T1', 'acp-b', 'idle', 1);
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C2:append:7:bot-a', 'bot-a', 'slack', 'C2', 'append:7', 'acp-c', 'idle', 1);
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C2:append:8:bot-b', 'bot-b', 'slack', 'C2', 'append:8', 'acp-d', 'idle', 1);
+      -- (a) a createNew row plus this agent's own reply.
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C1', 'T1', '1', 'U1', 'text', 'ask', 'bot-a', 1);
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, revision)
+        VALUES ('', 'C1', 'T1', '2', 'bot-a', 'text', 'answer', 2);
+      -- (c) a co-daemon delivery the old table recorded for a SECOND agent.
+      INSERT INTO transcript_recipient (orgId, channel, thread, ts, agentId)
+        VALUES ('', 'C1', 'T1', '1', 'bot-b');
+      -- (b) the same message stored once per append coordinate.
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C2', 'append:7', '10', 'U1', 'text', 'dup', 'bot-a', 3);
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C2', 'append:8', '10', 'U1', 'text', 'dup', 'bot-b', 4);
+      -- (d) a row whose session is already gone.
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C3', 'T3', '20', 'U1', 'text', 'orphan', 'bot-z', 5);
+      -- (e) THREE copies of one message, two of them ONE agent's (a rotated append session) and
+      -- neither of those the kept copy: the shape that can repoint two admissions onto one PK.
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C4:append:6:bot-b', 'bot-b', 'slack', 'C4', 'append:6', 'acp-e', 'idle', 1);
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C4:append:7:bot-a', 'bot-a', 'slack', 'C4', 'append:7', 'acp-f', 'idle', 1);
+      INSERT INTO sessions (key, agentId, platform, channel, thread, acpSessionId, state, updatedAt)
+        VALUES ('slack:C4:append:9:bot-a', 'bot-a', 'slack', 'C4', 'append:9', 'acp-g', 'idle', 1);
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C4', 'append:6', '30', 'U1', 'text', 'trip', 'bot-b', 6);
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C4', 'append:7', '30', 'U1', 'text', 'trip', 'bot-a', 7);
+      INSERT INTO transcript (orgId, channel, thread, ts, sender, kind, text, recipient, revision)
+        VALUES ('', 'C4', 'append:9', '30', 'U1', 'text', 'trip', 'bot-a', 8);
+      PRAGMA user_version = 23;
+    `)
+    old.close()
+    return path
+  }
+
+  it('re-keys the record, backfills admissions, merges append duplicates and nulls their threads', async () => {
+    const path = await v23Store()
+    const upgraded = await LocalStore.open(path)
+
+    // The createNew rows keep their physical thread and gain one admission each.
+    expect((await upgraded.threadTranscript('C1', 'T1')).map((r) => r.text)).toEqual(['ask', 'answer'])
+    expect(
+      (await upgraded.transcriptPageForAgent(readScope('C1', 'T1', 'bot-a', 'slack:C1:T1:bot-a'), null, 10)).rows.map(
+        (r) => r.text
+      )
+    ).toEqual(['answer', 'ask'])
+    // The old delivery row became bot-b's admission on the SAME row.
+    expect(
+      (await upgraded.transcriptPageForAgent(readScope('C1', 'T1', 'bot-b', 'slack:C1:T1:bot-b'), null, 10)).rows.map(
+        (r) => r.text
+      )
+    ).toEqual(['ask'])
+    await upgraded.close()
+
+    const after = new DatabaseSync(path)
+    // The append pair is ONE row at MIN(seq), carrying both former copies' admissions, with its
+    // former coordinate reported as thread-unknown.
+    const merged = after.prepare("SELECT seq, thread FROM transcript WHERE channel = 'C2'").all() as {
+      seq: number
+      thread: string | null
+    }[]
+    expect(merged).toHaveLength(1)
+    expect(merged[0]!.thread).toBeNull()
+    const keys = (
+      after
+        .prepare('SELECT sessionKey FROM transcript_recipient WHERE seq = ? ORDER BY sessionKey')
+        .all(merged[0]!.seq) as { sessionKey: string }[]
+    ).map((r) => r.sessionKey)
+    expect(keys).toEqual(['slack:C2:append:7:bot-a', 'slack:C2:append:8:bot-b'])
+    // Three copies also collapse to one row, and the agent that admitted two of the non-kept
+    // copies keeps exactly ONE admission on it rather than aborting the migration on the PK.
+    const tripled = after.prepare("SELECT seq FROM transcript WHERE channel = 'C4'").all() as { seq: number }[]
+    expect(tripled).toHaveLength(1)
+    expect(
+      (
+        after
+          .prepare('SELECT sessionKey FROM transcript_recipient WHERE seq = ? ORDER BY sessionKey')
+          .all(tripled[0]!.seq) as { sessionKey: string }[]
+      ).map((r) => r.sessionKey)
+    ).toEqual(['slack:C4:append:6:bot-b', 'slack:C4:append:7:bot-a'])
+    // A row whose session is gone is correctly an observation.
+    const orphan = after.prepare("SELECT seq FROM transcript WHERE channel = 'C3'").get() as { seq: number }
+    expect(after.prepare('SELECT COUNT(*) AS n FROM transcript_recipient WHERE seq = ?').get(orphan.seq)).toEqual({
+      n: 0
+    })
+    // The legacy delivery table is gone.
+    expect(() => after.prepare('SELECT COUNT(*) FROM transcript_recipient_legacy').get()).toThrow()
+    expect(after.prepare('PRAGMA user_version').get()).toEqual({ user_version: SCHEMA_VERSION })
+    const maxSeq = (after.prepare('SELECT MAX(seq) AS m FROM transcript').get() as { m: number }).m
+    after.close()
+
+    // A row inserted after the upgrade continues past every migrated seq.
+    const restarted = await LocalStore.open(path)
+    await restarted.appendTranscript({ channel: 'C1', thread: 'T1', ts: '99', sender: 'U1', kind: 'text', text: 'new' })
+    await restarted.close()
+    const check = new DatabaseSync(path)
+    expect((check.prepare('SELECT MAX(seq) AS m FROM transcript').get() as { m: number }).m).toBeGreaterThan(maxSeq)
+    check.close()
+  })
+})
+
+describe('the cron report outbox', () => {
+  const outcome = (agentId: string, firedAt: string) => ({
+    cronId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    agentId,
+    firedAt,
+    status: 'success' as const
+  })
+
+  it('holds one row per run, oldest first, until the run is acknowledged', async () => {
+    const s = await store()
+    const first = outcome('agent-a', '2026-09-30T09:00:00.000Z')
+    const second = outcome('agent-a', '2026-09-30T10:00:00.000Z')
+    await s.queueCronReport(first, 1_000)
+    await s.queueCronReport(second, 2_000)
+    await s.queueCronReport({ ...first, durationMs: 5 }, 3_000)
+    const rows = await s.pendingCronReports(10, [])
+    expect(rows.map((row) => row.firedAt)).toEqual([first.firedAt, second.firedAt])
+    expect(rows[0]).toMatchObject({ agentId: 'agent-a', cronId: first.cronId })
+    expect(JSON.parse(rows[0]!.report)).toEqual({ ...first, durationMs: 5 })
+
+    await s.acknowledgeCronReport('agent-a', first.cronId, first.firedAt)
+    expect((await s.pendingCronReports(10, [])).map((row) => row.firedAt)).toEqual([second.firedAt])
+    await s.close()
+  })
+
+  it('answers a pool member only for the agents it serves', async () => {
+    const [a, b] = await sharedMembers('member-a', 'member-b')
+    await a.queueCronReport(outcome('agent-a', '2026-09-30T09:00:00.000Z'), 1_000)
+    await a.queueCronReport(outcome('agent-b', '2026-09-30T09:00:00.000Z'), 1_000)
+    expect((await b.pendingCronReports(10, ['agent-b'])).map((row) => row.agentId)).toEqual(['agent-b'])
+    expect(await b.pendingCronReports(10, [])).toEqual([])
+    await a.close()
+  })
+})
+
+describe.skipIf(usingPostgresStore())('the v46 → v47 beside handle on SQLite', () => {
+  it('adds the columns to a v46 store and stamps the current version', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-beside-v46-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    for (const column of ['besideIntegrationId', 'besideChannel', 'besideTs'])
+      old.exec(`ALTER TABLE permission_requests DROP COLUMN ${column}`)
+    old.exec('PRAGMA user_version = 46')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    await upgraded.createPermissionRequest({
+      id: 'request-1',
+      agentId: 'bot-a',
+      sessionId: 'acp-1',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: 'Butler',
+      command: 'Write src/app.ts',
+      status: 'pending',
+      resolvedAt: null
+    })
+    expect(await upgraded.setPermissionRequestBeside('bot-a', 'request-1', 'int-1', 'D111', '1.200')).toBe(true)
+    await upgraded.close()
+    const db = new DatabaseSync(path)
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    db.close()
+  })
+})
+
+describe.skipIf(usingPostgresStore())('the v47 → v48 join ask on SQLite', () => {
+  it('adds the column to a v47 store, and a swept join card names its channel and call', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-join-v47-')), 'local.sqlite')
+    await (await LocalStore.open(path)).close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE permission_requests DROP COLUMN joinAsk')
+    old.exec('PRAGMA user_version = 47')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    await upgraded.createPermissionRequest({
+      id: 'request-1',
+      agentId: 'bot-a',
+      sessionId: 'acp-1',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: 'Butler',
+      command: 'Let Butler join #general to read it?',
+      status: 'pending',
+      resolvedAt: null,
+      joinAsk: JSON.stringify({ tool: 'getChannelHistory', name: 'general', purpose: 'read' })
+    })
+    expect(await upgraded.setPermissionRequestNotify('bot-a', 'request-1', 'int-1', 'C1', '1.200')).toBe(true)
+    await upgraded.close()
+    const db = new DatabaseSync(path)
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    db.close()
+
+    // Reopening expires it, and the sweep hands back what its session is told.
+    const restarted = await LocalStore.open(path)
+    expect(await restarted.takeOrphanedPermissionNotices('int-1')).toMatchObject([
+      {
+        id: 'request-1',
+        sessionId: 'acp-1',
+        status: 'expired',
+        joinAsk: JSON.stringify({ tool: 'getChannelHistory', name: 'general', purpose: 'read' })
+      }
+    ])
+    await restarted.close()
+  })
+})
+
+describe.skipIf(usingPostgresStore())('the v48 → v49 reply thread on SQLite', () => {
+  it('adds the column to a v48 store, keeps its sessions, and reads back where the session replied', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-reply-v48-')), 'local.sqlite')
+    const key = sessionKey('slack', 'D1', 'append:1000', 'bot-a')
+    const fresh = await LocalStore.open(path)
+    await fresh.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'D1',
+      thread: 'append:1000',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await fresh.close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN replyThread')
+    old.exec('PRAGMA user_version = 48')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // A row from before the column replies where the session is.
+    expect((await upgraded.getSession(key))?.replyThread).toBeNull()
+    await upgraded.setSessionReplyTarget(key, 'C1', '1700.0001')
+    expect((await upgraded.getSession(key))?.replyThread).toBe('1700.0001')
+    await upgraded.setSessionReplyTarget(key, 'C1', null)
+    expect((await upgraded.getSession(key))?.replyThread).toBeNull()
+    await upgraded.close()
+    const db = new DatabaseSync(path)
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    db.close()
+  })
+})
+
+describe.skipIf(usingPostgresStore())('the v49 → v50 standing digest on SQLite', () => {
+  it('adds the column to a v49 store, keeps its sessions, and reads back the recorded digest', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ac-standing-v49-')), 'local.sqlite')
+    const key = sessionKey('slack', 'C1', '100.1', 'bot-a')
+    const fresh = await LocalStore.open(path)
+    await fresh.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: '100.1',
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 1
+    })
+    await fresh.close()
+    const old = new DatabaseSync(path)
+    old.exec('ALTER TABLE sessions DROP COLUMN standingDigest')
+    old.exec('PRAGMA user_version = 49')
+    old.close()
+
+    const upgraded = await LocalStore.open(path)
+    // A session from before the column has no digest, so its next resume treats the context as changed.
+    expect((await upgraded.getSession(key))?.standingDigest).toBeNull()
+    await upgraded.setSessionStandingDigest(key, 'digest-1')
+    expect((await upgraded.getSession(key))?.standingDigest).toBe('digest-1')
+    // A later state upsert leaves it alone.
+    await upgraded.setSessionState(key, 'prompting', 2)
+    expect(await upgraded.getSession(key)).toMatchObject({ acpSessionId: 'acp-1', standingDigest: 'digest-1' })
+    await upgraded.close()
+    const db = new DatabaseSync(path)
+    expect((db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(SCHEMA_VERSION)
+    db.close()
+  })
+})
+
+describe.skipIf(!usingPostgresStore())('the v46 → v47 beside handle on PostgreSQL', () => {
+  it('adds the columns and keeps the rows already there', async () => {
+    const databaseUrl = process.env.DATA_PLANE_TEST_DATABASE_URL!
+    const schema = `mig_${randomUUID().replace(/-/g, '')}`
+    const config = { version: 1 as const, databaseUrl, maxConnections: 2 }
+    const orgForAgent = (): string => 'org-a'
+    const admin = new pgDriver.Client({ connectionString: databaseUrl })
+    await admin.connect()
+    const request = (id: string) => ({
+      id,
+      agentId: 'bot-a',
+      sessionId: 'acp-1',
+      createdAt: 100,
+      requesterId: null,
+      requesterName: 'Butler',
+      command: 'Write src/app.ts',
+      status: 'pending' as const,
+      resolvedAt: null
+    })
+    try {
+      const fresh = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await fresh.finishSchemaInitialization()
+      const first = await LocalStore.open({ database: fresh, shared: true, ownerId: 'm1', orgForAgent })
+      await first.createPermissionRequest(request('request-1'))
+      await first.close()
+
+      await admin.query(`SET search_path TO ${schema}`)
+      for (const column of ['besideIntegrationId', 'besideChannel', 'besideTs'])
+        await admin.query(`ALTER TABLE permission_requests DROP COLUMN ${column}`)
+      await admin.query('UPDATE _local_store_schema_version SET version = 46 WHERE singleton = true')
+
+      const database = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await database.finishSchemaInitialization()
+      const upgraded = await LocalStore.open({ database, shared: true, ownerId: 'm2', orgForAgent })
+      try {
+        await upgraded.createPermissionRequest(request('request-2'))
+        expect(await upgraded.setPermissionRequestBeside('bot-a', 'request-2', 'int-1', 'D222', '2.200')).toBe(true)
+        expect(await upgraded.resolvePermissionRequest('bot-a', 'request-2', 'denied', 300)).toBe(true)
+        expect(await upgraded.takeOrphanedPermissionNotices('int-1')).toMatchObject([
+          { id: 'request-2', notifyChannel: 'D222', notifyTs: '2.200' }
+        ])
+        expect((await upgraded.listPermissionRequests('bot-a')).map((r) => r.id).sort()).toEqual([
+          'request-1',
+          'request-2'
+        ])
+      } finally {
+        await upgraded.close()
+      }
+      const version = await admin.query('SELECT version FROM _local_store_schema_version')
+      expect(Number(version.rows[0].version)).toBe(SCHEMA_VERSION)
+    } finally {
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => undefined)
+      await admin.end()
+    }
+  })
+})
+
+describe.skipIf(!usingPostgresStore())('the v49 → v50 standing digest on PostgreSQL', () => {
+  it('adds the column and keeps the sessions already there', async () => {
+    const databaseUrl = process.env.DATA_PLANE_TEST_DATABASE_URL!
+    const schema = `mig_${randomUUID().replace(/-/g, '')}`
+    const config = { version: 1 as const, databaseUrl, maxConnections: 2 }
+    const orgForAgent = (): string => 'org-a'
+    const admin = new pgDriver.Client({ connectionString: databaseUrl })
+    await admin.connect()
+    const key = sessionKey('slack', 'C1', '100.1', 'bot-a')
+    try {
+      const fresh = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await fresh.finishSchemaInitialization()
+      const first = await LocalStore.open({ database: fresh, shared: true, ownerId: 'm1', orgForAgent })
+      await first.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: '100.1',
+        acpSessionId: 'acp-1',
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: 1
+      })
+      await first.close()
+
+      await admin.query(`SET search_path TO ${schema}`)
+      await admin.query('ALTER TABLE sessions DROP COLUMN standingDigest')
+      await admin.query('UPDATE _local_store_schema_version SET version = 49 WHERE singleton = true')
+
+      const database = await PostgresAsyncDatabase.open(config, () => undefined, schema)
+      await database.finishSchemaInitialization()
+      const upgraded = await LocalStore.open({ database, shared: true, ownerId: 'm2', orgForAgent })
+      try {
+        expect((await upgraded.getSession(key))?.standingDigest).toBeNull()
+        await upgraded.setSessionStandingDigest(key, 'digest-1')
+        expect(await upgraded.getSession(key)).toMatchObject({ acpSessionId: 'acp-1', standingDigest: 'digest-1' })
+      } finally {
+        await upgraded.close()
+      }
+      const version = await admin.query('SELECT version FROM _local_store_schema_version')
+      expect(Number(version.rows[0].version)).toBe(SCHEMA_VERSION)
+    } finally {
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => undefined)
+      await admin.end()
+    }
+  })
+})

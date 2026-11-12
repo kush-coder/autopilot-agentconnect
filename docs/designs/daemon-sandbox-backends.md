@@ -1,0 +1,1542 @@
+# Daemon Sandbox Backends
+
+**Status: Partially implemented.** Every strategy is offered by default and made
+available by its startup probe; each agent names the one its sessions run in. The Linux
+microsandbox backend implements release image defaults and explicit overrides,
+resource configuration, guest execution, host mounts, retained-disk stop/start,
+and Docker/Compose tooling that agents can start inside each VM when needed.
+Networking has one fixed requirement for isolated sessions: public internet
+access, with no access to other session VMs or host/private networks. End-to-end
+network and workload validation remains pending.
+
+The VM implementation uses the existing workspace modes and lifecycle.
+
+A backend is also what a daemon's executor facet wraps when it hosts sessions for
+other members of its group; [session-executors.md](session-executors.md) §5 names the
+execution strategies after these backends.
+
+This extends [daemon configuration and lifecycle](daemon-detailed-design.md) and
+uses the existing [execution-driver seam](cluster-spawn-and-shim.md#1-why-a-seam-at-all).
+[Workspace ownership](git-workspace-model.md) remains a separate concern. The
+Control Plane does not carry ACP or provider request traffic.
+
+## 1. Configuration and ownership
+
+The daemon-owned `sandbox` object in `~/.agentconnect/config.json` is a table of
+execution strategies ([session-executors.md](session-executors.md) §5) plus the
+settings they share. Its default is every strategy on:
+
+```json
+{
+  "sandbox": {
+    "host": true,
+    "srt": true,
+    "microsandbox": true,
+    "env": {},
+    "mounts": [],
+    "share": false
+  }
+}
+```
+
+Release builds include the shared runtime image reference. This example uses
+that default, withdraws unsandboxed sessions, and sizes the VMs:
+
+```json
+{
+  "sandbox": {
+    "host": false,
+    "env": {
+      "PNPM_CONFIG_STORE_DIR": "/cache/pnpm"
+    },
+    "mounts": [
+      {
+        "source": "/srv/agent-cache/pnpm",
+        "target": "/cache/pnpm",
+        "mode": "writable"
+      }
+    ],
+    "microsandbox": {
+      "cpus": 2,
+      "memoryMiB": 2048,
+      "diskGiB": 10
+    }
+  }
+}
+```
+
+The resource values shown are the defaults, not measured minimums or capacity
+recommendations. All three are positive integers bounded by the SDK's supported
+numeric ranges. Source/development builds have no release image default and
+require an explicit `sandbox.microsandbox.image`, such
+as `registry.example.com/agentconnect/runtime-sandbox-full:build-tag`; without one
+the microsandbox strategy is unavailable with that reason. An explicit image
+also overrides the release default. Networking is fixed backend behavior; the
+strict VM configuration has no network modes, port mappings, or outbound-proxy
+settings.
+
+| Setting                        | Meaning and delivery status                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sandbox.host`                 | Implemented: default `true`. The unconfined direct child for this machine's own sessions, available on every platform. `false` refuses every unsandboxed session.                                                                                                                                                                                                             |
+| `sandbox.srt`                  | Implemented: default `true`. Available when the live SRT/bwrap probe passes and `sandbox.mounts` suits it. `false` withdraws it, and no probe or session uses SRT.                                                                                                                                                                                                            |
+| `sandbox.microsandbox`         | Implemented: default `true`, or an object of the VM parameters below. Available on Linux with a usable `/dev/kvm`, an image reference, and an intact msb and libkrunfw once installed. `false` withdraws it.                                                                                                                                                                  |
+| `sandbox.backend`              | Removed (#2463): a file that still sets it refuses startup, naming the table above as the replacement (either value was the default table).                                                                                                                                                                                                                                   |
+| `security.requireSandbox`      | Removed (#2463), with `--require-sandbox`: a file that still sets it refuses startup, naming `sandbox.host: false` as the replacement of `true`.                                                                                                                                                                                                                              |
+| `sandbox.env`                  | Environment defaults for sandboxed session runtimes, default `{}`; shared by SRT and microsandbox. Runtime and agent variables override them; daemon-enforced private paths and security settings remain authoritative.                                                                                                                                                       |
+| Agent `execution`              | Implemented: the strategy an agent's sessions run in, `host` when a hand-authored `agent.json` names none; the retired `runInSandbox` boolean is ignored. The console's **Execution strategy** picker offers the placement's strategies.                                                                                                                                      |
+| `sandbox.microsandbox.image`   | Implemented: optional, non-empty OCI override. Release builds default to their bundled shared-image reference; development builds require an explicit image. No Kubernetes image lookup is used.                                                                                                                                                                              |
+| `cpus`, `memoryMiB`, `diskGiB` | Per-VM CPU allocation, memory limit, and capacity of each writable disk; defaults are `2`, `2048`, and `10`. New VMs have a root upper disk and a Docker data disk, plus one disk when overlay mounts are configured, each capped by `diskGiB`. All are sparse; host capacity planning remains the operator's responsibility.                                                 |
+| `sandbox.mounts`               | Operator-owned filesystem mappings, default `[]`, with `source`, `target`, and `mode` (`readonly` by default, or `writable` / `overlay`). SRT requires equal normalized host paths and mounts an `overlay` read-only; microsandbox accepts absolute guest targets and `~/` relative to the session HOME. Workspace, HOME, and runtime state remain automatically provisioned. |
+| `sandbox.share`                | Implemented: default `false`. `true` lets this machine host isolated sessions for the other members of its daemon group, under this machine's runtime sign-in, and opens one TLS-PSK port for them. Read at start; `config/push` cannot set it. See [Sharing a machine with its group](#sharing-a-machine-with-its-group).                                                    |
+
+### Strategy table (implemented on the daemon)
+
+One daemon runs several backends side by side, and an agent chooses which one its
+sessions use ([session-executors.md](session-executors.md) §5). `true` takes a
+strategy's defaults and `false` withdraws it; `sandbox.env` and `sandbox.mounts`
+apply to every sandboxing strategy. Configured is what a machine offers, and each
+startup probe decides whether an offered strategy is available or records why not.
+
+Every availability probe is cheap and has no side effects. `srt` is the existing live SRT
+probe. When it fails on a user-namespace error and
+`kernel.apparmor_restrict_unprivileged_userns` reads `1` (the Ubuntu 23.10+
+default), its reason names that restriction, the host fix (an AppArmor `userns`
+profile for `/usr/bin/bwrap` or the sysctl set to `0`) and the user docs, then
+keeps bwrap's own text; the daemon never changes the host setting.
+`microsandbox` opens `/dev/kvm`, resolves the image reference, and, when the
+daemon's runtime store already holds the pinned msb, checks that msb and its
+libkrunfw are there. It installs nothing, pulls no image and boots no VM, and a
+machine without KVM stops there. Once it passes, the daemon installs msb when needed,
+prepares the image, reads its runtime table and probes the image's models in the
+background, after it is ready; a session that needs the image first prepares it
+itself. A mount layout a strategy cannot honor, such as a
+renamed target for SRT, makes that strategy unavailable with the validation error
+rather than refusing startup. An `overlay` mount is not one of them: SRT mounts its
+base read-only. A table with no available
+entry refuses startup, which keeps the old fail-closed behavior.
+
+The effective table is reported at registration (`capabilities.strategies`), and the
+executor facet reports the same table with `host` limited to Linux. Each runtime in
+`facts/daemon-runtimes` carries one entry per offered strategy (`strategies`):
+availability with a reason, and for `host` and `srt` the models and `modelsSource`
+of the host probe. A `microsandbox` entry names a runtime the image lacks once the
+image has been read. Its models come from the host's own runtime probe run in one
+probe VM ([below](#vm-availability-and-configuration-changes)) and are refreshed by
+the selector a session in this machine's own VM advertises. They are recorded in
+`microsandbox/image-models.json` and read back as `cached` at startup; an image
+change carries each runtime's last list over, still `cached`, until the new image's
+probe replaces it. An entry with no list yet carries no models.
+
+A session launches in its agent's strategy. One whose strategy is unavailable here
+is refused with the probe's reason, and nothing falls back to a weaker boundary;
+the old optional-sandbox downgrade is gone, as is the downgrade of an
+`externalExecution` runtime, which now runs only under `host`. `srt` and
+`microsandbox` sessions run in one process, each resolving its runtime from its own
+catalog: the host install for `host` and `srt`, the image's runtimes for
+`microsandbox`. Executor placement asks for the agent's strategy by name, and every
+strategy spreads: an `srt` session lands on a member whose facet offers `srt`
+([below](#the-srt-strategy-srt-around-the-shim)). A confined `srt` session of this
+machine runs in its session directory's SRT-wrapped shim
+([below](#this-machines-confined-srt-sessions)), and every other `srt` host of this
+machine in an agent-scoped one (R1b-2b).
+
+The Control Plane half landed first. An agent stores `execution`, a strategy slug,
+and nothing else about its boundary since the retirement (#2463). The Control Plane
+checks a new value against the strategies where the agent is placed, the daemon's
+table or for a group those at least one ready member offers, and refuses one it
+cannot run with 409 and the reason; a daemon that reports no table offers `host`
+alone.
+A session keeps the strategy it was born with: its holder records it with the birth
+verdict, and an executor refuses a `prepare` in another strategy for an environment
+it already holds (S2b).
+Model selection judges a rule's target against the machines the session could land
+on, in the strategy's own catalog, and placement lands a session only where its
+runtime and model run (S2c). The console's strategy picker (S3) offers the same
+tables: the daemon read model carries each machine's own table, and an agent carries
+its placement's.
+
+### Shared mounts and manual conversion
+
+`sandbox.mounts` replaces `security.sandboxReadRoots` and
+`security.sandboxWriteRoots`. The old fields are removed; the daemon does not
+automatically migrate or retain a compatibility path for them. Convert existing
+configuration manually using this table, then remove the old fields:
+
+| Previous entry                                          | Entry to add to `sandbox.mounts`                                                               |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `security.sandboxReadRoots: ["/opt/toolchain"]`         | `{ "source": "/opt/toolchain", "target": "/opt/toolchain", "mode": "readonly" }`               |
+| `security.sandboxWriteRoots: ["/srv/agent-cache/pnpm"]` | `{ "source": "/srv/agent-cache/pnpm", "target": "/srv/agent-cache/pnpm", "mode": "writable" }` |
+
+The former mount-level `readOnly` field is also removed: replace `true` with
+`mode: "readonly"` and `false` with `mode: "writable"` when upgrading the daemon.
+Ordinary mount identities in retained VM bindings remain unchanged by this rename.
+
+Keep a previously writable path writable when converting duplicate legacy
+entries. Launch preparation consumes only `sandbox.mounts`. Normalization expands
+host `~`, requires existing absolute sources, and resolves symlinks using the
+current root normalization. Existing protected-path checks remain in effect.
+After normalization, reject different sources mapped to the same target; merge
+permissions only for entries with the same source and target.
+
+For SRT, access remains additive: a read-only entry adds read access; it does not
+revoke write access already granted by a workspace or writable mount. Retain
+writable children of read-only parents rather than collapsing nested paths.
+microsandbox applies actual guest mount flags: a nested read-only mount restricts
+that subtree even inside a writable parent, and a writable child remains writable
+inside a read-only parent. Keep these nested mappings. User mappings that overlap
+the VM's automatically provisioned paths are rejected, except for children of
+the session HOME. Runtime credentials, settings, sockets, and internal overlay
+paths remain protected.
+
+SRT uses the configured paths at their host locations: its filesystem rules do
+not rename a host path inside the sandbox. Normalize `source` and `target` as
+host paths and require them to be equal. A mapping such as
+`/srv/agent-cache/pnpm` to `/cache/pnpm` fails validation for SRT. The same mapping
+is supported by microsandbox, where `target` is an absolute guest path.
+The shared configuration list is kept outside the
+`sandbox.microsandbox` object.
+
+For example, an SRT-friendly mapping uses the same common configuration shape:
+
+```json
+{
+  "sandbox": {
+    "env": {
+      "PNPM_CONFIG_STORE_DIR": "/srv/agent-cache/pnpm"
+    },
+    "mounts": [
+      {
+        "source": "/srv/agent-cache/pnpm",
+        "target": "/srv/agent-cache/pnpm",
+        "mode": "writable"
+      }
+    ]
+  }
+}
+```
+
+Apply the effective read/write access through both the outer backend and any
+runtime-native tool sandbox. A writable package cache must remain writable to
+the actual tool process. Mount configuration does not rewrite package-manager
+settings: point the package manager at the effective target path. Do not mount
+an entire host HOME to make an isolated runtime work. Session retirement detaches
+operator-owned mounts without deleting their host contents.
+
+### Sandbox environment defaults
+
+Use `sandbox.env` for machine-local settings that accompany mounts. Values are
+strings passed literally: the daemon does not expand `~`, `${HOME}`, or shell
+commands. The child tool may implement its own expansion, as pnpm does for
+`${HOME}` in the example below. Environment variable names must be valid process
+variable names; values may be empty, must not contain NUL, and are limited to
+16,384 characters each.
+
+The merge order is inherited environment, `sandbox.env`, runtime-definition env,
+agent env/secrets, then daemon-owned runtime and security settings. Private
+`HOME` and XDG directories remain session-owned. Config-file variables such as
+`KUBECONFIG_DATA` follow the existing materialization rules. Unsandboxed agents,
+daemon subprocesses, and runtime compatibility probes do not consume these
+defaults. The local `chat` command uses them when running with SRT.
+
+Restart the daemon after editing `config.json`. A retained microsandbox session
+uses the updated environment when its runtime restarts; changing only
+`sandbox.env` does not require replacing its VM. Changes to mounts, VM resources,
+credential scope, or image content replace the VM while retaining its host-mounted
+workspace, HOME, and memory. The VM root disk and its Docker and Overlay write
+volumes are disposable across replacement; put durable files in host mounts.
+
+### Shared bases with session-local writes
+
+microsandbox also accepts `mode: "overlay"` for directory sources. Multiple
+sessions, including sessions belonging to different agents, can read the same
+host base while keeping additions, changes, and deletions on their own writable
+layer. `readonly` rejects guest writes; `writable` writes directly to the host;
+`overlay` never writes back to its host source. SRT has no copy-on-write layer, so
+it mounts an `overlay` base read-only: sessions read it, and writes under it fail.
+
+For example, mount a shared pnpm store under the session's XDG data directory:
+
+```json
+{
+  "sandbox": {
+    "env": {
+      "PNPM_CONFIG_STORE_DIR": "${HOME}/.local/share/pnpm/store"
+    },
+    "mounts": [
+      {
+        "source": "/srv/agent-cache/pnpm",
+        "target": "~/.local/share/pnpm/store",
+        "mode": "overlay"
+      }
+    ]
+  }
+}
+```
+
+The source must be an existing, populated host store directory. `~` in `source`
+uses the daemon's HOME; `~` in a microsandbox `target` uses the session HOME.
+Verify the effective target with `pnpm store path` in the actual session and
+project, since package-manager versions, environment, and filesystem layout
+affect the default.
+An explicit store setting keeps pnpm from choosing a project-local store when
+the workspace and mounted store are on different filesystems. This shares store
+contents only; each session still has its own `node_modules`. Registry metadata
+is a separate cache, so a populated store alone does not guarantee a fresh
+session can install fully offline.
+
+The daemon mounts each base read-only at an internal path and allocates one
+session-owned ext4 disk for all its overlay upper/work directories. Before
+starting session processes, it mounts the merged directories as root through
+the SDK. Suspension retains the disk; resume recreates the mounts; session
+deletion removes the disk. Root setup rejects symlinks in target directories.
+Overlay targets cannot overlap other configured mounts. Changes to the configured
+mount layout still require discarding a retained VM before recreating it.
+
+Use a stable base while sessions have it mounted. Live host mutation consistency
+and cache invalidation controls are separate work; this mode does not make an
+OverlayFS lower layer safe to modify in place. Guest cache misses stay private
+and are not automatically published for other sessions.
+
+Configuration is machine-local desired state. Agent configuration can select a
+runtime and request sandboxing, but cannot supply backend executables, images,
+or mounts. Future backends add a typed configuration member and an implementation at the existing execution-plane
+composition point. Do not add speculative backend branches throughout ACP.
+
+### VM availability and configuration changes
+
+The current microsandbox integration supports Linux with usable KVM. The startup
+probe is the cheap one of the [strategy table](#strategy-table-implemented-on-the-daemon):
+it opens `/dev/kvm` and, when the runtime store already holds the pinned
+`microsandbox@0.7.14` package, checks its msb and libkrunfw, then recovers the
+state an earlier run left and collects the cached images no binding needs. It boots
+no VM; that rule is the availability probe's alone. Once it passes, a background task
+of the ready daemon, or a session that needs the image first, installs the package
+through the daemon's RuntimeStore when needed, preserving its native platform
+package, prepares the image, boots a temporary VM, validates the runtime table, and
+checks stop/start.
+The table it read is recorded against the image's platform identity under the
+state directory, so a restart on an image the cache still holds boots no
+preparation VM; an image not read yet in this run fails a Console read of a
+retained VM once, and starts its preparation. A failed install or pull fails the
+session that asked and is retried by the next.
+
+The same background task then probes the image's models. It boots one probe VM,
+`probe/models`, whose mounts and credential bindings are the union of each runtime's
+local VM launch in a scope of its own under `run/vm-probe`, and runs the host's
+runtime probe for every image runtime through the VM's shim, serially and within the
+host probe's per-runtime budget. A runtime whose launch disagrees with those already
+in the VM on a binding name, a mount, or another runtime's protected credential file
+is left out with a warning. The VM starts through the manager's serialized start, is
+drained and removed when the sweep ends, and a shutdown aborts the sweep without
+waiting on it. No install, pull or preparation VM resumes once shutdown has begun,
+whoever asked for the image. A preparation VM already being created runs nothing in
+it, and the manager's shutdown waits until that VM is gone. The next probe removes a
+probe VM an earlier run left behind. The task
+runs once a run, only where the strategy is available. A session in the strategy while it
+is unavailable is refused, with no fallback to SRT or a host process. The
+standalone `chat` command refuses an agent that runs in microsandbox; use daemon
+sessions.
+The upstream SDK requires its derived Unix socket paths to fit Linux's 108-byte
+limit, so an unusually long daemon root can fail preflight.
+
+Upgrading from 0.7.2 migrates the SDK's local catalog. Rolling back only the
+daemon binary does not restore that catalog, and the older SDK cannot preserve
+scoped credential headers. Keep a consistent backup of stopped VM state and
+bindings before an upgrade that may need rollback.
+
+This implementation adds no new backend for Linux hosts without usable KVM. They can
+keep SRT, including fail-closed startup with `sandbox.host: false`. The
+new VM boundary requires bare metal or a VM exposing nested virtualization;
+Podman/runsc with systrap remains a future no-KVM option, not a hidden fallback.
+
+The manager persists each environment ID, sandbox ID, requested image/resources/
+mount specification, and a hash of the SDK's saved configuration. Reuse rejects
+missing or changed bindings and configuration rather than silently recreating the
+VM. Each new session owns a VM using the image configured at creation, including
+sessions that share workspace files. Its private HOME lives under
+`runtime-homes/<session-leaf>/home` unless it already owns a confined session
+directory. For shared workspaces, native-memory directories mount the agent's
+existing memory store so every session shares it; runtime
+state stays in the session's HOME. Image changes apply to new sessions;
+resume keeps the original image, runtime versions, HOME and disks until session
+retention removes them. Sessions created in a legacy shared agent VM continue
+using that VM until its last session retires. Resource and mount changes still
+require environment recreation. Image
+digest resolution and in-place disk migration remain proposed.
+
+Because each release pins its own image, an upgraded daemon would otherwise
+leave the previous release's image cached forever. Startup therefore collects
+the image cache before it pulls, keeping the configured image and every image a
+persisted binding still records, which a retained VM validates when it starts,
+and removing the rest one reference at a time. Whole-cache pruning is not used:
+it removes any image no sandbox has booted, which includes the image a daemon
+just pulled and has not started a session on. A removal the backend refuses
+because a sandbox still boots from that image's digest is kept and logged, and a
+cache that cannot be read is logged without failing startup, so collection never
+costs availability. A retained VM usually pins the previous release past
+startup, so a retention pass that discards at least one session VM runs the same
+collection again. The same pass also retires session VMs whose session row is
+gone, such as those left by a purge while microsandbox was unavailable, but never
+the agent's shared VM, a hosted executor VM, a loaded or dream VM, or a VM of an
+agent with work in flight.
+An upgrade pre-pulls the next release's image from a separate
+process while the old daemon still runs, so every pull records the reference it
+fetched in a file under the microsandbox state directory, and the runtime pass
+keeps that reference. No cache timestamp can stand in for the record: re-pulling
+a tag that is already cached keeps its creation time, and every sandbox create
+refreshes its update time. Pulls and collections share one lock file in the same
+directory, holding the owner's pid, because a removal deletes layer files that a
+concurrent pull may already have chosen to reuse. A pull waits for the lock and
+fails after ten minutes instead of taking it; a runtime collection skips its
+round. A lock is reclaimed only when its holder is provably gone: no valid pid,
+a dead pid, or this process's own pid left by an earlier incarnation. Each
+collection also sweeps the flat rootfs store that v1.55 filled and the backend's
+own removal never touches: refs whose manifest is no longer cached, then blobs
+that no remaining ref names. The temporary preparation VM has a stable name and
+is reclaimed before it is recreated; a start interrupted before its teardown
+would otherwise leave a VM behind that pins a retired image. A create can also
+fail after microsandbox claimed the name: it writes the sandbox directory before
+the database row, so a full disk can stop it in between and leave the name taken
+by nothing a lookup finds. When a create collides and lookup confirms that no VM
+holds the name, the daemon repeats it as a replacing create, for the preparation
+VM and session VMs alike; a name a recorded VM holds is never replaced.
+
+Collection runs whenever the microsandbox strategy is available, not only once a
+session used it. A daemon on which it is withdrawn or unavailable keeps its
+microsandbox state, including stopped VMs and their disks, in case it becomes
+available again, and logs a startup warning with the number of retained
+environments, why the strategy is out, and how to reclaim the space. An upgrade
+pre-pulls the next release's image only on a machine that has pulled one before. The
+pre-pull probes no models: it is a separate short-lived process with no runtime
+catalog or VM of its own, and the carried-over lists cover the new daemon until its
+own probe replaces them.
+
+The ACP runtime, its two helper endpoints, daemon-run Git, workspace filesystem
+operations and skill publication use the same persistent Node shim and WebSocket
+protocol as Kubernetes, so a VM and a pool pod are driven the same way. The shim
+starts with each running VM, before anything else runs in it, and a VM whose shim
+cannot start is refused. It starts exposed and unbound, as a hosted VM's does, and
+whoever drives the VM binds it: for this machine's own sessions that is the
+in-process executor entry (`execution/local-executor.ts`,
+[session-executors.md](session-executors.md) §11 step 4), which binds it as a
+holder binds an executor's, with no Control Plane request and no pipe, so a local
+session starts and runs while the Control Plane is down. The entry carries the
+WebSocket over agentd's TCP stream to guest loopback; it does not publish a host
+port or add a forwarding process. It compares the shim's one-time token on every
+dial and binds at this daemon's own generation, from the store's allocator under
+the environment's id. The shim does not prevent idle suspension. Each runtime and
+each Git, file or skill operation holds the VM until it finishes; a stopped VM
+ends the binding, and the next use binds the resumed VM at a new generation with
+a new token. The binding grants `acp`, `materialize`, `exec`, `tunnel`, `read` and
+the skill channels, and nothing else. Both helper tunnels are opened on every
+bind; one that cannot be served is logged by name and the VM still runs, as for
+every executor. The credential lives for a day rather than a pod's ten minutes.
+The shim renews at half that lifetime by presenting the same one-time token again,
+which proves nothing new, and a renewal ends any helper stream with a frame in
+flight, such as the MCP bridge's connection.
+
+The daemon stages its bundled shim and audited skills CLI in root-owned `/run`
+files on startup, including when the VM retains an older runtime image. This
+updates preparation code without replacing the session's image or disks. The
+same root step creates the shim's runtime directory, `/run/agentconnect`, for
+the image's ordinary user, which is the pool image's layout. Skill
+source acquisition and the authoritative journal remain on the daemon; workspace
+inspection, installation, verification, and cleanup execute inside the VM. A
+legacy daemon-owned skill receipt can seed the new journal after its original
+host-side recovery completes under the workspace lock. The journal is keyed by
+the host directory's canonical path and storage identity, so replacing a VM
+preserves ownership while replacing its workspace revokes it. Console file and
+skill reads use this same
+guest filesystem view: virtiofs symlinks and executable modes are not interpreted
+through their host-side representation.
+
+Retired-root sweeps skip cold VMs; explicit Console reads may resume them. If
+optional microsandbox initialization fails, host file inspection remains
+available while VM launches remain refused. Kubernetes and microsandbox share
+the paged skill receipt protocol and require duty admission before serving
+activation or explicit launch prepares a sandbox workspace.
+
+Kubernetes mode retains `K8sDriver`, its resource configuration, and image rollout.
+`sandbox.host: false` with `--k8s` is rejected as conflicting configuration; the
+default table has no effect on pool execution, which probes no local strategy. Sharing an image does not mean nesting
+microsandbox inside every pool pod.
+
+### Runtime discovery
+
+A self-hosted daemon combines host installations, image installations, and the
+stored credential sources used to prepare runtime authentication. Discovery checks
+the specific authentication file and, for a shared provider store, the corresponding
+provider record. Configuration directories and empty stores do not establish a login.
+
+Host and Sandbox apply the same display rule using their own binary availability:
+
+| Binary available | Stored login | Display                                                            |
+| ---------------- | ------------ | ------------------------------------------------------------------ |
+| Yes              | Yes          | Runtime models and capabilities; retain any observed login failure |
+| Yes              | No           | Login required                                                     |
+| No               | Yes          | Binary not installed on host / Binary not installed in image       |
+| No               | No           | Hidden                                                             |
+
+The daemon probes host installations to learn their models and capabilities.
+These metadata probes use host SRT when available and otherwise run on the host;
+they do not submit a model turn. A machine that offers no `host` and has SRT confines
+them in it; a VM-only machine probes on the host, which requires no host SRT.
+The image table supplies the guest command and binary version. A candidate missing
+from that table remains visible with **Binary not installed in image** when it has
+a stored login. An installed image runtime without a stored login remains visible
+on the VM tab with **Login required**.
+
+Stored credentials indicate configuration, not current validity. Successful model
+enumeration does not establish a login or clear the absence of stored credentials.
+Expired logins remain visible; an authentication failure from the host probe or a real turn
+records the existing login requirement. For sandbox execution, the console shows
+**Binary not installed in image** first and **Login required** only after the
+image contains that runtime. The underlying authentication status is retained.
+
+File and database discovery currently covers Claude, Codex, Qoder, OMP, Grok, pi,
+OpenCode, DSH, Hermes, Auggie, Cline, Amp, Antigravity/Qwen/Kimi OAuth, Qwen saved API
+keys, Antigravity ACP file logins, Devin, and Copilot's stored token map. These
+descriptors also prepare the corresponding files in the private runtime HOME.
+Keyring-only logins are not detected by file discovery. Credential formats without
+a shared discovery descriptor retain the runtime probe's authentication result.
+
+### API key protection
+
+Proxy substitution is limited to `Authorization`, `X-Api-Key`, `Api-Key` and
+`X-Goog-Api-Key` on the credential's allowed HTTPS hosts. Header names are
+case-insensitive; query strings, bodies and other headers cannot receive the
+host key. A provider requiring a different credential header is unsupported.
+The header policy is part of the retained VM specification: a VM created with
+the previous unrestricted header policy is replaced before its next launch,
+preserving its host-mounted workspace and HOME but recreating its VM disks.
+
+Claude Code and Codex file-based API logins use microsandbox's built-in TLS proxy.
+The daemon discovers Claude's saved `primaryApiKey` in its active global config
+(including `CLAUDE_CONFIG_DIR` and the legacy `.config.json` layout), or Codex's
+`OPENAI_API_KEY` in `CODEX_HOME/auth.json`. Private copies contain placeholders;
+the raw host API credential file is not mounted. Claude retains the existing
+global-config seed allowlist, and private settings survive later preparation.
+Codex's private `auth.json` is a regular projected file, replacing the shared
+auth-file link for API logins. Matching key values in its seeded `config.toml`
+and launch environment are replaced too. No native authentication environment
+variable is added, so the runtime still selects its own authentication method.
+
+Claude authorizes its configured `ANTHROPIC_BASE_URL` host, defaulting to
+`api.anthropic.com`. Codex resolves the host `config.toml`, selected profile and
+`CODEX_CONFIG` overrides: the built-in provider uses `openai_base_url` or
+`api.openai.com`; a custom provider can use the file login when
+`requires_openai_auth = true`. `OPENAI_BASE_URL` does not control the pinned Codex
+runtime's routing. Unsupported endpoints keep the placeholder without receiving
+proxy injection; there is no plaintext fallback. Guest-side endpoint changes
+cannot authorize an additional host. This path covers registered `claude-acp`
+and `codex-acp` file logins and their `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`
+variables, each bound at the same endpoint as its file login, not keyring-only
+or helper-only keys.
+
+Pure OAuth logins keep their existing shared credentials and native refresh.
+Claude can also keep a separate shared OAuth directory alongside its projected
+API config. If that directory contains the raw API config, launch refuses the
+overlapping mount. Codex files explicitly selecting a non-API authentication
+mode while also storing an API key are refused rather than exposing the key or
+silently changing native authentication. These mixed-source layouts remain
+compatibility follow-ups; this change does not add OAuth proxying.
+
+For DeepSeek Harness in microsandbox, the daemon resolves the standard
+`DEEPSEEK_API_KEY` reference using the existing credential-file descriptors and
+DSH parser (`.credentials.yaml`, including the legacy layout and version-1 refs,
+then `.env`). An explicit launch or inherited host key takes precedence, so a
+malformed unused YAML seed cannot override it. The guest
+receives only a placeholder; microsandbox's built-in TLS proxy substitutes the key
+in request headers for `https://api.deepseek.com`. A non-default base URL in the
+launch environment, host environment or DSH `.env` refuses the launch with a
+diagnostic. Custom credential-reference names are outside this first implementation.
+
+OpenCode 2 keeps its sign-ins in its own database, which no private HOME copies. The
+daemon reads the host's sign-ins through OpenCode's own `opencode auth export
+--standalone` (a private server that exits with the command) and takes the active
+API-key records only. Each provider's key travels in its own `OPENCODE_API_<hash>`
+variable, and `OPENCODE_CONFIG_CONTENT` points that provider's `options.apiKey` at it
+with `{env:…}`, unless the launch's config already sets that provider's key. Under SRT
+the variable holds the key; in microsandbox it holds a placeholder that the same proxy
+swaps on the provider's allowed HTTPS hosts. Providers sharing a key share one
+placeholder with their combined authorized hosts. Routing comes from the provider's
+base URL in standard host OpenCode config or `OPENCODE_CONFIG_CONTENT`, in either the
+`provider.<id>.options` or `providers.<id>.settings` shape, else its models' own APIs
+and the provider's default origin. Unknown or unsupported destinations get no proxy
+key injection and no config pointer; other providers can still start and
+authenticate. Configure a supported HTTPS `baseURL` to enable that provider. There is
+no fallback to mounting its real API key, and guest workspace configuration cannot
+authorize a new destination. Copies of the protected keys in projected OpenCode
+config files, Bearer headers, and JSON environment config are replaced too, without
+replacing matching substrings in paths or unrelated text. The host files are
+unchanged. `OPENCODE_CONFIG` and `OPENCODE_CONFIG_DIR` paths are not imported or used
+for proxy routing; use the standard host config locations or
+`OPENCODE_CONFIG_CONTENT`. Symlinked host files are skipped, matching native HOME
+seeding. Host keys go only to the registered `opencode` runtime ID, not to custom
+runtime IDs that run the same binary.
+
+OpenCode OAuth and external sign-ins stay on the host: no private HOME receives
+them, so where the host has only those, the guest signs in itself or uses keys the
+agent configures. There is no OAuth proxy or refresh coordinator. Inactive, blank,
+or malformed key records are not selected and do not prevent preparing other
+records; a host without OpenCode, or whose export fails, contributes no keys.
+
+pi uses the same proxy for file-based `type: api_key` records in `auth.json` and
+provider `apiKey` fields in `models.json`, honoring `PI_CODING_AGENT_DIR`. Its
+shared state descriptors now discover and seed `models.json` for both SRT and
+microsandbox. The VM receives projected auth, model and settings files; matching
+key values and Bearer headers are replaced, and host files remain unchanged.
+Providers sharing a literal key share a placeholder and their authorized hosts.
+Routing uses the host's JSONC `models.json` provider and model `baseUrl` values,
+with audited defaults for Anthropic, OpenAI, DeepSeek, Google, xAI, OpenRouter,
+Groq and Mistral. Guest model edits cannot authorize additional destinations.
+
+This pi path supports literal API keys. Command-based keys, interpolation and
+structured provider `env` credentials are replaced by inert placeholders without
+executing helpers or importing their secret values. Unknown providers and
+unsupported endpoints also retain placeholders without proxy injection; their
+keys are never mounted as a fallback. Extra secrets stored only in arbitrary
+headers or extensions are not discovered by this path. Symlinked host files are
+skipped, matching native HOME seeding. OAuth records and guest-only logins retain
+their existing behavior, including refreshed private OAuth state on resume.
+Pure OAuth launches do not enable secret injection. SRT authentication and tool
+policies are unchanged; it imports the native files without this VM proxy.
+
+Grok Build uses the same proxy for literal `model.<id>.api_key` values with an
+explicit HTTPS `base_url` in the host's `config.toml`. The shared state inventory
+honors `GROK_HOME` and `GROK_AUTH_PATH` and seeds only the native auth file plus
+`config.toml`, `managed_config.toml` and `requirements.toml`, excluding backups.
+Both discovery and VM projection inspect these files, including conditional TOML
+tables. Matching values and Bearer headers become placeholders; TOML dates,
+unrelated settings and refreshed guest OAuth state survive projection and resume.
+Repeated keys share a placeholder and their host-authorized destinations.
+
+Grok keys in cached `auth.json` API records, managed/requirements layers,
+version overrides or models without an explicit supported endpoint are hidden
+without authorizing injection. Inherited endpoints, interpolation, helpers and
+environment-only logins are not resolved. Those API configurations remain
+unavailable; there is no plaintext fallback. OAuth keeps its native behavior.
+Host system-wide `/etc/grok` files are not imported. Secrets stored only in
+arbitrary headers or extensions are outside discovery. Native Grok 1.0.25's
+per-model API path was verified with the SDK CA and a real ACP tool turn; its
+cached xAI API-login path still needs validation with a valid native login.
+
+Qwen Code uses the same proxy for keys saved in `settings.json`: model-provider
+`envKey` references to the file's `env` values (including native protocol defaults
+and `providerProtocol` mappings), plus legacy `security.auth.apiKey`. This is file
+credential import; environment-only logins are not added. Shared discovery and
+private-HOME seeding honor `QWEN_HOME`, and private launches pin both `QWEN_HOME`
+and `QWEN_RUNTIME_DIR`. The seed inventory includes native settings, OAuth and
+account files, excluding settings backups and runtime snapshots.
+
+Only explicit HTTPS model `baseUrl` or legacy auth `baseUrl` values from the host
+settings authorize proxy injection. Missing or unsupported endpoints, unknown
+protocols and interpolation keep placeholders without importing a plaintext key.
+Default endpoints, `.env`, workspace/CLI overrides and extra keys stored only in
+arbitrary fields are outside this path. Matching key values and Bearer headers in
+the seeded files are replaced; repeated keys share their authorized destinations.
+Guest edits cannot authorize new hosts. OAuth-only launches retain native seeding,
+and guest-refreshed OAuth state survives API-key rotation. SRT imports the same
+native files without enabling this VM proxy. Native Qwen 0.23.3's OpenAI-compatible
+API path was verified with the SDK CA and a real ACP tool turn.
+
+Oh My Pi uses the same proxy for API keys in its native `agent.db`, honoring
+`PI_CODING_AGENT_DIR`. The existing credential-table extractor writes placeholders
+before inserting any row into the private database; API keys never enter its
+journal during seeding. Native OAuth and login metadata are preserved. Routing
+covers the audited built-in Anthropic, OpenAI, DeepSeek, Google, xAI, OpenRouter,
+Groq and Mistral endpoints. Unknown providers keep placeholders without injection.
+Custom model files are not part of the existing HOME seed; model-file-only keys,
+broker/command/environment credentials and OAuth protection remain outside this
+path. Native OMP 18.1.17 completed an ACP model/tool turn through this proxy.
+
+OMP resume checks a host-only copy of the private database and WAL, opened through
+directory/file descriptors without following guest symlinks. This check is
+bounded to 256 MiB combined. A retained API record the host still binds, holding
+its key in the clear or a stale one, gets its placeholder in that copy, which then
+replaces the private database with OAuth refreshes and usage records intact; a
+record the host no longer binds is left as it is. When every record already holds
+its placeholder, the original files are not rewritten. A database that cannot be
+read safely requires a new session; existing data is retained. Key values rotate
+through the stopped-VM lifecycle. OAuth-only and SRT launches keep native seeding.
+
+Amp uses the same proxy for nonempty `apiKey@<service URL>` entries in its native
+`secrets.json`, including `XDG_DATA_HOME` relocation. The record's HTTPS host
+authorizes header injection; changing guest settings cannot authorize another
+destination. HTTP, custom ports, URL userinfo and malformed addresses retain
+placeholders without injection. Shared keys share a binding across their allowed
+hosts. Native JSONC settings, including `AMP_SETTINGS_FILE`, are projected into
+the private HOME with matching key values replaced. Unrelated credential records
+and guest-only logins retain native behavior; stopped-VM rotation preserves them.
+This covers native Amp CLI file login, not the adapter's separate
+`amp-acp/credentials.json` setup file, environment-only credentials, or arbitrary
+workspace configuration. SRT keeps native authentication. Amp ACP 0.9.0 and the
+native CLI were checked with synthetic credentials; an authenticated model/tool
+turn remains a release acceptance task.
+
+Kimi Code projects nonempty literal `api_key` values from the active
+`.kimi-code/config.toml`, honoring `KIMI_CODE_HOME`. Only supported model
+providers with explicit HTTPS `base_url` values authorize injection; unknown
+protocols, OAuth/registry-backed providers, unresolved routes and service-only
+keys retain placeholders without injection. Repeated values share a binding;
+matching copies in seeded files are replaced before guest access. Environment-only
+credentials, `api_key_env`, provider `env` bags and arbitrary header credentials
+are outside this path. This is static API-key protection, not OAuth shielding.
+The native OAuth credentials directory remains shared and writable for refresh.
+
+A retained configuration's keys the host still binds, in the clear or stale, are
+replaced by their placeholders; a key the host no longer binds is left as it is.
+Guest settings survive resume, but cannot authorize new destinations. Native Kimi
+Code 2.1.1 accepted file keys and placeholders through ACP and sent them as Bearer
+headers to a synthetic local endpoint. Real provider TLS/model/tool turns inside a
+VM remain unverified.
+
+When a DeepSeek key is available, the daemon projects the credential seed files
+with that ref replaced by the placeholder; other provider refs, OAuth records and
+existing private logins are preserved. Without a DeepSeek key, normal seeding is
+unchanged. On the currently supported Linux backend, projection holds directory
+and file descriptors without following symlinks and publishes by atomic rename,
+so a guest swapping a file or parent cannot redirect a daemon write. The daemon
+rejects mounts exposing protected host paths, sharing SRT's
+boundary and runtime-state inventory, and supplies the guest CA environment even
+when process-environment inheritance is disabled. Keys stay out
+of serialized launch metadata and environment bindings. The SDK persists its own
+secret configuration on the host; this protection is against guest access.
+All VM launches reject requested mounts of the host SDK state directory, its
+ancestors or its descendants, including launches for runtimes that do not use
+secret injection themselves. Public support helpers live outside SDK state;
+retained VMs can keep their previous exact read-only helper mounts.
+The proxy does not redact provider responses, so the allowed provider remains a
+trusted recipient of the key.
+
+The pinned SDK installs the proxy CA into the guest system bundle before execution.
+Combining it with operator-provided trust bundles is deferred: protected runtime
+launches explicitly refuse custom `TLS_TRUST_ENV`, `CODEX_CA_CERTIFICATE`, `REQUESTS_CA_BUNDLE` or
+`CURL_CA_BUNDLE` settings instead of silently replacing them. Use SRT for those
+configurations until custom trust is supported.
+
+New VMs receive the proxy configuration at creation. Retained protected VMs reload
+the host key before starting again; already-running VMs keep their current key
+until stopped and resumed. Previously unprotected VMs fail configuration
+reuse and retain their data: start a new session instead of treating an old disk
+that may contain credentials as protected. If a protected VM's credential later
+disappears, restore that credential and retry or start a new session; no VM or
+session data is automatically discarded. SRT and Kubernetes authentication
+paths are unchanged. No separate daemon HTTP proxy or networking option is added.
+
+A VM this machine hosts for another member of its daemon group takes the same
+protection, from this machine's own environment and sign-in, for every runtime it
+admits ([Sharing a machine with its group](#sharing-a-machine-with-its-group)). The
+agent's environment cannot widen it: the holder strips recognized provider keys from
+the launch, an endpoint the agent sets authorizes no host, and a trust bundle it sets
+only leaves the proxy's CA untrusted. Its
+durable state is a mounted directory rather than the VM's disks, so the spec change
+that adds the secrets replaces a hosted VM that predates them without losing the
+session.
+
+## 2. Selecting the backend
+
+The choice favors session development workflows over maximum hardening.
+microsandbox is the first new backend because its full guest environment is a
+better fit for ordinary Docker workflows; performance still needs measurement.
+
+| Option                                | Development experience and operating cost                                                                                                                                                                                     | Decision                                                                                         |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| SRT / bubblewrap                      | Already integrated, uses host tools, no image or guest kernel. Current network wrapping mainly serves proxy-aware HTTP(S) clients; host access to development servers and arbitrary network tools is not a general guarantee. | Keep the default and existing behavior during rollout.                                           |
+| Podman / crun                         | Familiar OCI images, volumes, port publishing, and inexpensive ordinary containers. A separate nested Docker environment adds storage, permissions, and networking work.                                                      | Retain as the performance baseline and a possible lightweight future backend.                    |
+| Podman / gVisor                       | Rootless integration exists and systrap needs no KVM. Nested Docker requires extra network/storage configuration; starting dockerd does not establish unmodified Compose or Testcontainers compatibility.                     | Do not choose it first for this Docker-oriented workflow.                                        |
+| Docker Sandboxes (`sbx`)              | Provides a VM-based agent environment and Docker-enabled templates, but adds product-specific lifecycle setup and a separate VM startup cost.                                                                                 | Keep as a comparison, not the first daemon integration. This is distinct from Docker Engine.     |
+| microsandbox                          | OCI images, streaming execution APIs, independent VMs, and an official independent-Docker example. Requires KVM on Linux; beta APIs and disk/lifecycle limits need an adapter and tests.                                      | First new backend, initially opt-in.                                                             |
+| OpenSandbox / OpenShell               | Broader sandbox services with additional server, gateway, policy, or execution components.                                                                                                                                    | Defer: the first change needs an execution backend for the daemon, not another management plane. |
+| Kata / direct Firecracker integration | Useful VM building blocks, particularly around Kubernetes; a direct VMM integration also needs image, networking, and guest execution machinery.                                                                              | Defer; revisit for a specific pool or scale requirement.                                         |
+
+[gVisor's Docker guide](https://gvisor.dev/docs/tutorials/docker-in-gvisor/) requires
+raw-packet support, disabling dockerd's automatic iptables management, and extra
+network setup. It recommends inner host networking for affected port-exposure
+scenarios; Docker 29 also needs a suitable storage arrangement. Its example uses
+an outer Docker/runsc setup, not our untested rootless Podman/DinD combination.
+[microsandbox's Docker example](https://docs.microsandbox.dev/examples/docker/docker-in-sandbox)
+uses `docker:dind`, a flat ext4 disk, and an ordinary guest dockerd. This supports
+prioritizing its compatibility test; it is not proof that every Compose project
+or Testcontainers cleanup helper already works.
+
+Measure complete Linux agent sessions before drawing performance or density
+conclusions. Vendor guest-boot figures and empty-container timings are not
+substitutes for ACP readiness, dependency installation, and Docker workloads.
+
+Cloud deployment is possible without bare metal on supported
+[EC2 instance types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
+and [Google Compute Engine types](https://docs.cloud.google.com/compute/docs/instances/nested-virtualization/overview#restrictions),
+with nested virtualization explicitly enabled. Check the deployed machine type
+and measure there; do not extrapolate bare-metal or desktop boot numbers.
+
+## 3. Session environment and image contract
+
+`MicrosandboxManager` owns the VMs, and the in-process executor entry supplies the
+`SpawnDriver` contract over them. ACP runs through the VM's shim with the pool's
+`RemoteShimDriver` and `createRemoteRuntime`: the shim
+resolves the command and its executable hints in the guest, starts the runtime as
+the image's ordinary user in its own process group, relays its stdio as numbered
+frames, and reports its exit. The entry sends the image's environment beneath
+the launch environment and names the workspace root as the working directory, as
+a direct guest exec did. The VM starter sets `AC_SHIM_COMPLETE_ENV=1`, because
+the daemon that drives the VM is on the same machine, so the shim treats that
+environment as whole and adds none of the fill-ins a pod template supplies: no
+provider variables, no Codex auth request composed from an inherited key, no
+DeepSeek preset. The flag is the starter's own claim and is not implied by an
+identity that arrived on stdin. Stop closes the
+runtime's stdin, signals its process
+group, and escalates to a kill past the deadline. A lost shim ends every runtime
+on it at once and fences the VM, so the host is rebuilt on the next turn; a
+stop the shim does not confirm with the runtime's exit fences the VM as well. The
+runtime's stderr arrives on the shim's stream and is written to the daemon's
+stderr; the shim's own tagged lines go to the debug log. Native tools run inside
+the existing harness and VM. There is no external CLI invocation for each tool
+call.
+
+Daemon-owned Git operations for mounted workspaces cross the shim's exec channel
+with the pool's runner, command policy and result parsing. The shim fences each
+command's working directory and path operands to the workspace root in the guest,
+and the launch's HOME, PATH, XDG directories and Git credential socket replace the
+host's in the environment a caller supplies. A command that never reached the
+shim, because the VM could not start or is stopping, fails as a transport error.
+Canonical clone preparation outside an exposed workspace remains host-side.
+Workspace reads and attachment access use host-backed directories mounted at the
+same guest paths. Once a VM exists, workspace mutations cross the shim's file
+channel, so a rename is the guest's own and immediately visible to guest Git,
+whereas renaming a staged clone on the host could leave the VM's cached directory
+view stale. Initial directory preparation remains local before VM boot. This does
+not require a second filesystem copy or a Kubernetes tunnel. The runtime's command
+lookup happens in the shim, and generated launch files use the guest file API.
+Filesystem mutations retain descriptor-anchored paths, no-follow checks, and
+atomic writes. The shim's tunnel host serves the MCP and Git credential sockets at
+the pool's in-guest paths and proxies each connection over the channel to this
+daemon's own socket, so the guest reaches those two servers and nothing else;
+the image's Kubernetes entrypoint and control connection are not started.
+
+New sessions use their own `agent/session-…` environment, writable runtime HOME,
+disk, and guest network namespace. Retained legacy sessions and canonical
+workspace preparation continue using the `agent/agent` environment. Existing
+shared-workspace versus session-workspace choices still govern repository data;
+separate VMs do not make a deliberately shared host mount private. Linked-worktree
+Git metadata, secondary repositories, and file attachments keep consistent guest
+paths. This change does not redesign Git storage.
+
+### Current image contract and VM storage
+
+The resolved OCI image must contain Node at
+`/usr/local/bin/node`, `/usr/bin/git`, Python 3.11+ for shim staging and overlay mounts, the declared runtime tools,
+and `/opt/agentconnect/runtime/k8s-runtimes.json`. The daemon's full image also
+includes `bubblewrap` and `socat` for the native Claude sandbox.
+Startup reads and validates that table in a real VM; individual
+runtime execution and full-session compatibility still need workload checks.
+
+The SDK's `create()` does not execute OCI ENTRYPOINT/CMD automatically. The manager
+explicitly stages and starts the shim, which starts the requested runtime commands.
+The pool's Kubernetes security context, volumes, and resource limits do not
+travel inside its OCI image. In particular, the pool's shim startup and UID/HOME
+configuration are not a substitute for the local VM's launch settings. See the
+upstream [execution semantics](https://docs.microsandbox.dev/sandboxes/commands).
+
+Each streaming execution owns an SDK `AgentClient` connection. The daemon uses
+the pinned SDK's exec protocol and explicitly closes that client before reporting
+process completion or releasing the VM's active-execution count. Closing stdin
+sends EOF; it does not close a process that is still running. This avoids relying
+on garbage collection of the SDK's high-level exec handles, while retaining
+cancellation, backpressure, and live output limits. The shim and its staging
+are the executions that use this channel; ACP streams, daemon-run Git and
+workspace files are multiplexed on the shim's WebSocket instead.
+After an output-limit failure, the daemon kills the process and drains its
+terminal event before closing: the pinned relay can otherwise reuse the client
+ID while old output is still arriving. Losing transport before that terminal
+event fences and stops the VM before another execution can reuse it.
+
+New VMs share the image's read-only layers and keep root filesystem changes in a
+private writable upper disk. Each VM also owns an ext4 disk mounted at
+`/var/lib/docker`, so Docker's OverlayFS snapshots do not nest on the root
+OverlayFS mount. Both sparse disks use `diskGiB` as their individual capacity.
+Workspace, HOME, and cache mounts retain their existing ownership and isolation.
+Creating a VM does not copy the full base image, including on hosts without
+reflink support. Generated launch files are written after boot through the guest
+file API.
+
+Existing flat-root VMs keep their saved layout and data when resumed. A new
+binding records ownership of its Docker disk; older bindings do not acquire or
+delete separate disks. Suspend retains both writable disks. Discard deletes the
+VM and then its owned Docker disk, retaining the binding if disk cleanup fails
+so the operation can be retried. SDK connections are explicitly detached after
+the VM stops. Resume and disk deletion retry the pinned SDK's transient disk-lock
+contention for up to one second after shutdown.
+
+Each VM mounts `/run` as tmpfs so process IDs and service sockets cannot survive
+a stop/start while application data remains on the persistent disks. Operator
+mounts cannot replace `/run` or `/var/lib/docker`. Shim staging creates
+`/run/agentconnect` on that tmpfs for the image's ordinary user, so a VM and a
+pool pod serve the helper sockets at the same paths.
+
+As observed in `0.6.17`, starting a retained flat-disk VM still validates the
+OCI image's VMDK cache. The manager runs the official
+`msb pull <image> --materialize layered --quiet` before its VM probe, preparing
+the shared layers and VMDK without generating an unused flat base disk. Retained
+flat VMs continue to use their original disk. The same image preparation runs
+before version activation during CLI upgrades; startup still verifies VM
+boot and stop/start, reusing the prepared image cache.
+
+### Release image selection and Docker
+
+Stable system dependencies live in manually published `base-<version>` tags of
+the two runtime image packages, built from `docker/runtime-sandbox-base.Dockerfile`.
+Both bases provide Node, Git, the build toolchain and Chrome with its system
+libraries. Only the full base adds Docker, bubblewrap and socat. Neither base
+installs agent-browser or an ACP harness. Updating system dependencies requires a
+base build and an explicit digest update; release builds reuse these pinned bases
+even with an empty build cache.
+
+`docker/runtime-sandbox.Dockerfile` owns the application versions and installation.
+The full image first adds Antigravity in an independent, fixed-version layer,
+then agent-browser, then the other harnesses. The pool image starts with
+agent-browser and then installs its harnesses. Routine application upgrades change
+these exact version pins and use the normal release image build, without publishing
+another base. Standalone downloads also pin SHA-256. The shim remains an independent
+compilation stage whose small helper payload is copied last into both final images;
+it does not need a separately published image.
+
+The release build bundles `dist/release.json` with a `runtimeSandboxImage` OCI
+reference. It names the current release's `runtime-sandbox-full:v<version>` alias.
+The image workflow creates this alias even when it reuses an older component
+image. The pool continues to use the separate `runtime-sandbox` image. Both targets
+share the same helper payload over their respective application layers. Additional
+self-hosted runtimes belong in the full application stage. The pool provides Claude Code,
+Codex, DeepSeek Harness, and OpenCode. The full image additionally installs Antigravity,
+Cline, Devin, GitHub Copilot, goose, Grok Build, Kilo, Oh My Pi, pi, Qwen Code,
+Qoder CLI, and Qoder CN CLI. The `qoder` compatibility ID resolves to `qoder-cli`
+before host discovery and image projection. Both IDs share one native launch
+definition and one probe state; reported `aliasOf` metadata lets the Console show
+one entry while existing agent configurations retain either ID. Explicit runtime
+overrides remain independent. pi includes both its ACP adapter and the underlying
+CLI. Packages are version-pinned; standalone downloads also pin their SHA-256.
+
+Each application stage bakes an explicit runtime roster and generates its own runtime table
+after installation by probing the executables as the ordinary runtime user, without
+provider credentials. A roster entry may name a `probeEnv` for the probe alone: goose opens no
+session until a provider and model are named, so its entry names them with no key or endpoint,
+and the generated table never carries the setting. Missing executables fail the build instead of silently
+reducing the roster. Installed runtimes remain discoverable without a saved login;
+saved logins also keep runtimes visible when their executable is missing.
+General development toolchain expansion can follow independently.
+The daemon package is published before image finalization; the matching
+image workflow must complete before this default can be pulled. A missing image
+fails preflight rather than selecting another version.
+Runtime-image input changes also trigger daemon package publication so its
+bundled default follows the updated image.
+The release images are currently Linux amd64; an arm64 daemon must configure
+a compatible image explicitly. The full image's Antigravity binary requires
+AVX in the guest CPU; amd64 emulation without AVX cannot run that runtime.
+
+To update system dependencies, edit `docker/runtime-sandbox-base.Dockerfile` and run
+the **Build runtime bases** workflow manually in GitHub Actions. Its default tag is
+`base-YYYYMMDD-HHMMSS` in UTC; an optional explicit tag must also include the date.
+The workflow refuses to overwrite an existing tag, publishes both bases and verifies
+each with the application layers, runtime table and real shim session. Successful jobs
+report digest-pinned references in the run summary and upload them as artifacts.
+Update the two base ARGs in the release Dockerfile to those verified references.
+
+For a local build, use a new tag and an amd64 host with AVX for full application
+verification. Push candidates before checking them: nothing references a new tag
+until the release Dockerfile pins it. Run these commands from the repository root:
+
+```bash
+set -eu
+BASE_VERSION=20260911.2
+for variant in runtime-sandbox runtime-sandbox-full; do
+  docker buildx build --builder "$(docker context show)" --platform linux/amd64 \
+    -f docker/runtime-sandbox-base.Dockerfile --target "$variant-base" \
+    -t "ghcr.io/agentconnect-md/$variant:base-$BASE_VERSION" --load .
+  docker push "ghcr.io/agentconnect-md/$variant:base-$BASE_VERSION"
+done
+
+for variant in runtime-sandbox runtime-sandbox-full; do
+  docker buildx build --builder "$(docker context show)" --platform linux/amd64 \
+    -f docker/runtime-sandbox.Dockerfile --target "$variant-verify" \
+    --build-arg "RUNTIME_SANDBOX_BASE=ghcr.io/agentconnect-md/runtime-sandbox:base-$BASE_VERSION" \
+    --build-arg "RUNTIME_SANDBOX_FULL_BASE=ghcr.io/agentconnect-md/runtime-sandbox-full:base-$BASE_VERSION" \
+    --output type=cacheonly .
+  node scripts/verify-runtime-image.mjs "$variant" \
+    --build-arg "RUNTIME_SANDBOX_BASE=ghcr.io/agentconnect-md/runtime-sandbox:base-$BASE_VERSION" \
+    --build-arg "RUNTIME_SANDBOX_FULL_BASE=ghcr.io/agentconnect-md/runtime-sandbox-full:base-$BASE_VERSION"
+done
+```
+
+The `-verify` target runs the runtime-table probe, the static in-image checks and the
+shim smoke test — the image's own entrypoint started as the pod starts it, the daemon
+side dialling it over loopback, the real ACP runtime answering `initialize` and
+`session/new` — as build stages, so the host needs no toolchain. The host script
+checks the tini entrypoint and browser path inherited from the pinned system base,
+follows application-stage inheritance and checks the final non-root user. Other
+configuration overrides are rejected. The release fingerprint includes application
+assets and installation scripts as well as Dockerfile pins and shim content.
+To try a built image by hand, build
+the `$variant` target with `--load -t "$variant:local"` and, after `pnpm install` and
+`pnpm --filter '@agentconnect.md/daemon^...' build`, run
+`pnpm --filter @agentconnect.md/daemon exec tsx scripts/smoke-runtime-image.mts "$variant:local"`,
+which starts the container with `docker run` and drives the same steps.
+
+After both variants pass, inspect the pushed tags' registry digests with
+`docker buildx imagetools inspect`. Verify anonymous pulls, then update both `ARG`
+defaults in `docker/runtime-sandbox.Dockerfile` to `tag@sha256:digest` references in
+the dependency update PR. Do not overwrite an existing base tag.
+Changing only the manual base Dockerfile does not publish a daemon or release image;
+changing a base digest in the release Dockerfile does. Normal release CI continues
+to verify the final images and exercise a real ACP session through the shim.
+
+An explicit daemon image overrides this metadata. Development builds remove
+release metadata and require an explicit image; they do not derive a default
+from the development package version. Release defaults and explicit image
+overrides select the image for newly created VMs. Retained environments compare
+the recorded platform manifest identity with the configured image: another tag
+for the same digest reuses the VM, while changed content replaces it on refresh.
+
+The full image contains `bubblewrap` and `socat` for native credential shields;
+bubblewrap supports `--argv0` so Codex can start while its state directory is
+hidden. It also includes pinned Docker Engine, CLI, containerd, Buildx, and Compose packages.
+The pool image does not include those tools or the Docker sudo grant.
+The full image's ordinary container user and shim entrypoint remain in
+place. Image construction installs and verifies the tools; it does not start
+Docker. The image provides this command for manual startup inside the VM:
+
+```sh
+sudo -n dockerd > /tmp/dockerd.log 2>&1 &
+docker info
+```
+
+Wait for that command's Docker server to become ready before using containers.
+Agent-tool startup remains pending acceptance: the current native Codex sandbox
+sets `no_new_privs`, which prevents this sudo command from elevating.
+The image grants the `agent` user permission to run `dockerd` through sudo and
+access the Docker group's Unix socket. It does not grant unrestricted sudo.
+A custom image owns its corresponding tools and startup permissions.
+
+There is no daemon Docker configuration, automatic startup, health gate, or
+Docker process supervisor. Docker failures are ordinary tool failures and do not
+stop an otherwise healthy agent VM. The host Docker socket is not mounted by the
+backend; ambient host Docker contexts and connection paths are removed from guest
+launches. Managed-pool pod privileges are unchanged by the image's installed tools.
+
+Docker image layers, named volumes, and build caches live on the VM's retained
+ext4 Docker disk. The image's manual `dockerd` command starts its own containerd,
+whose data root is `/var/lib/docker/containerd/daemon`, on the same disk. A custom
+image that starts a separate system containerd must also place that service's
+data root on ext4; Docker's `data-root` setting does not relocate a separate
+containerd's storage. Stopping retains the data; after a VM restart the agent
+starts dockerd again when needed. VM retirement deletes the owned disk.
+Docker-published ports belong to the
+VM's network namespace, so two sessions can use the same internal port. This does not publish the port on the
+daemon host or provide a remote browser preview.
+
+### Session network isolation
+
+In session-isolation mode, each session's VM has its own network environment.
+The required behavior is fixed:
+
+- Sessions can access the public internet, including DNS, Git, and package registries.
+- Sessions cannot connect directly to other session VMs or to host/private-network services.
+- Services inside one session can communicate normally, including guest loopback
+  and Docker container networks.
+
+Shared workspace mode continues to reuse the agent's VM and therefore its
+network environment; separate conversations in that mode are not isolated VMs.
+SRT retains its existing network integration.
+
+The current manager selects upstream's `single-tenant` deployment profile,
+retains its default public-only outbound policy, and configures no published
+ports. See [microsandbox networking](https://docs.microsandbox.dev/networking/overview).
+The backend uses the SDK guest channel for daemon communication. This does not
+require allowing guest access to the host's general network services.
+The existing policy is the implementation baseline; complete-session tests must
+still establish public egress and denied host/private/peer connectivity, including
+applicable IPv4/IPv6 host addresses and aliases. The upstream
+[host category](https://github.com/superradcompany/microsandbox/blob/v0.7.2/crates/network/lib/engine/policy/destination.rs#L40)
+covers the VM gateway; a routable public address belonging to the host can still classify
+as public. Blocking that route remains an implementation/validation gap. Selecting
+a deployment profile alone is not evidence that these checks passed.
+
+Two isolated sessions can each listen on guest port 3000 or publish a Docker
+container on guest port 5432 without a conflict. Those ports belong to separate
+VM networks. Allocating different host ports is only needed when exposing these
+services through listeners on the daemon host; it does not create session
+isolation. Host port publication, dynamic preview forwarding, and remote browser
+access are outside this delivery scope. No daemon networking configuration is
+added for them.
+
+### Stop, restart, and retirement
+
+- A completed turn keeps its environment available for the existing idle policy.
+- The existing ACP host idle/max-lifetime policy stops the host. The VM manager
+  refuses suspend/removal while executions remain active, and the idle sweep also
+  stops VMs left idle after workspace preparation. Stopping retains mounted
+  workspace/HOME data and the private disk. Detached guest background processes
+  are not independently leased and end when the VM stops.
+- Start boots a new guest process environment from retained disk and re-establishes
+  ACP; use runtime `session/load` when supported. It does not resume process memory,
+  an old TCP connection, or an interrupted guest process.
+- Before admitting new VM launches, daemon restart stops recorded owned VMs that
+  are still running. It retains their disks and replaces the shim and ACP
+  processes on the next start; it does not adopt the old running processes.
+- Agent installation starts a background workspace prefetch that refreshes changed
+  agent-level VMs without awaiting all agents before daemon readiness. Unchanged
+  VMs remain asleep; session-owned VMs refresh on their next use. Workspace preparation
+  for that agent joins the same queue. Activation and refresh prepare mounts without
+  starting ACP; initialization and session loading happen at the actual runtime wake.
+- A replacement stops the old VM, creates a fresh candidate with the desired
+  mounts, verifies mount presence and permissions, and atomically commits its binding.
+  Only then are the old VM and its owned disks removed. A failed candidate preserves
+  the old binding and reports failure rather than silently using obsolete settings.
+  Durable candidate and retirement records permit cleanup after an interrupted swap.
+- VM identity and the full persisted configuration hash must still match their
+  binding before refresh. An externally altered VM is refused, not automatically
+  adopted or erased. Host-mounted files are never copied or deleted by VM replacement.
+- Retirement uses existing dirty/unpushed-work protection before deleting a
+  session's retained storage. VM removal deletes its private disk and binding;
+  operator-owned host mount contents are not deleted by VM removal.
+
+The inspected SDK does not provide general pause/resume of running process state.
+Lifecycle and configuration-reuse rules are documented
+[upstream](https://docs.microsandbox.dev/sandboxes/lifecycle).
+
+### Host-strategy shim launcher
+
+[session-executors.md](session-executors.md) §5 names `host` as an execution
+strategy: the same shim, started as a plain child process of the daemon with no
+sandbox around it, which [architecture.md](architecture.md) §9.1 already treats
+as an operator's choice. `startHostShim` (`execution/host-shim.ts`) is that
+launcher. Its one production caller is the executor facet
+([below](#sharing-a-machine-with-its-group)); the launcher itself opens no
+network listener.
+
+- **Linux only.** Elsewhere it refuses with the reason the design gives: the
+  shim's console read path is fd-bound and its helper locations are image-fixed.
+- **A short per-session runtime root**, `<daemonRoot>/hs/<12 hex>`, mode `0700`.
+  It sits beside the sessions and not under a session HOME because every socket
+  beneath it must fit the AF_UNIX path budget; a daemon root too long for that is
+  refused. The shim receives it as `AC_SHIM_RUNTIME_ROOT`, so its tunnel sockets,
+  Git config and skill staging are per session and two sessions on one machine
+  cannot replace each other's endpoints.
+- **A unix socket, never TCP.** The shim proves itself to whoever dials it and
+  authenticates nobody
+  ([cluster-spawn-and-shim.md](cluster-spawn-and-shim.md) §3). A pod's network
+  policy or a VM's guest loopback decides who can dial there; on a host, a
+  loopback port is reachable by every local user and by a sandboxed agent on the
+  same machine. `AC_SHIM_SOCKET` makes the shim listen on
+  `<runtimeRoot>/shim.sock` and nowhere else.
+- **Identity on stdin**, as for the VM, and a workspace root
+  `<daemonRoot>/sessions/<leaf>` with `workspace`, `repos` and `home` created
+  `0700`. The shim's HOME is that `home`; of the daemon's environment it inherits
+  only `PATH`, `LANG`, `LC_ALL` and `TZ`, so a provider key in the daemon's
+  environment does not reach a runtime through the pod fill-ins.
+- **No complete environment.** The holder that drives a host shim may be another
+  machine, whose environment describes that machine. The shim therefore fills
+  HOME and the other machine facts itself, exactly as a pod does.
+- **Its own process group.** Stop signals the group, the shim ends the runtimes
+  it started before exiting (no pod or VM teardown follows on a host), a kill
+  follows past the deadline, and the runtime root is removed. The workspace stays.
+- **A marked-process sweep behind it.** Each runtime leads a process group of
+  its own, exactly as in a pod, so the group signal reaches only the shim; a shim
+  that crashes or is killed ends nothing. The launcher therefore mints a random
+  per-shim mark (not the identity token), the shim receives it as
+  `AC_SHIM_RUNTIME_MARK`, and the ACP runner copies it into every runtime's
+  environment in both environment modes. Pods and VMs set no mark and are
+  unchanged. Whenever the shim has exited — a stop, a crash, a failed start — and
+  before the runtime root is removed, the launcher reads `/proc/<pid>/environ` of
+  this user's processes and kills each one that carries exactly that mark, by
+  group when it leads one. The mark is verified at kill time, so a recycled pid is
+  never signalled. The sweep exists for crashes, not for containment: a process
+  that clears its environment and re-parents escapes it, which is the limit the
+  daemon's own unsandboxed local launch already has (architecture.md §9.1).
+- **It ends with its daemon.** A `host` session's process tree ends with the
+  daemon (session-executors.md §9), and a daemon that is killed, runs out of
+  memory or crashes stops nothing itself. The launcher therefore hands the shim
+  one extra descriptor, named by `AC_SHIM_PARENT_FD`, whose other end it holds
+  and never writes. The kernel closes that end when the daemon goes, however it
+  goes; the shim reads end-of-file as that event, ends its runtimes as it does on
+  a stop, sweeps its own mark because no launcher is left to do it, and exits. Its
+  output went to that daemon too, so a host shim ignores write errors on it: a
+  log line that fails must not end the shim before its runtimes. It is an event,
+  not a poll, and the identity on stdin is read as before. The shim watches only
+  when it listens on `AC_SHIM_SOCKET`; pods and VMs are unchanged.
+- **A restart finishes what is left.** The launcher writes the mark to
+  `<runtimeRoot>/mark` before it starts the shim, so there is no moment at which
+  a marked process exists that a later daemon life cannot find; the facet's
+  per-session record is written before the launch and would have to be rewritten
+  after it. When the executor facet starts, and before any shim start it
+  serializes, `sweepStaleHostShims` takes every runtime root under
+  `<daemonRoot>/hs` that no live shim of this process owns, sweeps the mark it
+  names — an earlier life's shim carries it too — and removes the root. Only a
+  value shaped like a mark is looked for, and the sweep still matches it exactly
+  in `/proc/<pid>/environ` at kill time. A `prepare` therefore never starts a
+  second shim over a session directory an earlier life's shim still runs in.
+- **Helpers from the daemon's installation.** `AC_SHIM_HELPER_ROOT` is the
+  directory that holds `shim/index.js`, which resolves the MCP bridge, the
+  merge-when-ready watcher, the `agentconnect-secrets` entry and the git-credential wrapper
+  (`bin/git-credential`, emitted by the build beside `shim/`) from the daemon's own
+  bundle. Git runs a sandbox helper through `sh`, because npm ships that wrapper
+  without its executable bit. The `agentconnect-secrets` wrapper cannot ship that way, since
+  a runtime finds it by PATH lookup: the launcher writes it per launch into
+  `<runtimeRoot>/pathbin` (`runtimeWrapperDir`) when the helper root has `shim/secrets.js`, and the
+  ACP runner puts that directory first on PATH when the image's `pathbin` is absent.
+  The image's `pathbin` and the DeepSeek preset have no counterpart in an installation;
+  the launcher reports them in `missingHelpers` rather than naming a path that is not there.
+
+The launcher returns the socket path, the runtime root, the helper root, the
+workspace root, the identity token, the missing helpers, an exit promise and
+`stop`. The daemon-side authors of sandbox paths (`sandboxGitCredentialTarget`,
+`buildSandboxMcpServers`) accept that runtime root, so the git-credential socket
+variable, the Git config location and `AC_MCP_ENDPOINT` move with it; the default
+is the image's layout.
+
+`effectiveStrategies` (`execution/strategies.ts`) is the table the facet prepares
+from: `host`, `srt` and `microsandbox` of the machine's own table
+(`machineStrategies`), each available or unavailable with a reason, with `host` on
+Linux alone. The executor facet reports it at registration, beside the machine's own
+table for its own sessions ([Strategy table](#strategy-table-implemented-on-the-daemon)).
+
+### The srt strategy: SRT around the shim
+
+`srtLauncher` (`execution/srt-local.ts`) is the host launcher with SRT around the
+shim's process ([session-executors.md](session-executors.md) §5), so every runtime,
+bridge and helper the shim starts is inside the boundary. `startHostShim` takes the
+boundary as an option; `srtShimBoundary` (`execution/srt-shim.ts`) wraps the shim's
+command once its runtime root exists.
+
+- **The policy is this machine's.** `srtShimPolicy` composes it from the
+  environment and this machine's own paths; a holder sends none. Writable: the
+  environment's directory, its `home`, the runtime root, SRT's temp root, and the
+  environment's writable mounts, which for a hosted session are its directory and
+  the shared sign-in its HOME points at. Hidden: the daemon root, the agents
+  directory, the host HOME, the temp roots, `/run` and every runtime's state
+  location, as for a local confined launch. Read-only carve-backs: the shim bundle
+  (the helper root), node, the daemon's runtime store whole — a runtime a `prepare`
+  installs after the start must be visible — and each admitted runtime's install. A
+  writable mount that would reopen a protected root refuses the start; a read root
+  that would reopen one is left out and logged.
+- **The VM's rule for `.git`.** The policy denies nothing under `.git`: the holder's
+  Git runs through the shim inside the boundary, as in a VM. The runtime's inner
+  profile keeps its own deny.
+- **The policy lives outside the boundary**, in `<runtimeRoot>.p` beside the runtime
+  root, which the sandbox cannot read or write. It goes with the runtime root, and
+  `sweepStaleHostShims` removes one whose runtime root no live shim owns.
+- **The shim's bundle hosts the provider.** The launch is
+  `node <shim entry> __sandbox-runtime <policy> <daemon pid> <environment> -- node <shim entry> --identity-stdin`,
+  so the executor's own installation is the one SRT runs from, and the identity
+  still arrives on stdin.
+- **Stdin is the lifeline.** The provider hands bubblewrap stdio only, so the
+  launcher sets no `AC_SHIM_PARENT_FD`. It sets `AC_SHIM_STDIN_LIFELINE` instead and
+  keeps the shim's stdin open past the identity line. Its end-of-file — a stop closing
+  it, or the kernel closing it when the daemon dies — makes the shim end its runtimes
+  and exit, as the extra descriptor does for a plain host shim. The provider's owner
+  watch stays behind it: bubblewrap's PID namespace takes the shim and every runtime
+  with it.
+- **A short temp root**, `<runtimeRoot>/t`, handed to the provider as SRT's TMPDIR.
+  SRT's multiplexer socket sits directly under TMPDIR, so the root stays within the
+  AF_UNIX budget; a daemon root too long for it is refused.
+- **SRT's proxy reaches the runtimes.** SRT isolates the network namespace and sets
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (and their lowercase
+  forms) for its bridge; the provider adds `NODE_USE_ENV_PROXY`. The ACP runner copies
+  them from its own environment over the launch's in both environment modes, but
+  only when SRT marked the shim (`SANDBOX_RUNTIME=1`): inside that namespace the
+  bridge is the only route out. SRT's bridge asks for credentials, so the runner also
+  appends `http.proxyAuthMethod=basic` to the launch's `GIT_CONFIG_*` pairs; without
+  it Git answers the proxy's 407 by asking the runtime's credential helper. Pods and
+  VMs are unchanged.
+- **The holder's Git takes the same route.** Workspace Git strips proxy variables and
+  pins `http.<url>.proxy` and `remote.<name>.proxy` to empty, so nothing a checkout or
+  the host configures reroutes its egress. Inside SRT that would leave it no route at
+  all, so the shim's Git exec (`srtGitEnv`, `shim/srt-route.ts`) points those empty
+  pins at the bridge and adds the same auth method, keeping every other setting the
+  holder sent. The bridge is the boundary's own, set by SRT in the shim's environment,
+  so it is no route a checkout chose.
+- **Stop drains the shim.** SRT forwards no signal inward, so stop closes the shim's
+  stdin; the shim ends its runtimes before it exits, and the group kill past the
+  deadline and the marked sweep remain behind it.
+
+The shim's socket is inside what the runtime can write, as in a pod or a VM: a
+runtime can reach and replace it. `test/srt-shim.test.ts` runs the real boundary in
+CI's **Sandbox (Linux)** job.
+
+### This machine's confined srt sessions
+
+A confined `srt` session — one with its own session directory — launches through
+the in-process executor entry, as a local VM does
+([session-executors.md](session-executors.md) §11). A second `LocalExecutor` drives
+the same `srtLauncher`, which starts a local environment at its fixed runtime root and
+a hosted one at a random root with its holder's seed. Every other host of an `srt`
+agent runs in an agent-scoped shim (below).
+
+- **One shim per session directory.** The environment's id is
+  `<agentId>/session-<leaf>` and its workspace root the session directory, so the
+  shim's HOME is the session's `home`, as the launch composition names it.
+- **A runtime root fixed by the id**, `<daemonRoot>/hs/<12 hex of its hash>`, which
+  `startHostShim` takes as `runtimeRootName`. The launch composition therefore names
+  the shim's temp root (`<runtimeRoot>/t`) and its `agent` tunnel
+  (`AC_AGENT_CHANNEL_SOCKET`) before the shim starts, and the MCP spec names its `mcp`
+  tunnel. A start waits out the previous shim's removal of that root and clears one an
+  earlier daemon life left.
+- **The descriptor is the composition's roots.** `prepareRuntimeLaunch` computes the
+  write and read roots as for a runtime wrapped alone and returns them as mounts at
+  their host paths (`launch.srt`); `srtShimPolicy` composes the shim's policy from
+  them. No per-host settings file or temp directory is written, and this daemon's own
+  MCP and git-credential sockets are not opened in the boundary: both are reached
+  through the shim's tunnels. The runtime's inner profile is composed as before.
+- **Bound in process.** The shim runs with the complete-env flag, the launch env being
+  this daemon's whole composition, and the dial compares its one-time token.
+- **Lifetime.** The shim stops with its host unless something still holds it; the
+  session idle sweep stops one nothing has used within the session ttl, as it
+  suspends a local VM; shutdown stops them all. A descriptor that mounts anything
+  else is another environment, which the entry starts afresh once nothing holds the
+  old one.
+- **Workspace Git and files through the shim** (R1b-2a). The workspace plane
+  resolver puts an `srt` agent on the srt plane, which sends a path inside a confined
+  session's directory to that session's shim and everything else to this disk: its Git
+  (`localShimGitRunner`, `execution/local-git.ts`, shared with the local VM) with the
+  session's HOME, the shim's temp root and its `agent` tunnel over the caller's env,
+  its files (`SrtWorkspaceFs`) and the console's reads. The session directory itself
+  stays on this disk, since the shim runs in it. A filter, hook or helper the
+  session's repository configures therefore runs inside the boundary, which is why the
+  policy denies nothing under `.git`; `test/srt-shim.test.ts` shows a filter's write
+  reaching the session and not the daemon root.
+- **A narrower first use.** Git before the session's first runtime starts the shim on
+  the session directory alone. A running shim serves any request its policy already
+  grants; the runtime's launch mounts more, so it waits for that Git to end and starts
+  the shim again, and only a running runtime refuses a changed descriptor.
+
+Every other `srt` host of this machine — the agent's shared host, a pass's, a session
+host with no directory of its own — runs in an **agent-scoped** shim (R1b-2b):
+
+- **One per host key**, `<agentId>/<host dir>` as a VM's placement names it, its
+  runtime root fixed by that id like a session's.
+- **Rooted at the agent's directory, which stays hidden.** `srtShimPolicy` writes a
+  root only where a mount names it: a session's directory is its own, but an agent's
+  holds its `agent.json`. The mounts are the launch composition's roots — the cwd,
+  the HOME, managed memory, the worktree and secondary-root parents, the `.git`
+  directories — and the runtime-policy and config-file surfaces read-only, as the
+  per-host policy reopened them.
+- **It starts in the host's cwd** (`cwd` in the descriptor), which must be a writable
+  mount. That is where a runtime wrapped alone started, so SRT's own protections are
+  anchored where they were, and the runtime runs there.
+- **The runtime keeps its own sandbox.** Codex's filesystem helper and Claude Code's
+  Bash sandbox wrap each command in a bubblewrap of their own. The SRT policy of an
+  ordinary host sets `allowNestedUserNamespaces`: sandbox-runtime 0.0.81 otherwise
+  forbids a nested user namespace (`--disable-userns`, `user.max_user_namespaces=0`),
+  and the runtime's wrap fails with ENOSPC. That trades SRT's write denies against a
+  hostile command for the runtime's working sandbox; the offline skills helper keeps
+  the denies, as it nests nothing.
+- **The tool bridge dials the host's own tunnel**: the MCP spec follows the host key,
+  a pass's included.
+- **Git and files stay on the host**, as they were for this agent: a runtime wrapped
+  alone could already write its `.git/config`, and `srt` is for trusted work.
+
+### Sharing a machine with its group
+
+`sandbox.share` switches on the executor facet
+([session-executors.md](session-executors.md) §3, §6, §7, §10): this daemon hosts
+`session`-isolated sessions for the other members of its daemon group. It is the
+**machine owner's** consent, so it lives in this machine's config file, is read
+once at start, and is not among the keys `config/push` may set. Off, which is the
+default, the daemon is exactly what it was: no listener, no executor facts at
+registration, no `hostedSessions` on the heartbeat, and a relayed
+`executor/prepare` answered `facet_off`. The code is `execution/executor-facet.ts`
+and `execution/executor-pipe.ts`; `daemon.ts` only wires it.
+
+```json
+{ "sandbox": { "share": true } }
+```
+
+**How much it lends.** `limits.maxConcurrentSessions` is this machine's capacity, and
+holders place each new session where it would be least full for its capacity
+(session-executors.md §6). In a group of unequal machines, size each one in its own
+config file — for example `8`, `2` and `1` — and the larger machine takes the larger
+share; left at the default everywhere, placement is "fewest sessions wins".
+
+**What it lends.** CPU and disk, and — the part that is easy to miss — this
+machine's **runtime sign-in**: a session placed here runs under whatever runtime
+login or API-key configuration this machine has. Each launch that starts the shim
+seeds the session's `home` from it with the local confined tier's own preparers
+(`prepareRuntimeHome`, `prepareSharedRuntimeCredentials`), for every runtime the
+machine admits, because a `prepare` names no runtime: a shared login is linked to
+the machine's own file, other runtimes' small config and credential files are
+copied once, and files already in the session's `home` always win. The seed also
+carries this machine's own values of the provider-key variables a holder strips, for
+the runtimes it admits, from their definitions over its environment as a local launch
+here takes them; the shim fills the seed
+in beneath the holder's environment. An `srt` environment takes the same seed, and
+the shared sign-in it points at becomes one of the boundary's writable roots, so a
+token refresh still works. A `microsandbox` environment seeds
+its own `home` instead, through the local VM's credential step
+([API key protection](#api-key-protection)): the VM starts with this machine's
+recognized keys as placeholder secrets, `home` holds the projected files with
+placeholders, the raw files are neither copied nor mounted, and the shim fills in the
+placeholders and the proxy's CA beneath the holder's environment. An environment key
+no preparer protects, such as an environment-only Claude or Codex key, arrives as its
+value, as it does in a local VM. A runtime whose credentials that step refuses, such
+as for a custom trust bundle or an unsupported endpoint, gets no sign-in in the VM,
+its environment key included, rather than a plain copy. Runtime credentials —
+sign-in and recognized provider keys — are this machine's only: the holder strips
+them from the launch, including one configured as an agent secret, and a runtime this
+machine cannot authenticate answers `authRequired` (session-executors.md §8). The
+agent's other environment and secrets come from the session's holder, over the
+encrypted pipe.
+
+**When the facet is on.** Only when `share` is true, the effective strategy table
+has an available entry, and the listener is bound. It prepares `host`, `srt` and
+`microsandbox`, each only where the table has it available; all three need Linux. A
+machine that shares but can run no strategy, or cannot bind, starts with the facet
+dark and logs why.
+
+**What it opens.** One TCP listener on every interface, on an ephemeral port that
+registration publishes as `capabilities.executor.endpoint`. Nothing fixes the port
+because nothing needs to know it in advance; the cost is that a host firewall
+filtering inbound LAN traffic has no fixed port to allow. The published address is
+the local address the Control Plane connection leaves from, which on a LAN is the
+interface the machine's peers reach it on; a multi-homed machine where that is
+wrong has no override yet. On that port:
+
+- TLS 1.3 with a pre-shared key and no certificate, the suite pinned to
+  `TLS_AES_128_GCM_SHA256` on both ends (a callback-supplied key is bound to
+  SHA-256, so a peer that prefers another suite fails instead of falling back).
+  The PSK identity is the session's leaf. The key is 32 random bytes, minted per
+  launch, held in memory only, returned once in the `prepare` reply the Control
+  Plane relays, and never logged or written to disk.
+- Nothing is served before a handshake succeeds under the key of an environment
+  that is live on this machine. An unknown identity is answered with a key nobody
+  holds, so it fails exactly as a wrong key does and the listener does not reveal
+  which sessions it hosts. A handshake has ten seconds; the sockets waiting for one
+  are capped at twice the session capacity (at least eight) and one more is dropped
+  unread; refusals are logged as a count once a minute, never as an identity, an
+  address or a key.
+- After the handshake the socket is piped byte for byte to that session's shim
+  unix socket, and the facet parses nothing. A `prepare` can therefore only arrive
+  on the Control Plane connection. One pipe per environment: a newly admitted dial
+  closes the one before it.
+
+**Preparing an environment.** A relayed `executor/prepare` reserves a slot against
+`limits.maxConcurrentSessions` — counting preparations in flight and this machine's
+own isolated sessions, and refusing only a `prepare`, never the machine's own
+births — and answers `full` with the live count when it cannot. The request names
+the holder's `launchId` and no number: the facet **allocates** the binding
+generation itself, from the one it last applied, which it keeps on disk beside the
+environment with that launch's id (`<daemonRoot>/sessions/<leaf>.json`, written
+durably before anything else happens) and returns in the `ready` reply:
+
+- _The same `launchId`_ joins the preparation in flight or returns the same reply —
+  the same generation and key, nothing rotated, no pipe closed. Once that launch is
+  gone (the environment stopped for idleness, its shim exited, the daemon restarted,
+  or a `release` is removing it) the answer is `launch_retired`, never a second key.
+- _A new `launchId`_ is a new launch, at one past the last generation applied:
+  `<daemonRoot>/sessions/<leaf>/{workspace,repos,home}` is created or attached, the
+  shim is started if it is not running, a fresh key is minted, and the pipe admitted
+  under the old key is closed. Environment starts are serialized, as VM starts are.
+- _Nothing awaits_ between entering `prepare` and recording the launch, so prepares
+  apply in arrival order — which the Control Plane made authorization order
+  (session-executors.md §6).
+
+An environment is bound to the agent it was created for: a `prepare` that names
+another agent is refused, because the Control Plane vouched only for the agent the
+request names. A strategy the effective table does not have available is
+`strategy_unavailable`, and a draining daemon answers `draining`.
+
+**Idle stop.** An environment with no admitted pipe for sixty seconds — two of the
+holder dialer's capped reconnect delays, so a blip it is still retrying through is
+not read as idle — has its shim stopped. Its slot is freed, its key and cached
+reply are dropped, and its directory and applied generation stay.
+
+**Release.** A holder that retires the session sends `executor/release`, which the
+Control Plane relays here: a launch still inside the launcher is waited for, the shim
+stops, and the environment and its inventory record are removed. It is fenced to the
+`launchId` it names — a session key outlives its launches, so a retransmitted or
+reordered release must not delete what a newer one created — and answers `unknown`
+both for an environment it does not have and for one on another launch, so a resend
+is free. It is deliberately NOT gated by `share` or the group's switch: withdrawn
+consent must still let a holder clean up what it placed.
+
+**Backstop reconcile.** Every ten minutes the facet sweeps its on-disk inventory,
+which is labelled by agent id and session leaf and nothing else. It reads **no
+store**: it discards an environment whose agent the Control Plane's `agent/exists`
+no longer knows, or that neither a `prepare` nor a dial has touched within this
+machine's own workspace retention window (`sessions.workspaceRetention`, never past
+`sessions.retention`; both `never` ⇒ never) — only when it is older
+than ten minutes, has no live shim and no admitted pipe, and was not touched since
+the lookup. Last use is stamped in the record, so a restart does not reset that
+clock. It never judges dirtiness, and it retains everything when the Control Plane
+cannot answer. Lending compute therefore needs nothing but the control connection
+(session-executors.md §7). The sweep also runs with `share` off, so what an earlier
+run left is still collected.
+
+**Shutdown.** Hosted environments join the daemon's existing shutdown drain and
+add no phase: once it starts, `prepare` is refused, environments with a connected
+holder get `limits.shutdownDrainMs`, and then every shim is stopped (which runs its
+marked-process sweep). A machine hosting nothing spends nothing. Directories stay;
+keys die with the process, so a holder's next launch sends a new `prepare`.
+
+**Withdrawing consent.** `share` is read at start. Switched off, the machine is
+nobody's candidate, creates nothing and opens no port, so an environment that
+already exists here cannot be attached either until `share` is on again; it stays
+on disk until its session retires.
+
+## 4. Delivery and acceptance
+
+Delivery is split into independently reviewable steps:
+
+1. **Implemented — SRT configuration and mounts:** add the SRT backend (then
+   selected by the since-removed `sandbox.backend`) and `sandbox.mounts`, remove
+   legacy security roots, and apply mount permissions to SRT and native tools.
+   Existing configuration is converted manually. Preserve the pool and
+   unsandboxed-agent paths.
+2. **Implemented, workload validation pending — minimal microsandbox execution:**
+   explicit image and resources, Linux VM boot/runtime-table/stop-start checks,
+   shim-backed ACP streams, helper tunnels and guest Git, shared host
+   filesystem paths, and retained environment lifecycle. Keep upstream public-only
+   networking and SRT as default.
+3. **Implemented — release image and Docker:** bundle the shared release image
+   reference with explicit override support, and provide Docker/Compose tools
+   and manual startup permissions in the image. Verify actual workloads and
+   lifecycle below.
+4. **Pending — network and workload validation:** verify public egress, denied
+   host/private/peer connectivity, and concurrent sessions using the same guest
+   ports. Complete native-tool, Docker, and lifecycle checks; fix demonstrated
+   gaps without adding network modes or host port publication.
+5. **Pending — performance measurement:** run real projects at increasing session
+   counts. Change the default only after compatibility and resource measurements
+   support it.
+6. **Partly implemented — strategy table and convergence:** the strategy table and the
+   agent's strategy choice ([above](#strategy-table-implemented-on-the-daemon)): the
+   Control Plane half, then the daemon's table, probes, dispatch and refusal (S2a),
+   then the birth strategy and mismatch refusal (S2b), target checks and the image's
+   model probe (S2c), the console picker (S3), local VMs launched through the
+   in-process executor (M4), `srt` as an SRT boundary around the shim on an executor
+   (R1a), confined local `srt` sessions through the in-process executor (R1b-1), and
+   their workspace Git and files over the shim (R1b-2a), and every other `srt` host in
+   an agent-scoped shim (R1b-2b), with no daemon host wrapping a runtime alone
+   (R1b-2c; session-executors.md §5, §11, §12). Local
+   microsandbox Git and workspace files already cross the shim instead of agentd exec.
+
+Implementation status above does not establish successful end-to-end daemon
+execution. Pull requests that reach this path boot one real VM in CI
+(`packages/daemon/scripts/smoke-microsandbox-runtime.mts`): the startup probe, the
+image's ACP runtime answering `initialize` through the shim on a cold, a running
+and a resumed VM, the runtime's user, directory and environment, both helper
+endpoints reached from inside the guest, and daemon-run Git through the shim with
+its workspace-root fence. It submits no model turn and checks no
+network policy. The current VM slice still needs complete-session and lifecycle
+evidence, with the following acceptance checks:
+
+| Area                       | Required evidence                                                                                                                                                                                                                                                           |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Existing behavior          | The default table, a table without `host`, refusal of an unavailable strategy, and Kubernetes execution remain usable. No-KVM behavior is explicit.                                                                                                                         |
+| Mounts                     | SRT accepts equal normalized paths and rejects remapping; read-only is the default and writable mounts reach native tools. Verify nested/duplicate entries, VM guest targets and mount flags, package-cache access, and host-data preservation on retirement.               |
+| Image and complete session | Explicit image preparation, ACP initialize/new/load, output, cancellation, cleanup, and a real native-tool turn succeed. Verify the release image default, explicit overrides, and metadata-free development builds.                                                        |
+| Docker                     | Compose and Testcontainers work, including DNS, random ports, bind mounts, build cache, and cleanup helpers. Two sessions use the same internal ports.                                                                                                                      |
+| Networking                 | Verify public DNS/Git/npm egress, denied host/private/peer connections across applicable IPv4/IPv6 addresses and aliases, and successful same-port listeners in two isolated sessions. Guest loopback and Docker networking must remain usable.                             |
+| Lifecycle                  | Idle stop preserves work/cache; start re-establishes ACP; daemon restart fences old hosts; dirty/unpushed work prevents destructive retirement.                                                                                                                             |
+| Performance                | Measure cold image preparation, warm disk clone, stopped-session restart, ACP-ready latency, and Git/install/build duration. At 1/10/20 sessions, record whole-environment memory, peaks, disk growth, CPU limits, and cleanup. Record reflink versus sparse-copy behavior. |
+
+Keep plain Podman/crun and Docker Sandboxes as labeled comparison arms where
+useful. Compare actual agent sessions before deciding latency or density targets.

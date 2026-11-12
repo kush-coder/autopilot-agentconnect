@@ -1,0 +1,302 @@
+import { execFile } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { z } from 'zod'
+import { MAX_FRAME_BYTES } from '@agentconnect.md/protocol'
+import { existsSync, realpathSync } from 'node:fs'
+import { isAbsolute, join, normalize, resolve, sep } from 'node:path'
+import { applyFileSinkPayload } from './file-sink.js'
+import { DEFAULT_SHIM_PATHS, type ShimPaths } from './sandbox-paths.js'
+import { ClusterSkillHandler } from './skill-handler.js'
+import type { ClusterSkillRequestContext } from './skill-handler.js'
+import type { SkillWriteBackStaging } from './skill-git-writeback.js'
+import { GitExecPayloadSchema, type GitExecResult } from './git-exec.js'
+import type { ShimCapability } from './protocol.js'
+import { applyWorkspaceFilesPayload } from './workspace-files-channel.js'
+import { applyMemoryFsPayload, isMemoryFsPayload } from './memory-fs-channel.js'
+import { srtGitEnv } from './srt-route.js'
+
+export { ALLOWED_GIT_SUBCOMMANDS, ExecRefusedError } from '../workspace/git-command-policy.js'
+import { ExecRefusedError, validateGitArgs } from '../workspace/git-command-policy.js'
+
+/**
+ * Per-stream raw ceiling — a cheap first bound, NOT the authoritative one.
+ *
+ * The result travels as ONE shim frame, and `MAX_FRAME_BYTES` is 256 KiB, so a 32 MiB buffer did
+ * not mean "large results are allowed": it meant a large result was assembled and then dropped
+ * by the transport, taking the channel with it.
+ */
+const MAX_STREAM_BYTES = 64 * 1024
+
+/**
+ * The authoritative bound: the SERIALIZED size, because JSON encoding is not size-preserving.
+ *
+ * `git status -z` emits filenames verbatim, control bytes included, and JSON expands each one to
+ * a six-byte `\uXXXX` escape — so ~57 KB of raw output measured 333 KB serialized, passing a raw
+ * check and then failing the 256 KiB frame. Checking the encoded form is the only check that
+ * corresponds to what the transport will accept. The headroom covers the frame envelope
+ * (correlation id, capability, generation) that wraps this payload.
+ */
+const FRAME_ENVELOPE_HEADROOM_BYTES = 4 * 1024
+const MAX_RESPONSE_BYTES = MAX_FRAME_BYTES - FRAME_ENVELOPE_HEADROOM_BYTES
+
+/** Shell convention for a signalled child, so a killed git is never mistaken for exit 0. */
+const SIGNAL_EXIT_BASE = 128
+const SIGNAL_NUMBERS: Record<string, number> = { SIGTERM: 15, SIGKILL: 9, SIGINT: 2, SIGHUP: 1 }
+
+/** The image's own table generator. It drives each runtime through `initialize` (and a session),
+ *  so the answer is what the runtimes SAY they are, not what a manifest claims. */
+const RUNTIME_TABLE_GENERATOR = '/opt/agentconnect/bin/generate-runtime-table.mjs'
+
+export interface ExecHandlerDeps {
+  /** Root the sandbox permits work inside; a cwd outside it is refused. */
+  workspaceRoot: string
+  /** Ceiling on the caller-supplied deadline, so a hung child cannot pin the channel. */
+  timeoutMs?: number
+  /** Where this shim keeps its staging and finds its bridge; the image's layout unless the entrypoint names another root. */
+  paths?: ShimPaths
+  /** Test seam: the shim's own environment, which SRT sets its bridge in; default `process.env`. */
+  shimEnv?: Record<string, string | undefined>
+  log?: { info: (m: string) => void; warn: (m: string) => void }
+  /** The bundle handler's staging for skill write-back; set only when this shim advertises `skill-git-writeback-v1`. */
+  skillWriteBack?: SkillWriteBackStaging
+}
+
+/** Applied when the caller names no deadline; the ceiling bounds one that is too generous. */
+const DEFAULT_TIMEOUT_MS = 120_000
+const MAX_TIMEOUT_MS = 15 * 60_000
+
+/** Resolve symlinks before comparing: a lexical prefix check passes for `<root>/link` even when
+ *  the link points outside, so containment has to be decided on canonical paths. */
+function canonical(path: string): string {
+  try {
+    return realpathSync(normalize(resolve(path)))
+  } catch {
+    // git needs an existing cwd anyway; refusing here says why instead of leaving git to.
+    throw new ExecRefusedError(`cwd does not resolve: ${path}`)
+  }
+}
+
+/**
+ * Refuse an operand that escapes the workspace root, for a path that does not exist yet.
+ *
+ * Lexical rather than `realpath`, because a clone target is precisely a path that is not there:
+ * containment is decided on the normalized form, and the ROOT is canonicalized so a symlinked mount
+ * still compares correctly. A RELATIVE operand is resolved against the fenced cwd first, the way git
+ * itself resolves it — checking only absolute ones let `../escaped` through the fence untouched.
+ */
+function assertInsideRoot(root: string, cwd: string, requested: string): void {
+  const base = canonical(root)
+  const target = normalize(isAbsolute(requested) ? resolve(requested) : resolve(cwd, requested))
+  if (target !== base && !target.startsWith(base + sep)) {
+    throw new ExecRefusedError(`path escapes the workspace root: ${requested}`)
+  }
+}
+
+/** Refuse a cwd that escapes the workspace root, whatever the daemon asked for. */
+export function resolveCwd(root: string, requested: string | undefined): string {
+  const base = canonical(root)
+  if (!requested) return base
+  if (!isAbsolute(requested)) throw new ExecRefusedError('cwd must be absolute')
+  const target = canonical(requested)
+  if (target !== base && !target.startsWith(base + sep)) {
+    throw new ExecRefusedError('cwd escapes the workspace root')
+  }
+  return target
+}
+
+/**
+ * Serve the shim's non-ACP capabilities inside the sandbox.
+ *
+ * Every check here duplicates one the daemon already made, deliberately. The daemon is the
+ * trusted half and this is the half holding the filesystem: a check that only runs on the far
+ * side of a channel protects nothing on this side.
+ */
+export function createExecHandler(
+  deps: ExecHandlerDeps
+): (
+  capability: ShimCapability,
+  payload: unknown,
+  abort?: AbortSignal,
+  context?: ClusterSkillRequestContext
+) => Promise<unknown> {
+  const paths = deps.paths ?? DEFAULT_SHIM_PATHS
+  // The handler defaults the git credential helper and the agent channel socket; only the log is this caller's.
+  const git = deps.log ? { log: deps.log } : {}
+  const skillHandler = new ClusterSkillHandler({
+    stagingRoot: paths.skillStagingDir,
+    workspaceRoot: deps.workspaceRoot,
+    stateRoot: join(deps.workspaceRoot, '.agentconnect', 'cluster-skill-state'),
+    git,
+    ...(deps.skillWriteBack ? { writeBack: deps.skillWriteBack } : {})
+  })
+  const workspaceSkills = new Map<string, ClusterSkillHandler>()
+  return async (capability, payload, abort, context) => {
+    if (capability === 'materialize') {
+      await applyFileSinkPayload(payload)
+      return null
+    }
+    if (capability === 'exec') return runGit(payload, deps, abort)
+    if (capability === 'probe') return probeRuntimes(deps, abort)
+    if (capability === 'skills') {
+      if (typeof payload !== 'object' || payload === null || !('cwd' in payload)) {
+        return skillHandler.handle(payload, abort, context)
+      }
+      const scoped = z
+        .object({ cwd: z.string().min(1), request: z.unknown() })
+        .strict()
+        .parse(payload)
+      const cwd = resolveCwd(deps.workspaceRoot, scoped.cwd)
+      let handler = workspaceSkills.get(cwd)
+      if (!handler) {
+        handler = new ClusterSkillHandler({
+          stagingRoot: join(paths.skillStagingDir, createHash('sha256').update(cwd).digest('hex')),
+          workspaceRoot: cwd,
+          stateRoot: join(cwd, '.agentconnect', 'cluster-skill-state'),
+          git,
+          ...(deps.skillWriteBack ? { writeBack: deps.skillWriteBack } : {})
+        })
+        workspaceSkills.set(cwd, handler)
+      }
+      return handler.handle(scoped.request, abort, context)
+    }
+    // The console's file operations, run on the mounted volume. The mount is handed over as the
+    // ANCHOR rather than the daemon's root being validated here: the operations walk to it from an
+    // open descriptor, so "is this inside the mount" and "which directory is it" are one question
+    // with one answer instead of two that a rename can separate.
+    if (capability === 'read') {
+      // The managed memory tree rides the same capability: its root is on the same mount, and the
+      // primitives are walked from the same anchor by the same descent.
+      if (isMemoryFsPayload(payload)) return applyMemoryFsPayload(payload, deps.workspaceRoot)
+      return applyWorkspaceFilesPayload(payload, deps.workspaceRoot)
+    }
+    throw new ExecRefusedError(`capability ${capability} is not served by this handler`)
+  }
+}
+
+/**
+ * Ask this image what it provides: the runtimes, and the in-pod MCP bridge beside them.
+ *
+ * Runs the generator rather than reading the table it wrote at build time: the two agree by
+ * construction, but a live answer cannot go stale against the image the way a copy in a ConfigMap
+ * can — and that staleness is silent, because a daemon advertising a version nobody can run looks
+ * exactly like a healthy one.
+ */
+async function probeRuntimes(deps: ExecHandlerDeps, abort?: AbortSignal): Promise<unknown> {
+  return await new Promise((resolvePromise, reject) => {
+    execFile(
+      process.execPath,
+      [RUNTIME_TABLE_GENERATOR, '-'],
+      {
+        cwd: resolveCwd(deps.workspaceRoot, undefined),
+        timeout: deps.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        ...(abort ? { signal: abort } : {}),
+        maxBuffer: MAX_STREAM_BYTES
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(new ExecRefusedError(`runtime probe failed: ${(error as Error).message}`))
+          return
+        }
+        try {
+          const table = JSON.parse(String(stdout)) as Record<string, unknown>
+          // Consulted here rather than assumed there: whether this image ships the bridge, and
+          // which interpreter runs it, are facts of THIS filesystem — and an older image, whose
+          // probe simply reports neither, is the version skew the daemon has to read rather than
+          // guess. `process.execPath` because the daemon must not have to trust the pod's PATH.
+          const bridgeEntry = (deps.paths ?? DEFAULT_SHIM_PATHS).mcpBridgeEntry
+          const bridge = existsSync(bridgeEntry)
+            ? { mcpBridge: { command: process.execPath, args: [bridgeEntry] } }
+            : {}
+          resolvePromise({ ...table, ...bridge })
+        } catch (err) {
+          reject(new ExecRefusedError(`runtime probe produced invalid JSON: ${(err as Error).message}`))
+        }
+      }
+    )
+  })
+}
+
+async function runGit(payload: unknown, deps: ExecHandlerDeps, abort?: AbortSignal): Promise<GitExecResult> {
+  const parsed = GitExecPayloadSchema.parse(payload)
+  validateGitArgs(parsed.args)
+  const [subcommand, ...rest] = parsed.args
+  const cwd = resolveCwd(deps.workspaceRoot, parsed.cwd)
+  // Every non-option operand of clone/worktree is a candidate write path, so each is fenced to the root as Git resolves it.
+  if (subcommand === 'clone' || subcommand === 'worktree') {
+    for (const argument of rest) {
+      if (argument.startsWith('-')) continue
+      assertInsideRoot(deps.workspaceRoot, cwd, argument)
+    }
+  }
+  // The caller's deadline governs, bounded by this side's ceiling so a compromised daemon cannot pin a child here.
+  const timeoutMs = Math.min(parsed.timeoutMs ?? DEFAULT_TIMEOUT_MS, deps.timeoutMs ?? MAX_TIMEOUT_MS)
+  // Inside SRT the holder's empty proxy pins would leave no route out, so they name the boundary's own bridge (session-executors.md §5).
+  const env = srtGitEnv(parsed.env, deps.shimEnv ?? process.env)
+  return await new Promise<GitExecResult>((resolvePromise, reject) => {
+    execFile(
+      'git',
+      parsed.args,
+      {
+        cwd,
+        // The env replaces rather than extends, and is a trusted input that argv filtering does not close (GIT_SSH_COMMAND, GIT_CONFIG_*).
+        ...(env ? { env } : {}),
+        timeout: timeoutMs,
+        // The daemon's abort kills the child here, matching what simple-git's signal does locally.
+        ...(abort ? { signal: abort } : {}),
+        // A killed git leaves index.lock behind, so the timeout is a last resort behind the daemon's abort.
+        killSignal: 'SIGTERM',
+        maxBuffer: MAX_STREAM_BYTES
+      },
+      (error, stdout, stderr) => {
+        const failure = error as (Error & { code?: unknown; signal?: string | null; killed?: boolean }) | null
+        if (failure?.code === 'ABORT_ERR') {
+          // A cancelled child reports neither killed nor a signal, so classify it before it reads as a spawn failure.
+          reject(new ExecRefusedError(`git ${subcommand} was cancelled`))
+          return
+        }
+        if (failure?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+          // Must precede the killed check: Node kills the child on overflow, which would otherwise read as a timeout.
+          reject(
+            new ExecRefusedError(
+              `git ${subcommand} produced more than ${MAX_STREAM_BYTES} bytes on one stream, which does not fit a shim frame`
+            )
+          )
+          return
+        }
+        const deliver = (result: GitExecResult): void => {
+          // Measured on the encoded form, since that is what the transport frames.
+          const serialized = Buffer.byteLength(JSON.stringify(result), 'utf8')
+          if (serialized > MAX_RESPONSE_BYTES) {
+            reject(
+              new ExecRefusedError(
+                `git ${subcommand} result is ${serialized} bytes once encoded, over the ${MAX_RESPONSE_BYTES} a shim frame can carry`
+              )
+            )
+            return
+          }
+          resolvePromise(result)
+        }
+        if (failure && (failure.killed === true || typeof failure.signal === 'string')) {
+          // A signalled child has no exit code; mapping it to 0 made a timed-out `status` read as a clean tree.
+          const signal = failure.signal ?? ''
+          deliver({
+            code: SIGNAL_EXIT_BASE + (SIGNAL_NUMBERS[signal] ?? 0),
+            stdout: String(stdout),
+            stderr: `${String(stderr)}\ngit ${subcommand} was terminated${signal ? ` by ${signal}` : ''} after ${timeoutMs}ms`
+          })
+          return
+        }
+        if (failure && typeof failure.code === 'string') {
+          // Spawn-level failure (git missing, cwd gone), reported distinctly from a git-level exit.
+          reject(new ExecRefusedError(`git could not be run: ${failure.message}`))
+          return
+        }
+        deliver({
+          code: typeof failure?.code === 'number' ? failure.code : 0,
+          stdout: String(stdout),
+          stderr: String(stderr)
+        })
+      }
+    )
+  })
+}

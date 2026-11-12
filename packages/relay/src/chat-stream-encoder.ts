@@ -1,0 +1,230 @@
+// Encoders from one turn's `rd/chat` output to a chat wire protocol; the AI SDK UI message stream is the first (shared-bot-relay.md §10.4).
+import type { AgentApiProtocol, WebchatDone, WebchatOutput } from '@agentconnect.md/protocol'
+
+/** One turn's encoder: each call returns the wire text to write, possibly empty. */
+export interface ChatStreamEncoder {
+  /** The response headers of this protocol. */
+  readonly headers: Readonly<Record<string, string>>
+  /** The stream's opening, written once the turn is admitted. */
+  open(): string
+  output(output: WebchatOutput): string
+  /** The turn's terminal `done`; the stream ends after it. */
+  done(done: WebchatDone): string
+  /** The turn ended without a `done` (the daemon link dropped); the stream ends after it. */
+  fail(message: string): string
+  /** A no-op the client ignores, keeping idle intermediaries from closing a silent turn. */
+  keepalive(): string
+  /** Set once the stream handed the caller a question and ended; the turn waits for the next request's answer. */
+  readonly awaitingCaller?: boolean
+}
+
+/** One chat wire protocol the agent chat API serves: its route, how its request names the conversation and the turn, and its stream. */
+export interface ChatProtocol {
+  /** The API entry an agent adds, and the turn's `origin`. */
+  readonly id: AgentApiProtocol
+  readonly path: string
+  /** How a 400 names the conversation id this protocol's request must carry. */
+  readonly chatIdName: string
+  chatId(body: unknown): string | undefined
+  /** The turn's text, or undefined when the request has no user message with text. */
+  text(body: unknown): string | undefined
+  encoder(turnId: string, body: unknown): ChatStreamEncoder
+  /** The caller's answers to a parked turn's questions, when this protocol hands them out and the request carries some. */
+  answers?(body: unknown): ChatAnswers | undefined
+}
+
+/** One answer to a question the stream handed out: an elicitation's value (null dismisses) or a permission verdict. */
+export type ChatAnswer =
+  { kind: 'elicitation'; requestId: string; value: unknown } | { kind: 'permission'; requestId: string; allow: boolean }
+
+/** A request answering a parked turn: which turn, the last output the caller already has, and its answers. */
+export interface ChatAnswers {
+  turnId: string
+  afterIndex: number
+  answers: ChatAnswer[]
+}
+
+/** The subset of the `ai` package's `UIMessageChunk` this encoder emits; the tests pin it to that type. */
+export type UiMessageChunk =
+  | { type: 'start'; messageId?: string }
+  | { type: 'start-step' }
+  | { type: 'finish-step' }
+  | { type: 'finish'; finishReason?: UiFinishReason }
+  | { type: 'text-start'; id: string }
+  | { type: 'text-delta'; id: string; delta: string }
+  | { type: 'text-end'; id: string }
+  | { type: 'reasoning-start'; id: string }
+  | { type: 'reasoning-delta'; id: string; delta: string }
+  | { type: 'reasoning-end'; id: string }
+  | { type: 'message-metadata'; messageMetadata: { title: string } }
+  | { type: 'error'; errorText: string }
+  | {
+      type: 'tool-input-available'
+      toolCallId: string
+      toolName: string
+      input: unknown
+      dynamic: true
+      providerMetadata: { agentconnect: { turnId: string; index: number } }
+    }
+  | { type: 'tool-approval-request'; approvalId: string; toolCallId: string }
+  | { type: `data-${string}`; id?: string; data: unknown }
+
+export type UiFinishReason = 'stop' | 'length' | 'content-filter' | 'tool-calls' | 'error' | 'other'
+
+// The AI SDK's `UI_MESSAGE_STREAM_HEADERS`, minus `connection`, which the HTTP server owns.
+export const UI_MESSAGE_STREAM_HEADERS: Readonly<Record<string, string>> = {
+  'content-type': 'text/event-stream',
+  'cache-control': 'no-cache',
+  'x-vercel-ai-ui-message-stream': 'v1',
+  'x-accel-buffering': 'no'
+}
+
+/** ACP `stopReason` → the AI SDK finish reason; anything unrecognized is `other`. */
+export function uiFinishReason(stopReason: string | undefined): UiFinishReason {
+  switch (stopReason) {
+    case undefined:
+    case 'end_turn':
+      return 'stop'
+    case 'max_tokens':
+      return 'length'
+    case 'refusal':
+      return 'content-filter'
+    default:
+      return 'other'
+  }
+}
+
+// The dynamic tools a turn's questions arrive as: `addToolOutput` answers the first, `addToolApprovalResponse` the second.
+export const ASK_TOOL_NAME = 'agentconnect_ask'
+export const APPROVAL_TOOL_NAME = 'agentconnect_approval'
+
+const sse = (chunk: UiMessageChunk): string => `data: ${JSON.stringify(chunk)}\n\n`
+const SSE_DONE = 'data: [DONE]\n\n'
+
+/** The AI SDK UI message stream (protocol v1): SSE parts in the §10.4 mapping table. */
+export class UiMessageStreamEncoder implements ChatStreamEncoder {
+  readonly headers = UI_MESSAGE_STREAM_HEADERS
+  private openPart?: { kind: 'text' | 'reasoning'; id: string; segmentId?: string }
+  private partSeq = 0
+  private noticeSeq = 0
+  // A `tool_update` carries only what changed, so each part is rebuilt from the call's last full state.
+  private readonly tools = new Map<string, { toolCallId: string; title: string; status: string }>()
+  awaitingCaller = false
+
+  constructor(private readonly turnId: string) {}
+
+  open(): string {
+    return sse({ type: 'start', messageId: this.turnId }) + sse({ type: 'start-step' })
+  }
+
+  output(output: WebchatOutput): string {
+    const ev = output.event
+    // A status-only snapshot has no part, and a stream that handed out a question has ended.
+    if (!ev || this.awaitingCaller) return ''
+    switch (ev.kind) {
+      case 'message':
+        return this.delta('text', ev.text, ev.segmentId)
+      case 'thinking':
+        return this.delta('reasoning', ev.text)
+      case 'tool_call': {
+        const tool = { toolCallId: ev.toolCallId, title: ev.title, status: ev.status }
+        this.tools.set(ev.toolCallId, tool)
+        return this.close() + sse({ type: 'data-tool', id: ev.toolCallId, data: tool })
+      }
+      case 'tool_update': {
+        const prior = this.tools.get(ev.toolCallId)
+        const tool = { toolCallId: ev.toolCallId, title: ev.title ?? prior?.title ?? '', status: ev.status }
+        this.tools.set(ev.toolCallId, tool)
+        return this.close() + sse({ type: 'data-tool', id: ev.toolCallId, data: tool })
+      }
+      case 'plan':
+        // ACP resends the whole list, so one id replaces the part in place.
+        return this.close() + sse({ type: 'data-plan', id: 'plan', data: { entries: ev.entries } })
+      case 'session_info':
+        return sse({ type: 'message-metadata', messageMetadata: { title: ev.title } })
+      case 'notice':
+        // A wait notice replaces the last one (empty text clears it); a standing one stays.
+        return (
+          this.close() +
+          (ev.standing
+            ? sse({ type: 'data-notice', id: `notice-${++this.noticeSeq}`, data: { text: ev.text, standing: true } })
+            : sse({ type: 'data-notice', id: 'notice', data: { text: ev.text } }))
+        )
+      case 'elicitation': {
+        const { kind: _kind, requestId, ...card } = ev
+        return this.handOut(requestId, ASK_TOOL_NAME, card, output.index)
+      }
+      case 'permission':
+        return this.handOut(ev.requestId, APPROVAL_TOOL_NAME, { tool: ev.tool, detail: ev.detail }, output.index, true)
+      case 'image':
+        // A shared image is announced by caption only; its preview bytes stay on the console surface.
+        return this.close() + sse({ type: 'data-image', id: ev.postId, data: { postId: ev.postId, text: ev.text } })
+      default:
+        return '' // a settled card, MCP App, and `superseded` kinds have no representation here
+    }
+  }
+
+  /** Hand the caller one question as a dynamic tool call and end the stream; the next request's answer resumes the turn. */
+  private handOut(requestId: string, toolName: string, input: unknown, index: number, approval = false): string {
+    this.awaitingCaller = true
+    const call = sse({
+      type: 'tool-input-available',
+      toolCallId: requestId,
+      toolName,
+      input,
+      dynamic: true,
+      providerMetadata: { agentconnect: { turnId: this.turnId, index } }
+    })
+    return (
+      this.close() +
+      call +
+      (approval ? sse({ type: 'tool-approval-request', approvalId: requestId, toolCallId: requestId }) : '') +
+      sse({ type: 'finish-step' }) +
+      sse({ type: 'finish', finishReason: 'tool-calls' }) +
+      SSE_DONE
+    )
+  }
+
+  done(done: WebchatDone): string {
+    if (done.error !== undefined) return this.fail(done.error)
+    return (
+      this.close() +
+      sse({ type: 'finish-step' }) +
+      sse({ type: 'finish', finishReason: uiFinishReason(done.stopReason) }) +
+      SSE_DONE
+    )
+  }
+
+  fail(message: string): string {
+    return this.close() + sse({ type: 'error', errorText: message }) + SSE_DONE
+  }
+
+  keepalive(): string {
+    return ': keepalive\n\n'
+  }
+
+  private delta(kind: 'text' | 'reasoning', text: string, segmentId?: string): string {
+    if (text === '') return ''
+    let out = ''
+    const current = this.openPart
+    if (!current || current.kind !== kind || (segmentId !== undefined && current.segmentId !== segmentId)) {
+      out += this.close()
+      const id = `${kind}-${++this.partSeq}`
+      this.openPart = { kind, id, ...(segmentId !== undefined ? { segmentId } : {}) }
+      out += sse({ type: kind === 'text' ? 'text-start' : 'reasoning-start', id })
+    }
+    const id = this.openPart!.id
+    return (
+      out +
+      sse(kind === 'text' ? { type: 'text-delta', id, delta: text } : { type: 'reasoning-delta', id, delta: text })
+    )
+  }
+
+  /** End the open text or reasoning part, so the next one starts after whatever part comes between. */
+  private close(): string {
+    const current = this.openPart
+    if (!current) return ''
+    this.openPart = undefined
+    return sse({ type: current.kind === 'text' ? 'text-end' : 'reasoning-end', id: current.id })
+  }
+}

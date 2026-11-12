@@ -1,0 +1,208 @@
+import { describe, expect, it } from 'vitest'
+import { z } from 'zod'
+import { SEND_MESSAGE_ACTION_SCHEMAS, TOOL_ARG_SCHEMAS } from '../src/mcp/ops.js'
+import { GITHUB_REVIEW_TOOLS, toolsForIntegrations } from '../src/mcp/tools.js'
+import { CODE_HOST_EFFECT_TOOLS } from '../src/codehost/effect-tools.js'
+import { externalMemoryTools } from '../src/memory/tools.js'
+import { FOLLOW_UP_WATCH_TOOL, PROPOSE_WATCH_TOOL, RECORD_CHECK_WATCH_TOOL } from '../src/mcp/ops/assistant-items.js'
+import { ASSISTANT_REMINDER_TOOLS } from '../src/mcp/ops/assistant-reminders.js'
+import { COORDINATOR_LIST_TASKS_TOOL } from '../src/auto-session/coordinator-prompt.js'
+import { READ_TASK_TOOL, STOP_TASK_TOOL, UPDATE_TASK_TOOL } from '../src/mcp/ops/assistant-subsessions.js'
+import { GETTING_TO_KNOW_TOOL } from '../src/mcp/ops/getting-to-know.js'
+import { CODE_HOST_RESEARCH_TOOLS } from '../src/mcp/ops/code-host-research.js'
+import { CAPABILITY_REQUEST_TOOLS } from '../src/mcp/ops/capability-requests.js'
+import { AGENT_CRON_TOOLS } from '../src/mcp/ops/agent-crons.js'
+import { allPortPlatforms, sessionToolsFor } from '../src/platforms/read-ports.js'
+import type { ToolDescriptor } from '../src/tool-schema/descriptor.js'
+import type { Integration } from '../src/agents/agent-schema.js'
+
+/**
+ * The advertised JSON Schema and the zod validator are two views of ONE tool contract: the
+ * descriptor carries the model-facing prose and the narrowed platform enums, the zod schema
+ * is what the dispatch boundary actually enforces. Nothing derives one from the other, so
+ * this is what keeps them from drifting — a field added to only one side fails here.
+ */
+const slackInt: Integration = {
+  id: 'int-1',
+  platform: 'slack',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { botToken: 'xoxb', appToken: 'xapp' }
+}
+const telegramInt: Integration = {
+  id: 'int-2',
+  platform: 'telegram',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { botToken: '123456:ABC' }
+}
+const qqInt: Integration = {
+  id: 'int-3',
+  platform: 'qq',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { appId: '123456', appSecret: 'secret' }
+}
+const dingTalkInt: Integration = {
+  id: 'int-4',
+  platform: 'dingtalk',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { clientId: 'client-example', clientSecret: 'secret' }
+}
+const weChatInt: Integration = {
+  id: 'int-5',
+  platform: 'wechat',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { botId: 'bot-example@im.bot', botToken: 'secret', boundUserId: 'user-example@im.wechat' }
+}
+
+const weComInt: Integration = {
+  id: 'int-6',
+  platform: 'wecom',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { botId: 'aibot-example', secret: 'secret' }
+}
+
+const ALL_CAPABILITIES = new Set(['recall', 'create', 'get', 'update', 'delete'] as const)
+
+// Port gates open per SESSION platform, so one platform's tool list is not the whole surface:
+// a tool only Telegram declares is advertised only to a Telegram session.
+const advertised: ToolDescriptor[] = [
+  ...toolsForIntegrations([slackInt, telegramInt, qqInt], {
+    organizationKnowledge: true,
+    decisions: true,
+    currentPlatform: 'slack'
+  }),
+  ...toolsForIntegrations([slackInt, telegramInt], {
+    organizationKnowledge: true,
+    decisions: true,
+    currentPlatform: 'telegram'
+  }),
+  ...toolsForIntegrations([dingTalkInt], { organizationKnowledge: true, decisions: true, currentPlatform: 'dingtalk' }),
+  ...toolsForIntegrations([weChatInt], { organizationKnowledge: true, decisions: true, currentPlatform: 'wechat' }),
+  ...toolsForIntegrations([weComInt], { organizationKnowledge: true, decisions: true, currentPlatform: 'wecom' }),
+  ...externalMemoryTools(ALL_CAPABILITIES),
+  ...GITHUB_REVIEW_TOOLS,
+  ...CODE_HOST_EFFECT_TOOLS.map((t) => t.descriptor),
+  ...CODE_HOST_RESEARCH_TOOLS,
+  // The widest form each is advertised in: with `watch`, toward a Control Plane that takes it (assistant-mode.md §5.14).
+  FOLLOW_UP_WATCH_TOOL,
+  GETTING_TO_KNOW_TOOL,
+  RECORD_CHECK_WATCH_TOOL,
+  PROPOSE_WATCH_TOOL,
+  ...ASSISTANT_REMINDER_TOOLS,
+  // A coordinator's listTasks also takes `after` (assistant-mode.md §5.18 ④).
+  COORDINATOR_LIST_TASKS_TOOL,
+  READ_TASK_TOOL,
+  STOP_TASK_TOOL,
+  UPDATE_TASK_TOOL,
+  ...CAPABILITY_REQUEST_TOOLS,
+  ...AGENT_CRON_TOOLS
+]
+
+interface ObjectSchemaView {
+  properties?: Record<string, unknown>
+  required?: string[]
+  oneOf?: ObjectSchemaView[]
+}
+
+const fields = (schema: ObjectSchemaView) => ({
+  properties: Object.keys(schema.properties ?? {}).sort(),
+  required: [...(schema.required ?? [])].sort()
+})
+
+/** The validator's own field view, through zod's JSON Schema projection. */
+const validatorFields = (schema: z.ZodType) =>
+  fields(z.toJSONSchema(schema, { io: 'input', unrepresentable: 'any' }) as ObjectSchemaView)
+
+describe('advertised tool schemas agree with their zod validators', () => {
+  const byName = new Map(advertised.map((tool) => [tool.name, tool]))
+
+  it('advertises every dispatchable tool that takes arguments', () => {
+    const missing = [...TOOL_ARG_SCHEMAS.keys()].filter(
+      // `listChannelAgents` and `submitGithubReview` are dispatch-only aliases.
+      (name) => !byName.has(name) && name !== 'listChannelAgents' && name !== 'submitGithubReview'
+    )
+    expect(missing).toEqual([])
+  })
+
+  it.each([...TOOL_ARG_SCHEMAS.keys()].filter((name) => name !== 'listChannelAgents' && name !== 'submitGithubReview'))(
+    '%s takes exactly the advertised arguments',
+    (name) => {
+      const descriptor = byName.get(name)!
+      const schema = TOOL_ARG_SCHEMAS.get(name)!
+      expect(validatorFields(schema)).toEqual(fields(descriptor.inputSchema as ObjectSchemaView))
+    }
+  )
+
+  it.each(Object.entries(SEND_MESSAGE_ACTION_SCHEMAS))(
+    'sendMessage %s takes only advertised arguments',
+    (_, schema) => {
+      const root = fields(byName.get('sendMessage')!.inputSchema as ObjectSchemaView)
+      const action = validatorFields(schema)
+      expect(action.properties.filter((key) => !root.properties.includes(key))).toEqual([])
+      expect(action.required).toEqual(expect.arrayContaining(root.required))
+    }
+  )
+
+  it('advertises every sendMessage action argument, and requires only action and message', () => {
+    const root = fields(byName.get('sendMessage')!.inputSchema as ObjectSchemaView)
+    const union = new Set(
+      Object.values(SEND_MESSAGE_ACTION_SCHEMAS).flatMap((schema) => validatorFields(schema).properties)
+    )
+    expect(root.properties).toEqual([...union].sort())
+    expect(root.required).toEqual(['action', 'message'])
+  })
+})
+
+describe('platform session tools advertise exactly what their validators take', () => {
+  for (const platform of allPortPlatforms()) {
+    const family = sessionToolsFor(platform)
+    if (!family) continue
+    it.each(family.descriptors.map((d) => d.name))(`${platform}: %s`, (name) => {
+      const descriptor = family.descriptors.find((d) => d.name === name)!
+      const schema = family.argSchemas.get(name)
+      expect(schema, `${name} has no validator`).toBeDefined()
+      expect(validatorFields(schema!)).toEqual(fields(descriptor.inputSchema as ObjectSchemaView))
+    })
+  }
+})

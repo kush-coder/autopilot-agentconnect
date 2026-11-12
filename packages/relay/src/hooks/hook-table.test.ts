@@ -1,0 +1,178 @@
+import { describe, it, expect } from 'vitest'
+import type { RcHookAssign } from '@agentconnect.md/protocol'
+import { HookTable } from './hook-table.js'
+
+const HOOK_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const AGENT = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+const DAEMON = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+
+function rule(overrides: Partial<RcHookAssign> = {}): RcHookAssign {
+  return {
+    hookId: HOOK_A,
+    kind: 'webhook',
+    agentId: AGENT,
+    daemonId: DAEMON,
+    sessionMode: 'perDelivery',
+    webhook: { urlToken: 'wh_tok1' },
+    ...overrides
+  }
+}
+
+describe('HookTable', () => {
+  it('upsert indexes a webhook rule by its urlToken', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    expect(t.getByToken('wh_tok1')?.hookId).toBe(HOOK_A)
+    expect(t.size()).toBe(1)
+  })
+
+  it('upsert is by hookId — a re-assign replaces, not duplicates', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    t.upsert(rule({ sessionMode: 'shared' }))
+    expect(t.size()).toBe(1)
+    expect(t.getByHookId(HOOK_A)?.sessionMode).toBe('shared')
+    expect(t.getByToken('wh_tok1')?.sessionMode).toBe('shared')
+  })
+
+  it('a token change re-indexes: the old token stops resolving', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    t.upsert(rule({ webhook: { urlToken: 'wh_tok2' } }))
+    expect(t.getByToken('wh_tok1')).toBeUndefined()
+    expect(t.getByToken('wh_tok2')?.hookId).toBe(HOOK_A)
+  })
+
+  it('remove drops both indexes', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    t.remove(HOOK_A)
+    expect(t.getByToken('wh_tok1')).toBeUndefined()
+    expect(t.size()).toBe(0)
+  })
+
+  it('remove of an unknown hookId is a no-op', () => {
+    const t = new HookTable()
+    expect(() => t.remove(HOOK_A)).not.toThrow()
+  })
+
+  describe('code-host repository index', () => {
+    const HOOK_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+    const gh = (repoId: string, hookId = HOOK_A): RcHookAssign =>
+      rule({
+        hookId,
+        kind: 'github',
+        sessionMode: 'perThread',
+        webhook: undefined,
+        github: {
+          repoId,
+          repoFullName: 'acme/infra',
+          events: ['issues:opened'],
+          labelFilter: [],
+          mentionOnly: false,
+          installationIds: ['41']
+        }
+      })
+    const gl = (projectId: string, hookId = HOOK_A): RcHookAssign =>
+      rule({
+        hookId,
+        kind: 'gitlab',
+        sessionMode: 'perThread',
+        webhook: undefined,
+        gitlab: {
+          projectId,
+          projectPath: 'acme/infra',
+          sessionKeyPrefix: `gitlab:${projectId}`,
+          events: ['issues:opened'],
+          mentionOnly: false,
+          serviceAccountUserId: '7',
+          serviceAccountUsername: 'acme-agent',
+          signingToken: 'whsec_test'
+        }
+      })
+
+    it('indexes a github rule by its repository; one repo carries many hooks', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(gh('100', HOOK_B))
+      expect(
+        t
+          .getByCodeHostRepo('github', '100')
+          .map((r) => r.hookId)
+          .sort()
+      ).toEqual([HOOK_A, HOOK_B])
+      expect(t.getByCodeHostRepo('github', '999')).toEqual([])
+    })
+
+    it('a repository change re-indexes: the old repository stops resolving', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(gh('200'))
+      expect(t.getByCodeHostRepo('github', '100')).toEqual([])
+      expect(t.getByCodeHostRepo('github', '200')[0]?.hookId).toBe(HOOK_A)
+    })
+
+    it('a kind flip github→webhook clears the repo index (and vice versa the token index)', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(rule()) // same hookId, back to webhook kind
+      expect(t.getByCodeHostRepo('github', '100')).toEqual([])
+      expect(t.getByToken('wh_tok1')?.hookId).toBe(HOOK_A)
+      t.upsert(gh('100'))
+      expect(t.getByToken('wh_tok1')).toBeUndefined()
+      expect(t.getByCodeHostRepo('github', '100')).toHaveLength(1)
+    })
+
+    it('remove drops only that hook from the repo bucket', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(gh('100', HOOK_B))
+      t.remove(HOOK_A)
+      expect(t.getByCodeHostRepo('github', '100').map((r) => r.hookId)).toEqual([HOOK_B])
+      t.remove(HOOK_B)
+      expect(t.getByCodeHostRepo('github', '100')).toEqual([])
+    })
+
+    it('qualifies the key by provider: two hosts may carry the same numeric id', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(gl('100', HOOK_B))
+      expect(t.getByCodeHostRepo('github', '100').map((r) => r.hookId)).toEqual([HOOK_A])
+      expect(t.getByCodeHostRepo('gitlab', '100').map((r) => r.hookId)).toEqual([HOOK_B])
+    })
+
+    it('a provider flip moves the rule between keys instead of leaving both resolving', () => {
+      const t = new HookTable()
+      t.upsert(gh('100'))
+      t.upsert(gl('100'))
+      expect(t.getByCodeHostRepo('github', '100')).toEqual([])
+      expect(t.getByCodeHostRepo('gitlab', '100')[0]?.hookId).toBe(HOOK_A)
+    })
+  })
+})
+
+describe('HookTable — reconnect snapshot', () => {
+  const SNAP = '33333333-3333-4333-8333-333333333333'
+  const HOOK_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+
+  it('removes a hook deleted while the link was down, token index included', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    t.upsert(rule({ hookId: HOOK_B, webhook: { urlToken: 'wh_gone' } }))
+    t.beginSnapshot(SNAP)
+    expect(t.getByToken('wh_gone')?.hookId).toBe(HOOK_B)
+    t.upsert(rule())
+    t.endSnapshot(SNAP, [])
+    expect(t.getByToken('wh_tok1')?.hookId).toBe(HOOK_A)
+    expect(t.getByToken('wh_gone')).toBeUndefined()
+    expect(t.getByHookId(HOOK_B)).toBeUndefined()
+  })
+
+  it('keeps a hook the CP withheld because it failed to compile it', () => {
+    const t = new HookTable()
+    t.upsert(rule())
+    t.beginSnapshot(SNAP)
+    t.endSnapshot(SNAP, [HOOK_A])
+    expect(t.getByToken('wh_tok1')?.hookId).toBe(HOOK_A)
+  })
+})

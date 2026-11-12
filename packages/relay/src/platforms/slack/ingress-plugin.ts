@@ -1,0 +1,530 @@
+/**
+ * Slack's **relay ingress plugin** (§8, stage S3) — the first implementer of
+ * the #560 contract. What moved here from `relay-ingress-manager.ts`:
+ *
+ *  - the `assign()` fork's Slack arm: credential-shape validation + the
+ *    `SlackHttpIngest` construction, with every ingest callback now wired to
+ *    the platform-free {@link RelayIngressHost} instead of manager privates;
+ *  - the two interaction forwarders (`forwardSessionAction` /
+ *    `forwardSessionShortcut`) — platform-named parallel functions the audit
+ *    flagged as "a switch expressed as duplicated call sites" — including
+ *    their dedup-id minting (§8: the plugin mints the dedup id, core owns the
+ *    table);
+ *  - the verify/handle pair, delegating to the SAME primitives the manager's
+ *    `resolveVerified` ladder uses today (`verifySlackSignature`, the ingest's
+ *    `handleEvent`/`handleInteraction`), so the staged route adoption cannot
+ *    diverge from the live path.
+ *
+ * The module's other halves sit beside this file: the ingest class in
+ * `http-ingest.ts`, the shared HTTP Events API routes in `http-ingress.ts`.
+ */
+import { createHash } from 'node:crypto'
+import type { RdMsgPlatformAction } from '@agentconnect.md/protocol'
+import { slackEnvelopeExternallyShared } from '@agentconnect.md/message'
+import {
+  SlackHttpIngest,
+  type HttpSlackSessionAction,
+  type HttpSlackSessionShortcut,
+  type HttpSlackSessionStop,
+  type HttpSlackAppHomeOpened,
+  type HttpSlackAssistantThreadStarted,
+  type HttpSlackBotJoined,
+  type HttpSlackMemberJoined,
+  type SlackInteractiveBody,
+  type SlackMessageEvent
+} from './http-ingest.js'
+import { registerSlackHttpIngress } from './http-ingress.js'
+import { verifySlackSignature } from '../../hooks/signature.js'
+import { sessionKeyOf } from '../../bot-arbitration.js'
+import type { BotAssignment, RouteTarget } from '../../bot-arbitration.js'
+import type { DemuxHints, HandledDelivery, RelayIngressHost, RelayPlatformIngressPlugin } from '../contract.js'
+
+/** Stable daemon-side dedup id for one Slack interaction. The hash deliberately omits
+ *  open-config's one-shot triggerId (interactionId already identifies that click), so
+ *  sensitive trigger material never leaks into logs or dedup keys. */
+export function httpSlackActionMsgId(botId: string, action: HttpSlackSessionAction): string {
+  const { target, interactionId, kind } = action
+  let value: string | boolean | undefined
+  switch (action.kind) {
+    case 'set-model':
+      value = action.model
+      break
+    case 'set-effort':
+      value = action.effort
+      break
+    case 'set-permission-mode':
+      value = action.permissionMode
+      break
+    case 'set-fast':
+      value = action.fastMode
+      break
+    case 'set-output':
+      value = action.outputMode
+      break
+    case 'permission-choice':
+      value = `${action.requestId}:${action.optionId}`
+      break
+    case 'elicitation-choice':
+      value = `${action.requestId}:${action.value ?? ''}`
+      break
+    // The confirmed fields are part of the identity: two Confirms on one card are two answers,
+    // and a redelivery of either must dedup against itself rather than against the other.
+    case 'elicitation-confirm':
+      value = `${action.requestId}:${JSON.stringify(action.fields)}`
+      break
+    case 'open-config':
+    case 'cancel':
+      break
+  }
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify({
+        v: 1,
+        botId,
+        target: [target.v, target.agentId, target.integrationId, target.sessionKey],
+        interactionId,
+        kind,
+        value
+      })
+    )
+    .digest('hex')
+  return `slack-action:${digest}`
+}
+
+export function httpSlackShortcutMsgId(botId: string, shortcut: HttpSlackSessionShortcut): string {
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify({
+        v: 1,
+        botId,
+        channelId: shortcut.channelId,
+        threadTs: shortcut.threadTs,
+        interactionId: shortcut.interactionId
+      })
+    )
+    .digest('hex')
+  return `slack-action:${digest}`
+}
+
+/** Stable daemon-side dedup id for one native agent-session Stop. `kind` keeps it distinct
+ *  from a shortcut that happened to reuse the same conversation + receipt. */
+export function httpSlackStopMsgId(botId: string, stop: HttpSlackSessionStop): string {
+  const digest = createHash('sha256')
+    .update(
+      JSON.stringify({
+        v: 1,
+        botId,
+        kind: 'agent-session-stopped',
+        channelId: stop.channelId,
+        threadTs: stop.threadTs,
+        interactionId: stop.interactionId
+      })
+    )
+    .digest('hex')
+  return `slack-action:${digest}`
+}
+
+/** Forward an HTTP Slack status-modal action to the exact agent that rendered
+ *  the button. This intentionally does not use channel ownership: the operator
+ *  may click an older Bob session after switching the channel default to Alice.
+ *  Exact-pair validation and delivery both live in the host. */
+export function forwardSessionAction(host: RelayIngressHost, botId: string, action: HttpSlackSessionAction): void {
+  const { target, interactionId: _interactionId, userId, ...payload } = action
+  const route = host.directory.targetForAgent(botId, target.agentId, target.integrationId)
+  if (!route) {
+    host.log.warn(`relay-ingress(${botId}): ignored stale session action for agent ${target.agentId}`)
+    return
+  }
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: target.sessionKey,
+    msgId: httpSlackActionMsgId(botId, action),
+    botId,
+    ...(userId ? { userId } : {}),
+    payload
+  }
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted)
+        host.log.warn(`relay-ingress(${botId}): daemon rejected session action (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) => host.log.warn(`relay-ingress(${botId}): session action forward failed: ${(err as Error).message}`))
+}
+
+/** Resolve a message shortcut from live conversation ownership (the core-owned
+ *  affinity → owner → default ladder behind `directory.resolveTarget`), then
+ *  let the daemon resolve the exact bot-scoped session before it opens the
+ *  modal. False ⇒ the caller opens a local unavailable modal while the one-shot
+ *  trigger id is still valid. */
+export function forwardSessionShortcut(
+  host: RelayIngressHost,
+  botId: string,
+  shortcut: HttpSlackSessionShortcut
+): boolean {
+  const route = host.directory.resolveTarget(botId, { channelId: shortcut.channelId, threadTs: shortcut.threadTs })
+  // A shortcut's trigger id is one-shot: returning true here CONSUMES it, so
+  // delivery must be possible NOW — an offline daemon falls back to the local
+  // unavailable modal exactly as an unroutable conversation does.
+  if (!route || !host.canDeliver(route)) return false
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: sessionKeyOf({ channel: shortcut.channelId, thread: shortcut.threadTs }),
+    msgId: httpSlackShortcutMsgId(botId, shortcut),
+    botId,
+    ...(shortcut.userId ? { userId: shortcut.userId } : {}),
+    payload: {
+      kind: 'open-config-for-thread',
+      triggerId: shortcut.triggerId,
+      channelId: shortcut.channelId,
+      threadTs: shortcut.threadTs
+    }
+  }
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted)
+        host.log.warn(`relay-ingress(${botId}): daemon rejected session shortcut (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) =>
+      host.log.warn(`relay-ingress(${botId}): session shortcut forward failed: ${(err as Error).message}`)
+    )
+  return true
+}
+
+/** Forward the native Stop to EVERY conversation participant's daemon, not one arbitrated
+ *  owner: Slack's session-level Stop means "stop all in-progress work for this thread", and a
+ *  shared bot's participants may span daemons while Slack sees one calling agent. One frame
+ *  per daemon suffices — the receiving daemon interrupts all of ITS thread sessions. Nothing
+ *  is returned to Slack, so an unroutable or offline target is bounded loss like any other
+ *  forwarded event. */
+export function forwardSessionStop(host: RelayIngressHost, botId: string, stop: HttpSlackSessionStop): void {
+  const coords = { channelId: stop.channelId, threadTs: stop.threadTs }
+  const primary = host.directory.resolveTarget(botId, coords)
+  const routes = new Map<string, RouteTarget>()
+  for (const route of [...(primary ? [primary] : []), ...host.directory.conversationParticipants(botId, coords)])
+    if (!routes.has(route.daemonId)) routes.set(route.daemonId, route)
+  if (routes.size === 0) {
+    host.log.warn(`relay-ingress(${botId}): no participant for the agent-session stop in ${stop.channelId}`)
+    return
+  }
+  for (const route of routes.values()) {
+    const rd: RdMsgPlatformAction = {
+      source: 'platform_action',
+      platformId: 'slack',
+      agentId: route.agentId,
+      integrationId: route.integrationId,
+      sessionKey: sessionKeyOf({ channel: stop.channelId, thread: stop.threadTs }),
+      msgId: httpSlackStopMsgId(botId, stop),
+      botId,
+      ...(stop.userId ? { userId: stop.userId } : {}),
+      payload: {
+        kind: 'agent-session-stopped',
+        channelId: stop.channelId,
+        threadTs: stop.threadTs,
+        ...(stop.archived ? { archived: true as const } : {})
+      }
+    }
+    void host
+      .forwardAction(rd, route)
+      .then((ack) => {
+        if (!ack.accepted)
+          host.log.warn(`relay-ingress(${botId}): daemon rejected the agent-session stop (${ack.reason ?? 'unknown'})`)
+      })
+      .catch((err) =>
+        host.log.warn(`relay-ingress(${botId}): agent-session stop forward failed: ${(err as Error).message}`)
+      )
+  }
+}
+
+// Opening Messages addresses its current owner, without reusing an older thread's affinity.
+export function forwardAppHomeOpened(host: RelayIngressHost, botId: string, opened: HttpSlackAppHomeOpened): void {
+  const route = host.directory.resolveTarget(botId, { channelId: opened.channelId })
+  if (!route) return
+  const digest = createHash('sha256')
+    .update(JSON.stringify([botId, 'app-home-opened', opened]))
+    .digest('hex')
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: sessionKeyOf({ channel: opened.channelId }),
+    msgId: `slack-action:${digest}`,
+    botId,
+    userId: opened.userId,
+    payload: { kind: 'app-home-opened', channelId: opened.channelId }
+  }
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted) host.log.warn(`relay-ingress(${botId}): daemon rejected app home (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) => host.log.warn(`relay-ingress(${botId}): app home forward failed: ${(err as Error).message}`))
+}
+
+// An Assistant "new chat" addresses the DM's current owner, whose daemon decides whether the DM appends.
+export function forwardAssistantThreadStarted(
+  host: RelayIngressHost,
+  botId: string,
+  started: HttpSlackAssistantThreadStarted
+): void {
+  const route = host.directory.resolveTarget(botId, { channelId: started.channelId })
+  if (!route) return
+  const digest = createHash('sha256')
+    .update(JSON.stringify([botId, 'assistant-thread-started', started]))
+    .digest('hex')
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: sessionKeyOf({ channel: started.channelId }),
+    msgId: `slack-action:${digest}`,
+    botId,
+    ...(started.userId ? { userId: started.userId } : {}),
+    payload: { kind: 'assistant-thread-started', channelId: started.channelId, threadTs: started.threadTs }
+  }
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted)
+        host.log.warn(`relay-ingress(${botId}): daemon rejected the new assistant thread (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) =>
+      host.log.warn(`relay-ingress(${botId}): new assistant thread forward failed: ${(err as Error).message}`)
+    )
+}
+
+// Another member's join goes to the channel's owning daemon, which looks them up for every agent (assistant-mode.md §5.3).
+/** The bot's own join reaches the channel's owning daemon, which may take a getting-to-know task (assistant-mode.md §5.13). */
+export function forwardBotJoined(host: RelayIngressHost, botId: string, joined: HttpSlackBotJoined): void {
+  const route = host.directory.resolveTarget(botId, { channelId: joined.channelId })
+  if (!route) return
+  const digest = createHash('sha256')
+    .update(JSON.stringify([botId, 'bot-joined', joined]))
+    .digest('hex')
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: sessionKeyOf({ channel: joined.channelId }),
+    msgId: `slack-action:${digest}`,
+    botId,
+    ...(joined.inviter ? { userId: joined.inviter } : {}),
+    payload: {
+      kind: 'bot-joined',
+      channelId: joined.channelId,
+      ...(joined.inviter ? { inviter: joined.inviter } : {})
+    }
+  }
+  // A daemon predating the action refuses it as unsupported, which costs only the getting-to-know task.
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted)
+        host.log.debug(`relay-ingress(${botId}): daemon declined the bot's join (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) => host.log.warn(`relay-ingress(${botId}): bot join forward failed: ${(err as Error).message}`))
+}
+
+export function forwardMemberJoined(host: RelayIngressHost, botId: string, joined: HttpSlackMemberJoined): void {
+  const route = host.directory.resolveTarget(botId, { channelId: joined.channelId })
+  if (!route) return
+  const digest = createHash('sha256')
+    .update(JSON.stringify([botId, 'member-joined', joined]))
+    .digest('hex')
+  const rd: RdMsgPlatformAction = {
+    source: 'platform_action',
+    platformId: 'slack',
+    agentId: route.agentId,
+    integrationId: route.integrationId,
+    sessionKey: sessionKeyOf({ channel: joined.channelId }),
+    msgId: `slack-action:${digest}`,
+    botId,
+    userId: joined.userId,
+    payload: {
+      kind: 'member-joined',
+      channelId: joined.channelId,
+      userId: joined.userId,
+      ...(joined.externallyShared ? { externallyShared: true } : {})
+    }
+  }
+  // A daemon predating the action refuses it as unsupported, which costs only the detection.
+  void host
+    .forwardAction(rd, route)
+    .then((ack) => {
+      if (!ack.accepted)
+        host.log.debug(`relay-ingress(${botId}): daemon declined a member join (${ack.reason ?? 'unknown'})`)
+    })
+    .catch((err) => host.log.warn(`relay-ingress(${botId}): member join forward failed: ${(err as Error).message}`))
+}
+
+/** The plugin's typed verified product: one authenticated Slack delivery as the two HTTP routes parse it; opaque to core (§8). */
+export type SlackVerifiedDelivery =
+  | {
+      kind: 'event'
+      event?: SlackMessageEvent
+      eventAtMs?: number
+      dedupKey?: string
+      eventId?: string
+      /** The envelope's `is_ext_shared_channel` (assistant-mode.md §5.3). */
+      externallyShared?: boolean
+    }
+  | { kind: 'interaction'; body: SlackInteractiveBody }
+
+function headerString(v: string | string[] | undefined): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+export const slackIngressPlugin: RelayPlatformIngressPlugin<SlackHttpIngest, SlackVerifiedDelivery> = {
+  platformId: 'slack',
+
+  // `POST /slack/events` + `POST /slack/interactions`, declared by the module
+  // that owns them — the bootstrap no longer imports this by name (audit F5).
+  installRoutes: registerSlackHttpIngress,
+
+  buildIngest(a: BotAssignment, host: RelayIngressHost): SlackHttpIngest | undefined {
+    if (!('botToken' in a.secrets)) {
+      host.log.warn(`relay-ingress(${a.botId}): incomplete Slack HTTP assignment`)
+      return undefined
+    }
+    const botId = a.botId
+    return new SlackHttpIngest(
+      botId,
+      { botToken: a.secrets.botToken, signingSecret: a.secrets.signingSecret },
+      {
+        onMessage: (msg, sidecar) => host.forward(botId, msg, sidecar),
+        onBotUserId: (uid) => host.reportBotUserId(botId, uid),
+        onChannelsChanged: (channels) => {
+          if (!a.claimUrl) host.reportChannels({ botId, channels })
+        },
+        agents: () => host.directory.agents(botId),
+        currentOwner: (channelId) => host.directory.channelOwner(botId, channelId),
+        onSetChannelAgent: (channelId, agentId) => host.setChannelAgent(botId, channelId, agentId),
+        onSelectThreadAgent: (channelId, threadTs, agentId) =>
+          host.selectThreadAgent(botId, channelId, threadTs, agentId),
+        onSessionAction: (action) => forwardSessionAction(host, botId, action),
+        onSessionShortcut: (shortcut) => forwardSessionShortcut(host, botId, shortcut),
+        onSessionStopped: (stop) => forwardSessionStop(host, botId, stop),
+        onAppHomeOpened: (opened) => forwardAppHomeOpened(host, botId, opened),
+        onAssistantThreadStarted: (started) => forwardAssistantThreadStarted(host, botId, started),
+        onMemberJoined: (joined) => forwardMemberJoined(host, botId, joined),
+        onBotJoined: (joined) => forwardBotJoined(host, botId, joined),
+        appHomeContext: (channelId) => ({
+          webAppUrl: host.webAppUrl(),
+          orgSlug: a.orgSlug,
+          connectUrl: a.claimUrl,
+          ...(a.installerUserId ? { installerUserId: a.installerUserId } : {}),
+          ...(a.installedAgentIds ? { connected: a.installedAgentIds.length > 0, botId } : {}),
+          agentId:
+            (channelId ? host.directory.resolveTarget(botId, { channelId }) : undefined)?.agentId ??
+            (a.installedAgentIds
+              ? a.installedAgentIds.length === 1
+                ? a.installedAgentIds[0]
+                : undefined
+              : host.directory.soleTarget(botId)?.agentId)
+        }),
+        onBotRevoked: (reason, proof) => {
+          host.log.warn(`relay-ingress(${botId}): workspace revoked the app (${reason})`)
+          // Fence with the generation THIS ingest was built from, so a late probe of an older ingest cannot revoke its replacement.
+          host.reportRevoked(botId, { reason, ...proof }, a.credentialRevision)
+        },
+        onCredentialCheck: (check) => {
+          const observedAtMs = host.clock.now()
+          if (check.result === 'ok') {
+            host.reportCredentialCheck(botId, { result: 'ok', observedAtMs }, a.credentialRevision)
+            return
+          }
+          // A CP without credential checks cannot mark a rejection, so it gets the revocation it always did.
+          if (!host.credentialCheckSupported()) {
+            host.log.warn(`relay-ingress(${botId}): Slack rejected the token (${check.code}) — reporting revocation`)
+            host.reportRevoked(
+              botId,
+              { reason: 'tokens_revoked', evidence: 'probe', code: check.code },
+              a.credentialRevision
+            )
+            return
+          }
+          host.log.warn(`relay-ingress(${botId}): Slack rejected the token (${check.code}) — marking it, not revoking`)
+          host.reportCredentialCheck(
+            botId,
+            { result: 'rejected', code: check.code, observedAtMs },
+            a.credentialRevision
+          )
+        },
+        log: host.log
+      }
+    )
+  },
+
+  extractDemuxHints(_rawBody: Buffer, body: unknown, _headers): DemuxHints {
+    // Events carry the ids at the envelope top level; interactions nest the
+    // team id under `team.id`. Both are pre-verify HINTS only.
+    const b = body as { api_app_id?: string; team_id?: string; team?: { id?: string } } | undefined
+    return {
+      ...(b?.api_app_id ? { appId: b.api_app_id } : {}),
+      ...((b?.team_id ?? b?.team?.id) ? { tenantId: b?.team_id ?? b?.team?.id } : {})
+    }
+  },
+
+  verify(ingest, rawBody, body, headers, now): SlackVerifiedDelivery | undefined {
+    const signature = headerString(headers['x-slack-signature'])
+    const timestamp = headerString(headers['x-slack-request-timestamp'])
+    if (!verifySlackSignature(ingest.signingSecret, timestamp, rawBody, signature, now)) return undefined
+    const b = body as
+      { type?: string; event?: SlackMessageEvent; event_time?: number } | SlackInteractiveBody | undefined
+    // POSITIVE discrimination: an Events API envelope is exactly
+    // `type === 'event_callback'` (url_verification never reaches verify — the
+    // route answers it pre-candidate). Everything else on this seam is an
+    // interaction payload, pre-extracted from the urlencoded `payload=` field
+    // by the route.
+    if (b && typeof b === 'object' && (b as { type?: string }).type !== 'event_callback')
+      return { kind: 'interaction', body: b as SlackInteractiveBody }
+    const env = b as
+      | { event?: SlackMessageEvent; event_time?: number; event_id?: string; api_app_id?: string; team_id?: string }
+      | undefined
+    // The dedup identity is the (api_app_id, team_id, event_id) composite: a
+    // retry for one app/install reuses it, while one Slack message delivered to
+    // several explicitly mentioned apps must reach each of their agents.
+    const dedupKey = env?.event_id ? `${env.api_app_id ?? ''}\0${env.team_id ?? ''}\0${env.event_id}` : undefined
+    return {
+      kind: 'event',
+      ...(env?.event ? { event: env.event } : {}),
+      ...(env?.event_time ? { eventAtMs: env.event_time * 1000 } : {}),
+      ...(dedupKey ? { dedupKey } : {}),
+      // The per-delivery receipt a redelivery reuses — the daemon-side dedup id of a
+      // forwarded non-chat event is minted from it.
+      ...(env?.event_id ? { eventId: env.event_id } : {}),
+      ...(slackEnvelopeExternallyShared(env) ? { externallyShared: true } : {})
+    }
+  },
+
+  async handle(ingest, verified, host): Promise<HandledDelivery> {
+    if (verified.kind === 'interaction') {
+      // block_suggestion needs its options ON the 200 body; every other branch
+      // resolves to '' — the same contract the interactions route holds today.
+      const result = await ingest.handleInteraction(verified.body)
+      return { syncResponse: result ?? '' }
+    }
+    // Plugin-minted identity, core-owned table (§8): a settled repeat answers 200, an unsettled one is handled again.
+    if (host.dedupPeek(verified.dedupKey)) return {}
+    const outcome = await ingest.handleEvent(
+      verified.event,
+      verified.eventAtMs,
+      verified.eventId,
+      verified.externallyShared === true
+    )
+    // No daemon took the message, so it stays unmarked and the route asks Slack to redeliver it.
+    if (outcome === 'retry') return { admission: { disposition: 'retry' } }
+    host.dedupMark(verified.dedupKey)
+    return {}
+  }
+}

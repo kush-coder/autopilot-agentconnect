@@ -1,0 +1,142 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { prisma } from '../setup.db.js'
+import { buildHttpApp, type HttpApp } from '../fakes/build-http.js'
+import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import { AgentId, BotId, IntegrationId, OrgId } from '../../src/domain/ids.js'
+import type { IconStore } from '../../src/icons/icon-store.js'
+import type { BotProfileIconAgent } from '../../src/http/bot-profile-icon.js'
+
+const ORG = `/api/v1/orgs/${DEFAULT_ORG_ID}`
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4////fwAJ+wP9CNHoHgAAAABJRU5ErkJggg==',
+  'base64'
+)
+
+let running: HttpApp | undefined
+
+afterEach(async () => {
+  await running?.close()
+  running = undefined
+})
+
+describe('Agent icon bot profile fan-out', () => {
+  it('syncs dedicated Telegram/Discord/Feishu bots only when the Agent icon changes', async () => {
+    const store: IconStore = {
+      put: vi.fn(async () => undefined),
+      get: vi.fn(async () => null),
+      delete: vi.fn(async () => undefined),
+      publicUrl: vi.fn((key, version) => `https://images.example.test/${key}?v=${version}`)
+    }
+    const telegramSync = vi.fn(async (_botToken: string, _agent: BotProfileIconAgent) => {})
+    const discordSync = vi.fn(async (_botToken: string, _agent: BotProfileIconAgent) => {})
+    const feishuSync = vi.fn(
+      async (_appId: string, _appSecret: string, _region: 'feishu' | 'lark', _agent: BotProfileIconAgent) => {}
+    )
+    const waitForSyncedIcon = async (icon: unknown) => {
+      let previousCallCounts: number[] | undefined
+      await vi.waitFor(() => {
+        const callCounts = [telegramSync.mock.calls.length, discordSync.mock.calls.length, feishuSync.mock.calls.length]
+        const lastCallCounts = previousCallCounts
+        previousCallCounts = callCounts
+        expect(telegramSync.mock.calls.at(-1)?.[1].icon).toEqual(icon)
+        expect(discordSync.mock.calls.at(-1)?.[1].icon).toEqual(icon)
+        expect(feishuSync.mock.calls.at(-1)?.[3].icon).toEqual(icon)
+
+        // Each route starts a detached latest-wins sync. A preceding sync may
+        // observe the newer icon and retry, so wait for a quiet window instead
+        // of treating those valid repair calls as duplicates.
+        expect(callCounts).toEqual(lastCallCounts)
+      })
+    }
+    running = buildHttpApp(prisma, { S3_PUBLIC_BASE_URL: 'https://images.example.test' }, undefined, undefined, {
+      iconStore: store,
+      syncTelegramBotIcon: telegramSync,
+      syncDiscordBotProfile: discordSync,
+      syncFeishuAppIcon: feishuSync
+    })
+
+    const create = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/agents`,
+      payload: { name: 'profile-sync', runtime: 'codex' }
+    })
+    expect(create.statusCode).toBe(201)
+    const agentId = AgentId((create.json() as { id: string }).id)
+    const orgId = OrgId(DEFAULT_ORG_ID)
+
+    for (const [platform, token] of [
+      ['telegram', 'telegram-token'],
+      ['discord', 'discord-token'],
+      ['feishu', 'feishu-secret']
+    ] as const) {
+      const botId = BotId(randomUUID())
+      await running.deps.repos.bot.create({
+        id: botId,
+        orgId,
+        platform,
+        name: `${platform}-bot`,
+        ...(platform === 'feishu' ? { feishuAppId: 'cli_feishu', feishuRegion: 'lark' } : {})
+      })
+      await running.deps.repos.botSecret.put(OrgId(DEFAULT_ORG_ID), botId, {
+        botToken: token,
+        appToken: platform === 'feishu' ? 'cli_feishu' : null,
+        signingSecret: null
+      })
+      await running.deps.repos.integration.create({
+        id: IntegrationId(randomUUID()),
+        orgId,
+        agentId,
+        botId,
+        platform,
+        name: `${platform}-bot`
+      })
+    }
+
+    const ordinaryEdit = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/agents/${agentId}`,
+      payload: { description: 'ordinary edit' }
+    })
+    expect(ordinaryEdit.statusCode).toBe(200)
+    expect(telegramSync).not.toHaveBeenCalled()
+    expect(discordSync).not.toHaveBeenCalled()
+    expect(feishuSync).not.toHaveBeenCalled()
+
+    const glyphEdit = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/agents/${agentId}`,
+      payload: { icon: { kind: 'glyph', glyph: 'bot', color: '#2563eb' } }
+    })
+    expect(glyphEdit.statusCode).toBe(200)
+    await waitForSyncedIcon({
+      kind: 'glyph',
+      glyph: 'bot',
+      color: '#2563eb'
+    })
+
+    const upload = await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${agentId}/icon`,
+      headers: { 'content-type': 'image/png' },
+      payload: PNG
+    })
+    expect(upload.statusCode).toBe(200)
+    await waitForSyncedIcon({
+      kind: 'image',
+      generation: expect.any(String)
+    })
+
+    const remove = await running.app.inject({
+      method: 'DELETE',
+      url: `${ORG}/agents/${agentId}/icon`
+    })
+    expect(remove.statusCode).toBe(200)
+    await waitForSyncedIcon({
+      kind: 'glyph',
+      glyph: expect.any(String),
+      color: expect.any(String)
+    })
+    expect(feishuSync).toHaveBeenCalledWith('cli_feishu', 'feishu-secret', 'lark', expect.any(Object))
+  })
+})

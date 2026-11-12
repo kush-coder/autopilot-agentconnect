@@ -1,0 +1,689 @@
+import { K8sHttp, loadInClusterConfig } from '@agentconnect.md/k8s-client'
+import { K8sDriver } from './driver.js'
+import type { LaunchGenerations } from '../remote/launch-registry.js'
+import {
+  PROBE_GRANTS,
+  RUNTIME_GRANTS,
+  agentSandboxSubject,
+  poolRuntimeImage,
+  resolvePodIp,
+  resolvePodName,
+  sandboxSubjectAgentId,
+  sandboxSubjectForPath,
+  sandboxSubjectSessionLeaf,
+  sessionSandboxSubject,
+  type SandboxSubject
+} from './sandbox-identity.js'
+import { SandboxApi, assertSandboxFence } from './sandbox-api.js'
+import { PROBE_CLAIM_EXPIRES_ANNOTATION, PROBE_CLAIM_LABEL, PROBE_CLAIM_TTL_MS, probeAgentId } from './probe-claim.js'
+import { clusterMetrics } from '../metrics/cluster-metrics.js'
+import { ShimDialer } from '../shim/dialer.js'
+import { spawnSubject } from '../shim/binding.js'
+import { ShimAutoMergeClient, askArmed } from '../shim/auto-merge-client.js'
+import { ShimGitRunner, type GitExecPayload } from '../shim/git-exec.js'
+import { ShimFileSink } from '../shim/channels.js'
+import type { ShimSession } from '../shim/session.js'
+import { ClusterSkillClient } from '../shim/skill-client.js'
+import { ChannelLossWatcher } from '../remote/channel-loss-watcher.js'
+import { TunnelBinder } from '../remote/tunnel-binder.js'
+import { codehostProxyUrl, type CodehostListener } from '../remote/codehost-spawn.js'
+import { ShimWorkspaceFiles } from '../shim/workspace-files-channel.js'
+import { ShimMemoryFs } from '../shim/memory-fs-channel.js'
+import { ShimWorkspaceFs } from '../shim/workspace-fs-channel.js'
+import { RoutedWorkspaceFiles, WorkspaceViolationError, type WorkspaceFiles } from '../workspace/workspace-files.js'
+import { RoutedWorkspaceFs, type WorkspacePlacement } from '../workspace/workspace-fs.js'
+import { sessionDirIn } from '../workspace/session-layout.js'
+import type { MemoryFs } from '../memory/fs.js'
+import { DEFAULT_SHIM_LISTEN_PORT, DEFAULT_SHIM_WORKSPACE_ROOT } from '../shim/protocol.js'
+import { resolveOrphanReconcilerSettings, stampRefreshMsFor } from './orphan-reconciler.js'
+import type { TunnelListenOptions, TunnelName } from '../shim/tunnel.js'
+import { K8sRuntimeTableSchema, type K8sRuntimeTable } from '../runtimes/k8s-runtimes.js'
+import type { GitRunner } from '../workspace/git-runner.js'
+import { deferredGitRunner } from '../workspace/git-runner.js'
+import type { DaemonGitProxyRoute } from '../workspace/git-injection.js'
+import type { ExecutionPlane } from '../execution/plane.js'
+import { ShimBundleClient } from '../shim/bundle-client.js'
+
+const SILENT = { info: () => {}, warn: () => {} }
+
+/** A probe drives every runtime through `initialize` plus a session, on a possibly cold pod. */
+const PROBE_TIMEOUT_MS = 180_000
+
+/**
+ * Assembles the k8s execution plane: the shim dialer, the driver, and the seams that make an
+ * agent's git run where its workspace actually is.
+ *
+ * It exists because every piece of this was built and tested separately and nothing put them
+ * together — `--k8s` changed the daemon's BEHAVIOUR (no probing, declared runtimes, no host
+ * sandbox) while `AcpHost` still fell back to `LocalDriver`, so runtimes kept running on the
+ * daemon's own host and no Sandbox was ever created.
+ *
+ * A pod is claimed per SUBJECT (sandbox-identity.ts): the agent's own, or one confined session's
+ * (git-workspace-model §11). Agent-keyed seams below route each path to the pod that owns it — a
+ * session pod owns `<mount>/sessions/<leaf>`, the agent pod everything else.
+ */
+export interface K8sRuntimePlaneOptions {
+  /** Durable, install-shared allocator for launch generations — in production the daemon store,
+   *  which every pool member shares, so an agent that moves between members keeps counting up. */
+  generations: LaunchGenerations
+  /** Per-agent tenant lookup: a pool member serves every org, so the agent names the tenant. */
+  orgForAgent?: (agentId: string) => string | undefined
+  /** Whether this member still holds the agent's duty when a launch is published. */
+  servesAgent?: (agentId: string) => boolean
+  /** Warm pool the claims reference. v1beta1 requires one; a cold pool is `replicas: 0`. */
+  warmPoolName?: string
+  /** Namespace shared by agent sandboxes, separate from the daemon pool namespace. */
+  sandboxNamespace?: string
+  /** Deployment-unique identity for this member, normally the Pod UID from the Downward API. */
+  memberId?: string
+  /** Port the sandbox shim listens on; the daemon combines it with the ready pod's IP. */
+  shimPort?: number
+  /** Environment the deployment settings come from; `process.env` unless a test names another. */
+  env?: NodeJS.ProcessEnv
+  readyTimeoutMs?: number
+  /** How often held claims are re-stamped as in use; omit to derive it from the sweep's own grace, 0 to run no timer. */
+  stampRefreshMs?: number
+  /** Kubernetes surface. Built from the pod's own in-cluster config when omitted; supplied by
+   *  tests so the assembly can be exercised without a cluster. */
+  api?: SandboxApi
+  /**
+   * Which daemon-side sockets an agent's sandbox needs a tunnel to, and where each one lives.
+   *
+   * Both halves are the DAEMON's to answer: only it knows that this agent authenticates git
+   * through a GitHub App, and only it knows the path its own server listens on. The plane holds
+   * the mechanism and no policy — omit either and no tunnel is opened.
+   */
+  tunnelsFor?: (agentId: string) => TunnelName[]
+  tunnelSocketPath?: (tunnel: TunnelName, agentId: string) => string | undefined
+  /** Tags a subject's daemon-socket connection with that subject (the agent channel binds a pod window to its pod). */
+  tunnelGreeting?: (subject: string, tunnel: TunnelName) => Buffer | undefined
+  /** What a `listen` carries beside the name: `codehost`'s routes and the proxy CA, its certificate alone. */
+  tunnelListenOptions?: (agentId: string, tunnel: TunnelName) => TunnelListenOptions | undefined
+  /** Prepare a managed Git invocation using its pod's current code-host route. */
+  mapGitEnv?: (agentId: string, env: Record<string, string>, route?: DaemonGitProxyRoute) => Record<string, string>
+  /** Lifetime of an issued session credential. The shim renews at half of it, so a test that has
+   *  to cross a renewal shortens it rather than waiting out the default. */
+  credentialTtlMs?: number
+  /** How long a pod that is up may go without a shim channel before the launch counts as lost.
+   *  Injected so a test can cross the window in milliseconds rather than waiting out the default. */
+  rebindGraceMs?: number
+  /** Fired when an agent's shim channel binds — the moment its volume (and memory tree) becomes reachable. */
+  onSandboxBound?: (agentId: string) => void
+  log?: { info: (m: string) => void; warn: (m: string) => void; debug?: (m: string) => void }
+}
+
+export interface K8sPlaneSettings {
+  warmPoolName: string
+  sandboxNamespace: string
+  memberId: string
+  shimPort: number
+}
+
+/** Deployment-owned settings. Env rather than the config file: they describe where this pod sits
+ *  in the cluster, which is the deployment's to state and not an operator preference. */
+export const K8S_WARM_POOL_ENV = 'AC_K8S_WARM_POOL'
+export const K8S_SANDBOX_NAMESPACE_ENV = 'AC_K8S_SANDBOX_NAMESPACE'
+export const K8S_MEMBER_ID_ENV = 'AC_K8S_MEMBER_ID'
+export const K8S_SHIM_PORT_ENV = 'AC_K8S_SHIM_PORT'
+export const DEFAULT_SHIM_PORT = DEFAULT_SHIM_LISTEN_PORT
+
+/** Explicit options win per FIELD, so a caller may name one and leave the rest to the env. */
+export function resolveK8sPlaneSettings(options: Partial<K8sRuntimePlaneOptions> = {}): K8sPlaneSettings {
+  const env = options.env ?? process.env
+  const warmPoolName = options.warmPoolName ?? env[K8S_WARM_POOL_ENV]?.trim()
+  if (!warmPoolName) throw new Error(`--k8s requires ${K8S_WARM_POOL_ENV}`)
+  const sandboxNamespace = options.sandboxNamespace ?? env[K8S_SANDBOX_NAMESPACE_ENV]?.trim()
+  if (!sandboxNamespace) throw new Error(`--k8s requires ${K8S_SANDBOX_NAMESPACE_ENV}`)
+  const memberId = options.memberId ?? env[K8S_MEMBER_ID_ENV]?.trim()
+  if (!memberId) throw new Error(`--k8s requires ${K8S_MEMBER_ID_ENV}`)
+  const rawPort = options.shimPort ?? env[K8S_SHIM_PORT_ENV] ?? DEFAULT_SHIM_PORT
+  const shimPort = Number(rawPort)
+  if (!Number.isInteger(shimPort) || shimPort < 1 || shimPort > 65_535) {
+    throw new Error(`${K8S_SHIM_PORT_ENV} is not a valid port: ${rawPort}`)
+  }
+  return { warmPoolName, sandboxNamespace, memberId, shimPort }
+}
+
+/** The env contract on its own, which is what a deployment has to satisfy. */
+export function k8sPlaneSettings(env: NodeJS.ProcessEnv): K8sPlaneSettings {
+  return resolveK8sPlaneSettings({ env })
+}
+
+/** Extra work for the held probe sandbox, given the identity that routes a launch into it and the
+ *  cwd a session must use — the POD's mount, never a path on the daemon's disk. */
+export type ProbeSandboxSweep = (table: K8sRuntimeTable, sandbox: { agentId: string; cwd: string }) => Promise<void>
+
+export interface K8sRuntimePlane extends ExecutionPlane {
+  driver: K8sDriver
+  dialer: ShimDialer
+  /** This member's stable identity — one half of the pool-wide probe election. */
+  memberId: string
+  /** The runtime image the pool's template pins: the same answer for every member at a given
+   *  moment, and what the probe's published result is keyed on. */
+  runtimeImage: () => Promise<string>
+  /** Bring a subject's Sandbox up and bind its channel WITHOUT starting a runtime, so the
+   *  workspace can be prepared on the pod's own volume before the runtime looks at it. */
+  ensureChannel: (subject: string) => Promise<void>
+  /** Run `work` while holding the subject's Sandbox against the ordinary idle sweep. */
+  withSandbox: <T>(subject: string, work: () => Promise<T>) => Promise<T>
+  /** Ask a sandbox which runtimes the image actually provides, and tear it down again. `sweep` runs
+   *  while that same sandbox is still held and bound, which is what lets the credentialed model
+   *  probe reuse this pod instead of claiming a second one. A caller that arrives while a probe is
+   *  already in flight awaits ITS table and its own sweep is skipped — the pod is gone by then. */
+  probeRuntimes: (sweep?: ProbeSandboxSweep) => Promise<K8sRuntimeTable>
+  /** A git runner on the pod that owns the path; an unbound session path gets one that refuses on first use as removed or asleep and wakes nothing, any other unbound path undefined, which callers refuse. */
+  gitRunnerFor: (agentId: string, cwd?: string, abort?: AbortSignal) => GitRunner | undefined
+  /** A git runner on exactly this subject's pod while it is bound, at its workspace root; undefined otherwise. */
+  podGitRunner?: (subject: string, abort?: AbortSignal) => GitRunner | undefined
+  /** The console's file operations, each root on the pod that owns it and refused per call while that pod is unbound; separate from git because `read` and `exec` are separate capabilities. */
+  workspaceFilesFor: (agentId: string) => WorkspaceFiles | undefined
+  /** Where the agent's WORKSPACE files live and which coordinates they are addressed in — the
+   *  filesystem twin of `gitRunnerFor`, answering while any pod of the agent is bound and routing
+   *  each path to its pod. Undefined keeps the caller on this daemon's own disk, which is what a
+   *  self-hosted agent beside a cluster one needs. */
+  workspaceFsFor: (agentId: string) => WorkspacePlacement | undefined
+  /** Every pod of the agent a merge watcher may run in: its own, then each session pod launched here (§11). */
+  autoMergeSubjects: (agentId: string) => SandboxSubject[]
+  /** One pod's merge-when-ready channel while bound — with `bind`, also a launched pod that is up, never woken; its armed set dies with the pod. */
+  autoMergeAt: (subject: string, bind?: boolean) => Promise<ShimAutoMergeClient | undefined>
+  /** Every pod of the agent bound right now, its own first. */
+  boundSubjects: (agentId: string) => SandboxSubject[]
+  /** Whether a merge-when-ready watcher is armed in one subject's pod, asked of its own registry; a launched pod with no channel yet is bound, never claimed or woken, and a channel lost twice rejects with `ShimChannelLostError`. */
+  armedIn: (subject: string) => Promise<boolean>
+  /** The agent's managed memory tree on its OWN pod's volume: one root beside the checkout
+   *  (`<mount>/.agentconnect/memory`), so it follows the agent across members and survives a
+   *  rollout, and is reachable exactly when that pod is. */
+  memoryFsFor: (agentId: string) => MemoryFs | undefined
+  /** Whether this agent's work runs in a pod right now — ANY of its pods, the SAME condition
+   *  `gitRunnerFor` answers on. Callers that build paths for that work read it here rather than
+   *  re-deriving it, so an environment can never describe one filesystem while the execution
+   *  happens in another. */
+  runsInSandbox: (agentId: string) => boolean
+  /** The pod that owns a workspace path (§11) — the routing every read uses, exposed so a caller can hold and judge the same pod. */
+  subjectForPath: (agentId: string, path?: string) => SandboxSubject
+  /** Whether one subject's pod is bound right now — the agent's own for the agent id. */
+  sandboxBound: (subject: string) => boolean
+  /** Hold a pod that is ALREADY bound against the idle sweep, or undefined when it is asleep — the non-claiming, non-waking half of `withSandbox`, for a read that may never resurrect a pod. */
+  holdIfBound: (subject: string) => (() => void) | undefined
+  /** Empty a directory on the pod volume that owns it, reporting why not rather than throwing. The one
+   *  destructive operation a cluster workspace needs — a partial clone — and it cannot be an
+   *  `rmSync`, because the directory is on a filesystem the daemon cannot see. */
+  clearPath: (agentId: string, root: string) => Promise<string | undefined>
+  /** Where a subject's bound pod mounts its workspace, as its shim reported; undefined before a
+   *  bind or from a legacy shim (callers fall back to DEFAULT_SHIM_WORKSPACE_ROOT). */
+  workspaceRootFor: (subject: string) => string | undefined
+  /** The session directory of one confined session, in the coordinates of ITS pod (§11). */
+  sessionDirFor: (agentId: string, leaf: string) => string
+  /** `cwd` aims the installs at the runtime's checkout (a placed session); the pool's pods take none and install at their workspace root. */
+  skillClientFor?: (subject: string, cwd?: string) => ClusterSkillClient | undefined
+  workspaceIncarnationFor?: (subject: string) => string | undefined
+  /** A key the subject's ledger was kept under before `workspaceIncarnationFor`'s, adopted when that one has none. */
+  deviceWorkspaceIncarnationFor?: (subject: string) => string | undefined
+  shimGenerationFor?: (subject: string) => number | undefined
+  /** Whether the subject's bound pod serves `tunnel` (S5b routes private skill Sources of a pod without `agent` through the daemon). */
+  servesTunnel?: (subject: string, tunnel: TunnelName) => boolean
+  /** Subjects this daemon holds a Sandbox for, and since when — the idle sweep's candidates. Read from
+   *  the driver, not inferred from live hosts: a launch outlives the host it was made for. */
+  launched: () => Array<{ subject: SandboxSubject; agentId: string; since: number }>
+  /** Take over an agent's pods from the cluster (claim → Sandbox → mode) so this member can suspend them. */
+  adoptAgent: (agentId: string) => Promise<void>
+  /** Take over the Running pods of agents `serves` admits that no launch here tracks; resolves the subjects it took. */
+  adoptUntracked: (serves: (agentId: string) => boolean) => Promise<string[]>
+  /** No longer served here: launches, channels, tunnels and loss watches of every pod of the agent go; claims and volumes stay. */
+  releaseAgent: (agentId: string) => void
+  /** Stop every pod of an agent this member is handing over, keeping the claims and volumes. What
+   *  `releaseAgent` alone cannot do: releasing drops the launches the idle sweep reads, so an agent
+   *  moved away would keep a Running pod nobody is left to suspend. Adopts first, so a pod this
+   *  member never launched is stopped too. Reports what it could not stop; never throws. */
+  suspendAgent: (agentId: string) => Promise<void>
+  /** Suspend a quiet subject's pod, keeping its Sandbox and workspace volume. `busy` means work
+   *  still holds it and the caller should try again later; `absent` means there is nothing to
+   *  suspend. Waking is not a separate call — the next launch's bind does it. */
+  suspendIdle: (subject: string) => Promise<'suspended' | 'busy' | 'absent'>
+  /** Suspend a subject's launched pod that never came up within the pod-up bound, whatever its activity; `absent` when it is no such pod. */
+  suspendStalled: (subject: string) => Promise<'suspended' | 'busy' | 'absent'>
+  /** Destroy every sandbox of an agent for good: the claims go, and their workspace volumes with them. For
+   *  agent REMOVAL only — the local path deletes the checkout at the same point. */
+  discardAgent: (agentId: string) => Promise<void>
+  /** Destroy one confined session's sandbox: its claim goes, and the session's clones and HOME with it (§11 retirement). */
+  discardSession: (agentId: string, leaf: string) => Promise<void>
+  /** Whether the cluster holds a claim for a subject at all, read without waking anything. */
+  hasSandbox: (subject: string) => Promise<boolean>
+  /** The uid of the claim the cluster holds for a subject, the fence a resume travels with; undefined when it holds none. */
+  claimUidFor: (subject: string) => Promise<string | undefined>
+  /** Resume a sleeping pod onto the claim whose uid was just observed and bind its channel, creating nothing; a claim gone or replaced since refuses. */
+  resumeChannel: (subject: string, claimUid: string) => Promise<void>
+  stop: () => Promise<void>
+}
+
+/**
+ * Build and start the plane. Throws if the process is not in a pod: `--k8s` outside a cluster is a
+ * misconfiguration to report at boot, not something to degrade into running runtimes locally —
+ * that degradation is precisely the shape that would put agent code on the daemon's host.
+ */
+export async function startK8sRuntimePlane(options: K8sRuntimePlaneOptions): Promise<K8sRuntimePlane> {
+  // Resolved HERE rather than by the caller, so the whole env contract lives in one place and a
+  // caller that overrides this factory (a test) does not have to satisfy it.
+  const settings = resolveK8sPlaneSettings(options)
+  const api =
+    options.api ??
+    (() => {
+      const config = loadInClusterConfig()
+      return new SandboxApi(new K8sHttp(config), settings.sandboxNamespace)
+    })()
+
+  // Built before the dialer and the driver because both wire into them; their deps read the driver
+  // lazily, which is what lets the three refer to each other without an ordering problem.
+  const lossWatcher = new ChannelLossWatcher({
+    sandboxReadiness: (subject, opts) => driver.sandboxReadiness(subject, opts),
+    connectionsFor: (subject) => dialer.connectionsFor(subject),
+    podUpTimeoutMs: () => driver.podUpTimeoutMs,
+    onChannelLost: (subject, reason) => driver.onChannelLost(subject, reason),
+    ...(options.rebindGraceMs === undefined ? {} : { rebindGraceMs: options.rebindGraceMs }),
+    log: options.log ?? SILENT
+  })
+  const tunnels = new TunnelBinder({
+    ...(options.tunnelsFor === undefined ? {} : { tunnelsFor: options.tunnelsFor }),
+    ...(options.tunnelSocketPath === undefined ? {} : { tunnelSocketPath: options.tunnelSocketPath }),
+    ...(options.tunnelGreeting === undefined ? {} : { tunnelGreeting: options.tunnelGreeting }),
+    ...(options.tunnelListenOptions === undefined ? {} : { tunnelListenOptions: options.tunnelListenOptions }),
+    log: options.log ?? SILENT
+  })
+
+  const dialer = new ShimDialer({
+    verifier: { reviewToken: (token, audiences) => api.reviewToken(token, audiences) },
+    resolveEndpoint: async (record, signal) => {
+      const subject = spawnSubject(record)
+      const launch = driver.currentLaunch(subject)
+      if (!launch || launch.generation !== record.generation || launch.sandboxUid !== record.sandboxUid) {
+        throw new Error(`sandbox ${subject} no longer owns this shim dial`)
+      }
+      const sandbox = await api.getSandbox(launch.sandboxName, { signal })
+      if (driver.currentLaunch(subject) !== launch) throw new Error(`sandbox ${subject} left this member`)
+      assertSandboxFence(sandbox, launch)
+      // A reconnect may reach a healthy shim before the pod's Ready condition catches up.
+      const podIp = resolvePodIp(sandbox)
+      const podName = resolvePodName(sandbox)
+      if (!podIp || !podName) throw new Error(`sandbox ${subject} has no pod endpoint`)
+      return { endpoint: shimEndpoint(podIp, settings.shimPort), podName }
+    },
+    now: () => Date.now(),
+    metrics: clusterMetrics,
+    onConnection: (connection) => {
+      // A rebind cancels any pending loss check: this IS the replacement it was waiting for.
+      lossWatcher.cancel(spawnSubject(connection.binding))
+      driver.onChannelBound(connection)
+      options.onSandboxBound?.(connection.binding.agentId)
+    },
+    // A closed socket is not a lost launch; renewals reconnect underneath the logical session.
+    // `ShimSession.lose()` is terminal — reporting loss here killed the runtime on every
+    // routine renewal, which is the exact failure ShimSession exists to prevent. Loss is reported
+    // only if no replacement binds for the same launch within the grace window.
+    onConnectionLost: (subject, reason) => lossWatcher.schedule(subject, reason),
+    ...(options.credentialTtlMs === undefined ? {} : { credentialTtlMs: options.credentialTtlMs }),
+    log: options.log ?? SILENT
+  })
+  /** The bound session of one subject's pod, or undefined while that pod is down or unbound. */
+  const boundSession = (subject: string): ShimSession | undefined => {
+    const session = driver.sessionFor(subject)
+    return session?.isAttached() ? session : undefined
+  }
+  const mountOf = (subject: string): string => driver.workspaceRootFor(subject) ?? DEFAULT_SHIM_WORKSPACE_ROOT
+  const sessionDirFor = (agentId: string, leaf: string): string =>
+    sessionDirIn(mountOf(sessionSandboxSubject(agentId, leaf)), leaf)
+  // The pod a path lives on, read off the path (git-workspace-model §11): a suspended session pod is still addressable, its launch forgotten or not.
+  const subjectForPath = (agentId: string, path: string | undefined): SandboxSubject =>
+    sandboxSubjectForPath(agentId, path, mountOf(agentSandboxSubject(agentId)))
+  /** Every pod of the agent that is bound right now: its own first, then its sessions'. */
+  const boundSubjectsOf = (agentId: string): SandboxSubject[] =>
+    [agentSandboxSubject(agentId), ...driver.sessionSubjectsOf(agentId)].filter((subject) => boundSession(subject))
+  // The one condition that means "this agent's work happens in a pod" — ANY of its pods. Defined once
+  // because two callers must agree on it: the git runner, and the credential pointers that git will read.
+  const runsInSandbox = (agentId: string): boolean => boundSubjectsOf(agentId).length > 0
+  // A session pod's claim uid; none refuses as `sandbox-removed`, since that claim IS the session's volume and a read never creates one.
+  const sessionClaimOf = async (subject: SandboxSubject): Promise<string> => {
+    const claimUid = await driver.claimUidFor(subject)
+    if (claimUid === undefined) {
+      throw new WorkspaceViolationError(
+        `sandbox "${subject}" no longer exists, so this workspace was removed`,
+        'sandbox-removed'
+      )
+    }
+    return claimUid
+  }
+  // Path-free: the message rides the wire to the Control Plane, and the subject already names the pod.
+  const unboundRefusal = (subject: SandboxSubject): WorkspaceViolationError =>
+    new WorkspaceViolationError(
+      `sandbox "${subject}" has no bound channel, so this workspace cannot be reached`,
+      'sandbox-unavailable'
+    )
+  /** The bound session that owns `path`; a read never wakes a pod, so an unbound one refuses as `sandbox-removed` when its session claim is gone and otherwise as the `sandbox-unavailable` the console's session wake answers. */
+  const sessionForPath = async (agentId: string, path: string): Promise<ShimSession> => {
+    const subject = subjectForPath(agentId, path)
+    const session = boundSession(subject)
+    if (!session && sandboxSubjectSessionLeaf(subject) !== undefined) await sessionClaimOf(subject)
+    if (!session) throw unboundRefusal(subject)
+    return session
+  }
+  const codehostProxyFor = (subject: string): CodehostListener | undefined =>
+    boundSession(subject) ? tunnels.listeningAt(subject, 'codehost')?.proxy : undefined
+
+  function podGitRunner(subject: SandboxSubject, session: ShimSession, cwd?: string, abort?: AbortSignal): GitRunner {
+    return new ShimGitRunner(
+      {
+        request: async (capability, payload, requestOptions) => {
+          if (boundSession(subject) !== session) throw unboundRefusal(subject)
+          const release = driver.retainLaunched(subject)
+          if (!release) throw unboundRefusal(subject)
+          try {
+            const git = payload as GitExecPayload
+            const listener = codehostProxyFor(subject)
+            const route = listener
+              ? { proxyUrl: codehostProxyUrl(listener), trustBundle: listener.trustBundle }
+              : undefined
+            const env =
+              git.env === undefined
+                ? undefined
+                : (options.mapGitEnv?.(sandboxSubjectAgentId(subject), git.env, route) ?? git.env)
+            return await session.request(capability, env === undefined ? payload : { ...git, env }, requestOptions)
+          } finally {
+            release()
+          }
+        }
+      },
+      cwd,
+      undefined,
+      abort
+    )
+  }
+
+  const runtimeProbeAgentId = probeAgentId(settings.memberId)
+  const driver = new K8sDriver({
+    api,
+    // The runtime probe is the member's own, not any org's, so it claims under `install`.
+    orgForAgent: (agentId) => (agentId === runtimeProbeAgentId ? 'install' : options.orgForAgent?.(agentId)),
+    servesAgent: (agentId) => agentId === runtimeProbeAgentId || (options.servesAgent?.(agentId) ?? true),
+    warmPoolName: settings.warmPoolName,
+    generations: options.generations,
+    // The probe runs an ACP runtime through this same driver, whose `launch` binds a channel of its
+    // own — without this it would bind that pod with the full agent grant set.
+    grantsForAgent: (agentId) => (agentId === runtimeProbeAgentId ? PROBE_GRANTS : RUNTIME_GRANTS),
+    claimMetadataForAgent: (agentId) =>
+      agentId === runtimeProbeAgentId
+        ? {
+            labels: { [PROBE_CLAIM_LABEL]: 'true' },
+            annotations: {
+              [PROBE_CLAIM_EXPIRES_ANNOTATION]: new Date(Date.now() + PROBE_CLAIM_TTL_MS).toISOString()
+            }
+          }
+        : undefined,
+    onChannelReady: (subject, session) => tunnels.ensure(subject, session),
+    // The listener belongs to the current bound pod, including preparation before runtime spawn.
+    codehostFor: codehostProxyFor,
+    // Asked again at spawn, since the launch registers its slots after the pod bound; a shim that predates `provider` reports none.
+    providerFor: async (subject) => {
+      const session = driver.sessionFor(subject)
+      if (session?.isAttached()) await tunnels.ensure(subject, session)
+      return tunnels.listeningAt(subject, 'provider')?.proxy
+    },
+    connectChannel: (record, podIp, timeoutMs) =>
+      dialer.connect(shimEndpoint(podIp, settings.shimPort), record, timeoutMs),
+    revokeChannel: (subject) => {
+      dialer.revoke(subject)
+      tunnels.release(subject, 'sandbox channel revoked')
+    },
+    metrics: clusterMetrics,
+    ...(options.readyTimeoutMs === undefined ? {} : { readyTimeoutMs: options.readyTimeoutMs }),
+    log: options.log ?? SILENT
+  })
+
+  let probeInFlight: Promise<K8sRuntimeTable> | undefined
+
+  function probeRuntimes(sweep?: ProbeSandboxSweep): Promise<K8sRuntimeTable> {
+    if (probeInFlight) return probeInFlight
+    const probeSubject = agentSandboxSubject(runtimeProbeAgentId)
+    probeInFlight = (async () => {
+      // Reset this member's deterministic claim so a container restart cannot adopt its leaked probe.
+      await driver.removeSandbox(probeSubject)
+      try {
+        // Hold the Sandbox across the request so the ordinary idle sweep cannot suspend it.
+        return await driver.withSandbox(probeSubject, async () => {
+          await driver.ensureBoundChannel(probeSubject, undefined, PROBE_GRANTS)
+          const session = driver.sessionFor(probeSubject)
+          if (!session) throw new Error('probe sandbox bound no session')
+          const raw = await session.request('probe', {}, { timeoutMs: PROBE_TIMEOUT_MS })
+          const table = K8sRuntimeTableSchema.parse(raw)
+          // Reported, never raised: the table is the half the member cannot serve without, and a
+          // sweep that fails costs model detail, not the runtimes themselves.
+          if (sweep) {
+            const cwd = mountOf(probeSubject)
+            await sweep(table, { agentId: runtimeProbeAgentId, cwd }).catch((err: unknown) => {
+              options.log?.warn(`k8s: probe sandbox sweep failed: ${(err as Error).message}`)
+            })
+          }
+          return table
+        })
+      } finally {
+        // Best-effort: a claim left behind here expires and the orphan reconciler collects it.
+        await driver.removeSandbox(probeSubject).catch((err: unknown) => {
+          options.log?.warn(`k8s: probe sandbox teardown failed: ${(err as Error).message}`)
+        })
+      }
+    })().finally(() => {
+      probeInFlight = undefined
+    })
+    return probeInFlight
+  }
+
+  function releaseSubject(subject: string, reason: string): void {
+    // Close the pod's channel first: it may otherwise keep using a binding this member no longer honours.
+    dialer.revoke(subject)
+    // After the revoke, whose close schedules one: nobody here waits on a loss for a pod not served here.
+    lossWatcher.cancel(subject)
+    tunnels.release(subject, reason)
+    driver.release(subject)
+  }
+
+  function releaseAgent(agentId: string, reason = 'agent no longer served here'): void {
+    for (const subject of driver.sessionSubjectsOf(agentId)) releaseSubject(subject, reason)
+    releaseSubject(agentSandboxSubject(agentId), reason)
+  }
+
+  async function discardSession(agentId: string, leaf: string): Promise<void> {
+    const subject = sessionSandboxSubject(agentId, leaf)
+    releaseSubject(subject, 'session retired')
+    await driver.removeSandbox(subject)
+  }
+
+  // A claim this member is USING must not look like a leak to the orphan sweep, and a launch served from
+  // the registry never touches the API — so the stamp is refreshed on a tick derived from the SAME grace
+  // the sweep reads, never a constant of its own: an install that shortens the grace would otherwise let a
+  // held claim age past it between two ticks. Unref'd — bookkeeping never holds a process up.
+  const stampRefreshMs = options.stampRefreshMs ?? stampRefreshMsFor(resolveOrphanReconcilerSettings().graceMs)
+  const stampRefresh =
+    stampRefreshMs > 0
+      ? setInterval(() => {
+          void driver.refreshAdmissionStamps().catch((err: unknown) => {
+            options.log?.warn(`k8s: refreshing the sandbox admission stamps failed: ${(err as Error).message}`)
+          })
+        }, stampRefreshMs)
+      : undefined
+  stampRefresh?.unref?.()
+
+  return {
+    driver,
+    dialer,
+    memberId: settings.memberId,
+    runtimeImage: () => poolRuntimeImage(api, settings.warmPoolName),
+    ensureChannel: async (subject) => {
+      await driver.ensureBoundChannel(subject as SandboxSubject)
+    },
+    withSandbox: (subject, work) => driver.withSandbox(subject as SandboxSubject, work),
+    probeRuntimes,
+    // A workspace here is on a pod's volume, in the pod's coordinates, whether or not a channel to it is bound.
+    workspacesOffDisk: true,
+    // The driver claims the pod a host key names, so only a confined session's host hands it one; every other host shares the agent's pod (§11).
+    spawnFor: ({ hostKey, confined }) => ({ driver, ...(confined() ? { hostKey } : {}) }),
+    podGitRunner: (subject, abort) => {
+      const session = boundSession(subject)
+      return session ? podGitRunner(subject as SandboxSubject, session, undefined, abort) : undefined
+    },
+    gitRunnerFor: (agentId, cwd, abort) => {
+      // No channel to the owning pod of a non-session path answers undefined, which the workspace manager refuses as `sandbox-unavailable`.
+      const subject = subjectForPath(agentId, cwd)
+      const session = boundSession(subject)
+      if (session) return podGitRunner(subject, session, cwd, abort)
+      if (cwd === undefined || sandboxSubjectSessionLeaf(subject) === undefined) return undefined
+      // A session directory whose pod is asleep, beside a bound agent pod: the runner is routed on first use as the path's read is, so a removed claim refuses as such, and it wakes nothing.
+      if (boundSession(agentSandboxSubject(agentId))) {
+        return deferredGitRunner(async () => podGitRunner(subject, await sessionForPath(agentId, cwd), cwd, abort))
+      }
+      // With the agent pod down too it still runs nothing, as before: it only asks the claim, so a removed session reads as removed rather than asleep, as a file read does.
+      return deferredGitRunner(async () => {
+        await sessionClaimOf(subject)
+        throw unboundRefusal(subject)
+      })
+    },
+    // Routed even with no pod bound, so each root refuses on its own terms: a session's can say its sandbox was removed.
+    workspaceFilesFor: (agentId) =>
+      new RoutedWorkspaceFiles(async (root) => {
+        const session = await sessionForPath(agentId, root)
+        return new ShimWorkspaceFiles(session, undefined, session.hasCapability('transfer'))
+      }),
+    workspaceFsFor: (agentId) => {
+      // Paths are composed on the mount the agent's own pod reported; a session pod's is asked for its own paths.
+      const [first] = boundSubjectsOf(agentId)
+      if (first === undefined) return undefined
+      const mount = mountOf(first)
+      const fs = new RoutedWorkspaceFs(async (path) => {
+        const subject = subjectForPath(agentId, path)
+        return new ShimWorkspaceFs(await sessionForPath(agentId, path), mountOf(subject))
+      })
+      return { fs, mount }
+    },
+    autoMergeSubjects: (agentId) => [agentSandboxSubject(agentId), ...driver.sessionSubjectsOf(agentId)],
+    autoMergeAt: async (subject, bind = false) => {
+      const session = boundSession(subject) ?? (bind ? await driver.bindLaunched(subject as SandboxSubject) : undefined)
+      return session ? new ShimAutoMergeClient(session) : undefined
+    },
+    boundSubjects: (agentId) => boundSubjectsOf(agentId),
+    armedIn: (subject) =>
+      askArmed(
+        async () => boundSession(subject) ?? (await driver.bindLaunched(subject as SandboxSubject)),
+        sandboxSubjectAgentId(subject)
+      ),
+    memoryFsFor: (agentId) => {
+      const subject = agentSandboxSubject(agentId)
+      const session = boundSession(subject)
+      return session ? new ShimMemoryFs(session, sandboxMemoryRoot(driver.workspaceRootFor(subject))) : undefined
+    },
+    runsInSandbox,
+    subjectForPath,
+    sandboxBound: (subject) => boundSession(subject) !== undefined,
+    // Bound-then-retain in one synchronous step, as the sweep's own gate reads it: a caller that checked and then awaited would have its pod suspended underneath it.
+    holdIfBound: (subject) => (boundSession(subject) ? driver.retainLaunched(subject) : undefined),
+    bundleStagerFor: async (agentId, path) => {
+      const session = await sessionForPath(agentId, path).catch(() => undefined)
+      return session?.hasCapability('bundle') ? new ShimBundleClient(session) : undefined
+    },
+    clearPath: async (agentId, root) => {
+      const session = await sessionForPath(agentId, root).catch(() => undefined)
+      if (!session) return `agent ${agentId} has no bound sandbox channel for ${root}`
+      return await new ShimFileSink(session).clear(root)
+    },
+    workspaceRootFor: (subject) => driver.workspaceRootFor(subject),
+    sessionDirFor,
+    skillClientFor: (subject) => {
+      const session = boundSession(subject)
+      if (!session?.hasCapability('skills')) return undefined
+      return new ClusterSkillClient(
+        session,
+        session.hasCapability('skills-wide'),
+        false,
+        session.hasCapability('skills-receipts'),
+        session.hasCapability('skills-git'),
+        session.hasCapability('skills-git-writeback') && session.hasCapability('bundle')
+          ? new ShimBundleClient(session)
+          : undefined,
+        session.hasCapability('skills-git-gitlab')
+      )
+    },
+    workspaceIncarnationFor: (subject) => driver.currentLaunch(subject)?.claimUid,
+    shimGenerationFor: (subject) => driver.currentLaunch(subject)?.generation,
+    servesTunnel: (subject, tunnel) => tunnels.serves(subject, tunnel),
+    launched: () => driver.launched(),
+    suspendIdle: (subject) => driver.suspendIfIdle(subject),
+    suspendStalled: (subject) => driver.suspendIfStalled(subject),
+    adoptAgent: async (agentId) => {
+      // Start both under the current release fence and propagate partial failure for retry.
+      const [shared, sessions] = await Promise.allSettled([
+        driver.adopt(agentSandboxSubject(agentId)),
+        driver.adoptSessions(agentId)
+      ])
+      if (shared.status === 'rejected') throw shared.reason
+      if (sessions.status === 'rejected') throw sessions.reason
+      const adopted = sessions.value
+      if (adopted.length > 0)
+        options.log?.info(`cluster: agent ${agentId} taken over with ${adopted.length} session pod(s)`)
+      // Adoption records Running pods only, so mark the rest as served here too: a claim whose pod
+      // slept through a departure and this return is otherwise untouched by the takeover, and the
+      // orphan sweep's version fence would have nothing to refuse a collection in flight with.
+      await driver.markServed(agentId)
+    },
+    adoptUntracked: (serves) => driver.adoptUntracked(serves),
+    releaseAgent,
+    suspendAgent: async (agentId) => {
+      // Adoption records only Running pods and creates nothing, so this wakes none and skips the rest.
+      await driver.adopt(agentSandboxSubject(agentId)).catch(() => undefined)
+      await driver.adoptSessions(agentId).catch((err: unknown) => {
+        options.log?.warn(`k8s: could not list the session sandboxes of agent ${agentId}: ${(err as Error).message}`)
+        return []
+      })
+      for (const subject of [...driver.sessionSubjectsOf(agentId), agentSandboxSubject(agentId)]) {
+        const outcome = await driver.suspendIfIdle(subject).catch((err: unknown) => `failed: ${(err as Error).message}`)
+        // `busy` is a hold this member still owns; it lapses within a TTL and the idle sweep is gone by
+        // then, so say so rather than letting a Running pod look handled.
+        if (outcome === 'suspended')
+          options.log?.info(`cluster: suspended the sandbox "${subject}" — the agent is no longer served here`)
+        else if (outcome !== 'absent')
+          options.log?.warn(`cluster: could not suspend the sandbox "${subject}" of the departing agent (${outcome})`)
+      }
+    },
+    discardAgent: async (agentId) => {
+      releaseAgent(agentId, 'agent removed')
+      await driver.removeAgentSandboxes(agentId)
+    },
+    discardSession,
+    // Listed from the cluster, not from this member's launches: a session pod it never launched holds the old repository too.
+    discardSessions: async (agentId, exceptLeaf) => {
+      for (const subject of await driver.sessionClaimSubjects(agentId)) {
+        const leaf = sandboxSubjectSessionLeaf(subject)!
+        if (leaf !== exceptLeaf) await discardSession(agentId, leaf)
+      }
+    },
+    hasSandbox: (subject) => driver.hasClaim(subject as SandboxSubject),
+    claimUidFor: (subject) => driver.claimUidFor(subject as SandboxSubject),
+    resumeChannel: async (subject, claimUid) => {
+      await driver.resumeBoundChannel(subject as SandboxSubject, claimUid)
+    },
+    stop: async () => {
+      if (stampRefresh) clearInterval(stampRefresh)
+      lossWatcher.cancelAll()
+      tunnels.releaseAll('daemon is shutting down')
+      dialer.stop()
+    }
+  }
+}
+
+/** The managed memory root on a sandbox volume: outside the user's checkout, on the same PVC. */
+export function sandboxMemoryRoot(workspaceRoot: string | undefined): string {
+  return `${(workspaceRoot ?? DEFAULT_SHIM_WORKSPACE_ROOT).replace(/\/+$/, '')}/.agentconnect/memory`
+}
+
+/** WebSocket URL for a Pod IP, including the brackets an IPv6 literal requires. */
+export function shimEndpoint(podIp: string, port: number): string {
+  const host = podIp.includes(':') && !podIp.startsWith('[') ? `[${podIp}]` : podIp
+  return `ws://${host}:${port}`
+}
+
+export { RoutedWorkspaceFs } from '../workspace/workspace-fs.js'

@@ -1,0 +1,552 @@
+#!/usr/bin/env node
+/**
+ * Relay bootstrap — load config, dial the CP for the rc/* control wire, serve the
+ * health surface, and accept daemon dial-ins on the rd/* wire. Local-first like the
+ * daemon: the CP client's `start()` is non-blocking and reconnects on its own, so a
+ * CP outage never stops the process (established rd/* connections keep serving).
+ *
+ * Data plane (webchat, PR 3): the browser dials the relay's `/webchat` WS with a
+ * CP-minted token; the relay `rc/verify`s it, then bridges the conversation onto the
+ * target daemon's rd/* socket (`rd/msg` in, `rd/chat` out) — content never touches the CP.
+ */
+import { randomUUID } from 'node:crypto'
+import {
+  BOT_CREDENTIAL_CHECK_FEATURE,
+  BOT_TENANT_FEATURE,
+  RELAY_CP_SUBPROTOCOL,
+  RELAY_PROJECTION_SNAPSHOT_V1_FEATURE,
+  RC_COMPUTER_MEDIA_USAGE_MAX,
+  type RcCodeHostFeedback,
+  type RcCodeHostDelivery,
+  type RcCodeHostMembershipAuthz,
+  type RcRunReport,
+  type RcSnapshotKind
+} from '@agentconnect.md/protocol'
+import { ClientTransport, systemClock } from '@agentconnect.md/connection'
+import { loadConfig, resolveAuth, toWsOrigin } from './config.js'
+import { RelayCpClient } from './relay-cp-client.js'
+import { buildRelayServer } from './server.js'
+import { createRelayDaemonServer, type RelayDaemonServer } from './relay-daemon-server.js'
+import { createComputerRelay } from './computer-relay.js'
+import { startStunServer } from './stun-server.js'
+import { startRelayTurn } from './turn/index.js'
+import { createRelayBrowserServer } from './relay-browser-server.js'
+import { createAhpServer } from './ahp-server.js'
+import { WebchatRouter, bindWebchatPostAuthor, fanImageUpdate, imageUpdateBound } from './webchat-router.js'
+import { VERDICT_TTL_MS, WebchatVerdictCache } from './webchat-verdict-cache.js'
+import { registerAgentChatRoutes } from './agent-chat-route.js'
+import { RelayIngressManager } from './relay-ingress-manager.js'
+import { relayIngressPlugins } from './platforms/registry.js'
+import { CollaborationRouter } from './collaboration-router.js'
+import { createAgentMsgRouter } from './agent-msg-router.js'
+import { toBotAssignment, toRoutesPatch } from './bot-arbitration.js'
+import { HookTable } from './hooks/hook-table.js'
+import { HookRateLimiter } from './hooks/rate-limit.js'
+import { registerHookIngress } from './hooks/ingress.js'
+import { registerGithubIngress } from './hooks/github-ingress.js'
+import { GithubAppWebhookTable } from './hooks/github-app-table.js'
+import { FollowUpWatchTable } from './hooks/follow-up-watch-table.js'
+import { registerGitlabIngress } from './hooks/gitlab-ingress.js'
+import { registerGiteaIngress } from './hooks/gitea/ingress.js'
+import { registerAzureDevOpsIngress } from './hooks/azure-devops/ingress.js'
+import { McpBindingTable } from './mcp/binding-table.js'
+import { registerMcpProxy, registerMemoryPluginProxy } from './mcp/proxy.js'
+import { MemoryConnectionBindingTable } from './memory/binding-table.js'
+import type { Logger } from './log.js'
+import { startRelayOpenTelemetry } from './observability.js'
+
+// Before `main()` so the SDK has patched http/undici by the time the server
+// and the CP client build theirs. No-ops unless an OTLP endpoint is set.
+const telemetry = startRelayOpenTelemetry()
+
+const RELAY_WS_PATH = '/api/v1/relays/ws'
+/** How often TURN bytes per Computer are reported for metering. */
+const MEDIA_USAGE_REPORT_MS = 60_000
+
+async function main(): Promise<void> {
+  const config = loadConfig()
+  // Env is a rolling-compatibility fallback for an older CP or a deployment
+  // that has not adopted DB-backed settings. A new CP replaces it exactly once
+  // through rc/auth/ok; later reconnects never hot-reload this process.
+  const deploymentConfig: { githubWebhookSecret?: string } = {
+    ...(config.GITHUB_APP_WEBHOOK_SECRET ? { githubWebhookSecret: config.GITHUB_APP_WEBHOOK_SECRET } : {})
+  }
+
+  // Build the server first so the CP client can log through its pino instance. The
+  // health probes and the CP-revoke callback read the client / rd server through a
+  // holder (both are constructed below, once the logger exists).
+  const held: {
+    client?: RelayCpClient
+    rdServer?: RelayDaemonServer
+    relayIngress?: RelayIngressManager
+  } = {}
+
+  // The bot-agnostic collaboration routing snapshot (agent-collaboration §2.3/§6.2).
+  // The CP ships it over `rc/collab-routes`; the cross-daemon `rd/agentmsg` router
+  // (built below, once `log` exists) resolves+authorizes+forwards agent-calls on it.
+  const collab = new CollaborationRouter()
+  const server = buildRelayServer(
+    {
+      isReady: () => held.client?.isReady() ?? false,
+      relayId: () => held.client?.relayId
+    },
+    { logger: true }
+  )
+  const log: Logger = {
+    debug: (m) => server.log.debug(m),
+    info: (m) => server.log.info(m),
+    warn: (m) => server.log.warn(m),
+    error: (m) => server.log.error(m)
+  }
+
+  // Cross-daemon `rd/agentmsg` router (agent-collaboration §2.3/§6.2) — resolves the
+  // target via the collaboration snapshot, authorizes the caller, and forwards a
+  // trusted claim to the owning daemon. Uses the holder so it sees `rdServer` late.
+  const routeAgentMsg = createAgentMsgRouter({ router: collab, daemons: () => held.rdServer, log })
+
+  // The relay is the shared INGRESS plane — a floating async rejection from any one
+  // bot's inbound handling (an async forward, a `views.open`, a `WebClient` call)
+  // must NEVER take down the whole process and drop every other bot + webchat +
+  // webhook. Log and keep serving, mirroring the daemon's guard. Node's default
+  // here is to crash.
+  process.on('unhandledRejection', (reason) => {
+    log.error(
+      `relay: unhandled rejection (continuing): ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`
+    )
+  })
+  process.on('uncaughtException', (err) => {
+    log.error(
+      `relay: uncaught exception (continuing): ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`
+    )
+  })
+
+  // The hook routing table — a memory copy of the CP's enabled hooks, replayed
+  // in full after every (re)register (webhook-triggers doc). Rules carry
+  // hmacSecret — never logged.
+  const hookTable = new HookTable()
+
+  // MCP proxy bindings — the CP pushes providerId → { upstreamUrl, headers, grantKeyHashes }
+  // over rc/mcp-assign (whole-pool broadcast); the /mcp/:providerId route resolves + proxies.
+  // Upstream headers are the upstream credential — never logged.
+  const mcpBindings = new McpBindingTable()
+  const memoryBindings = new MemoryConnectionBindingTable()
+  const followUpWatches = new FollowUpWatchTable()
+  const githubAppWebhooks = new GithubAppWebhookTable()
+  const projectionTable = (kind: RcSnapshotKind) =>
+    kind === 'mcp'
+      ? mcpBindings
+      : kind === 'hook'
+        ? hookTable
+        : kind === 'follow-up-watch'
+          ? followUpWatches
+          : kind === 'github-app'
+            ? githubAppWebhooks
+            : memoryBindings
+
+  const wsOrigin = toWsOrigin(config.CP_URL)
+  // TURN for viewer media without a punched path (computer-use.md §7.2); it checks credentials once the CP hands over the secret.
+  const relayTurn = await startRelayTurn(config, log)
+  const client = new RelayCpClient({
+    auth: resolveAuth(config),
+    name: config.RELAY_NAME,
+    daemonUrl: config.DAEMON_DIAL_URL,
+    ...(config.RELAY_STUN_URL ? { stunUrl: config.RELAY_STUN_URL } : {}),
+    ...(relayTurn ? { turn: relayTurn } : {}),
+    heartbeatDefaultMs: config.HEARTBEAT_DEFAULT_MS,
+    clock: systemClock,
+    connect: (opts) =>
+      ClientTransport.dial(wsOrigin, { subprotocol: RELAY_CP_SUBPROTOCOL, path: RELAY_WS_PATH, ...opts }),
+    log,
+    onRegistered: (id) => log.info(`relay: registered with CP as ${id}`),
+    onDeploymentConfig: (snapshot) => {
+      deploymentConfig.githubWebhookSecret = snapshot.githubWebhookSecret
+    },
+    // Unlike the GitHub secret, applied on every registration: bot assignments are replayed then too, so the anchor follows a restarted CP.
+    onDeploymentSnapshot: (snapshot) =>
+      void held.relayIngress
+        ?.applyDeploymentSnapshot(snapshot)
+        .catch((err) => log.error(`relay: deployment snapshot failed: ${String(err)}`)),
+    // Link (re)became READY — re-emit thread-assign reports and channel snapshots
+    // dropped while it was down.
+    onReady: () => {
+      // A snapshot left open by the dropped link never ends; the new CP's replay starts its own.
+      for (const table of [mcpBindings, hookTable, memoryBindings, followUpWatches, githubAppWebhooks])
+        table.abandonSnapshot()
+      // A CP without snapshots replays the full memory-binding set, so only its clear drops revoked grants.
+      if (!client.advertisedFeature(RELAY_PROJECTION_SNAPSHOT_V1_FEATURE)) memoryBindings.clear()
+      held.relayIngress?.flushPendingReports()
+    },
+    // CP revoked a daemon's credential/membership — drop its rd/* connection now (§9).
+    onRevoke: (daemonId) => held.rdServer?.revoke(daemonId),
+    // HTTP-bot control (§10): the manager is constructed below (after rdServer);
+    // these callbacks only fire once the relay is READY, so `held.relayIngress` is set.
+    onBotAssign: (a) => {
+      // §6.1: the assignment's origin-kind classification (present from an S1b CP)
+      // teaches this relay how to classify a platform id its build predates.
+      collab.learnPlatformKind(a.platform, a.originKind)
+      const assignment = toBotAssignment(a)
+      if (!assignment) {
+        // §6.7: an opaque secret bag for a platform this build predates — ids only,
+        // never the material. The S3 platform module takes this shape over.
+        log.warn(
+          `relay: bot-assign for ${a.botId} carried a secret or ingress shape this build does not support — skipped`
+        )
+        return
+      }
+      void held.relayIngress?.assign(assignment).catch((err) => log.error(`relay: bot-assign failed: ${String(err)}`))
+    },
+    onBotUnassign: (a) =>
+      void held.relayIngress
+        ?.unassign(a.botId, a.credentialRevision)
+        .catch((err) => log.error(`relay: bot-unassign failed: ${String(err)}`)),
+    // The patch is assembled by `toRoutesPatch` and nowhere else: a field the CP adds to
+    // the frame but a hand-written mapping here forgets pins every connected relay to the
+    // old value until a re-assign, which is exactly what a hot update exists to avoid.
+    onRoutes: (r) => held.relayIngress?.updateRoutes(r.botId, toRoutesPatch(r)),
+    onAssign: (a) => {
+      const target = { agentId: a.agentId, daemonId: a.daemonId, integrationId: '' }
+      held.relayIngress?.setAffinity(a.botId, a.sessionKey, target)
+    },
+    onParticipantAssign: (a) =>
+      held.relayIngress?.setParticipant(a.botId, a.sessionKey, {
+        agentId: a.agentId,
+        daemonId: a.daemonId,
+        integrationId: ''
+      }),
+    onFeedbackWatch: (watch) => hookTable.feedbackWatch(watch),
+    onFollowUpWatch: (watch) => followUpWatches.apply(watch),
+    onHookAssign: (rule) => hookTable.upsert(rule),
+    onHookRemove: (hookId) => hookTable.remove(hookId),
+    // Bot-agnostic collaboration routing snapshot (agent-collaboration §2.3/§6.2) —
+    // FULL-REPLACE the relay's cross-daemon agent-call routing/policy table.
+    onCollabRoutes: (snap) => collab.replace(snap),
+    // MCP proxy bindings (centralized-tool-management.md §5.2) — token-bearing, never logged.
+    onMcpAssign: (a) => mcpBindings.assign(a),
+    onMcpUnassign: (a) => mcpBindings.unassign(a.providerId, a.grantKeyHash),
+    onMemoryConnectionAssign: (a) => memoryBindings.assign(a),
+    onMemoryConnectionUnassign: (a) => memoryBindings.unassign(a.connectionId, a.revision, a.grantKeyHash),
+    onGithubAppAssign: (a) => githubAppWebhooks.apply(a),
+    onGithubAppUnassign: (a) => githubAppWebhooks.remove(a.githubAppId),
+    onSnapshotBegin: (s) => projectionTable(s.kind).beginSnapshot(s.snapshotId),
+    onSnapshotEnd: (s) => projectionTable(s.kind).endSnapshot(s.snapshotId, s.withheld)
+  })
+  held.client = client
+
+  // Relay ingress manager (§10): loads each `rc/bot-assign`'s inbound routing + creds and
+  // arbitrates/forwards inbound. Constructed before `listen()` so the IM HTTP
+  // ingresses can register their routes; `getDaemon` late-binds the rd/* server
+  // (created after listen).
+  const relayIngress = new RelayIngressManager({
+    getDaemon: (daemonId) => held.rdServer?.get(daemonId),
+    setChannelAgent: (botId, channelId, agentId) => client.emitSetChannelAgent({ botId, channelId, agentId }),
+    reportBotChannels: (m) => client.emitBotChannels(m),
+    reportBotConversation: (m) => client.emitBotConversation(m),
+    reportBotRevoked: (m) => client.reportBotRevoked(m),
+    reportBotCredentialCheck: (m) => client.reportBotCredentialCheck(m),
+    credentialCheckSupported: () => client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE),
+    reportBotTenant: (m) => client.reportBotTenant(m),
+    tenantReportSupported: () => client.advertisedFeature(BOT_TENANT_FEATURE),
+    credentialProbeIntervalMs: config.RELAY_CREDENTIAL_PROBE_INTERVAL_SEC * 1000,
+    selfRelayId: () => client.relayId,
+    reportThreadAssign: (m) => client.emitThreadAssign(m),
+    reportThreadParticipant: (m) => client.emitThreadParticipant(m),
+    lookupThread: (m) => client.lookupThread(m),
+    isAgentBotApp: (targetAgentId, platform, channelId, appId) =>
+      collab.isAgentBotAppFor(targetAgentId, platform, channelId, appId),
+    admitsAgentCall: (callerAgentId, targetAgentId) => collab.admits(callerAgentId, targetAgentId),
+    clock: systemClock,
+    log
+  })
+  held.relayIngress = relayIngress
+
+  // IM HTTP ingress. Each callback is demuxed, authenticated, deduplicated,
+  // normalized, arbitrated, and forwarded. Routes must register before listen.
+  //
+  // Mounted from the platform registry, not by name (audit F5): each plugin
+  // declares its own paths, so adding a platform never edits this file. The
+  // paths themselves are unchanged by construction and pinned by enumeration
+  // in `platforms/route-mounts.test.ts` — public callback URLs are external
+  // contracts.
+  for (const plugin of relayIngressPlugins) {
+    plugin.installRoutes(server, { manager: () => held.relayIngress, log })
+  }
+
+  // Public webhook ingress (POST /webhooks/in/:token). Routes must register
+  // before listen; the rd/* server only exists after it — hence the late bind.
+  // One limiter serves both ingresses (keys are hookIds — no collision).
+  const limiter = new HookRateLimiter(systemClock)
+  registerHookIngress(server, {
+    table: hookTable,
+    daemons: () => held.rdServer,
+    report: (r) => client.emitRunReport(r),
+    limiter,
+    clock: systemClock,
+    log
+  })
+
+  // Live Issue/PR actor checks cost at least two GitHub calls. Keep their
+  // repository-wide upstream budget separate from per-hook run capacity.
+  const githubAuthzLimiter = new HookRateLimiter(systemClock, { capacity: 10, refillPerSec: 0.25 })
+  registerGithubIngress(server, {
+    table: hookTable,
+    daemons: () => held.rdServer,
+    report: (r) => client.emitRunReport(r),
+    doorbell: (poke) => client.emitGithubInstallation(poke),
+    reportPullRequestFeedback: (signal) => client.reportPullRequestFeedback(signal),
+    followUpWatches,
+    reportFollowUpEvent: (signal) => client.reportFollowUpEvent(signal),
+    authorizeComment: (request) => client.authorizeGithubComment(request),
+    authorizeRerequest: (request) => client.authorizeGithubRerequest(request),
+    authzLimiter: githubAuthzLimiter,
+    limiter,
+    clock: systemClock,
+    log,
+    webhookSecret: () => deploymentConfig.githubWebhookSecret,
+    appWebhooks: githubAppWebhooks
+  })
+
+  // GitLab project webhooks (gitlab-com-integration.md §11.2): rule-carried
+  // signing tokens, live membership through the CP, same shared run limiter.
+  const gitlabAuthzLimiter = new HookRateLimiter(systemClock, { capacity: 10, refillPerSec: 0.25 })
+  const gitlabIngressDeps = {
+    reportFeedback: (signal: RcCodeHostFeedback) => client.reportCodeHostFeedback(signal),
+    reportFollowUpEvent: (signal: RcCodeHostFeedback) => client.reportFollowUpCodeHostEvent(signal),
+    table: hookTable,
+    daemons: () => held.rdServer,
+    report: (r: RcRunReport) => client.emitRunReport(r),
+    authorizeMembership: (request: RcCodeHostMembershipAuthz) => client.authorizeCodeHostMembership(request),
+    authzLimiter: gitlabAuthzLimiter,
+    limiter,
+    clock: systemClock,
+    log
+  }
+  registerGitlabIngress(server, gitlabIngressDeps)
+
+  // Gitea repository webhooks (gitea-integration.md §7): rule-carried signing
+  // keys, bare-hex signature, no replay window, live membership through the CP.
+  const giteaAuthzLimiter = new HookRateLimiter(systemClock, { capacity: 10, refillPerSec: 0.25 })
+  const giteaIngressDeps = {
+    reportFeedback: (signal: RcCodeHostFeedback) => client.reportCodeHostFeedback(signal),
+    table: hookTable,
+    daemons: () => held.rdServer,
+    report: (r: RcRunReport) => client.emitRunReport(r),
+    observe: (observed: RcCodeHostDelivery) => client.emitCodeHostDelivery(observed),
+    authorizeMembership: (request: RcCodeHostMembershipAuthz) => client.authorizeCodeHostMembership(request),
+    authzLimiter: giteaAuthzLimiter,
+    limiter,
+    clock: systemClock,
+    log
+  }
+  registerGiteaIngress(server, giteaIngressDeps)
+
+  // Azure DevOps service hooks (azure-devops-integration.md §11.3): rules keyed by subscription id, Basic credentials, live membership through the CP.
+  registerAzureDevOpsIngress(server, {
+    table: hookTable,
+    daemons: () => held.rdServer,
+    report: (r: RcRunReport) => client.emitRunReport(r),
+    observe: (observed: RcCodeHostDelivery) => client.emitCodeHostDelivery(observed),
+    authorizeMembership: (request: RcCodeHostMembershipAuthz) => client.authorizeCodeHostMembership(request),
+    authzLimiter: new HookRateLimiter(systemClock, { capacity: 10, refillPerSec: 0.25 }),
+    limiter,
+    clock: systemClock,
+    log
+  })
+
+  // MCP reverse proxy (ALL /mcp/:providerId) — resolves a grant to its upstream, SSRF-guards
+  // + IP-pins the operator-supplied upstream, swaps the bearer for the real headers, streams
+  // the exchange through. Routes must register before listen.
+  registerMcpProxy(server, {
+    bindings: mcpBindings,
+    allowlist: new Set(
+      (config.RELAY_MCP_ALLOWED_UPSTREAMS ?? '')
+        .split(',')
+        .map((h) => h.trim().toLowerCase())
+        .filter(Boolean)
+    ),
+    log,
+    ...(config.OPEN_CONNECTOR_URL ? { openConnectorUrl: config.OPEN_CONNECTOR_URL } : {}),
+    ...(config.OPEN_CONNECTOR_RUNTIME_TOKEN ? { openConnectorToken: config.OPEN_CONNECTOR_RUNTIME_TOKEN } : {})
+  })
+
+  registerMemoryPluginProxy(server, {
+    bindings: memoryBindings,
+    allowlist: new Set(
+      (config.RELAY_MEMORY_ALLOWED_UPSTREAMS ?? '')
+        .split(',')
+        .map((h) => h.trim().toLowerCase())
+        .filter(Boolean)
+    ),
+    log
+  })
+
+  // The webchat router (chatId → browser or AI SDK chat turn) — a daemon's rd/chat is delivered here.
+  const router = new WebchatRouter()
+  // One verdict per browser token for a minute at most, never past its `exp` (§10.4).
+  const webchatVerdicts = new WebchatVerdictCache((token) => client.verify('webchat-token', token))
+  // One verdict per (API key, agent, chat id) for a minute, the bound on how long a revoked key keeps chatting (§10.4).
+  const agentChatVerdicts = new WebchatVerdictCache<[apiKey: string, agentId: string, chatId: string]>(
+    (apiKey, agentId, chatId) => client.verifyAgentChatKey(apiKey, agentId, chatId),
+    Date.now,
+    (_args, verifiedAtMs) => verifiedAtMs + VERDICT_TTL_MS
+  )
+
+  // Agent chat API (POST /ai-sdk/… and /ag-ui/agents/:agentId/chat, §10.4); registered before listen, the rd/* server is late-bound.
+  const chatRoute = registerAgentChatRoutes(server, {
+    verify: (apiKey, agentId, chatId) => agentChatVerdicts.verify(apiKey, agentId, chatId),
+    daemons: () => held.rdServer,
+    router,
+    log
+  })
+
+  const ahpServer = createAhpServer(server, {
+    mode: () => config.AHP_MODE,
+    ...(config.AHP_AUTHORIZATION_SERVER ? { authorizationServer: config.AHP_AUTHORIZATION_SERVER } : {}),
+    verify: (credential, agentId, kind, resource) => client.verifyAhpCredential(credential, agentId, kind, resource),
+    daemon: (daemonId) => held.rdServer?.get(daemonId),
+    log
+  })
+  // Desktop daemons dial in beside the daemons, and agent daemons' MCP for them is forwarded (computer-use.md §3.7).
+  const computerRelay = createComputerRelay(server, {
+    verify: (token, computerId) => client.verifyComputer(token, computerId),
+    relayId: () => client.relayId,
+    log
+  })
+  // Bound before registering, so the CP never advertises a STUN address this instance cannot answer on.
+  const stunServer =
+    config.RELAY_STUN_PORT === undefined
+      ? undefined
+      : await startStunServer({ host: config.RELAY_STUN_HOST, port: config.RELAY_STUN_PORT, log })
+  client.start()
+  await server.listen({ port: config.PORT, host: config.HOST })
+
+  // Accept daemon dial-ins on rd/* (after listen, so `server.server` exists). Each
+  // rd/hello delegates the daemon's key to the CP via the CP client's `verify`; each
+  // inbound rd/chat is routed to the browser owning its chatId.
+  const rdServer = createRelayDaemonServer(server, {
+    verify: (kind, credential, daemonId) => client.verify(kind, credential, daemonId),
+    relayId: () => client.relayId,
+    clock: systemClock,
+    onChat: (chat) => router.deliver(chat),
+    // A completed reply post: render to the browser (if attached), then fan a
+    // context copy to every OTHER participant's daemon from the router's roster
+    // cache — independent of the browser sink, so a mid-turn browser close cannot
+    // drop the canonical post for the peers (webchat-multi-agents.md §5.2).
+    //
+    // The authorship claim is bound to the AUTHENTICATED source daemon FIRST
+    // (§5.2a): only a bound claim keeps the activation-capable depth stamp; an
+    // unbound one is stripped to the pre-§5.2a transcript-only shape, so a daemon
+    // can never make peers execute under an author identity the relay did not
+    // verify against the CP roster placement.
+    onWebchatPost: (fromDaemonId, post) => {
+      const roster = router.rosterOf(post.conversationId)
+      const bound = bindWebchatPostAuthor(post, fromDaemonId, roster)
+      if (!bound.authorBound && bound.post !== post) {
+        log.warn(
+          `relay: webchat post ${post.post.postId} author claim not bound to daemon ${fromDaemonId} — ` +
+            `depth stripped, context stays transcript-only`
+        )
+      }
+      router.deliverPost(bound.post)
+      for (const p of roster) {
+        // A continued member session takes no peer context (#2500).
+        if (p.agentId === post.agentId || !p.daemonId || p.targetSessionId) continue
+        const conn = rdServer.get(p.daemonId)
+        if (!conn) continue
+        void conn
+          .sendMsg({
+            source: 'webchat',
+            agentId: p.agentId,
+            sessionKey: post.conversationId,
+            msgId: randomUUID(),
+            chatId: post.conversationId,
+            ...(p.recordedDaemonId ? { recordedDaemonId: p.recordedDaemonId } : {}),
+            payload: { op: 'context', post: bound.post.post }
+          })
+          .catch((err) => log.warn(`relay: webchat post context fan-out failed: ${(err as Error).message}`))
+      }
+    },
+    onWebchatImageUpdate: (fromDaemonId, update) => {
+      if (!imageUpdateBound(update, fromDaemonId, router.rosterOf(update.conversationId))) {
+        log.warn(`relay: image update for post ${update.postId} not bound to daemon ${fromDaemonId} — dropped`)
+        return
+      }
+      router.deliverImageUpdate(update)
+      fanImageUpdate(
+        update,
+        router.rosterOf(update.conversationId),
+        (id) => rdServer.get(id),
+        (m) => log.warn(m)
+      )
+    },
+    onWebchatPromptSuggestion: (fromDaemonId, suggestion) => {
+      if (!imageUpdateBound(suggestion, fromDaemonId, router.rosterOf(suggestion.conversationId))) {
+        log.warn(
+          `relay: prompt suggestion for agent ${suggestion.agentId} not bound to daemon ${fromDaemonId} — dropped`
+        )
+        return
+      }
+      router.deliverPromptSuggestion(suggestion)
+    },
+    onAgentMsg: (fromDaemonId, msg) => routeAgentMsg(fromDaemonId, msg),
+    onRoute: (fromDaemonId, msg) => relayIngress.handleRoute(fromDaemonId, msg),
+    onRouteReport: (fromDaemonId, msg) => relayIngress.applyRouteReport(fromDaemonId, msg),
+    onPlatformRequest: (fromDaemonId, msg) => relayIngress.handlePlatformRequest(fromDaemonId, msg),
+    onDaemonReady: (daemonId) => router.deliverDaemonReady(daemonId),
+    log
+  })
+  held.rdServer = rdServer
+
+  // Accept browser webchat dial-ins on /webchat (CP-minted token → rc/verify → bridge
+  // onto the target daemon's rd/* socket).
+  const browserServer = createRelayBrowserServer(server, {
+    verify: (_kind, token) => webchatVerdicts.verify(token),
+    daemons: rdServer,
+    router,
+    log
+  })
+
+  log.info(`relay: health on ${config.HOST}:${config.PORT}; dialing CP at ${config.CP_URL} as "${config.RELAY_NAME}"`)
+
+  // TURN bytes per Computer go to the CP each minute for metering (computer-use.md §15.5); a closed link keeps them.
+  const reportMediaUsage = (): void => {
+    if (!relayTurn) return
+    for (const report of relayTurn.drainUsage(RC_COMPUTER_MEDIA_USAGE_MAX)) {
+      const sent = client.reportComputerMediaUsage(report)
+      if (!sent.ready) relayTurn.restoreUsage(report)
+    }
+  }
+  const mediaUsageTimer = relayTurn ? setInterval(reportMediaUsage, MEDIA_USAGE_REPORT_MS) : undefined
+  mediaUsageTimer?.unref()
+
+  let shuttingDown = false
+  const shutdown = async (sig: string): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    log.info(`relay: ${sig} — shutting down`)
+    if (mediaUsageTimer) clearInterval(mediaUsageTimer)
+    reportMediaUsage()
+    // Drop daemon, browser and desktop sockets with 1012 (they reconnect elsewhere), then stop the CP client and server.
+    for (const ws of rdServer.wss.clients) ws.close(1012, 'relay restarting')
+    for (const ws of browserServer.clients) ws.close(1012, 'relay restarting')
+    for (const ws of computerRelay.wss.clients) ws.close(1012, 'relay restarting')
+    chatRoute.closeAll('the relay is restarting')
+    ahpServer.close()
+    await held.relayIngress?.stopAll()
+    await client.stop()
+    await stunServer?.close()
+    await relayTurn?.close()
+    await server.close()
+    // Last, so spans from the drain above still make it out.
+    await telemetry
+      .shutdown()
+      .catch((err: unknown) => log.error(`relay: opentelemetry shutdown failed: ${(err as Error).message}`))
+    process.exit(0)
+  }
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGINT', () => void shutdown('SIGINT'))
+}
+
+main().catch((err) => {
+  console.error('relay: fatal boot error', err)
+  process.exit(1)
+})

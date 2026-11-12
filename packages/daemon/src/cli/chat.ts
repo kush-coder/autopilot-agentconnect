@@ -1,0 +1,254 @@
+import { createInterface } from 'node:readline'
+import { join } from 'node:path'
+import type { ContentBlock, SessionUpdate } from '@agentclientprotocol/sdk/unstable'
+import { loadConfig } from '../config/load-config.js'
+import { resolveRuntimeCatalog, type ResolvedRuntimeCatalog } from '../runtimes/registry.js'
+import { selectAgent } from '../agents/load-agents.js'
+import { agentChildEnv } from '../agents/agent-env.js'
+import { cleanupConfigFiles } from '../shim/config-file-env.js'
+import { memoryKindOf, memoryProviderFor } from '../memory/provider.js'
+import { WorkspaceManager } from '../workspace/workspace-manager.js'
+import { configureWorkspaceGitOrigins } from '../workspace/git-origin-policy.js'
+import { AcpHost } from '../acp/acp-host.js'
+import { agentStrategyOf } from '../execution/strategies.js'
+import { detectSandbox } from '../acp/sandbox.js'
+import { agentHostKey } from '../acp/host-key.js'
+import { resolveRoot } from '../paths.js'
+import { normalizeSandboxMounts } from '../runtimes/read-roots.js'
+import { installedRuntimeCatalog } from '../runtimes/probe.js'
+import { ArchiveStore, parseArchiveLaunch, storedArchiveRuntimeDef } from '../runtimes/archive-store.js'
+import { probeAllRuntimes, type ProbeOptions, type RuntimeProbeResult } from '../runtimes/runtime-prober.js'
+import { defaultProbeHostFactory } from '../acp/probe-host-factory.js'
+import { CuratedRuntimeAdmission } from '../runtimes/curated-admission.js'
+import { assembleRuntimeLaunch } from '../launch/assemble.js'
+import type { RuntimeDef } from '../config/config-schema.js'
+import { persistSkillSandboxRequirement } from '../skills/skill-sandbox-policy.js'
+
+export function renderUpdate(out: NodeJS.WritableStream) {
+  return (_sessionId: string, update: SessionUpdate): void => {
+    if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
+      out.write(update.content.text)
+    } else if (update.sessionUpdate === 'tool_call') {
+      const title = ('title' in update && update.title) || update.toolCallId || 'tool'
+      out.write(`\n[tool] ${title}\n`)
+    }
+  }
+}
+
+export interface RunChatOpts {
+  agentsDir?: string
+  agentName?: string
+  message?: string
+  configPath?: string
+  root?: string
+  out?: NodeJS.WritableStream
+  input?: NodeJS.ReadableStream
+  /** Test/embedding seams; production uses the normal catalog, host probe, ACP
+   * compatibility probe, and AcpHost constructor. */
+  resolveCatalog?: () => Promise<ResolvedRuntimeCatalog>
+  installed?: (runtimes: Record<string, RuntimeDef>) => Record<string, RuntimeDef>
+  probeRuntimes?: (runtimes: Record<string, RuntimeDef>, opts: ProbeOptions) => Promise<RuntimeProbeResult[]>
+  hostFactory?: (runtime: RuntimeDef, options: ConstructorParameters<typeof AcpHost>[1]) => AcpHost
+}
+
+export async function runChat(opts: RunChatOpts): Promise<void> {
+  const out = opts.out ?? process.stdout
+  const root = resolveRoot(opts.root)
+  const cfg = loadConfig({
+    root: opts.root,
+    configPath: opts.configPath,
+    optional: true,
+    overrides: { agentsDir: opts.agentsDir }
+  })
+  configureWorkspaceGitOrigins(cfg.security.workspaceGitAllowedOrigins)
+  const agent = selectAgent(cfg.agentsDir!, opts.agentName)
+  // The agent's own strategy, refused rather than run in a weaker one (session-executors.md §5); a VM needs the daemon.
+  const strategy = agentStrategyOf(agent)
+  if (strategy === 'microsandbox') {
+    throw new Error('chat does not support microsandbox yet; use a daemon session for an agent that runs in it')
+  }
+  if (strategy !== 'host' && strategy !== 'srt') throw new Error(`chat cannot run the ${strategy} strategy`)
+  if (strategy === 'host' && !cfg.sandbox.host) throw new Error('sandbox.host is off on this daemon')
+  const runInSandbox = strategy === 'srt'
+  // Validate operator mounts before probing a runtime; only an srt launch reads them.
+  const mounts = runInSandbox ? normalizeSandboxMounts(cfg.sandbox.mounts) : []
+  const operatorReadRoots = mounts.map((mount) => mount.source)
+  const operatorWriteRoots = mounts.filter((mount) => mount.mode === 'writable').map((mount) => mount.source)
+  const sandboxMechanism = cfg.sandbox.srt ? detectSandbox() : undefined
+  if (runInSandbox && !sandboxMechanism) {
+    throw new Error(cfg.sandbox.srt ? 'this host has no supported SRT mechanism' : 'sandbox.srt is off on this daemon')
+  }
+  await persistSkillSandboxRequirement(root)
+
+  const catalog = opts.resolveCatalog
+    ? await opts.resolveCatalog()
+    : await resolveRuntimeCatalog(cfg, root, { neededRuntimes: [agent.runtime], mode: 'cache-first' })
+  const runtimes = opts.installed ? opts.installed(catalog.runtimes) : installedRuntimeCatalog(catalog).runtimes
+  const entry = catalog.entries[agent.runtime]
+  const runtimeId = entry?.aliasOf ?? agent.runtime
+  const selected = runtimes[agent.runtime]
+  if (!selected) {
+    if (entry?.source === 'curated') {
+      throw new Error(`curated runtime "${agent.runtime}" is not installed or initialized on this host`)
+    }
+    const available = Object.keys(runtimes).sort().join(', ') || '(none)'
+    throw new Error(`runtime "${agent.runtime}" not found. Available: ${available}`)
+  }
+
+  // An archive-distributed runtime was admitted on the product's own state, and its binary lives in
+  // the daemon-owned store rather than on `$PATH` — so this launch path installs it too, or the
+  // spawn below would run the registry's relative `./cmd`. The store reuses what a previous run left.
+  const archiveLaunch = entry ? parseArchiveLaunch(agent.runtime, entry) : undefined
+  const runtime = archiveLaunch
+    ? storedArchiveRuntimeDef(
+        selected,
+        await new ArchiveStore({
+          root,
+          log: { info: (message) => out.write(`${message}\n`), warn: (message) => out.write(`${message}\n`) }
+        }).ensure(archiveLaunch)
+      )
+    : selected
+
+  if (entry?.source === 'curated') {
+    const admission = new CuratedRuntimeAdmission()
+    const probe = opts.probeRuntimes ?? probeAllRuntimes
+    const results = await probe(
+      { [runtimeId]: runtime },
+      {
+        curated: true,
+        hostFactory: defaultProbeHostFactory({ isolateAccountApps: cfg.security.isolateAccountApps }),
+        runInSandbox,
+        requireSandbox: runInSandbox,
+        daemonRoot: root,
+        agentsRoot: cfg.agentsDir,
+        sandboxMechanism,
+        hostEnv: process.env
+      }
+    )
+    admission.record(
+      results.find((result) => result.runtime === runtimeId) ?? {
+        runtime: runtimeId,
+        ok: false,
+        models: [],
+        error: 'ACP probe returned no result'
+      }
+    )
+    admission.assertLaunch(runtimeId, entry.source)
+  }
+
+  const agentEnv = agentChildEnv(agent)
+  const runtimeEnv = {
+    ...(runInSandbox ? cfg.sandbox.env : {}),
+    ...Object.fromEntries(runtime.env.map((entry) => [entry.name, entry.value]))
+  }
+  // Memory backend env joins the agent env BEFORE materialization, as the daemon does, so
+  // config-file detection sees the same child env on both paths.
+  Object.assign(agentEnv, memoryProviderFor(agent, runtime, agentEnv).runtimeEnv())
+  // The standalone chat CLI runs one agent locally, so it owns a plane with nothing registered
+  // on it: git runs here and no path lives in a sandbox.
+  const workspaces = new WorkspaceManager()
+  // Before the launch policy, not after: the sandbox boundary is computed from what is ON DISK, so
+  // a first run that assembled first would confine the runtime out of the checkouts it just cloned.
+  // The daemon's cold-host gate prepares in this order too (startHostWithRetry).
+  const cwd = await workspaces.prepareWorkspace(agent, {
+    skillsStateDir: join(root, 'skill-installs'),
+    skillsAgentId: entry?.skillsAgentId ?? null
+  })
+  const assembled = assembleRuntimeLaunch({
+    runtimeId,
+    runtime,
+    provider: memoryKindOf(agent),
+    hostKey: agentHostKey(agent.id),
+    scopeDir: agent.dir,
+    cwd: agent.workspace.path,
+    runInSandbox,
+    daemonRoot: root,
+    agentsRoot: cfg.agentsDir,
+    runtimeEnv,
+    agentEnv,
+    configFileDir: agent.dir,
+    // Same sandbox write carve-back the daemon grants: without it a sandboxed chat run cannot write
+    // its own session worktrees, nor read the secondary roots beside them.
+    trustedWorkspaceWriteRoots: runInSandbox ? workspaces.trustedWorkspaceWriteRoots(agent) : undefined,
+    trustedPrimaryCheckout: runInSandbox ? workspaces.localPrimaryCheckoutFor(agent) : undefined,
+    // No daemon here, so there is no MCP bridge socket, gh wrapper, or git-credential shim to carve
+    // back: mcpSocketPath / allowModelToolUnixSockets stay genuinely unused. The operator's
+    // daemon-wide toolchain roots still apply, exactly as they do under the daemon.
+    runtimeReadRoots: runInSandbox ? operatorReadRoots : undefined,
+    runtimeWriteRoots: runInSandbox ? operatorWriteRoots : undefined,
+    sandboxMechanism
+  })
+  for (const notice of assembled.configFiles?.notices ?? []) out.write(`⚠️ ${notice}\n`)
+  const hostOptions: ConstructorParameters<typeof AcpHost>[1] = {
+    onUpdate: renderUpdate(out),
+    runtimeId,
+    isolateAccountApps: cfg.security.isolateAccountApps,
+    env: assembled.launch.env,
+    inheritProcessEnv: assembled.launch.inheritProcessEnv,
+    sandbox: assembled.launch.sandbox,
+    toolSandbox: assembled.launch.toolSandbox,
+    configPrefs: {
+      model: agent.runtimeOverrides?.model,
+      permissionMode: agent.permissionMode,
+      reasoningEffort: agent.reasoningEffort,
+      fastMode: agent.fastMode
+    }
+  }
+  const host = opts.hostFactory
+    ? opts.hostFactory(assembled.runtime, hostOptions)
+    : new AcpHost(assembled.runtime, hostOptions)
+  // The adapter child runs in its own process group (see AcpHost.start), so a
+  // terminal Ctrl-C no longer kills it as a side effect — Node's default SIGINT
+  // exit would skip the finally below and leak it. Stop the host, then re-exit.
+  // Registered BEFORE start(): a first-run `npx -y` runtime download takes long
+  // enough that Ctrl-C mid-start is common, and the spawn happens early in start().
+  const onSigint = () => {
+    void host.stop().finally(() => {
+      cleanupConfigFiles(agent.dir)
+      process.exit(130)
+    })
+  }
+  process.once('SIGINT', onSigint)
+  try {
+    // Runtime adapters may discover skills only during initialization, and the clone/pull +
+    // unified-skill reconciliation above is complete before the child starts.
+    await host.start()
+    const sessionId = await host.newSession(
+      cwd,
+      [],
+      undefined,
+      undefined,
+      await workspaces.additionalWorkspaceDirectories(agent, cwd)
+    )
+
+    const send = async (text: string) => {
+      const blocks: ContentBlock[] = [{ type: 'text', text }]
+      await host.prompt(sessionId, blocks)
+      out.write('\n')
+    }
+
+    if (typeof opts.message === 'string' && opts.message.length > 0) {
+      await send(opts.message)
+      return
+    }
+
+    const rl = createInterface({ input: opts.input ?? process.stdin })
+    out.write(`Chatting with ${agent.name} (${agent.id}). Type .exit to quit.\n> `)
+    try {
+      for await (const line of rl) {
+        const text = line.trim()
+        if (text === '.exit' || text === '.quit') break
+        if (text.length > 0) await send(text)
+        out.write('> ')
+      }
+    } finally {
+      rl.close()
+    }
+  } finally {
+    process.removeListener('SIGINT', onSigint)
+    await host.stop()
+    // The chat "session" ends with the process — don't leave the materialized
+    // secret files behind (best-effort, mirrors the daemon's stopHost cleanup).
+    cleanupConfigFiles(agent.dir)
+  }
+}

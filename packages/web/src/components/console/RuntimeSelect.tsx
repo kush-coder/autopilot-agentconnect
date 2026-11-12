@@ -1,0 +1,217 @@
+import { Fragment, useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
+import { useTranslations } from 'next-intl'
+import { AgentMark } from '@/components/marks'
+import { Icon } from '@/components/ui'
+import { acpRuntime, useAcpRegistry } from '@/lib/acp-registry'
+import { IMAGE_BINARY_MISSING_LABEL, runtimeLabel, runtimeWarning } from '@/lib/data'
+
+export function RuntimeSelect({
+  value,
+  options,
+  needsLogin,
+  imageBinaryMissing,
+  onChange,
+  ariaLabel
+}: {
+  value: string
+  options: readonly string[]
+  // Login warnings never disable choices; logged-out placement is supported (preset-agents.md §3.2).
+  needsLogin?: readonly string[]
+  imageBinaryMissing?: readonly string[]
+  onChange: (value: string) => void
+  ariaLabel?: string
+}) {
+  const t = useTranslations('Agents.dialog.runtimeSelect')
+  const effectiveAriaLabel = ariaLabel ?? t('runtime')
+  const loginHint = t('loginHint')
+  const registry = useAcpRegistry()
+  const rows = options
+    .map((id) => ({
+      id,
+      label: runtimeLabel(id, acpRuntime(registry, id)?.name),
+      warning: runtimeWarning({
+        authRequired: needsLogin?.includes(id),
+        unavailableReason: imageBinaryMissing?.includes(id) ? 'image-binary-missing' : undefined
+      })
+    }))
+    .sort((a, b) => Number(a.warning === 'auth-required') - Number(b.warning === 'auth-required'))
+  const loginGroupIndex = rows.findIndex((row) => row.warning === 'auth-required')
+  const selectedIndex = Math.max(
+    0,
+    rows.findIndex((row) => row.id === value)
+  )
+  const selected = rows[selectedIndex]
+  const [open, setOpen] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(selectedIndex)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
+  const listboxId = useId()
+
+  useEffect(() => {
+    if (!open) return
+    const frame = requestAnimationFrame(() => listRef.current?.focus())
+    return () => cancelAnimationFrame(frame)
+  }, [open])
+
+  const closeAndFocus = () => {
+    setOpen(false)
+    requestAnimationFrame(() => triggerRef.current?.focus())
+  }
+
+  const pick = (id: string) => {
+    onChange(id)
+    closeAndFocus()
+  }
+
+  const openFromKeyboard = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      setActiveIndex(event.key === 'ArrowDown' ? selectedIndex : rows.length - 1)
+      setOpen(true)
+    }
+  }
+
+  const moveActive = (delta: number) => {
+    setActiveIndex((current) => (current + delta + rows.length) % rows.length)
+  }
+
+  const onListKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveActive(event.key === 'ArrowDown' ? 1 : -1)
+      return
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault()
+      setActiveIndex(event.key === 'Home' ? 0 : rows.length - 1)
+      return
+    }
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      const active = rows[activeIndex]
+      if (active) pick(active.id)
+      return
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      closeAndFocus()
+      return
+    }
+    if (event.key === 'Tab') setOpen(false)
+  }
+
+  return (
+    <div className="relative">
+      <button
+        ref={triggerRef}
+        type="button"
+        disabled={rows.length === 0}
+        className={`inp relative w-full cursor-pointer text-left outline-none transition-[background-color,border-color,box-shadow] ${
+          open
+            ? 'border-(--border-strong) shadow-(--focus-shadow)'
+            : 'hover:border-(--border-strong) hover:bg-(--surface-hover)'
+        }`}
+        aria-label={effectiveAriaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        onClick={() => {
+          setActiveIndex(selectedIndex)
+          setOpen((current) => !current)
+        }}
+        onKeyDown={openFromKeyboard}
+      >
+        <span className="inline-flex min-w-0 items-center gap-2">
+          {value ? (
+            <>
+              <span className="imark h-5 w-5 flex-none rounded-[5px]">
+                <AgentMark model={selected?.id ?? value} />
+              </span>
+              <span className="truncate">{selected?.label ?? value}</span>
+              {/* Keep the warning visible when the narrow field closes its menu. */}
+              {selected?.warning && (
+                <span
+                  className="flex-none"
+                  title={selected.warning === 'image-binary-missing' ? IMAGE_BINARY_MISSING_LABEL : loginHint}
+                >
+                  <Icon name="triangle-alert" size={13} color="var(--status-paused)" />
+                </span>
+              )}
+            </>
+          ) : (
+            // An unplaced agent has no selection; do not display the first option as selected.
+            <span className="truncate text-(--text-tertiary)">{t('selectRuntime')}</span>
+          )}
+        </span>
+        <Icon
+          name="chevron-down"
+          size={15}
+          color="var(--text-tertiary)"
+          className={`flex-none transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      {open && rows.length > 0 && (
+        <>
+          <div className="fscrim" onClick={() => setOpen(false)} />
+          <div
+            ref={listRef}
+            id={listboxId}
+            role="listbox"
+            tabIndex={-1}
+            aria-label={effectiveAriaLabel}
+            aria-activedescendant={`${listboxId}-option-${activeIndex}`}
+            // Keep names and wrapped status text readable within the viewport.
+            className="fmenu left-0 z-40 w-max min-w-full max-w-[calc(100vw-64px)] rounded-lg p-2 shadow-(--shadow-xl) outline-none"
+            onKeyDown={onListKeyDown}
+          >
+            {rows.map((row, index) => {
+              const isSelected = row.id === value
+              const isActive = index === activeIndex
+              return (
+                <Fragment key={row.id}>
+                  {index === loginGroupIndex && index > 0 && <div className="dmsep" aria-hidden="true" />}
+                  <button
+                    id={`${listboxId}-option-${index}`}
+                    type="button"
+                    role="option"
+                    tabIndex={-1}
+                    aria-selected={isSelected}
+                    title={
+                      row.warning === 'image-binary-missing'
+                        ? IMAGE_BINARY_MISSING_LABEL
+                        : row.warning
+                          ? loginHint
+                          : undefined
+                    }
+                    className={`fopt min-h-10 gap-3 rounded-md px-2 py-[6px] text-[13px] ${
+                      isSelected ? 'bg-(--surface-hover) text-(--text-primary)' : isActive ? 'bg-(--surface-hover)' : ''
+                    }`}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onClick={() => pick(row.id)}
+                  >
+                    <span className="imark h-7 w-7 flex-none rounded-md">
+                      <AgentMark model={row.id} />
+                    </span>
+                    <span className="flex min-w-0 flex-1 flex-col items-start gap-1">
+                      <span>{row.label}</span>
+                      {row.warning && (
+                        <span className="flex items-start gap-[4px] font-sans text-[11px] font-medium leading-normal text-(--status-paused)">
+                          <Icon name="triangle-alert" size={11} className="mt-[2px] flex-none" />
+                          <span>
+                            {row.warning === 'image-binary-missing' ? IMAGE_BINARY_MISSING_LABEL : t('loginRequired')}
+                          </span>
+                        </span>
+                      )}
+                    </span>
+                    {isSelected && <Icon name="check" size={16} color="var(--brand)" className="flex-none" />}
+                  </button>
+                </Fragment>
+              )
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}

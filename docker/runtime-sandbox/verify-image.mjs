@@ -1,0 +1,387 @@
+#!/usr/bin/env node
+// Static assertions run INSIDE the built runtime-sandbox image, as its own user, from the Dockerfile's verify stage.
+//
+//   node verify-image.mjs runtime-sandbox|runtime-sandbox-full
+//
+// Everything here reads the image's filesystem or runs its executables. The image's USER and ENV reach this stage as its
+// own uid and environment; the ENTRYPOINT does not, so scripts/verify-runtime-image.mjs reads the pinned base's config.
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { builtinModules } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+import { honorsNoLazyFetch, NO_LAZY_FETCH_FLOOR, parseGitVersion, SOURCE_CACHE_GIT_PROBE } from './source-cache-git.mjs'
+
+const variant = process.argv[2]
+if (!['runtime-sandbox', 'runtime-sandbox-full'].includes(variant)) {
+  process.stderr.write('usage: verify-image.mjs runtime-sandbox|runtime-sandbox-full\n')
+  process.exit(2)
+}
+
+const failures = []
+const notes = []
+const nodeBuiltins = new Set(builtinModules.flatMap((spec) => [spec, `node:${spec}`]))
+
+function check(name, fn) {
+  try {
+    const detail = fn()
+    notes.push(`  ✓ ${name}${detail ? ` — ${detail}` : ''}`)
+  } catch (err) {
+    failures.push(`  ✗ ${name}: ${err.message}`)
+  }
+}
+
+/** Run a shell command as the user this stage runs as, which is the image's own. */
+function sh(script) {
+  return execFileSync('sh', ['-c', script], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim()
+}
+
+/** Root-owned, not group/other writable, and an append as this user is refused. */
+function assertImmutable(label, path) {
+  const owner = sh(`stat -c '%U:%G %a' ${path}`)
+  if (!owner.startsWith('root:root')) throw new Error(`${label} is not root-owned (${owner})`)
+  const mode = owner.split(' ')[1]
+  if (/[2367]$/.test(mode) || /^.[2367]/.test(mode)) throw new Error(`${label} is group/other writable (${mode})`)
+  const refused = sh(`(echo x >> ${path} && echo WRITABLE) || echo refused`)
+  if (refused !== 'refused') throw new Error(`the runtime user can modify ${label}`)
+  return owner
+}
+
+const SHIM_PATH = '/opt/agentconnect/shim/index.js'
+// Must match SANDBOX_GIT_CREDENTIAL_HELPER in packages/daemon/src/shim/sandbox-paths.ts: git config carries this path.
+const CREDENTIAL_HELPER_PATH = '/opt/agentconnect/bin/git-credential'
+// Must match SANDBOX_PATHBIN_DIR in sandbox-paths.ts: the shim prepends exactly this directory to the runtime PATH.
+const PATHBIN_DIR = '/opt/agentconnect/pathbin'
+// The pinned gh a session runs directly, with the credential proxy's placeholder as GH_TOKEN.
+const GH_PATH = '/usr/local/bin/gh'
+// Must match SANDBOX_SECRETS_ENTRY in sandbox-paths.ts and SECRETS_WRAPPER_NAME in cp/secrets-shim.ts (capability-requests.md §4.9.2).
+const SECRETS_WRAPPER_PATH = '/opt/agentconnect/pathbin/agentconnect-secrets'
+// Must match SANDBOX_MCP_BRIDGE_ENTRY in sandbox-paths.ts: the daemon copies this path into the `mcpServers` spec.
+const MCP_BRIDGE_PATH = '/opt/agentconnect/shim/mcp-bridge.js'
+const SKILLS_CLI_PATH = '/opt/agentconnect/shim/skills/dist/cli.js'
+const SKILL_MUTATION_PATH = '/opt/agentconnect/shim/skills/workspace-mutation.js'
+// Must match SANDBOX_DSH_PRESET_DIR in sandbox-paths.ts: the shim passes this bundle to dsh-acp.
+const DSH_PRESET_DIR = '/opt/agentconnect/dsh/agent-presets/standard-no-search'
+// Must match SANDBOX_BROWSER_EXECUTABLE_ENV in sandbox-paths.ts: the shim forwards this path into the runtime's env.
+const BROWSER_ENV = 'AGENT_BROWSER_EXECUTABLE_PATH'
+
+// First, while nothing in this stage has run yet: a build step that ran as root inside the workspace leaves state
+// the runtime cannot write, and the symptom is a runtime that will not start for the user that owns its own home.
+check('the workspace contains nothing the runtime user cannot write', () => {
+  const uid = sh('id -u')
+  const foreign = sh(`find /agent -maxdepth 2 ! -uid ${uid} -printf '%u %p\\n' 2>/dev/null | head -10`)
+  if (foreign) throw new Error(`entries not owned by the runtime user: ${foreign.split('\n').join(', ')}`)
+  return 'clean'
+})
+
+// The volume outlives the image, so a uid that shifts between versions makes an agent's workspace unreadable to it.
+check('the workspace root is owned by the runtime user', () => {
+  const owner = sh('stat -c "%u:%g" /agent')
+  const uid = sh('id -u')
+  if (owner.split(':')[0] !== uid) throw new Error(`/agent is owned by ${owner} but the runtime is uid ${uid}`)
+  return owner
+})
+
+// The runtime is the untrusted party in this image, so root would hand it the whole filesystem.
+check('runs as a non-root user', () => {
+  const uid = sh('id -u')
+  if (uid === '0') throw new Error('image runs as root')
+  return `uid ${uid}`
+})
+
+check('Git supports the Source Cache bundle primitives', () => {
+  const output = sh('git --version')
+  const version = parseGitVersion(output)
+  if (!honorsNoLazyFetch(version)) {
+    const { major, minor, patch } = version
+    throw new Error(`Git ${major}.${minor}.${patch} does not honor GIT_NO_LAZY_FETCH (needs ${NO_LAZY_FETCH_FLOOR})`)
+  }
+  sh(SOURCE_CACHE_GIT_PROBE)
+  return `${output}; refs/heads blob:none bundle, --bundle-uri import under refs/bundles, fsck and GIT_NO_LAZY_FETCH work`
+})
+
+if (variant === 'runtime-sandbox-full') {
+  check('native Claude sandbox dependencies are installed', () => sh('set -e; bwrap --version; socat -V'))
+
+  check('Docker Engine, Buildx and Compose are installed without starting a daemon', () => {
+    return sh('set -e; dockerd --version; docker --version; docker buildx version; docker compose version')
+  })
+
+  check('the runtime user may elevate only the Docker daemon command', () => {
+    return sh(
+      'set -e; getent group docker | cut -d: -f4 | tr , "\\n" | grep -qx agent; sudo -n /usr/bin/dockerd --version; if sudo -n /usr/bin/id -u >/dev/null 2>&1; then exit 1; fi'
+    )
+  })
+} else {
+  check('pool image excludes native sandbox and Docker tools', () => {
+    return sh('for tool in bwrap socat docker dockerd containerd sudo; do if command -v "$tool"; then exit 1; fi; done')
+  })
+}
+
+// The ENTRYPOINT names tini; the host check reads that from the image config, this one proves the binary is there.
+check('tini is executable', () => {
+  if (sh('test -x /usr/bin/tini && echo yes || echo no') !== 'yes') throw new Error('/usr/bin/tini is not executable')
+  return '/usr/bin/tini'
+})
+
+// A shim the runtime can rewrite is a shim it can replace with one that answers the daemon however it likes.
+check('the shim is root-owned and not writable by the runtime user', () => assertImmutable('shim', SHIM_PATH))
+
+check('the pinned skills CLI is present, immutable and executable', () => {
+  const owner = sh(`stat -c '%U:%G %a' ${SKILLS_CLI_PATH}`)
+  if (!owner.startsWith('root:root')) throw new Error(`skills CLI is not root-owned (${owner})`)
+  const version = sh(`node ${SKILLS_CLI_PATH} --version`)
+  if (version !== '1.5.21') throw new Error(`skills CLI version is ${version}`)
+  return `${owner}, version ${version}`
+})
+
+check('the skill workspace mutation helper is present and immutable', () =>
+  assertImmutable('skill mutation helper', SKILL_MUTATION_PATH)
+)
+
+// Git spawns a credential helper per invocation; one the runtime can rewrite asks the daemon for credentials in its name.
+check('the git credential helper is present, executable and root-owned', () => {
+  const owner = assertImmutable('credential helper', CREDENTIAL_HELPER_PATH)
+  if (sh(`test -x ${CREDENTIAL_HELPER_PATH} && echo yes || echo no`) !== 'yes') {
+    throw new Error('credential helper is not executable, so git cannot run it')
+  }
+  return owner
+})
+
+// No wrapper stands in front of gh: it presents the placeholder the session holds.
+check('login shells resolve gh to the pinned binary', () => {
+  assertImmutable('login shell PATH profile', '/etc/profile.d/agentconnect-path.sh')
+  const resolved = execFileSync('bash', ['-lc', 'command -v gh'], { encoding: 'utf8' }).trim()
+  if (resolved !== GH_PATH) throw new Error(`login shell resolves gh to ${resolved}`)
+  const out = sh(`gh --version 2>&1 | head -1`)
+  if (!/^gh version /.test(out)) throw new Error(`gh did not run: ${out}`)
+  return out
+})
+
+check('Azure CLI and DevOps commands work with empty session state and no extension downloads', () => {
+  assertImmutable('Azure CLI', '/usr/bin/az')
+  const state = mkdtempSync(join(tmpdir(), 'ac-azure-image-'))
+  try {
+    const env = {
+      ...process.env,
+      AZURE_CONFIG_DIR: join(state, 'config'),
+      AZURE_EXTENSION_DIR: join(state, 'extensions'),
+      AZURE_EXTENSION_USE_DYNAMIC_INSTALL: 'no',
+      AZURE_CORE_COLLECT_TELEMETRY: 'false'
+    }
+    const az = (...args) => execFileSync('az', args, { env, encoding: 'utf8', timeout: 30_000 }).trim()
+    const version = JSON.parse(az('version', '--output', 'json'))
+    if (!version['azure-cli'] || !version.extensions?.['azure-devops']) {
+      throw new Error('Azure CLI or the azure-devops extension is missing')
+    }
+    const extension = az('extension', 'show', '--name', 'azure-devops', '--query', 'path', '--output', 'tsv')
+    if (!extension.startsWith('/opt/az/') || !extension.endsWith('/azure-cli-extensions/azure-devops')) {
+      throw new Error(`azure-devops is not installed in the CLI's system directory: ${extension}`)
+    }
+    assertImmutable('Azure DevOps extension', join(extension, 'azext_devops', '__init__.py'))
+    az('repos', 'show', '--help')
+    az('repos', 'pr', 'list', '--help')
+    return `Azure CLI ${version['azure-cli']}, azure-devops ${version.extensions['azure-devops']}`
+  } finally {
+    rmSync(state, { recursive: true, force: true })
+  }
+})
+
+// Live secrets are loaded at use time through this helper, so a pod agent without it could not load one.
+check('the agentconnect-secrets helper is present, root-owned, on PATH, and fails loudly with no channel', () => {
+  const owner = assertImmutable('agentconnect-secrets wrapper', SECRETS_WRAPPER_PATH)
+  const resolved = execFileSync('bash', ['-lc', 'command -v agentconnect-secrets'], { encoding: 'utf8' }).trim()
+  if (resolved !== SECRETS_WRAPPER_PATH) throw new Error(`login shell resolves agentconnect-secrets to ${resolved}`)
+  const out = sh(`env -u AC_AGENT_CHANNEL_CAPABILITY ${SECRETS_WRAPPER_PATH} list 2>&1; echo "exit=$?"`)
+  if (!out.includes('exit=1') || !/no AgentConnect agent channel/.test(out)) {
+    throw new Error(`the helper did not refuse without an agent channel: ${out}`)
+  }
+  return owner
+})
+
+// A helper that cannot reach a socket must SAY so and fail, or git reads an empty answer as "no credentials configured".
+check('the credential helper runs and fails loudly with no daemon socket', () => {
+  const out = sh(
+    `AC_AGENT_CHANNEL_SOCKET=/nonexistent/agent.sock ` +
+      `sh -c 'echo "protocol=https\nhost=github.com" | ${CREDENTIAL_HELPER_PATH} agent-x get; echo "exit=$?"' 2>&1`
+  )
+  if (!out.includes('exit=1')) throw new Error(`helper did not exit 1 without a socket: ${out}`)
+  if (!/agentconnect: no git credentials/.test(out)) throw new Error(`helper printed no actionable reason: ${out}`)
+  if (/password=/.test(out)) throw new Error('helper answered git despite having no credential')
+  return 'exits 1 with an actionable message'
+})
+
+// The harness spawns this per session from a spec the daemon builds around THIS path; it inherits the shim's threat model.
+check('the MCP bridge is present and root-owned', () => assertImmutable('mcp bridge', MCP_BRIDGE_PATH))
+
+// A bundle that reads a file the image does not ship dies on import, which the harness cannot tell from a missing module.
+check('the MCP bridge starts and fails loudly with no daemon socket', () => {
+  const out = sh(
+    `AC_MCP_ENDPOINT=/nonexistent/mcp.sock AC_MCP_TOKEN=probe ` +
+      `sh -c 'node ${MCP_BRIDGE_PATH} </dev/null; echo "exit=$?"' 2>&1`
+  )
+  if (!/mcp-bridge: could not reach daemon/.test(out)) throw new Error(`bridge did not run to its own error: ${out}`)
+  if (!out.includes('exit=1')) throw new Error(`bridge did not exit 1 without a socket: ${out}`)
+  return 'exits 1 with an actionable message'
+})
+
+// Same specifier shapes the daemon's assert-self-contained step looks for, run against the artifacts that shipped.
+check('the shim bundles are self-contained', () => {
+  const external = []
+  for (const path of [SHIM_PATH, MCP_BRIDGE_PATH, SKILL_MUTATION_PATH]) {
+    const bundle = sh(`cat ${path}`)
+    const specs = [...bundle.matchAll(/\bfrom\s*"([^"]+)"/g), ...bundle.matchAll(/\bimport\(\s*"([^"]+)"\s*\)/g)].map(
+      (match) => match[1]
+    )
+    const leaked = [...new Set(specs.filter((spec) => !nodeBuiltins.has(spec)))].sort()
+    if (leaked.length > 0) external.push(`${path}: ${leaked.join(', ')}`)
+  }
+  if (external.length > 0) throw new Error(`bundles reference non-builtin modules — ${external.join('; ')}`)
+  return 'Node builtins only'
+})
+
+// The pod template owns identity projection; a token baked in would be an identity nobody granted.
+check('carries no service-account token of its own', () => {
+  const found = sh(
+    'ls /var/run/secrets/kubernetes.io/serviceaccount/token /var/run/ac-identity/token 2>/dev/null | tr "\\n" " "'
+  )
+  if (found) throw new Error(`image ships a token at: ${found}`)
+  return 'none'
+})
+
+// Generated from the pinned adapter's standard declaration, then passed to dsh-acp as a bundle.
+check('bakes the no-search DeepSeek bundle the shim selects', () => {
+  const composition = `${DSH_PRESET_DIR}/cordis.patch.yml`
+  const listing = sh(`ls ${DSH_PRESET_DIR} 2>/dev/null | tr "\\n" " "`)
+  if (!listing.includes('cordis.patch.yml') || !listing.includes('package.json'))
+    throw new Error(`no bundle under ${DSH_PRESET_DIR}`)
+  const rows = sh(`grep -c "id: " ${composition}`)
+  if (Number(rows) < 10) throw new Error(`${composition} carries ${rows} plugin rows, so it is not a copied preset`)
+  const registry = sh(`grep -c 'id: agent-preset-registry' ${composition}`)
+  if (registry !== '1') throw new Error(`${composition} does not declare the preset registry`)
+  const disabled = sh(`grep -A6 "id: tool-web" ${composition} | grep -c "search: false" || true`)
+  if (disabled !== '1') throw new Error(`tool-web in ${composition} does not deregister web_search`)
+  if (sh(`test -d ${DSH_PRESET_DIR}/node_modules/@deepseek-ai/dsh && echo y || echo n`) !== 'y') {
+    throw new Error(`${DSH_PRESET_DIR} cannot resolve the unpacked harness`)
+  }
+  const writable = sh(`test -w ${composition} && echo y || echo n`)
+  if (writable === 'y') throw new Error('the runtime user can rewrite the preset it is seeded with')
+  return `${listing.trim()} (${rows.trim()} rows, read-only)`
+})
+
+// Select the preinstalled harness explicitly so each session can start without unpacking another copy.
+check('dsh-acp launches the installed harness instead of unpacking its own', () => {
+  const home = '/tmp/ac-dsh-probe'
+  sh(
+    `rm -rf ${home}; mkdir -p ${home}; HOME=${home} timeout 90 dsh-acp --dsh-path /usr/local/bin/dsh </dev/null >/dev/null`
+  )
+  const cache = sh(`du -sh ${home}/.cache/dsh-acp 2>/dev/null | cut -f1`)
+  const harness = sh(`readlink -f "$(command -v dsh)"; rm -rf ${home}`)
+  if (cache) throw new Error(`the adapter unpacked ${cache} into its cache, so it did not find the installed harness`)
+  return harness
+})
+
+// Git runs INSIDE the sandbox over the shim's exec channel, so a missing git is every workspace operation failing.
+check('provides the executables the shim must resolve', () => {
+  const required = ['git', 'gh', 'node', 'claude-agent-acp', 'codex-acp', 'dsh-acp', 'dsh', 'opencode']
+  const missing = required.filter((bin) => sh(`command -v ${bin} >/dev/null && echo y || echo n`) === 'n')
+  if (missing.length > 0) throw new Error(`missing: ${missing.join(', ')}`)
+  return required.join(' ')
+})
+
+// The npm package ships a placeholder that its postinstall replaces with the native binary, so presence alone proves nothing.
+check('OpenCode is the native 2.x binary', () => {
+  const version = sh('opencode --version')
+  if (!/^opencode v2\.\d+\.\d+$/.test(version)) throw new Error(`opencode --version printed ${JSON.stringify(version)}`)
+  return version
+})
+
+// `ldd chrome` on Chrome for Testing 152, by soname: apt satisfying a package name says nothing about what resolves.
+const CHROME_SONAMES = [
+  'libX11.so.6',
+  'libXcomposite.so.1',
+  'libXdamage.so.1',
+  'libXext.so.6',
+  'libXfixes.so.3',
+  'libXrandr.so.2',
+  'libasound.so.2',
+  'libatk-1.0.so.0',
+  'libatk-bridge-2.0.so.0',
+  'libatspi.so.0',
+  'libcairo.so.2',
+  'libcups.so.2',
+  'libdbus-1.so.3',
+  'libexpat.so.1',
+  'libgbm.so.1',
+  'libgio-2.0.so.0',
+  'libglib-2.0.so.0',
+  'libgobject-2.0.so.0',
+  'libnspr4.so',
+  'libnss3.so',
+  'libnssutil3.so',
+  'libpango-1.0.so.0',
+  'libsmime3.so',
+  'libxcb.so.1',
+  'libxkbcommon.so.0'
+]
+
+// The agent has no sudo, so a missing soname is a browser it downloads, cannot start and cannot fix.
+check('resolves every shared library Chrome needs', () => {
+  const cache = sh('/sbin/ldconfig -p')
+  const missing = CHROME_SONAMES.filter((so) => !cache.includes(`${so} `))
+  if (missing.length > 0) throw new Error(`unresolved: ${missing.join(', ')}`)
+  return `${CHROME_SONAMES.length} sonames`
+})
+
+// Preinstalled because `npm i -g agent-browser` EACCESes as the runtime user, and pruned to this platform's native binary.
+check('the pinned agent-browser CLI runs and carries only this platform binary', () => {
+  const version = sh('agent-browser --version')
+  if (!/^agent-browser \d+\.\d+\.\d+/.test(version)) throw new Error(`unexpected version output: ${version}`)
+  const natives = sh("ls /usr/local/lib/node_modules/agent-browser/bin | grep '^agent-browser-' | tr '\\n' ' '").trim()
+  if (natives.split(/\s+/).filter(Boolean).length !== 1) throw new Error(`bin/ carries native binaries: ${natives}`)
+  return `${version} (${natives})`
+})
+
+// This stage inherits the image ENV, so an unset variable here is an unset ENV in the image — and then agent-browser
+// downloads its own 391 MB Chrome into the workspace volume while the baked one is dead weight.
+check('the baked Chrome is what agent-browser is pointed at and runs as the runtime user', () => {
+  const path = process.env[BROWSER_ENV]
+  if (!path) throw new Error(`${BROWSER_ENV} is unset in the image environment`)
+  const owner = sh(`stat -c '%U:%G %a' ${path}`)
+  if (!owner.startsWith('root:root')) throw new Error(`${path} is owned by ${owner}, not root`)
+  if (sh(`test -w ${path} && echo y || echo n`) === 'y') throw new Error(`the runtime user can rewrite ${path}`)
+  const version = sh(`${path} --version`)
+  if (!/^Google Chrome for Testing \d+\./.test(version)) throw new Error(`unexpected version output: ${version}`)
+  return `${version} at ${path} (${owner})`
+})
+
+// The wrapper keeps `agent-browser install` from fetching a browser the image already carries; root-owned like the secrets helper.
+check('the agent-browser wrapper answers a bare install and defers otherwise', () => {
+  const wrapper = `${PATHBIN_DIR}/agent-browser`
+  const owner = sh(`stat -c '%U:%G %a' ${wrapper}`)
+  if (!owner.startsWith('root:root')) throw new Error(`the wrapper is not root-owned (${owner})`)
+  if (sh(`(echo x >> ${wrapper} && echo WRITABLE) || echo refused`) !== 'refused') {
+    throw new Error('the runtime user can modify the agent-browser wrapper')
+  }
+  const answered = sh(`${wrapper} install; echo "rc=$?"; du -sk $HOME/.agent-browser 2>/dev/null | cut -f1`)
+  if (!answered.includes('rc=0')) throw new Error(`install exited non-zero: ${answered}`)
+  if (!/already installed/.test(answered)) throw new Error(`install did not report the baked Chrome: ${answered}`)
+  const downloaded = Number(answered.split('\n').pop())
+  if (Number.isFinite(downloaded) && downloaded > 1024) throw new Error(`install wrote ${downloaded} KB into $HOME`)
+  const version = sh(`${wrapper} --version`)
+  if (!/^agent-browser \d+\.\d+\.\d+/.test(version))
+    throw new Error(`the wrapper did not reach the real CLI: ${version}`)
+  // An ACP child is spawned from an allowlist, so the image ENV may not reach it: the wrapper must default the path itself.
+  const unset = sh(`env -u AGENT_BROWSER_EXECUTABLE_PATH ${wrapper} install`)
+  if (!unset.includes('/opt/agentconnect/browser/chrome')) {
+    throw new Error(`the wrapper does not default the browser path when the env is unset: ${unset}`)
+  }
+  return `${version}, install answered locally, path defaulted with the env unset`
+})
+
+process.stdout.write(`${variant} in-image checks\n${[...notes, ...failures].join('\n')}\n`)
+if (failures.length > 0) {
+  process.stderr.write(`\n${failures.length} check(s) failed\n`)
+  process.exit(1)
+}

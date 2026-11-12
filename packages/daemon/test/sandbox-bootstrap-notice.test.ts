@@ -1,0 +1,148 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Daemon } from '../src/daemon.js'
+import { withStartupPhase } from '../src/session/startup-progress.js'
+import { LocalMemoryFs } from '../src/memory/fs.js'
+import { fakeSlackAppFactory } from './fakes/slack-app.js'
+import type { NormalizedMessage } from '../src/messages/normalized.js'
+
+// Startup phases never post chat messages: Slack keeps its status, other chat platforms their typing chrome.
+
+function scaffold(): string {
+  const root = mkdtempSync(join(tmpdir(), 'ac-sandbox-notice-'))
+  writeFileSync(
+    join(root, 'config.json'),
+    JSON.stringify({
+      version: 1,
+      controlPlane: { enabled: false },
+      runtimes: { claude: { command: 'node', args: ['unused'] } }
+    })
+  )
+  const agentDir = join(root, 'agents', 'bot-a')
+  mkdirSync(agentDir, { recursive: true })
+  writeFileSync(
+    join(agentDir, 'agent.json'),
+    JSON.stringify({
+      id: 'bot-a',
+      name: 'bot-a',
+      status: 'active',
+      runtime: 'claude',
+      workspace: { mode: 'from-scratch', path: join(agentDir, 'workspace') },
+      integrations: [],
+      output: { mode: 'low' }
+    })
+  )
+  return root
+}
+
+// Simulate the resource wait reported by the cluster driver.
+function coldSandbox(daemon: Daemon): void {
+  ;(daemon as unknown as { k8sPlane: unknown }).k8sPlane = {
+    runsInSandbox: () => false,
+    withSandbox: (_id: string, work: () => Promise<unknown>) => work(),
+    ensureChannel: () => withStartupPhase('sandbox', async () => {}),
+    workspaceRootFor: () => undefined,
+    gitRunnerFor: () => undefined,
+    workspaceFsFor: () => undefined,
+    memoryFsFor: () => new LocalMemoryFs(mkdtempSync(join(tmpdir(), 'ac-sandbox-notice-mem-'))),
+    autoMergeSubjects: () => [],
+    autoMergeAt: async () => undefined,
+    releaseAgent: () => {},
+    launched: () => [],
+    stop: async () => {}
+  }
+}
+
+function bootDaemon(root: string): Daemon {
+  const host = {
+    __started: true,
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => 'acp-1'),
+    prompt: vi.fn(async () => 'end_turn'),
+    cancel: vi.fn(),
+    stop: vi.fn()
+  }
+  return new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => host as never } as never)
+}
+
+function chatMsg(platform: 'slack' | 'telegram', id: string): NormalizedMessage {
+  return {
+    msgId: `cron:${platform}:${id}`,
+    traceId: id,
+    source: 'cron',
+    platform,
+    channel: 'C1',
+    thread: 'T1',
+    sender: { id: 'cron:s', isBot: false },
+    text: 'go',
+    mentionedBots: [],
+    isDm: false,
+    trigger: 'cron'
+  } as NormalizedMessage
+}
+
+type Dispatchable = { dispatch: (agentId: string, msg: NormalizedMessage) => Promise<unknown> }
+
+describe('session startup notices', () => {
+  it('keeps Slack on its existing working indicator without posting phase messages', async () => {
+    const daemon = bootDaemon(scaffold())
+    await daemon.start()
+    coldSandbox(daemon)
+    const statuses: string[] = []
+    const conn = {
+      setStatus: vi.fn(async (_c: string, _t: string, status: string) => void statuses.push(status)),
+      postMessage: vi.fn(async () => undefined)
+    }
+    vi.spyOn(daemon as never as { replyConnFor: () => unknown }, 'replyConnFor').mockReturnValue(conn)
+
+    await (daemon as never as Dispatchable).dispatch('bot-a', chatMsg('slack', '1'))
+
+    expect(statuses.slice(0, 2)).toEqual(['is starting up…', 'is thinking…'])
+    // Slack consumes only the lifecycle state; phase text is not supported there.
+    expect(conn.postMessage).not.toHaveBeenCalledWith('C1', '⏳ Starting sandbox…', expect.anything())
+    expect(statuses.filter((text) => text !== '').at(-1)).toBe('is thinking…')
+    await daemon.stop()
+  })
+
+  it('does not announce sandbox preparation when a warm turn does no preparation', async () => {
+    // A fake plane reports no pod, but this warm turn never asks it to prepare one.
+    const daemon = bootDaemon(scaffold())
+    await daemon.start()
+    coldSandbox(daemon)
+    const statuses: string[] = []
+    const conn = {
+      setStatus: vi.fn(async (_c: string, _t: string, status: string) => void statuses.push(status)),
+      postMessage: vi.fn(async () => undefined)
+    }
+    vi.spyOn(daemon as never as { replyConnFor: () => unknown }, 'replyConnFor').mockReturnValue(conn)
+
+    await (daemon as never as Dispatchable).dispatch('bot-a', chatMsg('slack', '1')) // warms the host
+    statuses.length = 0
+    await (daemon as never as Dispatchable).dispatch('bot-a', chatMsg('slack', '2')) // warm host, still no pod
+
+    expect(statuses).not.toContain('is starting a sandbox…')
+    expect(statuses.filter((text) => text !== '').at(-1)).toBe('is thinking…')
+    await daemon.stop()
+  })
+
+  it('posts no startup message on an on-demand chat platform', async () => {
+    const daemon = bootDaemon(scaffold())
+    await daemon.start()
+    coldSandbox(daemon)
+    // Telegram's typing action is its only turn chrome; a phase message would stay in the chat.
+    const conn = {
+      sendChatAction: vi.fn(async () => {}),
+      postMessage: vi.fn(async () => 'm1'),
+      updateMessage: vi.fn(async () => {})
+    }
+    vi.spyOn(daemon as never as { replyConnFor: () => unknown }, 'replyConnFor').mockReturnValue(conn)
+
+    await (daemon as never as Dispatchable).dispatch('bot-a', chatMsg('telegram', '1'))
+
+    expect(conn.postMessage).not.toHaveBeenCalledWith('C1', expect.stringMatching(/^⏳/), expect.anything())
+    expect(conn.updateMessage).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+})

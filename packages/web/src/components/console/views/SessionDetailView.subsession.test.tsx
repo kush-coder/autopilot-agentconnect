@@ -1,0 +1,742 @@
+// @vitest-environment happy-dom
+
+// A task's own page is read-only unless the server lets the caller continue a delegated task console-only (auto-session-mode.md §10), names the session it belongs to, and shows a follow-up's state and checks.
+
+import { act } from 'react'
+import { createRoot } from 'react-dom/client'
+import { SWRConfig } from 'swr'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Agent, DaemonRow, Session } from '@/lib/data'
+import {
+  sessionFromDto,
+  type AssistantSubsessionDto,
+  type SessionDetailDto,
+  type SessionDto,
+  type SessionMessageDto
+} from '@/lib/api'
+
+const wire = vi.hoisted(() => ({
+  rows: [] as unknown[],
+  detail: null as unknown,
+  messages: [] as unknown[],
+  busy: false,
+  draft: 'more please',
+  /** What the single-task read answers; null answers 404. */
+  task: null as unknown,
+  taskReads: [] as Array<[string, string]>,
+  /** The conversation's task list. */
+  subsessions: [] as unknown[],
+  integrations: [] as unknown[],
+  activity: {} as Record<string, number>
+}))
+const spies = vi.hoisted(() => ({
+  pgAttach: vi.fn(),
+  pgCancel: vi.fn(),
+  pgSend: vi.fn(() => true),
+  markSessionTarget: vi.fn(),
+  listFilters: [] as unknown[]
+}))
+
+vi.mock('next/navigation', () => ({
+  useParams: () => ({ id: 'session-1' }),
+  usePathname: () => '/acme/sessions/session-1',
+  useSearchParams: () => new URLSearchParams(''),
+  useRouter: () => ({
+    replace: () => {},
+    push: () => {},
+    prefetch: () => {},
+    back: () => {},
+    forward: () => {},
+    refresh: () => {}
+  })
+}))
+
+vi.mock('next/link', () => ({
+  default: ({ children, href }: { children: React.ReactNode; href: string }) => <a href={href}>{children}</a>
+}))
+
+vi.mock('@/lib/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/api')>()
+  return {
+    ...actual,
+    fetchSessionMessages: vi.fn(() => Promise.resolve({ messages: wire.messages, nextCursor: null })),
+    fetchSessionDetail: vi.fn(() => Promise.resolve(wire.detail)),
+    fetchMySessionIdentity: vi.fn(() => Promise.reject(new Error('no identity'))),
+    fetchConversationByKey: vi.fn(() => Promise.reject(new Error('no conversation'))),
+    fetchAgentTasks: vi.fn(() =>
+      Promise.resolve({ sessionId: 'session-1', tracked: true, tasks: [], truncated: false })
+    ),
+    fetchSessionPullRequest: vi.fn(() => Promise.reject(new actual.ApiError('pull request not found', 404))),
+    fetchWorkspaceFiles: vi.fn((_agentId: string, opts: { path: string }) =>
+      Promise.resolve({ path: opts.path, exists: true, entries: [], nextCursor: null })
+    ),
+    fetchWorkspaceGitStatus: vi.fn(() => Promise.resolve({ isRepo: false })),
+    fetchWorkspaceGitLog: vi.fn(() =>
+      Promise.resolve({ isRepo: false, commits: [], truncated: false, tracking: null })
+    ),
+    fetchAssistantSubsessions: vi.fn(() =>
+      Promise.resolve({ subsessions: wire.subsessions, truncated: false, nextCursor: null })
+    ),
+    fetchAssistantSubsession: vi.fn((agentId: string, sessionId: string) => {
+      wire.taskReads.push([agentId, sessionId])
+      return wire.task ? Promise.resolve(wire.task) : Promise.reject(new actual.ApiError('task not found', 404))
+    })
+  }
+})
+
+const agent = {
+  id: 'agent-1',
+  name: 'Ops bot',
+  runtime: 'claude',
+  model: 'sonnet',
+  status: 'online',
+  statusLabel: 'online',
+  icon: 'bot',
+  daemon: 'daemon-1',
+  workdir: './services/api',
+  workspace: { mode: 'scratch' },
+  canEdit: false
+} as unknown as Agent
+
+const daemons = [
+  { daemonId: 'daemon-1', name: 'edge-1', runtimeModels: [], mcpServers: [], caps: { features: [] as string[] } }
+] as unknown as DaemonRow[]
+const daemonFeatures = (daemons[0] as unknown as { caps: { features: string[] } }).caps.features
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    agents: [agent],
+    allSessions: wire.rows,
+    getSessions: () => wire.rows,
+    sessionsLoading: false,
+    crons: [],
+    daemons,
+    memberSets: [],
+    integrations: wire.integrations,
+    orgSetIds: new Set<string>(),
+    members: [],
+    sessionActivityVersionById: wire.activity,
+    sessionStreamGeneration: 0,
+    revalidateSessionLists: () => {}
+  })
+}))
+
+vi.mock('@/lib/org-context', () => ({
+  useOrgs: () => ({
+    activeOrg: { id: 'org-1', slug: 'acme' },
+    myRole: 'collaborator',
+    orgPath: (p: string) => `/acme${p}`
+  })
+}))
+
+vi.mock('@/lib/profile', () => ({ useProfile: () => ({ user: { name: 'Sam' }, me: null }) }))
+vi.mock('@/lib/acp-registry', () => ({ useAcpRegistry: () => ({}), acpRuntime: () => undefined }))
+vi.mock('@/lib/stick-to-bottom', () => ({ useStickToBottom: () => ({ pin: () => {}, awayFromBottom: false }) }))
+vi.mock('@/lib/auth', () => ({ isAuthConfigured: () => false }))
+vi.mock('@/lib/use-session-list', () => ({
+  useSessionList: (orgId: string | null, filters: unknown) => {
+    if (orgId) spies.listFilters.push(filters)
+    return { sessions: [], total: 0, isLoading: false, nextCursor: null, loadingMore: false }
+  }
+}))
+
+vi.mock('@/components/console/Shell', () => ({
+  useCrumbSlot: () => ({ register: () => {} }),
+  useMobileActionSlot: () => ({ action: null, register: () => {} })
+}))
+
+// One frozen object: the transcript effect keys on `reconcileLiveSteps` by identity.
+vi.mock('@/components/console/PlaygroundProvider', () => {
+  const playground = {
+    getPgSuggestion: () => undefined,
+    getPgSession: () => undefined,
+    getLiveSteps: () => [],
+    getBusyLaneAgentIds: () => [],
+    reconcileLiveSteps: () => {},
+    getPgImage: () => undefined,
+    getPgFiles: () => [],
+    setPgFiles: () => {},
+    getPgWorktree: () => false,
+    isPgBusy: () => wire.busy,
+    isPgTurnUnstreamed: () => false,
+    setPgImage: () => {},
+    openPlayground: () => 'pg_new',
+    pgSend: spies.pgSend,
+    markSessionTarget: spies.markSessionTarget,
+    getPgRelayFeatures: () => undefined,
+    pgAttach: spies.pgAttach,
+    getPgQueue: () => [],
+    pgCancelQueued: () => {},
+    pgAddAgent: () => {},
+    pgSetModel: () => {},
+    pgSetEffort: () => {},
+    pgSetPermissionPreset: () => {},
+    pgSetFast: () => {},
+    pgSetWorktree: () => {},
+    pgCancel: spies.pgCancel,
+    setPgInput: () => {},
+    getPgInput: () => 'more please',
+    subscribePgDraft: () => () => {}
+  }
+  return { usePlayground: () => playground, usePgDraft: () => wire.draft, usePgDraftHasText: () => wire.draft !== '' }
+})
+
+import SessionDetailView from './SessionDetailView'
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+
+interface Origin {
+  platform: string
+  channel: string
+  thread: string | null
+}
+
+// What the daemon records: the caller's platform, a channel derived from the agent, and a reserved thread of its own.
+const WEBCHAT_SUBSESSION: Origin = { platform: 'webchat', channel: 'a2a:agent-1', thread: 'subsession:delivery-1' }
+const WEBCHAT_CHECK: Origin = { platform: 'webchat', channel: 'a2a:agent-1', thread: 'subsession:check-delivery-2' }
+const SLACK_SUBSESSION: Origin = { platform: 'slack', channel: 'a2a:agent-1', thread: 'subsession:delivery-3' }
+const SLACK_CHECK: Origin = { platform: 'slack', channel: 'a2a:agent-1', thread: 'subsession:check-delivery-4' }
+const WEBCHAT: Origin = { platform: 'webchat', channel: 'conv-1', thread: null }
+const SLACK: Origin = { platform: 'slack', channel: 'C0123', thread: '1700000000.000100' }
+
+const listRow = (origin: Origin): Session =>
+  sessionFromDto({
+    sessionId: 'session-1',
+    sessionKey: {
+      platform: origin.platform,
+      channel: origin.channel,
+      ...(origin.thread !== null ? { thread: origin.thread } : {})
+    },
+    agentId: 'agent-1',
+    agentName: 'Ops bot',
+    title: 'Fix the flaky test',
+    status: 'idle',
+    lastActivityAt: '2026-10-01T00:00:00.000Z',
+    usage: null,
+    triggeredBy: 'sam',
+    channelName: null,
+    triggeredByName: 'Sam',
+    threadUrl: null,
+    runtime: 'claude',
+    model: 'sonnet',
+    daemonId: 'daemon-1'
+  } as unknown as SessionDto)
+
+const OWNER = { id: 'owner-1', agentId: 'agent-1', agentName: 'Ops bot', platform: 'slack', title: 'Deploy the thing' }
+
+// The Control Plane's own verdict: a task only where its daemon takes page messages, a webchat conversation in place.
+const detailOf = (
+  origin: Origin,
+  parentSession: SessionDetailDto['parentSession'] = null,
+  taskContinues = false
+): SessionDetailDto => {
+  const canContinue = origin.thread?.startsWith('subsession:') ? taskContinues : origin.platform !== 'webchat'
+  return {
+    id: 'session-1',
+    parentSession,
+    siblingSessions: [],
+    childSessions: [],
+    agentId: 'agent-1',
+    agentName: 'Ops bot',
+    platform: origin.platform,
+    channel: origin.channel,
+    thread: origin.thread,
+    title: 'Fix the flaky test',
+    status: 'idle',
+    lastActivityAt: '2026-10-01T00:00:00.000Z',
+    usage: null,
+    triggeredBy: 'sam',
+    channelName: null,
+    triggeredByName: 'Sam',
+    threadUrl: null,
+    runtime: 'claude',
+    model: 'sonnet',
+    effort: null,
+    fastMode: null,
+    permissionMode: null,
+    outputMode: null,
+    daemonId: 'daemon-1',
+    workspaceIsolation: 'shared',
+    executorDaemonId: null,
+    stayedHomeReason: null,
+    canContinue,
+    continuationUnavailableReason: canContinue ? null : 'unsupported_platform'
+  } as unknown as SessionDetailDto
+}
+
+const message = (seq: number, sender: string, text: string): SessionMessageDto => ({
+  seq,
+  sender,
+  ts: String(1_700_000_000 + seq),
+  kind: 'text',
+  text
+})
+
+let container: HTMLDivElement | undefined
+let root: ReturnType<typeof createRoot> | undefined
+
+async function settle() {
+  for (let i = 0; i < 6; i++) {
+    await act(async () => {
+      await Promise.resolve()
+    })
+  }
+}
+
+async function open(
+  origin: Origin,
+  {
+    listed = true,
+    parent = null,
+    taskContinues = false,
+    attachments = null
+  }: {
+    listed?: boolean
+    parent?: SessionDetailDto['parentSession']
+    taskContinues?: boolean
+    attachments?: SessionDetailDto['continuationAttachments']
+  } = {}
+) {
+  wire.rows = listed ? [listRow(origin)] : []
+  wire.detail = { ...detailOf(origin, parent, taskContinues), continuationAttachments: attachments }
+  await act(async () => {
+    root?.render(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <SessionDetailView />
+      </SWRConfig>
+    )
+  })
+  await settle()
+}
+
+function setViewport(mobile: boolean) {
+  window.matchMedia = ((query: string) => ({
+    matches: mobile && query.includes('max-width: 768px'),
+    media: query,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    onchange: null,
+    dispatchEvent: () => false
+  })) as unknown as typeof window.matchMedia
+}
+
+const text = () => container?.textContent ?? ''
+const composer = () => container?.querySelector<HTMLTextAreaElement>('textarea[placeholder="Message Ops bot…"]')
+const button = (label: string) => container?.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)
+
+beforeEach(() => {
+  wire.rows = []
+  wire.detail = null
+  wire.messages = [message(1, 'agent-1', 'TRANSCRIPT MARKER')]
+  wire.busy = false
+  wire.draft = 'more please'
+  wire.task = null
+  wire.taskReads = []
+  wire.subsessions = []
+  wire.integrations = []
+  wire.activity = {}
+  daemonFeatures.length = 0
+  spies.pgAttach.mockClear()
+  spies.pgCancel.mockClear()
+  spies.pgSend.mockClear()
+  spies.markSessionTarget.mockClear()
+  setViewport(false)
+  container = document.createElement('div')
+  document.body.append(container)
+  root = createRoot(container)
+})
+
+afterEach(() => {
+  act(() => root?.unmount())
+  container?.remove()
+  container = undefined
+  root = undefined
+})
+
+const SUBSESSIONS = [
+  ['a webchat-origin task', WEBCHAT_SUBSESSION],
+  ['a webchat-origin check', WEBCHAT_CHECK],
+  ['a Slack-origin task', SLACK_SUBSESSION],
+  ['a Slack-origin check', SLACK_CHECK]
+] as const
+
+describe.each([
+  ['on a desktop', false],
+  ['on a phone', true]
+])('a task’s own page %s', (_viewport, mobile) => {
+  beforeEach(() => setViewport(mobile))
+
+  it.each(SUBSESSIONS)('keeps %s readable but offers no composer', async (_name, origin) => {
+    await open(origin)
+
+    expect(text()).toContain('TRANSCRIPT MARKER')
+    expect(container?.querySelector('textarea')).toBeNull()
+    expect(button('Send message')).toBeNull()
+  })
+
+  it.each(SUBSESSIONS)('offers no composer stop for %s while its turn runs', async (_name, origin) => {
+    wire.busy = true
+    // Empty, so the composer would show Stop if it were offered at all.
+    wire.draft = ''
+    await open(origin)
+
+    expect(button('Stop response')).toBeNull()
+    expect(spies.pgCancel).not.toHaveBeenCalled()
+  })
+
+  it.each(SUBSESSIONS.slice(0, 2))('dials no webchat socket for %s', async (_name, origin) => {
+    await open(origin)
+
+    expect(spies.pgAttach).not.toHaveBeenCalled()
+  })
+
+  it('stays read-only when it is opened by a link rather than from a loaded list', async () => {
+    await open(WEBCHAT_SUBSESSION, { listed: false })
+
+    expect(text()).toContain('TRANSCRIPT MARKER')
+    expect(container?.querySelector('textarea')).toBeNull()
+  })
+
+  it.each(SUBSESSIONS)('names the session %s belongs to and links back to it', async (_name, origin) => {
+    await open(origin, { parent: OWNER })
+
+    const owner = container?.querySelector('[data-task-owner]')
+    expect(owner?.textContent).toBe('Belongs to Deploy the thing · task')
+    expect(owner?.querySelector('a')?.getAttribute('href')).toMatch(/\/sessions\/owner-1$/)
+    // Its tool calls stay in its own transcript, and the owner is a plain labelled link, not a tree.
+    expect(text()).toContain('TRANSCRIPT MARKER')
+    const related = container?.querySelector('[data-related-card]')
+    expect(related?.querySelector('[data-related-row="startedBy"]')?.textContent).toContain(
+      'Started by Deploy the thing'
+    )
+  })
+
+  it.each(SUBSESSIONS.filter(([name]) => name.endsWith('task')))(
+    'offers %s a composer that continues it by its target once the server lets this caller',
+    async (_name, origin) => {
+      await open(origin, { parent: OWNER, taskContinues: true })
+
+      expect(container?.querySelector('[data-task-owner]')?.textContent).toBe('Belongs to Deploy the thing · task')
+      expect(composer()).not.toBeNull()
+      // Never its conversation's own socket: the task is reached by its session, console-only.
+      expect(spies.pgAttach).not.toHaveBeenCalled()
+      await act(async () => button('Send message')?.click())
+      expect(spies.markSessionTarget).toHaveBeenCalledWith('session-1', 'session-1')
+      expect(spies.pgSend).toHaveBeenCalledTimes(1)
+      // The task's session, never the conversation id its channel names.
+      const [sessionId, agentId, , conversationId] = spies.pgSend.mock.calls[0] as unknown[]
+      expect([sessionId, agentId, conversationId]).toEqual(['session-1', 'agent-1', undefined])
+    }
+  )
+
+  it('says the owning session is not visible rather than inventing a link', async () => {
+    await open(SLACK_SUBSESSION)
+
+    const owner = container?.querySelector('[data-task-owner]')
+    expect(owner?.textContent).toBe('Task · the session it belongs to isn’t visible to you')
+    expect(owner?.querySelector('a')).toBeNull()
+  })
+})
+
+describe.each([
+  ['on a desktop', false],
+  ['on a phone', true]
+])('an ordinary session’s page %s', (_viewport, mobile) => {
+  beforeEach(() => setViewport(mobile))
+
+  it('keeps a webchat conversation’s composer, its stop and its socket', async () => {
+    wire.busy = true
+    // Stop replaces Send only while the composer is empty.
+    wire.draft = ''
+    await open(WEBCHAT)
+
+    expect(composer()).not.toBeNull()
+    expect(button('Stop response')).not.toBeNull()
+    expect(spies.pgAttach).toHaveBeenCalledWith('session-1', 'agent-1', 'conv-1')
+  })
+
+  it('probes the webchat socket again when the session reports activity', async () => {
+    await open(WEBCHAT)
+    spies.pgAttach.mockClear()
+
+    wire.activity = { 'session-1': 1 }
+    await open(WEBCHAT)
+
+    expect(spies.pgAttach).toHaveBeenCalledWith('session-1', 'agent-1', 'conv-1')
+  })
+
+  it('keeps a channel session’s continuation composer', async () => {
+    await open(SLACK)
+
+    expect(composer()).not.toBeNull()
+    expect(button('Send message')).not.toBeNull()
+  })
+
+  it('offers a channel session no attachment toward a daemon that cannot mirror one', async () => {
+    await open(SLACK)
+    expect(button('Attach a file')).toBeNull()
+  })
+
+  it('offers a channel session images only once its daemon mirrors them', async () => {
+    await open(SLACK, { attachments: 'images' })
+    const picker = container?.querySelector<HTMLInputElement>('input[type="file"]')
+    expect(picker?.getAttribute('accept')).toBe('image/*')
+    await act(async () => button('Attach a file')?.click())
+    expect(text()).toContain('Add images')
+    expect(text()).not.toContain('Add files')
+  })
+
+  it('offers files too where nothing mirrors the continued session', async () => {
+    await open(SLACK, { attachments: 'images_and_files' })
+    const picker = container?.querySelector<HTMLInputElement>('input[type="file"]')
+    expect(picker?.hasAttribute('accept')).toBe(false)
+    await act(async () => button('Attach a file')?.click())
+    expect(text()).toContain('Add files')
+  })
+
+  it('keeps tasks out of the Sessions rail, as All sessions does by default', async () => {
+    spies.listFilters.length = 0
+    await open(SLACK)
+
+    expect(spies.listFilters.length).toBeGreaterThan(0)
+    for (const filters of spies.listFilters) expect(filters).toMatchObject({ excludeTasks: true })
+  })
+
+  it('carries no task header, even with a session that started it', async () => {
+    await open(SLACK, { parent: OWNER })
+
+    expect(container?.querySelector('[data-task-owner]')).toBeNull()
+    expect(container?.querySelector('[data-related-row="startedBy"]')).not.toBeNull()
+  })
+
+  // auto-session-mode.md §6.2, §11: a threaded task's coordinator is its Control Plane parent, named once among its related sessions.
+  it('names the coordinator a threaded task belongs to once, from its metadata, and keeps its composer', async () => {
+    daemonFeatures.push('assistant-task-handle-v1', 'session-mode-auto-v1')
+    wire.integrations = [{ agentId: 'agent-1', channels: [{ channelId: 'C0123', sessionMode: 'auto' }] }]
+    await open(SLACK, { parent: { ...OWNER, id: 'coordinator-1', title: 'morning all' } })
+
+    expect(wire.taskReads).toEqual([])
+    expect(container?.querySelector('[data-task-owner]')).toBeNull()
+    // The dock's Related list and the phone's Related card draw the same one link.
+    const related = [...(container?.querySelectorAll('[data-related-row="startedBy"]') ?? [])]
+    expect(related.length).toBeGreaterThan(0)
+    for (const row of related)
+      expect((row.closest('a') ?? row.querySelector('a'))?.getAttribute('href')).toMatch(/\/sessions\/coordinator-1$/)
+    expect(composer()).not.toBeNull()
+  })
+
+  it('marks a coordinator’s own page in the desktop header and the phone header alike', async () => {
+    await open({ platform: 'slack', channel: 'C0123', thread: 'append:coordinator-1700000000000' })
+
+    const header = container?.querySelector('[data-session-header]')
+    const marker = header?.querySelector('[data-header-coordinator]')
+    expect(marker?.getAttribute('aria-label')).toContain('Coordinator')
+    // Both widths use the same marker, outside the desktop-only title group.
+    expect(marker?.parentElement).toBe(header)
+    expect(container?.querySelector('[data-task-owner]')).toBeNull()
+  })
+})
+
+/** A follow-up's row as the single-task read answers it. */
+const FOLLOW_UP: AssistantSubsessionDto = {
+  sessionId: 'session-1',
+  title: 'Watch the release',
+  state: 'open',
+  startedAt: '2026-10-01T00:00:00.000Z',
+  visible: true,
+  canStop: true,
+  parent: { sessionId: 'owner-1', title: 'Deploy the thing', platform: 'slack', channelName: null },
+  kind: 'follow-up',
+  followUp: {
+    id: 'item-1',
+    status: 'waiting',
+    nextCheck: '2026-10-16T09:00:00.000Z',
+    doneWhen: 'The release is published',
+    recentChecks: [{ at: '2026-10-15T09:00:00.000Z', observation: 'The tag exists; still a draft.', reported: true }]
+  }
+}
+
+describe.each([
+  ['on a desktop', false],
+  ['on a phone', true]
+])('a follow-up’s own page %s', (_viewport, mobile) => {
+  beforeEach(() => {
+    setViewport(mobile)
+    daemonFeatures.push('assistant-task-handle-v1')
+  })
+  const summary = () => container?.querySelector<HTMLElement>('[data-follow-up-summary]')
+
+  it('shows its state, what counts as done and its recent checks, read by its own session', async () => {
+    wire.task = FOLLOW_UP
+    await open(SLACK_CHECK, { parent: OWNER })
+
+    expect(wire.taskReads).toEqual([['agent-1', 'session-1']])
+    expect(summary()?.dataset.followUpSummary).toBe('waiting')
+    expect(summary()?.querySelector('[data-follow-up-status]')?.textContent).toBe(
+      'Waiting · next check Oct 16, 2026, 9:00 AM'
+    )
+    expect(summary()?.textContent).toContain('Follow-up')
+    const checks = summary()?.querySelector('[data-follow-up-checks]')
+    expect(checks?.textContent).toContain('The release is published')
+    expect(checks?.textContent).not.toContain('Done when')
+    expect(checks?.querySelector('[data-follow-up-check="reported"]')?.textContent).toContain('still a draft.')
+    // The page stays read-only, and still names the session it belongs to.
+    expect(container?.querySelector('[data-task-owner]')?.textContent).toBe('Belongs to Deploy the thing · task')
+    expect(container?.querySelector('textarea')).toBeNull()
+
+    await act(async () => summary()?.querySelector<HTMLButtonElement>('button[aria-label="Hide checks"]')?.click())
+    expect(summary()?.querySelector('[data-follow-up-checks]')).toBeNull()
+  })
+
+  // assistant-mode.md §5.14: what it watches sits under what counts as done, and each check says what started it.
+  it('names what it watches and what started each check', async () => {
+    const url = 'https://github.com/example-org/example-repo/pull/12'
+    wire.task = {
+      ...FOLLOW_UP,
+      followUp: {
+        ...FOLLOW_UP.followUp!,
+        watch: { url, target: 'example-org/example-repo#12', state: 'watching', reason: null },
+        recentChecks: [
+          {
+            at: '2026-10-15T09:00:00.000Z',
+            observation: 'Merged.',
+            reported: true,
+            startedBy: 'wake',
+            events: ['merged']
+          }
+        ]
+      }
+    }
+    await open(SLACK_CHECK, { parent: OWNER })
+    const checks = summary()?.querySelector('[data-follow-up-checks]')
+    expect(checks?.querySelector('[data-follow-up-watch]')?.textContent).toBe(
+      'Watching example-org/example-repo#12 · woken Oct 15, 9:00 AM (merged)'
+    )
+    expect(checks?.querySelector('[data-follow-up-watch] a')?.getAttribute('href')).toBe(url)
+    expect(checks?.querySelector('[data-follow-up-check-trigger]')?.textContent).toBe('Woken: merged')
+  })
+
+  // assistant-mode.md §5.13: a getting-to-know task's page names it as one.
+  it('names a getting-to-know task as one', async () => {
+    wire.task = { ...FOLLOW_UP, followUp: { ...FOLLOW_UP.followUp!, gettingToKnow: true } }
+    await open(SLACK_CHECK, { parent: OWNER })
+    expect(summary()?.textContent).toContain('Getting to know')
+    expect(summary()?.textContent).not.toContain('Follow-up')
+  })
+
+  it.each([
+    ['checking', 'Checking'],
+    ['paused', 'Paused'],
+    ['done', 'Done'],
+    ['stopped', 'Stopped']
+  ] as const)('reads %s as its state', async (status, label) => {
+    wire.task = { ...FOLLOW_UP, followUp: { ...FOLLOW_UP.followUp!, status, nextCheck: null } }
+    await open(SLACK_CHECK, { parent: OWNER })
+
+    expect(summary()?.querySelector('[data-follow-up-status]')?.textContent).toBe(label)
+  })
+
+  it.each([
+    ['a delegated task', { ...FOLLOW_UP, kind: 'delegated', followUp: undefined }],
+    ['a follow-up the reader may not see', { ...FOLLOW_UP, visible: false }]
+  ] as const)('shows nothing more for %s', async (_name, task) => {
+    wire.task = task
+    await open(SLACK_CHECK, { parent: OWNER })
+
+    expect(wire.taskReads).toEqual([['agent-1', 'session-1']])
+    expect(summary()).toBeNull()
+  })
+
+  it('stays as it was toward a daemon that cannot read one task', async () => {
+    daemonFeatures.length = 0
+    wire.task = FOLLOW_UP
+    await open(SLACK_CHECK, { parent: OWNER })
+
+    expect(wire.taskReads).toEqual([])
+    expect(summary()).toBeNull()
+    expect(container?.querySelector('[data-task-owner]')?.textContent).toBe('Belongs to Deploy the thing · task')
+  })
+
+  it('reads no task on an ordinary session’s page', async () => {
+    wire.task = FOLLOW_UP
+    await open(SLACK, { parent: OWNER })
+
+    expect(wire.taskReads).toEqual([])
+    expect(summary()).toBeNull()
+  })
+})
+
+// auto-session-mode.md §10: a channel coordinator posts no link card, so its task's card stands under the turn that answered the message the task was opened for.
+// A platform whose module declares no thread shape; Slack's footers carry the task instead (webchat-threads.md §7).
+describe('a channel coordinator’s task cards', () => {
+  it('draws a task’s card under the coordinator’s answer to the message it was opened for', async () => {
+    daemonFeatures.push('activity-every-agent-v1')
+    wire.messages = [
+      { ...message(1, 'sam', 'what is new in Node.js?'), ts: '1700000001.000100' },
+      { ...message(2, 'agent-1', 'Looking into it.'), ts: '1700000002.000100' },
+      { ...message(3, 'sam', 'thanks'), ts: '1700000003.000100' },
+      { ...message(4, 'agent-1', 'Any time.'), ts: '1700000004.000100' }
+    ]
+    wire.subsessions = [
+      {
+        sessionId: 'child-1',
+        title: 'Node.js release notes',
+        state: 'done',
+        startedAt: '2026-10-01T00:00:00.000Z',
+        visible: true,
+        canStop: false,
+        parent: null,
+        threaded: true,
+        openedForMessageId: '1700000001.000100'
+      }
+    ]
+    await open({ platform: 'discord', channel: '1234567890', thread: 'append:coordinator-1700000000000' })
+
+    const cards = [...(container?.querySelectorAll('[data-task-card]') ?? [])]
+    expect(cards.map((card) => card.getAttribute('data-task-card'))).toEqual(['child-1'])
+    expect(cards[0]!.textContent).toContain('Node.js release notes')
+    expect(cards[0]!.querySelector('[data-state-icon]')?.getAttribute('aria-label')).toBe('Idle')
+    // Under the coordinator's answer to that message, before the later exchange.
+    const after = (node: Node, text: string) =>
+      [...(container?.querySelectorAll('div') ?? [])].some(
+        (el) => el.textContent === text && Boolean(node.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)
+      )
+    expect(after(cards[0]!, 'thanks')).toBe(true)
+    const answer = [...(container?.querySelectorAll('div') ?? [])].find((el) => el.textContent === 'Looking into it.')!
+    expect(Boolean(answer.compareDocumentPosition(cards[0]!) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+  })
+
+  it('keeps the cards of every message in a batch the coordinator answered in one turn', async () => {
+    daemonFeatures.push('activity-every-agent-v1')
+    wire.messages = [
+      { ...message(1, 'sam', 'find what blocks 1.5'), ts: '1700000001.000100' },
+      { ...message(2, 'dana', 'and draft the notes'), ts: '1700000002.000100' },
+      { ...message(3, 'lee', 'nice'), ts: '1700000003.000100' },
+      { ...message(4, 'agent-1', 'On it, two tasks.'), ts: '1700000004.000100' }
+    ]
+    const task = (sessionId: string, title: string, openedForMessageId: string) => ({
+      sessionId,
+      title,
+      state: 'open',
+      startedAt: '2026-10-01T00:00:00.000Z',
+      visible: true,
+      canStop: true,
+      parent: null,
+      threaded: true,
+      openedForMessageId
+    })
+    wire.subsessions = [
+      task('child-1', 'Find what blocks 1.5', '1700000001.000100'),
+      task('child-2', 'Draft the notes', '1700000002.000100')
+    ]
+    await open({ platform: 'discord', channel: '1234567890', thread: 'append:coordinator-1700000000000' })
+
+    const cards = [...(container?.querySelectorAll('[data-task-card]') ?? [])]
+    expect(cards.map((card) => card.getAttribute('data-task-card'))).toEqual(['child-1', 'child-2'])
+    const answer = [...(container?.querySelectorAll('div') ?? [])].find((el) => el.textContent === 'On it, two tasks.')!
+    for (const card of cards)
+      expect(Boolean(answer.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true)
+  })
+})

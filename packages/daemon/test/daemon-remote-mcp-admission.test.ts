@@ -1,0 +1,383 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { WebchatDone, WebchatOutput } from '@agentconnect.md/protocol'
+import { Daemon } from '../src/daemon.js'
+import { RemoteWebchatGrantManager } from '../src/mcp/remote-webchat-grant.js'
+
+/**
+ * Integration coverage for admin-MCP delivery through the real webchat dispatch
+ * path. Runtime identity, launch provenance, ACP probe results, the preset marker,
+ * and OS sandbox policy are deliberately absent from admission: the executable is
+ * already inside the configured runtime boundary. A webchat turn carrying the
+ * CP-issued conversation entitlement is the only local attachment condition.
+ */
+
+const AGENT_ID = 'bot-a'
+const CONV = '88888888-8888-4888-8888-888888888888'
+const AUTHORITY = '11111111-1111-4111-8111-111111111111'
+const GRANT = '33333333-3333-4333-8333-333333333333'
+const TOKEN = 'secret-token-that-is-longer-than-thirty-two-bytes'
+
+it('does not revive a conversation-granted admin card through the organization provider host', async () => {
+  const daemon = Object.create(Daemon.prototype) as any
+  daemon.store = {
+    getAppCard: vi.fn(async () => ({
+      channel: CONV,
+      thread: CONV,
+      ts: '100',
+      sender: AGENT_ID,
+      body: JSON.stringify({
+        appId: 'native-app',
+        conversationId: CONV,
+        server: 'agentconnect-admin',
+        toolName: 'agentconnect-admin__configureIntegration',
+        title: 'Configure integration'
+      })
+    }))
+  }
+  daemon.orgForAgent = vi.fn()
+  expect(await daemon.reviveAppCard('native-app', CONV, {})).toBeUndefined()
+  expect(daemon.orgForAgent).not.toHaveBeenCalled()
+})
+
+function scaffold(opts: { builtin: boolean; execution: string }): string {
+  const root = mkdtempSync(join(tmpdir(), 'ac-rmcp-'))
+  writeFileSync(
+    join(root, 'config.json'),
+    JSON.stringify({
+      version: 1,
+      controlPlane: { enabled: false },
+      // An arbitrary user-defined ACP runtime proves descriptor delivery is not
+      // inferred from a canonical id, package, version, provenance, or probe.
+      runtimes: { 'arbitrary-acp': { command: 'node', args: ['unused'] } }
+    })
+  )
+  const adir = join(root, 'agents', AGENT_ID)
+  mkdirSync(adir, { recursive: true })
+  writeFileSync(
+    join(adir, 'agent.json'),
+    JSON.stringify({
+      id: AGENT_ID,
+      name: AGENT_ID,
+      status: 'active',
+      runtime: 'arbitrary-acp',
+      builtin: opts.builtin,
+      execution: opts.execution,
+      workspace: { mode: 'from-scratch', path: join(adir, 'workspace') },
+      integrations: [],
+      output: { mode: 'medium' }
+    })
+  )
+  return root
+}
+
+function fakeHost(rejectAdminDescriptor = false, toolUpdates: unknown[] = []) {
+  let onUpdate!: (sid: string, update: unknown) => void
+  const selectedAgents: Array<{ builtin: boolean; execution: string; runtime: string }> = []
+  const host = {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async (_cwd: string, mcpServers: Array<{ name?: string }>) => {
+      if (rejectAdminDescriptor && mcpServers.some((server) => server.name === 'agentconnect-admin')) {
+        throw new Error('runtime rejected HTTP MCP descriptor')
+      }
+      return 'acp-rmcp-1'
+    }),
+    modelOptions: vi.fn(() => null),
+    hasSession: vi.fn(() => true),
+    prompt: vi.fn(async (sid: string) => {
+      for (const update of toolUpdates) await onUpdate(sid, update)
+      onUpdate(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ok' } })
+      return { stopReason: 'end_turn' }
+    }),
+    cancel: vi.fn(async () => {}),
+    forgetSession: vi.fn(),
+    stop: vi.fn(async () => {})
+  }
+  const factory = (
+    agent: { builtin: boolean; execution: string; runtime: string },
+    callback: (sid: string, update: unknown) => void
+  ) => {
+    selectedAgents.push(agent)
+    onUpdate = callback
+    return host as never
+  }
+  return { factory, host, selectedAgents }
+}
+
+function fakeGrantClient() {
+  return {
+    issueWebchatMcpGrant: vi.fn(async (input: Record<string, unknown>) => ({
+      ...input,
+      grantId: GRANT,
+      grantRevision: 1,
+      token: TOKEN,
+      expiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+      mcpUrl: 'https://cp.example/api/v1/mcp'
+    })),
+    acceptWebchatMcpGrant: vi.fn(async (input: Record<string, unknown>) => ({ ...input, activated: true })),
+    revokeWebchatMcpGrant: vi.fn(async (input: Record<string, unknown>) => ({ ...input, revoked: true }))
+  }
+}
+
+async function runTurn(opts: {
+  builtin: boolean
+  execution: string
+  rejectAdminDescriptor?: boolean
+  toolUpdates?: unknown[]
+}) {
+  const { factory, host, selectedAgents } = fakeHost(opts.rejectAdminDescriptor, opts.toolUpdates)
+  const daemon = new Daemon({ root: scaffold(opts), hostFactory: factory as never })
+  await daemon.start()
+  const client = fakeGrantClient()
+  const anyDaemon = daemon as never as Record<string, any>
+  anyDaemon.remoteWebchatGrants = new RemoteWebchatGrantManager(client as never)
+
+  const outputs: WebchatOutput[] = []
+  const dones: WebchatDone[] = []
+  const turnId = '77777777-7777-4777-8777-777777777777'
+  await anyDaemon.dispatch(
+    AGENT_ID,
+    {
+      msgId: `webchat:${CONV}:${turnId}`,
+      traceId: turnId,
+      source: 'user',
+      platform: 'webchat',
+      channel: CONV,
+      sender: { id: 'alice', isBot: false },
+      text: 'go',
+      mentionedBots: [],
+      isDm: true,
+      trigger: 'dm'
+    },
+    undefined,
+    {
+      conversationId: CONV,
+      turnId,
+      sink: { output: (output: WebchatOutput) => outputs.push(output), done: (done: WebchatDone) => dones.push(done) },
+      remoteMcp: {
+        authorityId: AUTHORITY,
+        authorityGeneration: 1,
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString()
+      }
+    }
+  )
+  await daemon.stop().catch(() => {})
+  return { client, host, selectedAgents, dones, outputs }
+}
+
+function adminDescriptor(host: ReturnType<typeof fakeHost>['host']) {
+  const mcpServers = (host.newSession.mock.calls[0]?.[1] ?? []) as Array<{
+    name?: string
+    headers?: Array<{ name: string; value: string }>
+  }>
+  return mcpServers.find((server) => server.name === 'agentconnect-admin')
+}
+
+describe('admin MCP through the webchat dispatch path', () => {
+  it('projects a direct HTTP tool result into one native card without proxying the admin call', async () => {
+    const nativeUi = {
+      resourceUri: 'ui://agentconnect/integration-setup',
+      resourceVersion: 1,
+      orgId: AUTHORITY,
+      intent: { mode: 'create', provider: 'github' }
+    }
+    const update = {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'direct-http-call',
+      status: 'completed',
+      rawInput: { server: 'agentconnect-admin', tool: 'configureIntegration', arguments: nativeUi.intent },
+      rawOutput: { result: { structuredContent: nativeUi }, error: null }
+    }
+    const { host, outputs } = await runTurn({ builtin: true, execution: 'srt', toolUpdates: [update, update] })
+    expect(adminDescriptor(host)).toMatchObject({ type: 'http', url: 'https://cp.example/api/v1/mcp' })
+    const cards = outputs.filter((output) => output.event?.kind === 'app')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.event).toMatchObject({ nativeUi })
+  })
+  it.each([
+    ['without an OS sandbox', 'host'],
+    ['with an OS sandbox', 'srt']
+  ] as const)('attaches to an arbitrary runtime %s', async (_label, execution) => {
+    const { client, host, selectedAgents, dones } = await runTurn({ builtin: true, execution })
+
+    expect(dones).toHaveLength(1)
+    expect(selectedAgents[0]).toMatchObject({
+      builtin: true,
+      execution,
+      runtime: 'arbitrary-acp'
+    })
+    expect(client.issueWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(client.acceptWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(adminDescriptor(host)?.headers).toEqual([{ name: 'Authorization', value: `Bearer ${TOKEN}` }])
+    // The credential is ACP session configuration, never model prompt text.
+    expect(JSON.stringify(host.prompt.mock.calls)).not.toContain(TOKEN)
+  })
+
+  // The catalog belongs to the webchat surface, not to the preset: an ordinary agent gets it too.
+  it('attaches for an ordinary agent that carries no preset marker', async () => {
+    const { client, host, dones } = await runTurn({ builtin: false, execution: 'host' })
+
+    expect(dones).toHaveLength(1)
+    expect(client.issueWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(adminDescriptor(host)).toMatchObject({ type: 'http', url: 'https://cp.example/api/v1/mcp' })
+  })
+
+  it('keeps ordinary webchat running when the runtime rejects the admin descriptor', async () => {
+    const { client, host, dones } = await runTurn({
+      builtin: true,
+      execution: 'srt',
+      rejectAdminDescriptor: true
+    })
+
+    expect(dones).toHaveLength(1)
+    expect(client.issueWebchatMcpGrant).toHaveBeenCalledTimes(1)
+    expect(host.newSession).toHaveBeenCalledTimes(2)
+    expect(
+      ((host.newSession.mock.calls[0]?.[1] ?? []) as Array<{ name?: string }>).some(
+        (server) => server.name === 'agentconnect-admin'
+      )
+    ).toBe(true)
+    const fallbackServers = (host.newSession.mock.calls[1]?.[1] ?? []) as Array<{ name?: string }>
+    expect(fallbackServers.some((server) => server.name === 'agentconnect')).toBe(true)
+    expect(fallbackServers.some((server) => server.name === 'agentconnect-admin')).toBe(false)
+    expect(host.prompt).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('which turn installs admin MCP in a webchat coordinator conversation', () => {
+  const entitlement = { authorityId: AUTHORITY, authorityGeneration: 1, expiresAt: '2030-01-01T00:00:00.000Z' }
+  const coordinatorKey = `webchat:${CONV}:append:coordinator-1:${AGENT_ID}`
+  const taskThread = 'subsession:2'
+  const taskKey = `webchat:a2a:${taskThread}:${AGENT_ID}`
+  const ROOT = '11111111-1111-4111-8111-111111111111'
+
+  function routing(parent: { platform: string; channel: string; thread: string } | undefined) {
+    const daemon = Object.create(Daemon.prototype) as any
+    daemon.remoteWebchatGrants = new RemoteWebchatGrantManager(fakeGrantClient() as never)
+    daemon.clock = { now: () => Date.parse('2029-01-01T00:00:00.000Z') }
+    daemon.store = {
+      assistantSubsessions: {
+        get: vi.fn(async () => ({ parentSessionKey: coordinatorKey })),
+        threadsOf: vi.fn(async () => [{ platform: 'webchat', channel: CONV, thread: ROOT }])
+      },
+      getSession: vi.fn(async () => parent)
+    }
+    return daemon
+  }
+  const coordinatorParent = { platform: 'webchat', channel: CONV, thread: 'append:coordinator-1' }
+
+  it('the coordinator installs none; the page task it opened inherits its own grant of the entitlement', async () => {
+    const daemon = routing(coordinatorParent)
+    const coordinatorMsg = { channel: CONV, sessionThread: 'append:coordinator-1' }
+    expect(
+      await daemon.adminMcpEntitlement(AGENT_ID, coordinatorKey, coordinatorMsg, {
+        conversationId: CONV,
+        remoteMcp: entitlement
+      })
+    ).toBeUndefined()
+
+    const taskMsg = { channel: 'a2a', sessionThread: taskThread }
+    expect(await daemon.adminMcpEntitlement(AGENT_ID, taskKey, taskMsg, undefined)).toEqual({
+      conversationId: CONV,
+      entitlement,
+      sessionKey: taskKey
+    })
+  })
+
+  it('a task keyed on its webchat thread inherits its own grant as a page task does (webchat-threads.md §5.4)', async () => {
+    const daemon = routing(coordinatorParent)
+    daemon.remoteWebchatGrants.noteEntitlement(CONV, AGENT_ID, entitlement)
+    const threadKey = `webchat:${CONV}:${ROOT}:${AGENT_ID}`
+    expect(await daemon.adminMcpEntitlement(AGENT_ID, threadKey, { channel: CONV, thread: ROOT }, undefined)).toEqual({
+      conversationId: CONV,
+      entitlement,
+      sessionKey: threadKey
+    })
+  })
+
+  it('an ordinary webchat session installs its own conversation entitlement', async () => {
+    const daemon = routing(undefined)
+    expect(
+      await daemon.adminMcpEntitlement(
+        AGENT_ID,
+        `webchat:${CONV}:${CONV}:${AGENT_ID}`,
+        { channel: CONV, thread: CONV },
+        {
+          conversationId: CONV,
+          remoteMcp: entitlement
+        }
+      )
+    ).toEqual({ conversationId: CONV, entitlement })
+  })
+
+  it('a task gets nothing before its coordinator carried an entitlement, or under a parent that is no webchat coordinator', async () => {
+    const taskMsg = { channel: 'a2a', sessionThread: taskThread }
+    expect(await routing(coordinatorParent).adminMcpEntitlement(AGENT_ID, taskKey, taskMsg, undefined)).toBeUndefined()
+
+    const nested = routing({ platform: 'webchat', channel: 'a2a', thread: 'subsession:1' })
+    nested.remoteWebchatGrants.noteEntitlement('a2a', AGENT_ID, entitlement)
+    expect(await nested.adminMcpEntitlement(AGENT_ID, taskKey, taskMsg, undefined)).toBeUndefined()
+
+    const slack = routing({ platform: 'slack', channel: 'C1', thread: 'append:coordinator-1' })
+    slack.remoteWebchatGrants.noteEntitlement('C1', AGENT_ID, entitlement)
+    expect(await slack.adminMcpEntitlement(AGENT_ID, taskKey, taskMsg, undefined)).toBeUndefined()
+
+    const check = routing(coordinatorParent)
+    check.remoteWebchatGrants.noteEntitlement(CONV, AGENT_ID, entitlement)
+    expect(
+      await check.adminMcpEntitlement(
+        AGENT_ID,
+        taskKey,
+        { channel: 'a2a', sessionThread: 'subsession:check-1' },
+        undefined
+      )
+    ).toBeUndefined()
+  })
+})
+
+describe('an idle-closed webchat session and its conversation authority', () => {
+  const entitlement = { authorityId: AUTHORITY, authorityGeneration: 1, expiresAt: '2030-01-01T00:00:00.000Z' }
+  const coordinatorKey = `webchat:${CONV}:append:coordinator-1:${AGENT_ID}`
+  const taskKey = `webchat:a2a:subsession:2:${AGENT_ID}`
+
+  async function conversation(sessions: Record<string, { state: string }>, openInChannel: boolean) {
+    const client = fakeGrantClient()
+    const daemon = Object.create(Daemon.prototype) as any
+    daemon.remoteWebchatGrants = new RemoteWebchatGrantManager(client as never)
+    daemon.store = {
+      hasOpenSessionInChannel: vi.fn(async () => openInChannel),
+      getSession: vi.fn(async (key: string) => sessions[key])
+    }
+    daemon.remoteWebchatGrants.noteEntitlement(CONV, AGENT_ID, entitlement)
+    await daemon.remoteWebchatGrants.provision(CONV, entitlement, Date.now(), AGENT_ID, taskKey)
+    return { daemon, client }
+  }
+
+  it('a coordinator closing while its task still works leaves the task its grant and the entitlement', async () => {
+    const { daemon, client } = await conversation({ [taskKey]: { state: 'prompting' } }, false)
+    await daemon.releaseIdleWebchatGrant({ key: coordinatorKey, agentId: AGENT_ID, channel: CONV })
+    expect(client.revokeWebchatMcpGrant).not.toHaveBeenCalled()
+    expect(daemon.remoteWebchatGrants.taskSessionKeys(CONV)).toEqual([taskKey])
+    expect(daemon.remoteWebchatGrants.inheritedEntitlement(CONV, AGENT_ID)).toEqual(entitlement)
+  })
+
+  it('an open session of the conversation keeps the authority, and a closing task drops only its own descriptor', async () => {
+    const { daemon, client } = await conversation({}, true)
+    await daemon.releaseIdleWebchatGrant({ key: taskKey, agentId: AGENT_ID, channel: CONV })
+    expect(client.revokeWebchatMcpGrant).not.toHaveBeenCalled()
+    expect(daemon.remoteWebchatGrants.taskSessionKeys(CONV)).toEqual([])
+    expect(daemon.remoteWebchatGrants.inheritedEntitlement(CONV, AGENT_ID)).toEqual(entitlement)
+  })
+
+  it("the conversation's last open session closing revokes its authority", async () => {
+    const { daemon, client } = await conversation({ [taskKey]: { state: 'closed' } }, false)
+    await daemon.releaseIdleWebchatGrant({ key: coordinatorKey, agentId: AGENT_ID, channel: CONV })
+    expect(client.revokeWebchatMcpGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ authorityId: AUTHORITY, conversationId: CONV, reason: 'session_expired' })
+    )
+    expect(daemon.remoteWebchatGrants.taskSessionKeys(CONV)).toEqual([])
+    expect(daemon.remoteWebchatGrants.inheritedEntitlement(CONV, AGENT_ID)).toBeUndefined()
+  })
+})

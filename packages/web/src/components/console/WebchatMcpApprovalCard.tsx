@@ -1,0 +1,259 @@
+'use client'
+
+import { useState } from 'react'
+import useSWR from 'swr'
+import {
+  decideWebchatMcpOperation,
+  getWebchatMcpOperation,
+  listWebchatMcpOperations,
+  type WebchatMcpOperationDto
+} from '@/lib/api'
+import { Button } from '@/components/ui'
+import { useTranslations } from 'next-intl'
+
+/** A decided (or decision-lost) operation the owner must still be able to see.
+ *  `outcome` is the last DTO the CP returned; `null` means the decision response
+ *  was lost and the true state is unknown until an exact-operation refetch. */
+interface SettledOperation {
+  operation: WebchatMcpOperationDto
+  decision: 'approve' | 'deny'
+  outcome: WebchatMcpOperationDto | null
+}
+
+const OUTCOME_LABEL = {
+  awaiting_confirmation: 'awaitingConfirmation',
+  executing: 'executing',
+  completed: 'completed',
+  failed: 'failed',
+  ambiguous: 'ambiguous',
+  stale: 'stale'
+} as const satisfies Record<WebchatMcpOperationDto['status'], string>
+
+type OutcomeLabelKey = (typeof OUTCOME_LABEL)[keyof typeof OUTCOME_LABEL] | 'denied' | 'unknown'
+
+function outcomeLabel(entry: SettledOperation): OutcomeLabelKey {
+  if (!entry.outcome) return 'unknown'
+  if (entry.decision === 'deny' && entry.outcome.status === 'failed') return 'denied'
+  return OUTCOME_LABEL[entry.outcome.status]
+}
+
+function outcomeNote(entry: SettledOperation): 'lost' | 'ambiguous' | 'executing' | 'stale' | null {
+  if (!entry.outcome) return 'lost'
+  switch (entry.outcome.status) {
+    case 'ambiguous':
+    case 'executing':
+    case 'stale':
+      return entry.outcome.status
+    default:
+      return null
+  }
+}
+
+/** What the conversation tells the agent about a settled operation. Deliberately
+ * short and machine-readable: the agent reads the result itself with
+ * `getOperation`, so a bounded tool payload never has to ride the transcript. */
+export function approvalNotice(
+  operation: WebchatMcpOperationDto,
+  decision: 'approve' | 'deny',
+  outcome: WebchatMcpOperationDto
+): string {
+  // A denial lands as `failed` (the operation never ran), so the DECISION is what
+  // separates the two — the same rule the card's own label uses.
+  const state = decision === 'deny' && outcome.status === 'failed' ? 'denied' : outcome.status
+  return (
+    `[approval] ${operation.toolName} (operation ${operation.operationId}) is now ${state}. ` +
+    'Read it with getOperation and continue from there.'
+  )
+}
+
+/** Which operations a session raised: those whose id its own recorded rows carry, as a pending write's tool result names it. */
+export function raisedIn(rows: readonly { text?: string; body?: string }[] | null | undefined) {
+  return (operationId: string) =>
+    (rows ?? []).some((row) => row.body?.includes(operationId) || row.text?.includes(operationId))
+}
+
+export function WebchatMcpApprovalCard({
+  orgId,
+  agentId,
+  conversationId,
+  className = '',
+  raisedHere,
+  onDecided
+}: {
+  orgId: string
+  agentId: string
+  conversationId: string
+  className?: string
+  /** Only the operations this session raised, where a conversation's tasks raise theirs under its grant; absent shows all. */
+  raisedHere?: (operationId: string) => boolean
+  /** A decision the agent has to hear about: it received an operationId and
+   *  ended its turn, so nothing else would tell it the operation is settled.
+   *  Only ever called for a decision whose outcome is known. */
+  onDecided?: (operation: WebchatMcpOperationDto, decision: 'approve' | 'deny', outcome: WebchatMcpOperationDto) => void
+}) {
+  const t = useTranslations('Sessions.webchatApproval')
+  const { data, mutate } = useSWR(
+    ['webchat-mcp-operations', orgId, agentId, conversationId] as const,
+    () => listWebchatMcpOperations(orgId, agentId, conversationId),
+    { refreshInterval: 2_000 }
+  )
+  const [busy, setBusy] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [settled, setSettled] = useState<SettledOperation[]>([])
+  const settledIds = new Set(settled.map((entry) => entry.operation.operationId))
+  const pending = (data ?? []).filter(
+    (operation) => !settledIds.has(operation.operationId) && (raisedHere?.(operation.operationId) ?? true)
+  )
+  if (pending.length === 0 && settled.length === 0) return null
+
+  const upsertSettled = (entry: SettledOperation) =>
+    setSettled((current) => [
+      ...current.filter((existing) => existing.operation.operationId !== entry.operation.operationId),
+      entry
+    ])
+
+  const decide = async (operation: WebchatMcpOperationDto, decision: 'approve' | 'deny') => {
+    setBusy(`${operation.operationId}:${decision}`)
+    setError(null)
+    try {
+      const outcome = await decideWebchatMcpOperation(orgId, agentId, conversationId, operation.operationId, decision)
+      upsertSettled({ operation, decision, outcome })
+      if (outcome.status !== 'awaiting_confirmation' && outcome.status !== 'executing')
+        onDecided?.(operation, decision, outcome)
+    } catch {
+      // A lost response (network drop, 409 race) may still have executed: refetch so the true state shows.
+      try {
+        const outcome = await getWebchatMcpOperation(orgId, agentId, conversationId, operation.operationId)
+        if (outcome.status === 'awaiting_confirmation') {
+          setError(t('errors.notApplied'))
+        } else {
+          upsertSettled({ operation, decision, outcome })
+          if (outcome.status !== 'executing') onDecided?.(operation, decision, outcome)
+        }
+      } catch {
+        upsertSettled({ operation, decision, outcome: null })
+        setError(t('errors.responseLost'))
+      }
+    } finally {
+      setBusy(null)
+      await mutate()
+    }
+  }
+
+  const recheck = async (entry: SettledOperation) => {
+    setBusy(`${entry.operation.operationId}:recheck`)
+    setError(null)
+    try {
+      const outcome = await getWebchatMcpOperation(orgId, agentId, conversationId, entry.operation.operationId)
+      if (outcome.status === 'awaiting_confirmation') {
+        // The decision never reached the CP — put the card back in the pending list.
+        setSettled((current) => current.filter((existing) => existing !== entry))
+        await mutate()
+      } else {
+        upsertSettled({ ...entry, outcome })
+        if (!entry.outcome && outcome.status !== 'executing') onDecided?.(entry.operation, entry.decision, outcome)
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : t('errors.checkFailed'))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const dismiss = (entry: SettledOperation) => setSettled((current) => current.filter((existing) => existing !== entry))
+
+  return (
+    // Capped so a pile of operations can never push the composer off-screen. The strip
+    // scrolls on Y only: an overflow-y-auto box computes overflow-x from visible to
+    // auto, which is how a wide row used to grow a scrollbar across the whole card.
+    <div className={`grid max-h-[34vh] gap-1.5 overflow-y-auto overflow-x-hidden ${className}`} aria-live="polite">
+      {pending.map((operation) => (
+        // min-w-0: a grid item's auto min-width is its min-content width, so one long
+        // unbreakable arg string would widen the row past the strip — and the strip's
+        // overflow-y-auto turns that into a card-wide x scrollbar.
+        <section
+          key={operation.operationId}
+          className="min-w-0 rounded-lg border border-(--border-default) bg-(--surface-card) px-3 py-2 shadow-(--shadow-xs)"
+        >
+          {/* Buttons drop below the text on mobile, or their width becomes a min-content floor the strip clips. */}
+          <div className="flex flex-col gap-2 desktop:flex-row desktop:items-center">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2">
+                <span className="font-mono text-[10px] font-semibold uppercase leading-normal tracking-[.08em] text-(--amber-600)">
+                  {t('approvalRequired')}
+                </span>
+                <span className="font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                  {operation.toolName}
+                </span>
+              </div>
+              <div className="mt-[2px] font-sans text-[11px] font-normal leading-normal text-(--text-tertiary)">
+                {t('description')}
+              </div>
+            </div>
+            <div className="flex flex-none items-center gap-2">
+              <Button
+                variant="secondary"
+                size="xs"
+                disabled={busy !== null}
+                onClick={() => void decide(operation, 'deny')}
+              >
+                {busy === `${operation.operationId}:deny` ? t('denying') : t('deny')}
+              </Button>
+              <Button size="xs" disabled={busy !== null} onClick={() => void decide(operation, 'approve')}>
+                {busy === `${operation.operationId}:approve` ? t('approving') : t('approve')}
+              </Button>
+            </div>
+          </div>
+          <pre className="mt-1 max-h-24 overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-all rounded-md bg-(--surface-sunken) p-2 font-mono text-[10.5px] leading-[1.45] text-(--text-secondary)">
+            {JSON.stringify(operation.arguments, null, 2)}
+          </pre>
+        </section>
+      ))}
+      {settled.map((entry) => {
+        const note = outcomeNote(entry)
+        const unresolved = !entry.outcome || entry.outcome.status === 'executing'
+        return (
+          <section
+            key={entry.operation.operationId}
+            className="min-w-0 rounded-lg border border-(--border-default) bg-(--surface-card) px-3 py-2 shadow-(--shadow-xs)"
+          >
+            <div className="flex flex-col gap-2 desktop:flex-row desktop:items-center">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-x-2">
+                  <span className="font-mono text-[10px] font-semibold uppercase leading-normal tracking-[.08em] text-(--text-tertiary)">
+                    {t(`outcomes.${outcomeLabel(entry)}`)}
+                  </span>
+                  <span className="font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                    {entry.operation.toolName}
+                  </span>
+                </div>
+                {note && (
+                  <div className="mt-[2px] font-sans text-[11px] font-normal leading-normal text-(--text-tertiary)">
+                    {t(`notes.${note}`)}
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-none items-center gap-2">
+                {unresolved ? (
+                  <Button variant="secondary" size="xs" disabled={busy !== null} onClick={() => void recheck(entry)}>
+                    {busy === `${entry.operation.operationId}:recheck` ? t('checking') : t('checkStatus')}
+                  </Button>
+                ) : (
+                  <Button variant="secondary" size="xs" onClick={() => dismiss(entry)}>
+                    {t('dismiss')}
+                  </Button>
+                )}
+              </div>
+            </div>
+            {entry.outcome?.result !== undefined && (
+              <pre className="mt-1 max-h-24 overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-all rounded-md bg-(--surface-sunken) p-2 font-mono text-[10.5px] leading-[1.45] text-(--text-secondary)">
+                {JSON.stringify(entry.outcome.result, null, 2)}
+              </pre>
+            )}
+          </section>
+        )
+      })}
+      {error && <p className="font-sans text-[11.5px] font-medium leading-normal text-(--red-600)">{error}</p>}
+    </div>
+  )
+}

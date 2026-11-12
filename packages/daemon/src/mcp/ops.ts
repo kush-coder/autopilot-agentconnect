@@ -1,0 +1,656 @@
+import { randomUUID } from 'node:crypto'
+import {
+  listDecisions,
+  evaluateDecision,
+  LIST_DECISIONS_ARGS,
+  EVALUATE_DECISION_ARGS,
+  type DecisionDeps
+} from './ops/decisions.js'
+import {
+  describeMemoryEntries,
+  listMemoryEntries,
+  getMemoryEntry,
+  searchMemoryEntries,
+  createMemoryEntry,
+  updateMemoryEntry,
+  deleteMemoryEntry
+} from './ops/memory-entries.js'
+import {
+  DESCRIBE_MEMORY_ENTRIES_ARGS,
+  LIST_MEMORY_ENTRIES_ARGS,
+  GET_MEMORY_ENTRY_ARGS,
+  SEARCH_MEMORY_ENTRIES_ARGS,
+  CREATE_MEMORY_ENTRY_ARGS,
+  UPDATE_MEMORY_ENTRY_ARGS,
+  DELETE_MEMORY_ENTRY_ARGS
+} from '../memory/entries/tools.js'
+import { z, type ZodType } from 'zod'
+import type { AskDeps } from './ask.js'
+import type { InterceptedPost } from '../assistant/drafts.js'
+import {
+  allAttachmentReadTools,
+  isAttachmentReadTool,
+  sessionToolOwner,
+  type PlatformSessionToolEnv
+} from '../platforms/read-ports.js'
+import type { SessionContext, ToolHandler } from './ops/context.js'
+import { isGettingToKnowCoordinate, isCheckCoordinate, isResearchCoordinate } from '../session/subsession-coordinate.js'
+import { isCoordinatorCoordinate } from '../session/append-coordinate.js'
+import { gettingToKnowReadRefusal } from '../assistant/getting-to-know.js'
+import { ToolArgumentError } from './ops/args.js'
+import { describeToolArgumentFailure } from './ops/argument-error.js'
+import type { Logger } from '../log.js'
+import { listAgents, LIST_AGENTS_ARGS, type DirectoryDeps } from './ops/directory.js'
+import {
+  findKnowledge,
+  FIND_KNOWLEDGE_ARGS,
+  listKnowledge,
+  LIST_KNOWLEDGE_ARGS,
+  listOrgSkills,
+  LIST_ORG_SKILLS_ARGS,
+  type KnowledgeDeps
+} from './ops/knowledge.js'
+import {
+  deleteMemory,
+  DELETE_MEMORY_ARGS,
+  getMemory,
+  GET_MEMORY_ARGS,
+  readMemory,
+  READ_MEMORY_ARGS,
+  saveMemory,
+  SAVE_MEMORY_ARGS,
+  searchMemory,
+  SEARCH_MEMORY_ARGS,
+  updateMemory,
+  UPDATE_MEMORY_ARGS,
+  writeMemory,
+  WRITE_MEMORY_ARGS,
+  type MemoryOpsDeps
+} from './ops/memory.js'
+import { parseAgentTarget, type MessagingDeps } from './ops/messaging.js'
+import { COORDINATOR_MESSAGE_TOOLS, withoutBlankCoordinatorFields } from '../auto-session/coordinator-prompt.js'
+import { sendMessage, validateSendMessageAction } from './ops/send-message-actions.js'
+import { taskReachOf } from './ops/task-reach.js'
+import { getToolGuide, GET_TOOL_GUIDE_ARGS } from './ops/tool-guide.js'
+import {
+  addReaction,
+  ADD_REACTION_ARGS,
+  createCanvas,
+  CREATE_CANVAS_ARGS,
+  listBookmarks,
+  LIST_BOOKMARKS_ARGS,
+  addBookmark,
+  ADD_BOOKMARK_ARGS,
+  removeBookmark,
+  REMOVE_BOOKMARK_ARGS,
+  readList,
+  READ_LIST_ARGS,
+  addListItem,
+  ADD_LIST_ITEM_ARGS,
+  updateListItem,
+  UPDATE_LIST_ITEM_ARGS,
+  createConversation,
+  CREATE_CONVERSATION_ARGS,
+  deleteMessage,
+  DELETE_MESSAGE_ARGS,
+  getReactions,
+  GET_REACTIONS_ARGS,
+  readCanvas,
+  READ_CANVAS_ARGS,
+  scheduleMessage,
+  SCHEDULE_MESSAGE_ARGS,
+  searchPublicMessages,
+  SEARCH_PUBLIC_MESSAGES_ARGS,
+  updateCanvas,
+  UPDATE_CANVAS_ARGS,
+  type PlatformActionDeps
+} from './ops/platform-actions.js'
+import { shareFile, type ShareFileDeps } from './ops/share-file.js'
+import {
+  replyGithubReviewThreads,
+  REPLY_GITHUB_REVIEW_THREADS_ARGS,
+  submitCodeReview,
+  SUBMIT_CODE_REVIEW_ARGS,
+  type GithubReviewDeps
+} from './ops/github.js'
+import { runCodeHostEffectTool, type CodeHostEffectDeps } from './ops/code-host.js'
+import { CODE_HOST_EFFECT_TOOLS } from '../codehost/effect-tools.js'
+import {
+  listCodeHostRepositories,
+  LIST_CODE_HOST_REPOSITORIES_ARGS,
+  readCodeHostRepository,
+  READ_CODE_HOST_REPOSITORY_ARGS,
+  type CodeHostResearchDeps
+} from './ops/code-host-research.js'
+import {
+  getCurrentChannel,
+  getChannelHistory,
+  GET_CHANNEL_HISTORY_ARGS,
+  getThreadHistory,
+  GET_THREAD_HISTORY_ARGS,
+  getUserProfile,
+  GET_USER_PROFILE_ARGS,
+  listChannelMembers,
+  LIST_CHANNEL_MEMBERS_ARGS,
+  listChannels,
+  LIST_CHANNELS_ARGS,
+  listKnownUsers,
+  LIST_KNOWN_USERS_ARGS,
+  readAttachment,
+  READ_ATTACHMENT_ARGS,
+  type PlatformReadDeps
+} from './ops/platform-reads.js'
+import { viewSessionStatus, VIEW_SESSION_STATUS_ARGS, type SessionOpsDeps } from './ops/session.js'
+import {
+  assertPlaceRead,
+  assertFileRead,
+  isPlatformPost,
+  judgePlaceWrite,
+  type PlaceAccessDeps,
+  type WriteTarget
+} from './ops/place-gate.js'
+import { resolveChannelArg } from './ops/channel-names.js'
+import { recall, RECALL_ARGS } from './ops/recall.js'
+import { readTask, type TaskReadDeps } from './ops/read-task.js'
+import { askingToJoin, parkingOnJoin, type JoinAskDeps, type JoinParked } from './ops/join-ask.js'
+import { ASSISTANT_ITEM_ARG_SCHEMAS, ASSISTANT_ITEM_HANDLERS, type AssistantItemDeps } from './ops/assistant-items.js'
+import { GETTING_TO_KNOW_ARGS, gettingToKnow } from './ops/getting-to-know.js'
+import {
+  ASSISTANT_REMINDER_ARG_SCHEMAS,
+  ASSISTANT_REMINDER_HANDLERS,
+  type AssistantReminderDeps
+} from './ops/assistant-reminders.js'
+import {
+  ASSISTANT_SUBSESSION_ARG_SCHEMAS,
+  ASSISTANT_SUBSESSION_HANDLERS,
+  type AssistantSubsessionDeps
+} from './ops/assistant-subsessions.js'
+import {
+  requestCapability,
+  REQUEST_CAPABILITY_ARGS,
+  withdrawCapabilityRequest,
+  WITHDRAW_CAPABILITY_REQUEST_ARGS,
+  type CapabilityRequestDeps
+} from './ops/capability-requests.js'
+import {
+  deleteSchedule,
+  DELETE_SCHEDULE_ARGS,
+  listSchedules,
+  LIST_SCHEDULES_ARGS,
+  saveSchedule,
+  SAVE_SCHEDULE_ARGS,
+  type AgentCronToolDeps
+} from './ops/agent-crons.js'
+
+export type { McpContentResult, MessageGateway, SendIdentity, SessionContext } from './ops/context.js'
+export type { ChannelAgentsRequest } from './ops/directory.js'
+export type {
+  ReplyGithubReviewThreadsReq,
+  ReplyGithubReviewThreadsResult,
+  SubmitGithubReviewReq
+} from './ops/github.js'
+export type { SubmitCodeReviewReq } from '../codehost/review-adapter.js'
+export type { CodeHostEffectReq } from './ops/code-host.js'
+export { SEND_MESSAGE_BRANCHES } from './ops/messaging.js'
+export { SEND_MESSAGE_ACTIONS, SEND_MESSAGE_ACTION_SCHEMAS } from './ops/send-message-actions.js'
+export type {
+  ContinueSubsessionReq,
+  MessageAgentReq,
+  MessageAgentResult,
+  ReplyToSessionReq,
+  ReplyToSessionResult
+} from './ops/messaging.js'
+export type { SessionStatusReq, SessionStatusResult } from './ops/session.js'
+export { askHost, AskRequired } from './ask.js'
+export type { AskDeps, AskOutcome, AskPort, AskSpec } from './ask.js'
+
+/**
+ * Everything the daemon bridge tools need, composed from the per-domain deps each
+ * handler group declares (`src/mcp/ops/*`). One flat object still satisfies it, so the
+ * daemon wires it as a single literal; the grouping is what lets a handler take only
+ * the slice it uses.
+ */
+export interface OpsDeps
+  // MCP-side elicitation (#1965 Gap A): `ask` — a tool asks the agent's own host rather than guessing.
+  extends
+    AskDeps,
+    SessionOpsDeps,
+    MessagingDeps,
+    DirectoryDeps,
+    KnowledgeDeps,
+    DecisionDeps,
+    GithubReviewDeps,
+    CodeHostEffectDeps,
+    CodeHostResearchDeps,
+    MemoryOpsDeps,
+    ShareFileDeps,
+    PlatformReadDeps,
+    PlatformActionDeps,
+    PlaceAccessDeps,
+    JoinAskDeps,
+    AssistantItemDeps,
+    AssistantReminderDeps,
+    AssistantSubsessionDeps,
+    TaskReadDeps,
+    CapabilityRequestDeps,
+    AgentCronToolDeps {
+  /** Rejected tool arguments are logged here at debug, key names only — the sole trace of them (#1921). */
+  log?: Pick<Logger, 'debug'>
+  /** Fail-closed turn gate checked before every daemon bridge tool. Used to make
+   *  pause/cancel/loop interrupts terminal even while the runtime is still unwinding. */
+  canRun?: (ctx: SessionContext) => boolean | Promise<boolean>
+  /** The live connection a platform's OWN session tools (`read-ports.ts` `sessionTools`) act
+   *  through — ANY platform's, unlike `gatewayFor`, whose reply-surface registry deliberately
+   *  omits a platform with no free-text surface (Linear). Absent ⇒ those tools cannot run. */
+  sessionToolConnectionFor?: (integrationId: string) => unknown
+  /** Make a room for the session's work, which a task holds as one more thread (auto-session-mode.md §6.8). */
+  sessionToolRoomFor?: (ctx: SessionContext) => PlatformSessionToolEnv['makeRoom']
+  /** Collaboration Arena §6: resolve + execute an evaluation-registry tool.
+   *  Returns undefined when `name` is not an evaluation tool. Visibility and
+   *  role-aware authorization live behind this seam (the daemon guarantees
+   *  authentic caller identity; the game decides whether the action is legal). */
+  evaluationTool?: (
+    ctx: SessionContext,
+    name: string,
+    args: Record<string, unknown>
+  ) => Promise<{ result: unknown } | undefined>
+  /** MCP Apps (webchat-mcp-apps.md §3/§4): run one tool of a DAEMON-HOSTED UI server and, when
+   *  that tool declares an interface, open its card on this turn's surface. Returns undefined
+   *  when `name` is not one of those tools, so the static registry below still answers for
+   *  everything else. Shaped exactly like `evaluationTool` because it is the same kind of thing:
+   *  a dynamic, namespaced tool group resolved ahead of the static one, against the trusted
+   *  session context and never against tool input. */
+  appTool?: (
+    ctx: SessionContext,
+    name: string,
+    args: Record<string, unknown>
+  ) => Promise<{ result: unknown } | undefined>
+  /** Computer use (computer-use.md §5): run one `computer_*` tool; undefined when `name` is not one. */
+  computerTool?: (
+    ctx: SessionContext,
+    name: string,
+    args: Record<string, unknown>
+  ) => Promise<{ result: unknown } | undefined>
+}
+
+/**
+ * The daemon-local tools that do NOT need the session's own platform gateway, by name.
+ * Every entry is universal in the sense that matters here: it either talks to the CP, to
+ * the daemon itself, or resolves its own target gateway from the trusted session snapshot.
+ */
+const HANDLERS: Map<string, ToolHandler<OpsDeps>> = new Map<string, ToolHandler<OpsDeps>>([
+  ['shareFile', shareFile],
+  ['viewSessionStatus', viewSessionStatus],
+  ['describeMemoryEntries', describeMemoryEntries],
+  ['listMemoryEntries', listMemoryEntries],
+  ['getMemoryEntry', getMemoryEntry],
+  ['searchMemoryEntries', searchMemoryEntries],
+  ['createMemoryEntry', createMemoryEntry],
+  ['updateMemoryEntry', updateMemoryEntry],
+  ['deleteMemoryEntry', deleteMemoryEntry],
+  ['readMemory', readMemory],
+  ['writeMemory', writeMemory],
+  ['searchMemory', searchMemory],
+  ['saveMemory', saveMemory],
+  ['getMemory', getMemory],
+  ['updateMemory', updateMemory],
+  ['deleteMemory', deleteMemory],
+  ['listAgents', listAgents],
+  // A working alias so sessions already warm with the old tool set keep resolving.
+  ['listChannelAgents', listAgents],
+  ['findKnowledge', findKnowledge],
+  ['listKnowledge', listKnowledge],
+  ['listDecisions', listDecisions],
+  ['evaluateDecision', evaluateDecision],
+  ['listOrgSkills', listOrgSkills],
+  ['sendMessage', sendMessage],
+  ['getToolGuide', getToolGuide],
+  ['submitCodeReview', submitCodeReview],
+  // A working alias so sessions already warm with the pre-promotion tool set keep resolving.
+  ['submitGithubReview', submitCodeReview],
+  ['replyGithubReviewThreads', replyGithubReviewThreads],
+  ...CODE_HOST_EFFECT_TOOLS.map((tool): [string, ToolHandler<OpsDeps>] => [
+    tool.descriptor.name,
+    (ctx, args, deps) => runCodeHostEffectTool(tool, ctx, args, deps)
+  ]),
+  ['listCodeHostRepositories', listCodeHostRepositories],
+  ['readCodeHostRepository', readCodeHostRepository],
+  ['listKnownUsers', listKnownUsers],
+  ['listChannels', listChannels],
+  ['listChannelMembers', listChannelMembers],
+  ['getUserProfile', getUserProfile],
+  ['getChannelHistory', getChannelHistory],
+  ['getThreadHistory', getThreadHistory],
+  ['addReaction', addReaction],
+  ['getReactions', getReactions],
+  ['deleteMessage', deleteMessage],
+  ['listBookmarks', listBookmarks],
+  ['addBookmark', addBookmark],
+  ['removeBookmark', removeBookmark],
+  ['readList', readList],
+  ['addListItem', addListItem],
+  ['updateListItem', updateListItem],
+  ['createConversation', createConversation],
+  ['scheduleMessage', scheduleMessage],
+  ['searchPublicMessages', searchPublicMessages],
+  ['createCanvas', createCanvas],
+  ['readCanvas', readCanvas],
+  ['updateCanvas', updateCanvas],
+  ['recall', recall],
+  ['readTask', readTask],
+  ...ASSISTANT_ITEM_HANDLERS,
+  ['getToKnow', gettingToKnow],
+  ...ASSISTANT_REMINDER_HANDLERS,
+  ...ASSISTANT_SUBSESSION_HANDLERS,
+  ['requestCapability', requestCapability],
+  ['withdrawCapabilityRequest', withdrawCapabilityRequest],
+  ['listSchedules', listSchedules],
+  ['saveSchedule', saveSchedule],
+  ['deleteSchedule', deleteSchedule]
+])
+
+/**
+ * Every dispatchable tool's ARGUMENT schema, by name — the runtime contract each handler
+ * parses its input with. Advertised JSON Schemas (`mcp/tools.ts` and the per-platform
+ * descriptors) carry the model-facing prose; `test/mcp-tool-args.test.ts` holds the two
+ * sides to the same fields so neither can drift. `sendMessage` validates per action, in
+ * {@link SEND_MESSAGE_ACTION_SCHEMAS}, against one flat advertised schema.
+ */
+export const TOOL_ARG_SCHEMAS: Map<string, ZodType> = new Map<string, ZodType>([
+  ['viewSessionStatus', VIEW_SESSION_STATUS_ARGS],
+  ['describeMemoryEntries', DESCRIBE_MEMORY_ENTRIES_ARGS],
+  ['listMemoryEntries', LIST_MEMORY_ENTRIES_ARGS],
+  ['getMemoryEntry', GET_MEMORY_ENTRY_ARGS],
+  ['searchMemoryEntries', SEARCH_MEMORY_ENTRIES_ARGS],
+  ['createMemoryEntry', CREATE_MEMORY_ENTRY_ARGS],
+  ['updateMemoryEntry', UPDATE_MEMORY_ENTRY_ARGS],
+  ['deleteMemoryEntry', DELETE_MEMORY_ENTRY_ARGS],
+  ['readMemory', READ_MEMORY_ARGS],
+  ['writeMemory', WRITE_MEMORY_ARGS],
+  ['searchMemory', SEARCH_MEMORY_ARGS],
+  ['saveMemory', SAVE_MEMORY_ARGS],
+  ['getMemory', GET_MEMORY_ARGS],
+  ['updateMemory', UPDATE_MEMORY_ARGS],
+  ['deleteMemory', DELETE_MEMORY_ARGS],
+  ['listAgents', LIST_AGENTS_ARGS],
+  ['listChannelAgents', LIST_AGENTS_ARGS],
+  ['findKnowledge', FIND_KNOWLEDGE_ARGS],
+  ['listKnowledge', LIST_KNOWLEDGE_ARGS],
+  ['listDecisions', LIST_DECISIONS_ARGS],
+  ['evaluateDecision', EVALUATE_DECISION_ARGS],
+  ['listOrgSkills', LIST_ORG_SKILLS_ARGS],
+  ['submitCodeReview', SUBMIT_CODE_REVIEW_ARGS],
+  ['submitGithubReview', SUBMIT_CODE_REVIEW_ARGS],
+  ['replyGithubReviewThreads', REPLY_GITHUB_REVIEW_THREADS_ARGS],
+  ...CODE_HOST_EFFECT_TOOLS.map((tool): [string, ZodType] => [tool.descriptor.name, tool.args]),
+  ['listCodeHostRepositories', LIST_CODE_HOST_REPOSITORIES_ARGS],
+  ['readCodeHostRepository', READ_CODE_HOST_REPOSITORY_ARGS],
+  ['listKnownUsers', LIST_KNOWN_USERS_ARGS],
+  ['listChannels', LIST_CHANNELS_ARGS],
+  ['listChannelMembers', LIST_CHANNEL_MEMBERS_ARGS],
+  ['getUserProfile', GET_USER_PROFILE_ARGS],
+  ['getChannelHistory', GET_CHANNEL_HISTORY_ARGS],
+  ['getThreadHistory', GET_THREAD_HISTORY_ARGS],
+  ['addReaction', ADD_REACTION_ARGS],
+  ['getReactions', GET_REACTIONS_ARGS],
+  ['deleteMessage', DELETE_MESSAGE_ARGS],
+  ['listBookmarks', LIST_BOOKMARKS_ARGS],
+  ['addBookmark', ADD_BOOKMARK_ARGS],
+  ['removeBookmark', REMOVE_BOOKMARK_ARGS],
+  ['readList', READ_LIST_ARGS],
+  ['addListItem', ADD_LIST_ITEM_ARGS],
+  ['updateListItem', UPDATE_LIST_ITEM_ARGS],
+  ['createConversation', CREATE_CONVERSATION_ARGS],
+  ['scheduleMessage', SCHEDULE_MESSAGE_ARGS],
+  ['searchPublicMessages', SEARCH_PUBLIC_MESSAGES_ARGS],
+  ['createCanvas', CREATE_CANVAS_ARGS],
+  ['readCanvas', READ_CANVAS_ARGS],
+  ['updateCanvas', UPDATE_CANVAS_ARGS],
+  ['recall', RECALL_ARGS],
+  ['getToolGuide', GET_TOOL_GUIDE_ARGS],
+  ...ASSISTANT_ITEM_ARG_SCHEMAS,
+  ['getToKnow', GETTING_TO_KNOW_ARGS],
+  ...ASSISTANT_REMINDER_ARG_SCHEMAS,
+  ...ASSISTANT_SUBSESSION_ARG_SCHEMAS,
+  ['requestCapability', REQUEST_CAPABILITY_ARGS],
+  ['withdrawCapabilityRequest', WITHDRAW_CAPABILITY_REQUEST_ARGS],
+  ['listSchedules', LIST_SCHEDULES_ARGS],
+  ['saveSchedule', SAVE_SCHEDULE_ARGS],
+  ['deleteSchedule', DELETE_SCHEDULE_ARGS],
+  // The session's own conversation is read from trusted context alone — no arguments.
+  ['getCurrentChannel', z.object({})],
+  // One body serves every platform's credentialed attachment read, so one schema does too.
+  ...allAttachmentReadTools().map((tool) => [tool.name, READ_ATTACHMENT_ARGS] as [string, ZodType])
+])
+
+// Both model tools and automatic task output use the live-turn gate and the same conversation write policy.
+export async function authorizeSessionPublication(
+  ctx: SessionContext,
+  name: string,
+  target: WriteTarget,
+  deps: OpsDeps
+): Promise<void> {
+  if (deps.canRun && !(await deps.canRun(ctx))) throw new Error('this agent turn has been stopped')
+  if (!deps.shareTarget?.(ctx)?.ok) throw new Error(`${name}: this turn has no visible conversation to publish into`)
+  await judgePlaceWrite(ctx, name, target, deps)
+}
+
+/** A coordinator's `callAgent` target with the answer requested (auto-session-mode.md §5.4); a malformed one is left for the call's own validation. */
+function askingForAnswer(target: unknown): unknown {
+  try {
+    const { toAgent } = parseAgentTarget(target)
+    return toAgent === undefined ? target : { agentId: toAgent, needsReply: true }
+  } catch {
+    return target
+  }
+}
+
+// Execute a daemon tool; the bridge wraps its result or error as an MCP response.
+export async function executeTool(
+  ctx: SessionContext,
+  name: string,
+  args: Record<string, unknown>,
+  deps: OpsDeps
+): Promise<unknown> {
+  if (deps.canRun && !(await deps.canRun(ctx))) throw new Error('this agent turn has been stopped')
+  // assistant-mode.md §5.12: a follow-up's check runs only the read tools it was offered, whatever name the runtime sends.
+  if (isCheckCoordinate(ctx.thread) && !ctx.tools.some((tool) => tool.name === name))
+    throw new Error(`${name} is not available in a follow-up’s read-only check`)
+  // assistant-mode.md §5.15: organization research reads and writes memory only; nothing it calls posts, whatever name the runtime sends.
+  if (isResearchCoordinate(ctx.thread) && !ctx.tools.some((tool) => tool.name === name))
+    throw new Error(`${name} is not available to organization research, which cannot post or act anywhere`)
+  // auto-session-mode.md §5.4: a coordinator runs only the tools it was offered; its sendMessage decides on delivered messages, or posts and calls as any session's does.
+  if (isCoordinatorCoordinate(ctx.thread)) {
+    if (!ctx.tools.some((tool) => tool.name === name))
+      throw new Error(`${name} is not available to the coordinator, which only decides where each message goes`)
+    if (name === 'sendMessage') args = withoutBlankCoordinatorFields(args)
+    // Leaving a delivered message unanswered is an outcome of its own, so the turn's text has no message to answer.
+    if (name === 'ignoreMessage') {
+      if (!deps.coordinatorDecision) throw new Error('ignoreMessage: the coordinator is not available on this daemon')
+      return await deps.coordinatorDecision(ctx, { messageId: args.messageId, reason: args.reason, action: name })
+    }
+    if (name === 'sendMessage' && args.action !== 'postMessage' && args.action !== 'callAgent') {
+      if (!deps.coordinatorDecision) throw new Error('sendMessage: the coordinator is not available on this daemon')
+      return await deps.coordinatorDecision(ctx, args)
+    }
+    // Its question to another agent always asks for the answer, which comes back to it as a report.
+    if (name === 'sendMessage' && args.action === 'callAgent')
+      args = { ...args, toAgent: askingForAnswer(args.toAgent) }
+    // A place tool that acts for a person names their message, whose sender and thread it acts on; an offer may name the one it answers.
+    if (COORDINATOR_MESSAGE_TOOLS.has(name) || (name === 'propose' && args.messageId != null)) {
+      const { messageId, ...rest } = args
+      const found = deps.coordinatorMessage?.(ctx, messageId) ?? { error: 'is not available on this daemon' }
+      if ('error' in found) throw new Error(`${name}: ${found.error}`)
+      ctx = { ...ctx, forMessage: found.msg }
+      args = rest
+    }
+  }
+  // assistant-mode.md §5.13: a getting-to-know task reads only its own place, whatever the arguments name.
+  const elsewhere = isGettingToKnowCoordinate(ctx.thread) ? gettingToKnowReadRefusal(ctx, name, args) : undefined
+  if (elsewhere) throw new Error(elsewhere)
+  // Collaboration Arena evaluation tools (collaboration-arena.md §6): game-owned
+  // structured actions merged into the session tool set at composition time.
+  // Name collisions with product tools are rejected at daemon startup, so this
+  // dispatch can never shadow a product tool. The handler receives the trusted
+  // token-bound SessionContext — never tool-input-supplied identity.
+  if (deps.evaluationTool) {
+    const handled = await deps.evaluationTool(ctx, name, args)
+    if (handled !== undefined) return handled.result
+  }
+  // MCP Apps: a daemon-hosted UI server's tool, namespaced `<server>__<tool>`. Resolved here and
+  // not in the static registry because the set is discovered from the upstream server at
+  // composition time; the namespace is what makes it impossible to shadow a product tool.
+  if (deps.appTool) {
+    const handled = await deps.appTool(ctx, name, args)
+    if (handled !== undefined) return handled.result
+  }
+  // Computer use: the `computer_*` group, forwarded to a desktop daemon over the data plane.
+  if (deps.computerTool) {
+    const handled = await deps.computerTool(ctx, name, args)
+    if (handled !== undefined) return handled.result
+  }
+  // The rejection is all the model reads (#1921): tool, every issue, accepted shape, received key names.
+  const advertised = ctx.tools.find((tool) => tool.name === name)
+  const rejected = (issues: readonly string[], receivedKeys: readonly string[]): Error => {
+    deps.log?.debug(
+      `tool ${name}: rejected arguments (keys: ${receivedKeys.join(', ') || 'none'}): ${issues.join('; ')}`
+    )
+    return new Error(
+      describeToolArgumentFailure({
+        tool: name,
+        issues,
+        receivedKeys,
+        ...(advertised ? { advertised } : {}),
+        tools: ctx.tools,
+        ...(TOOL_ARG_SCHEMAS.has(name) ? { validator: TOOL_ARG_SCHEMAS.get(name) } : {})
+      })
+    )
+  }
+  try {
+    return await executeRegisteredTool(ctx, name, args, deps)
+  } catch (err) {
+    // The call's OWN keys: a handler may parse a nested object, whose field names are not this tool's.
+    if (err instanceof ToolArgumentError) throw rejected(err.issues, Object.keys(args))
+    throw err
+  }
+}
+
+/** A handler's writes pass the write rule once their target is resolved; a platform post is drafted where the rule asks for approval. */
+function writeDeps(ctx: SessionContext, name: string, args: Record<string, unknown>, deps: OpsDeps): OpsDeps {
+  const judged: OpsDeps = { ...deps, judgeWrite: (target) => judgePlaceWrite(ctx, name, target, deps) }
+  if (name !== 'sendMessage' || !isPlatformPost(args)) return judged
+  const draft = deps.draftPost
+  return {
+    ...judged,
+    authorizeFileRead: (source) => assertFileRead(ctx, source, deps),
+    judgePost: (target) => judgePlaceWrite(ctx, name, { kind: 'conversation', ...target }, deps, true),
+    ...(draft ? { interceptPost: (post: InterceptedPost) => draft(ctx, post) } : {})
+  }
+}
+
+/** A handler's gateways ask before the bot joins a channel a call was refused in; the agent-to-agent forms keep their own reach. */
+function joinDeps(
+  ctx: SessionContext,
+  name: string,
+  args: Record<string, unknown>,
+  deps: OpsDeps,
+  parked?: (call: JoinParked) => void
+): OpsDeps {
+  if (name === 'sendMessage' && !isPlatformPost(args)) return deps
+  return {
+    ...deps,
+    gatewayFor: (integrationId) => {
+      const gw = deps.gatewayFor(integrationId)
+      return gw && askingToJoin(ctx, name, integrationId, gw, deps, parked)
+    }
+  }
+}
+
+/** A private source's note rides first in the read's result, so a runtime that truncates it keeps the note. */
+function withPrivateSource(result: unknown, note: string): unknown {
+  return result !== null && typeof result === 'object' && !Array.isArray(result)
+    ? { privateSource: note, ...(result as Record<string, unknown>) }
+    : { privateSource: note, result }
+}
+
+/** The static registry behind {@link executeTool}: memory gate, local handlers, session tools, gateway reads. */
+async function executeRegisteredTool(
+  ctx: SessionContext,
+  name: string,
+  given: Record<string, unknown>,
+  deps: OpsDeps
+): Promise<unknown> {
+  // send-message-guide.md §3.3: the action and its arguments are checked before any lookup or effect.
+  if (name === 'sendMessage') validateSendMessageAction(ctx, given, await taskReachOf(ctx, deps))
+  // A channel named by its name is judged and acted on by the one id it resolves to.
+  const args = await resolveChannelArg(ctx, name, given, deps)
+  // Every agent's reads of another conversation and platform writes are judged by who is asking (§5.5).
+  const privateSource = await assertPlaceRead(ctx, name, args, deps)
+  const handler = HANDLERS.get(name)
+  if (handler) {
+    const judged = writeDeps(ctx, name, args, deps)
+    const result = await parkingOnJoin(ctx, deps, async (parked) =>
+      handler(ctx, args, joinDeps(ctx, name, args, judged, parked))
+    )
+    return privateSource ? withPrivateSource(result, privateSource) : result
+  }
+
+  // A platform's own session tools (read-ports.ts `sessionTools`): injected only into a session
+  // ON that platform, and refused at call time from anywhere else — they act through THIS
+  // session's connection, so a session elsewhere has nothing they could reach.
+  const owner = sessionToolOwner(name)
+  if (owner?.sessionTools) {
+    if (ctx.platform !== owner.platform) throw new Error(`${name} is only available in a ${owner.label} session`)
+    // NOT `gatewayFor`: that registry is the reply surfaces, and a platform without one (Linear)
+    // is absent from it by design — so it would answer undefined for exactly these tools.
+    if (!deps.sessionToolConnectionFor) throw new Error(`${name} is not wired on this daemon`)
+    const conn = ctx.integrationId ? deps.sessionToolConnectionFor(ctx.integrationId) : undefined
+    if (!conn) throw new Error(`no live ${owner.label} connection for integration ${ctx.integrationId ?? '(none)'}`)
+    const attribution = deps.sessionToolAttributionFor
+    const deliveryThread = deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread
+    const deliveryChannel = deps.deliveryChannelNow?.(ctx) ?? ctx.channel
+    const makeRoom = deps.sessionToolRoomFor?.(ctx)
+    return await owner.sessionTools.execute(name, ctx, args, {
+      connection: conn,
+      deliveryChannel,
+      deliveryThread,
+      ...(makeRoom ? { makeRoom } : {}),
+      originMsgId: deps.searchOrigin?.(ctx),
+      judgeWrite: (target) => authorizeSessionPublication(ctx, name, target, deps),
+      postIdentity: () => ({
+        username: ctx.agentName,
+        icon_url: ctx.iconUrl,
+        agentAuthorId: ctx.agentId,
+        response: {
+          responseId: randomUUID(),
+          deliveryState: 'final',
+          hopCount: deps.currentHopCount?.(ctx) ?? 0,
+          mentionedAgentIds: []
+        }
+      }),
+      recordPost: (text, ts) => deps.recordOutbound(ctx, deliveryChannel, deliveryThread, text, ts, ctx.integrationId!),
+      ...(attribution ? { attribution: () => attribution(ctx) } : {})
+    })
+  }
+
+  if (isAttachmentReadTool(name)) {
+    const reader = ctx.integrationId
+      ? (deps.attachmentReaderFor?.(ctx.integrationId) ?? deps.gatewayFor(ctx.integrationId))
+      : undefined
+    if (!reader) throw new Error(`no live attachment connection for integration ${ctx.integrationId ?? '(none)'}`)
+    return await readAttachment(ctx, args, deps, reader)
+  }
+
+  // The remaining session-bound read tools need the session's generic message gateway.
+  const gw = ctx.integrationId ? deps.gatewayFor(ctx.integrationId) : undefined
+  if (!gw) throw new Error(`no live platform connection for integration ${ctx.integrationId ?? '(none)'}`)
+
+  if (name === 'getCurrentChannel')
+    return await getCurrentChannel(
+      ctx,
+      gw,
+      deps.deliveryThreadNow?.(ctx) ?? ctx.deliveryThread,
+      deps.deliveryChannelNow?.(ctx) ?? ctx.channel
+    )
+  throw new Error(`unknown tool: ${name}`)
+}

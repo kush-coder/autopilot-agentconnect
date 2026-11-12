@@ -1,0 +1,3874 @@
+'use client'
+
+import { transferCapable } from '@/lib/shared-file'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import useSWR from 'swr'
+import Link from 'next/link'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import {
+  agentCapabilitySource,
+  agentDaemonLabel,
+  agentEffortDisplay,
+  agentLabel,
+  agentModelDisplay,
+  coordinatorModelOf,
+  agentPermissionDisplay,
+  agentPlacementIcon,
+  effectiveAgentStatus,
+  effortField,
+  enrichSessionWithAgent,
+  flattenFiles,
+  isGitWorkspace,
+  isPoolPlacementKind,
+  isSetPlacementKind,
+  MOCK_MODE,
+  MOCK_PREFIX,
+  runtimeCanDream,
+  permissionModeDefault,
+  runtimeLabel,
+  selectedModelId,
+  status,
+  supportsModes,
+  workspaceStatus,
+  type IntegrationRow,
+  workspaceSourceOf,
+  conversationGate
+} from '@/lib/data'
+import { agentSessionIsolationLabel } from '@/lib/session-isolation'
+import { agentStrategyValue } from '@/lib/execution-strategy'
+import { useAgentGithubAppDialog } from '@/components/console/GithubAppDialog'
+import { useStrategyNames } from '@/components/console/ExecutionStrategyField'
+import { permissionModeLabelKey } from '@/lib/permission-mode-i18n'
+import {
+  createAzureDevOpsHook,
+  createGithubHook,
+  createGiteaHook,
+  createGitlabHook,
+  creatorLabel,
+  fetchAgentApiEntries,
+  fetchAgentHooks,
+  fetchAgentInstallations,
+  fetchAgentRepos,
+  fetchGithubInstallations,
+  fetchGiteaConnections,
+  fetchGitlabConnections,
+  fetchHookRuns,
+  fetchSessionDetail,
+  sessionFromDetailDto,
+  updateAzureDevOpsHook,
+  updateGithubHook,
+  updateWebhookInstructions,
+  updateGiteaHook,
+  updateGitlabHook,
+  uploadAgentIcon,
+  openCoordinatorConversation,
+  githubAppPageUrl,
+  type GithubInstallationDto,
+  type HookDto,
+  type HookRunDto
+} from '@/lib/api'
+import { opensCoordinator } from '@/components/console/playground/coordinator'
+import { useOptionalDecisionsPrototype } from '@/lib/decisions/provider'
+import { CoordinatorFilterEvaluationsLink } from '@/components/console/CoordinatorFilterEvaluations'
+import { useConsoleData } from '@/lib/data-context'
+import { useProfile } from '@/lib/profile'
+import { usePlayground } from '@/components/console/PlaygroundProvider'
+import { useModal } from '@/components/console/ModalProvider'
+import { AgentEnvCard } from '@/components/console/AgentEnvCard'
+import { IntegrationMarks } from '@/components/console/IntegrationMarks'
+import { AgentSecretsCard } from '@/components/console/AgentSecretsCard'
+import { AgentToolsCard } from '@/components/console/AgentToolsCard'
+import { AgentSkillsCard } from '@/components/console/AgentSkillsCard'
+import { AgentDecisionsCard } from '@/components/console/AgentDecisionsCard'
+import { AgentComputersCard } from '@/components/console/AgentComputersCard'
+import { featureFlagEnabled } from '@/lib/feature-flags'
+import { DecisionModelLabel } from '@/components/console/decisions/DecisionModelLabel'
+import { modelEvaluationsTarget } from '@/components/console/decisions/ModelSelectionEvaluations'
+import { useCodeHostRowRouting } from '@/components/console/decisions/routing/useCodeHostRowRouting'
+import { AgentCallVisibility } from '@/components/console/AgentCallVisibility'
+import { ApprovalRequestsCard } from '@/components/console/ApprovalRequestsCard'
+import { IntegrationChannelList, roomGlyph, rowLabel } from '@/components/console/IntegrationChannelList'
+import { AgentApiCard } from '@/components/console/AgentApiCard'
+import { RecentSessionsCard } from '@/components/console/RecentSessionsCard'
+import { TriggerSelect } from '@/components/console/TriggerSelect'
+import { AnchoredFlyout } from '@/components/ui/AnchoredFlyout'
+import { discordBotInviteUrl } from '@/components/console/platforms/discord/invite'
+import { WorkspaceCard, type WorkspaceHeaderInfo } from '@/components/console/WorkspaceCard'
+import { WorkspaceFiles, workspaceReadModelKey } from '@/components/console/WorkspaceFiles'
+import { WorkspaceFilesMock } from '@/components/console/WorkspaceFilesMock'
+import { resolveWorkspaceRepoScope, workspaceRepoParamRewrite } from '@/components/console/WorkspaceRepoPicker'
+import { WorkspaceScopePicker } from '@/components/console/WorkspaceScopePicker'
+import { FileBrowserShell } from '@/components/console/FileBrowser'
+import { MemoryPanel } from '@/components/console/MemoryPanel'
+import { AssistantModePanel } from '@/components/console/AssistantModePanel'
+import { AssistantActivityPanel } from '@/components/console/AssistantActivityPanel'
+import { AgentCapabilityRequestsCard } from '@/components/console/AgentCapabilityRequestsCard'
+import { activityScope } from '@/lib/agent-activity'
+import { LocalSkillsList } from '@/components/console/LocalSkillsList'
+import { GithubReviewSettings } from '@/components/console/GithubReviewSettings'
+import { GiteaReviewSettings } from '@/components/console/GiteaReviewSettings'
+import { GitlabReviewSettings } from '@/components/console/GitlabReviewSettings'
+import { AzureDevOpsReviewSettings } from '@/components/console/AzureDevOpsReviewSettings'
+import { LabelFilterField } from '@/components/console/LabelFilterField'
+import { VisibilityValue } from '@/components/console/VisibilityField'
+import { IntegrationPlatformGroups, PLATFORM_TILE_WIDTH } from '@/components/console/IntegrationPlatformGroups'
+import { SelfAgentContext } from '@/components/console/SelfAgentTag'
+import LarkFeishuSwitcher from '@/components/LarkFeishuSwitcher'
+import {
+  AgentMark,
+  AzureDevOpsMark,
+  GiteaMark,
+  GithubMark,
+  GitlabMark,
+  LoadingState,
+  PlatformMark
+} from '@/components/marks'
+import { buildAgentReachabilityGraph } from '@/lib/agent-reachability'
+import type { Platform } from '@/components/console/modals/AddIntegrationModal'
+import { INTEGRATION_BLURB, isCoreTriggerKind } from '@/components/console/platforms/host-projections'
+import { botCardCopy, platformAgentCard, withCredentialCode } from '@/components/console/platforms/registry'
+import { NewChannelsDefault } from '@/components/console/NewChannelsDefault'
+import {
+  GT_TRIGGER_MODES,
+  GT_TRIGGER_PILL,
+  giteaCadencePick,
+  giteaCommentFamilies,
+  giteaDefaultTriggerMode,
+  giteaFamilyCarriesReviews,
+  giteaFamilySubscription,
+  giteaFamilyTile,
+  giteaHookFamily,
+  giteaHookNeedsNormalization,
+  giteaTriggerModeOf,
+  giteaTriggerModes,
+  giteaTriggerTooltip,
+  type GtFamily,
+  type GtTriggerMode
+} from '@/lib/gitea-events'
+import { giteaInstanceHost, giteaRepositoryUrl } from '@/lib/gitea-repositories'
+import {
+  GL_TRIGGER_MODES,
+  GL_TRIGGER_PILL,
+  gitlabCadencePick,
+  gitlabCommentFamilies,
+  gitlabDefaultTriggerMode,
+  gitlabFamilyCarriesReviews,
+  gitlabFamilySubscription,
+  gitlabFamilyTile,
+  gitlabHookFamily,
+  gitlabHookNeedsNormalization,
+  gitlabTriggerModeOf,
+  gitlabTriggerModes,
+  gitlabTriggerTooltip,
+  type GlFamily,
+  type GlTriggerMode
+} from '@/lib/gitlab-events'
+import { gitlabInstanceHost, gitlabProjectUrl } from '@/lib/gitlab-projects'
+import {
+  AZ_TRIGGER_MODES,
+  AZ_TRIGGER_PILL,
+  azureDevOpsCadencePick,
+  azureDevOpsCommentFamilies,
+  azureDevOpsDefaultTriggerMode,
+  azureDevOpsFamilyCarriesReviews,
+  azureDevOpsFamilySubscription,
+  azureDevOpsFamilyTile,
+  azureDevOpsHookFamily,
+  azureDevOpsHookNeedsNormalization,
+  azureDevOpsTriggerModeOf,
+  azureDevOpsTriggerModes,
+  azureDevOpsTriggerTooltip,
+  type AzFamily,
+  type AzTriggerMode
+} from '@/lib/azure-devops-events'
+import { azureDevOpsRepositoryUrl } from '@/lib/azure-devops-repositories'
+import {
+  orderedAzureDevOpsHookRows,
+  orderedGiteaHookRows,
+  orderedGithubHookRows,
+  orderedGitlabHookRows
+} from '@/lib/code-host-hook-groups'
+import { AgentIconPicker } from '@/components/console/AgentIconPicker'
+import { BuiltinBadge } from '@/components/console/BuiltinBadge'
+import { NotFound } from '@/components/console/NotFound'
+import { TrustedUsersField, type TrustedUsersFlush } from '@/components/console/TrustedUsersField'
+import { Button, Icon } from '@/components/ui'
+import { agentFilterPlacement, coordinatorFilterLabel, useCoordinatorFilterProviders } from '@/lib/coordinator-filter'
+import { useOrgs } from '@/lib/org-context'
+import { consoleKeys } from '@/lib/swr-keys'
+import { useSessionList } from '@/lib/use-session-list'
+import {
+  GH_TRIGGER_MODES,
+  githubTriggerPill,
+  githubTriggerDescription,
+  githubCommentFamilies,
+  githubDefaultTriggerMode,
+  githubFamilyCarriesReviews,
+  githubFamilySubscription,
+  githubFamilyTile,
+  githubHookFamily,
+  githubHookNeedsNormalization,
+  githubTriggerModes,
+  githubTriggerTooltip,
+  triggerModeOf,
+  type GhFamily,
+  type GhTriggerMode
+} from '@/lib/github-events'
+import {
+  effectiveRepoAccess,
+  hasChecksWritePermission,
+  hasPullRequestsReadPermission,
+  hasPullRequestsWritePermission,
+  installationForRepo,
+  repoAccessSatisfies,
+  requiredRepoAccess,
+  reviewPolicyLabel,
+  type HookReportingMode,
+  type HookReviewPolicy
+} from '@/lib/github-review-settings'
+import { useDaemonDetail } from '@/lib/use-daemon-detail'
+import { isCodeHostProvider, type CodeHostProvider } from '@agentconnect.md/protocol/code-host'
+import { CODE_HOST_PROJECTION, codeHostRecord } from '@/lib/code-hosts'
+import { githubHookScope, githubHookScopeKey } from '@/lib/github-hook-scope'
+import { EscapeLayer } from '@/components/console/Scrim'
+import { AgentKnowledgePanel } from '@/components/console/AgentKnowledgePanel'
+
+type DetailTab = 'config' | 'integrations' | 'workspace' | 'memory' | 'knowledge' | 'tools' | 'activity'
+const HOOK_REFRESH_MS = 30_000
+
+// The tile SET is derived from the owning daemon's advertised adapters (below)
+// — never hard-coded — so a tile can't promise a platform the Add-integration
+// modal would swap out from under the click. webhook/github are relay/CP-backed
+// triggers: always offered. Their one-liners (`INTEGRATION_BLURB`) are a host
+// projection over the same axis, drift-tested beside the picker's tiles.
+const HOOK_RUN_REFRESH_MS = 10_000
+
+// A module with no card-scope state still renders through a wrapper, so the card is written once.
+function PlainCardScope({ children }: { integration: IntegrationRow; children: ReactNode }) {
+  return <>{children}</>
+}
+
+function FeishuRegionBadge({ integration }: { integration: Pick<IntegrationRow, 'platform' | 'region'> }) {
+  if (integration.platform !== 'feishu') return null
+  return (
+    <span className="badge flex-none bg-(--surface-active) text-(--text-tertiary)">
+      {integration.region === 'lark' ? 'Lark' : 'Feishu'}
+    </span>
+  )
+}
+
+// One integration's warning pill: a revoked credential, then a rejected one, then an unserved agent; nothing while healthy.
+function IntegrationStatePill({
+  integration,
+  agentOffline,
+  mobile
+}: {
+  integration: Pick<IntegrationRow, 'platform' | 'revoked' | 'rejected' | 'credentialCode'>
+  agentOffline: boolean
+  mobile: boolean
+}) {
+  const t = useTranslations('Agents.detail')
+  const shape = mobile
+    ? 'inline-flex flex-none items-center gap-[5px] rounded-full px-[10px] py-[3px] font-sans text-[12px] font-semibold leading-normal'
+    : 'badge'
+  if (integration.revoked || integration.rejected) {
+    const copy = botCardCopy(integration.platform)
+    return (
+      <span
+        className={`${shape} bg-(--status-error-soft) text-(--status-error)`}
+        title={withCredentialCode(
+          integration.revoked ? copy.revokedHint : copy.rejectedHint,
+          integration.credentialCode
+        )}
+      >
+        {integration.revoked ? t('integrations.revoked') : t('integrations.rejected')}
+      </span>
+    )
+  }
+  if (agentOffline) {
+    return (
+      <span className={`${shape} bg-(--surface-active) text-(--text-tertiary)`}>
+        <span className="dot h-[6px] w-[6px] bg-(--text-disabled)" />
+        {t('integrations.offline')}
+      </span>
+    )
+  }
+  return null
+}
+
+// One row's settings dialog: the label filter on every thread row, the two review axes on a change-proposal row.
+interface CodeHostReviewSettingsDraft {
+  hookId: string
+  kind: CodeHostProvider
+  reviewPolicy: HookReviewPolicy
+  reportingMode: HookReportingMode
+  labelFilter: string[]
+  skipDrafts: boolean
+}
+
+// The review dialog's host plate on the inverse surface — each host keeps its own fill and color.
+const REVIEW_DIALOG_MARK: Record<CodeHostProvider, ReactNode> = {
+  github: <GithubMark color="#fff" />,
+  gitlab: <GitlabMark fillPct={100} />,
+  gitea: <GiteaMark color="#fff" fillPct={100} />,
+  'azure-devops': <AzureDevOpsMark color="#fff" fillPct={100} />
+}
+
+// The dialog settles one subscription row, so its subject names it.
+function rowSettingsTitle(hook: HookDto): string {
+  const label =
+    hook.kind === 'github'
+      ? githubFamilyTile(githubHookFamily(hook) ?? 'pull_request')?.label
+      : hook.kind === 'gitlab'
+        ? gitlabFamilyTile(gitlabHookFamily(hook) ?? 'merge_request')?.label
+        : hook.kind === 'azure-devops'
+          ? azureDevOpsFamilyTile(azureDevOpsHookFamily(hook) ?? 'merge_request')?.label
+          : giteaFamilyTile(giteaHookFamily(hook) ?? 'merge_request')?.label
+  return `${label ?? 'Subscription'} settings`
+}
+
+export default function AgentDetailView() {
+  const { id } = useParams<{ id: string }>()
+  return (
+    <SelfAgentContext value={id}>
+      <AgentDetail />
+    </SelfAgentContext>
+  )
+}
+
+/** A watched repository's name, linking to its page on the code host when that page is known. */
+function RepoName({ name, url, className }: { name: string; url: string | null; className: string }) {
+  if (!url) return <span className={className}>{name}</span>
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer" className={`${className} hover:underline`}>
+      {name}
+    </a>
+  )
+}
+
+function AgentDetail() {
+  const t = useTranslations('Agents.detail')
+  const decisionsPrototype = useOptionalDecisionsPrototype()
+  const decisions = useMemo(() => decisionsPrototype?.decisions ?? [], [decisionsPrototype])
+  const permissionT = useTranslations('Common.permissionModes')
+  const strategyT = useTranslations('Common.executionStrategy')
+  const chatActionsT = useTranslations('Common.chatActions')
+  const labelFilterT = useTranslations('Common.labelFilter')
+  const strategyNames = useStrategyNames()
+  const { orgPath, activeOrg, myRole } = useOrgs()
+  const { me } = useProfile()
+  const { id } = useParams<{ id: string }>()
+  const params = useSearchParams()
+  const router = useRouter()
+  const rawTab = params.get('tab')
+  // Integrations is the default landing tab (no `?tab=`); every other tab is `?tab=<id>`.
+  const requestedTab: DetailTab =
+    rawTab === 'config' ||
+    rawTab === 'workspace' ||
+    rawTab === 'memory' ||
+    rawTab === 'knowledge' ||
+    rawTab === 'tools' ||
+    rawTab === 'activity'
+      ? rawTab
+      : 'integrations'
+  const {
+    agents,
+    getAgent,
+    getSessions,
+    daemons,
+    daemonsLoading,
+    integrations,
+    agentsLoading,
+    updateAgent,
+    refresh,
+    memberSets,
+    orgSetIds
+  } = useConsoleData()
+  const { openPlayground } = usePlayground()
+  const { openModal } = useModal()
+  // Tasks belong to their session, so the Recent card and the header count leave them out as All sessions does.
+  const {
+    sessions: agentSessionRows,
+    total: agentSessionTotal,
+    isLoading: agentSessionsLoading
+  } = useSessionList(MOCK_MODE ? null : activeOrg?.id, { agentId: id, excludeTasks: true })
+  const {
+    sessions: workspaceSessionRows,
+    nextCursor: workspaceSessionsNextCursor,
+    loadingMore: workspaceSessionsLoadingMore,
+    loadMore: loadMoreWorkspaceSessions,
+    isLoading: workspaceSessionsLoading
+  } = useSessionList(
+    MOCK_MODE || requestedTab !== 'workspace' ? null : activeOrg?.id,
+    { agentId: id },
+    { grouped: false }
+  )
+  const selectedWorktreeSessionId = params.get('worktree')?.trim() || null
+  const { data: selectedWorktreeDetail } = useSWR(
+    requestedTab === 'workspace' && selectedWorktreeSessionId
+      ? consoleKeys.sessionDetail(activeOrg?.id, selectedWorktreeSessionId)
+      : null,
+    ([, orgId, , sessionId]) => fetchSessionDetail(sessionId, orgId)
+  )
+  // The Recent-sessions card reads the agent-filtered page above, NOT the
+  // org-wide loaded window (`getSessions`) — a busy org's newest 50 may not
+  // include this agent at all, which would render a false "No sessions yet"
+  // beside a nonzero header count. Mock mode has no CP to filter server-side,
+  // so it keeps the demo rows. Rows are display-enriched like data-context does.
+  const recentSessions = useMemo(
+    () =>
+      MOCK_MODE
+        ? getSessions(id).filter((s) => !s.subsession)
+        : agentSessionRows.map((s) => enrichSessionWithAgent(s, s.agentId ? getAgent(s.agentId) : undefined)),
+    [agentSessionRows, getAgent, getSessions, id]
+  )
+  const workspaceSessions = useMemo(
+    () => workspaceSessionRows.map((s) => enrichSessionWithAgent(s, s.agentId ? getAgent(s.agentId) : undefined)),
+    [getAgent, workspaceSessionRows]
+  )
+  const selectedWorktreeSession =
+    workspaceSessions.find((session) => session.id === selectedWorktreeSessionId) ??
+    (selectedWorktreeDetail?.agentId === id &&
+    selectedWorktreeDetail.workspaceIsolation === 'session' &&
+    !selectedWorktreeDetail.contentPurgedAt
+      ? sessionFromDetailDto(selectedWorktreeDetail)
+      : undefined)
+  // Which webhook row has its recent-deliveries panel expanded (one at a time).
+  const [hookRunsFor, setHookRunsFor] = useState<string | null>(null)
+  const [hookInstructionsFor, setHookInstructionsFor] = useState<string | null>(null)
+  // Hooks are agent-scoped (no org-wide list). Keep a stable resource key so a
+  // create/delete revalidation retains the last good rows while it refetches.
+  const hooksKey = consoleKeys.agentHooks(activeOrg?.id, id)
+  const {
+    data: agentHooksData,
+    error: hooksError,
+    isLoading: hooksLoading,
+    mutate: mutateHooks
+  } = useSWR(hooksKey, ([, orgId, , agentId]) => fetchAgentHooks(agentId, orgId), {
+    refreshInterval: HOOK_REFRESH_MS
+  })
+  const agentHooks = agentHooksData ?? []
+  const hooksLoadError = agentHooksData === undefined && hooksError
+  const { data: apiEntriesData, mutate: mutateApiEntries } = useSWR(
+    consoleKeys.agentApi(activeOrg?.id, id),
+    ([, orgId, , agentId]) => fetchAgentApiEntries(agentId, orgId)
+  )
+  const apiEntries = apiEntriesData ?? []
+  // Each code host renders as ONE group with a row per watched repository or
+  // project (design); webhooks stay flat rows.
+  const webhookHooks = agentHooks.filter((h) => h.kind === 'webhook')
+  // Each host's own rows, keyed by provider so a lookup replaces "the other one's" branch.
+  const codeHostHooks = codeHostRecord((provider) => agentHooks.filter((h) => h.kind === provider))
+  const githubHooks = codeHostHooks.github
+  const gitlabHooks = codeHostHooks.gitlab
+  // One flat row per subscription still — the grouping is only the ORDER (a repo's rows adjacent) plus its add offer.
+  const githubRows = orderedGithubHookRows(githubHooks)
+  // Each code-host row's subject family in its own host's stored vocabulary.
+  const codeHostRowFamily = (h: HookDto) =>
+    h.kind === 'github'
+      ? githubHookFamily(h)
+      : h.kind === 'gitlab'
+        ? gitlabHookFamily(h)
+        : h.kind === 'azure-devops'
+          ? azureDevOpsHookFamily(h)
+          : giteaHookFamily(h)
+  // Issues and change-request rows of every host carry their scope's decision routing (code-host-decisions.md §7).
+  const { rowOf: routingRowOf, drawer: routingEvaluationsDrawer } = useCodeHostRowRouting({
+    hooks: Object.values(codeHostHooks).flat(),
+    familyOf: codeHostRowFamily,
+    pillOf: (h) => codeHostRowPill(h),
+    agentOf: getAgent,
+    firstAgentId: id,
+    mockMembers: agents.map((agent) => ({ agentId: agent.id, hookId: `mock-${agent.id}`, name: agentLabel(agent) }))
+  })
+  const gitlabRows = orderedGitlabHookRows(gitlabHooks)
+  const giteaHooks = codeHostHooks.gitea
+  const giteaRows = orderedGiteaHookRows(giteaHooks)
+  const azureDevOpsHooks = codeHostHooks['azure-devops']
+  const azureDevOpsRows = orderedAzureDevOpsHookRows(azureDevOpsHooks)
+  // The agent works through one GitHub App: its installations back the rows, and GitHub's return lands back on its dialog.
+  const githubAgentAppId = getAgent(id)?.githubAppId ?? null
+  const returnedGithubApp = params.get('github-app')
+  const githubAppDialog = useAgentGithubAppDialog(
+    { id, githubAppId: githubAgentAppId },
+    returnedGithubApp && /^[0-9a-f-]{36}$/.test(returnedGithubApp) ? returnedGithubApp : undefined
+  )
+  const githubAppSlug = githubAppDialog.appSlug
+  const githubInstallationsKey =
+    activeOrg && githubHooks.length > 0
+      ? (['github-review-installations', activeOrg.id, githubAgentAppId] as const)
+      : null
+  const { data: githubInstallationsData } = useSWR<GithubInstallationDto[]>(githubInstallationsKey, () =>
+    fetchGithubInstallations(undefined, githubAgentAppId).then((result) => result.installations)
+  )
+  const githubInstallations = githubInstallationsData ?? []
+  // One deployment talks to exactly one GitLab instance (§24.1), so any connection names the host.
+  const gitlabConnectionsKey =
+    activeOrg && gitlabHooks.length > 0 ? (['gitlab-connections', activeOrg.id] as const) : null
+  const { data: gitlabConnectionsData } = useSWR(gitlabConnectionsKey, () =>
+    fetchGitlabConnections().then((result) => result.connections)
+  )
+  // A pending read and a failed one both arrive as undefined, and neither is evidence of an
+  // instance, so the host is named only once a connection has said it.
+  const gitlabInstanceUrl = gitlabConnectionsData?.[0]?.instanceUrl ?? null
+  // One deployment talks to exactly one Gitea instance (§3), so any connection names the host.
+  const giteaConnectionsKey = activeOrg && giteaHooks.length > 0 ? (['gitea-connections', activeOrg.id] as const) : null
+  const { data: giteaConnectionsData } = useSWR(giteaConnectionsKey, () =>
+    fetchGiteaConnections().then((result) => result.connections)
+  )
+  const giteaInstanceUrl = giteaConnectionsData?.[0]?.instanceUrl ?? null
+  // A watched repository's page on its host, once the host is known.
+  const repoPageUrl = (host: CodeHostProvider, repo: string | null): string | null => {
+    if (!repo) return null
+    if (host === 'github') return `https://github.com/${repo}`
+    if (host === 'gitlab') return gitlabInstanceUrl ? gitlabProjectUrl(gitlabInstanceUrl, repo) : null
+    if (host === 'azure-devops') return azureDevOpsRepositoryUrl(repo)
+    return giteaInstanceUrl ? giteaRepositoryUrl(giteaInstanceUrl, repo) : null
+  }
+
+  // Authorization provenance for the unauthorized-watch badge (multi-repo
+  // design §web 3): numeric repo ids first, names only for rolling legacy rows.
+  // GitHub-App workspaces have an implicit workspace grant. Scratch and manual
+  // GitHub workspaces rely on explicit grants (manual remains limited to its
+  // own repo).
+  const wsForRepos = getAgent(id)?.workspace
+  const reposKey = wsForRepos ? consoleKeys.agentRepos(activeOrg?.id, id) : null
+  const { data: agentReposData } = useSWR(reposKey, ([, orgId, , agentId]) => fetchAgentRepos(agentId, orgId))
+  // Installation grants authorize their account's repositories too (decision 10).
+  const grantsKey = wsForRepos ? consoleKeys.agentInstallations(activeOrg?.id, id) : null
+  const { data: installationGrantsData, error: installationGrantsError } = useSWR(grantsKey, ([, orgId, , agentId]) =>
+    fetchAgentInstallations(agentId, orgId)
+  )
+  // Which ROOT the Workspace tab browses, beside `?worktree=` which chooses the checkout within it.
+  // Pool placements hold their grants as authorization only — no secondary root is materialized
+  // there yet — so the menu offers nothing to switch to and the browser stays on the workspace.
+  const poolPlacedForRepos = isPoolPlacementKind(getAgent(id)?.placementKind, getAgent(id)?.setId, orgSetIds)
+  const workspaceRepoOptions = poolPlacedForRepos ? [] : (agentReposData ?? [])
+  const selectedRepo = resolveWorkspaceRepoScope(params.get('repo'), poolPlacedForRepos ? [] : agentReposData)
+  const selectRepoScope = useCallback(
+    (repo: string | null) => {
+      const next = new URLSearchParams(params)
+      if (repo) next.set('repo', repo)
+      else next.delete('repo')
+      router.replace(`${orgPath(`/agents/${id}`)}?${next.toString()}`, { scroll: false })
+    },
+    [id, orgPath, params, router]
+  )
+  // ...and once the grants are definitive, make the URL say which root the browser is actually
+  // reading, so a hand-written or revoked link stops disagreeing with the picker beside it.
+  const repoParamRewrite = workspaceRepoParamRewrite(
+    params.get('repo'),
+    selectedRepo,
+    poolPlacedForRepos ? [] : agentReposData
+  )
+  useEffect(() => {
+    if (repoParamRewrite !== undefined) selectRepoScope(repoParamRewrite)
+  }, [repoParamRewrite, selectRepoScope])
+  // Grandfathered out-of-set hooks keep firing; only the gh write-back is
+  // credential-less — badge them once the grant list has actually loaded.
+  const watchUnauthorized = (h: HookDto): boolean =>
+    wsForRepos !== undefined &&
+    agentReposData !== undefined &&
+    (installationGrantsData !== undefined || installationGrantsError !== undefined) &&
+    effectiveRepoAccess({
+      repoId: h.repoId,
+      repoFullName: githubHookScopeKey(h),
+      workspace: wsForRepos ?? { mode: 'scratch' },
+      authorizations: agentReposData,
+      installationGrants: installationGrantsData
+    }) === 'none'
+
+  const [reviewSettingsDraft, setReviewSettingsDraft] = useState<CodeHostReviewSettingsDraft | null>(null)
+  const [reviewSettingsSaving, setReviewSettingsSaving] = useState(false)
+  const [reviewSettingsError, setReviewSettingsError] = useState<string | null>(null)
+  // Save commits the trusted user the field still holds unentered, so clicking it never eats what was typed.
+  const trustedUsersFlush = useRef<TrustedUsersFlush | null>(null)
+  const reviewSettingsProvider = reviewSettingsDraft?.kind ?? null
+  const reviewSettingsHook = reviewSettingsDraft
+    ? codeHostHooks[reviewSettingsDraft.kind].find((hook) => hook.id === reviewSettingsDraft.hookId)
+    : undefined
+  const reviewSettingsRepoAccess = effectiveRepoAccess({
+    repoId: reviewSettingsHook?.repoId,
+    repoFullName: reviewSettingsHook ? githubHookScopeKey(reviewSettingsHook) : undefined,
+    workspace: wsForRepos ?? { mode: 'scratch' },
+    authorizations: agentReposData ?? [],
+    installationGrants: installationGrantsData
+  })
+  const reviewSettingsInstallation = installationForRepo(
+    reviewSettingsHook ? githubHookScopeKey(reviewSettingsHook) : undefined,
+    githubInstallations
+  )
+  const reviewSettingsNeededAccess = reviewSettingsDraft ? requiredRepoAccess(reviewSettingsDraft) : 'none'
+  // Only the github surface has a config-time blocker, named positively so no other
+  // host inherits it; GitLab's writer is the project bot, which carries no per-agent
+  // access tier to satisfy first.
+  const reviewSettingsBlocked =
+    reviewSettingsProvider === 'github' &&
+    (!repoAccessSatisfies(reviewSettingsRepoAccess, reviewSettingsNeededAccess) ||
+      (reviewSettingsDraft?.reviewPolicy !== undefined &&
+        reviewSettingsDraft.reviewPolicy !== 'off' &&
+        !hasPullRequestsWritePermission(reviewSettingsInstallation)) ||
+      (reviewSettingsDraft?.reportingMode === 'check' &&
+        (!hasChecksWritePermission(reviewSettingsInstallation) ||
+          !hasPullRequestsReadPermission(reviewSettingsInstallation))))
+
+  const openReviewSettings = (hook: HookDto) => {
+    // Opened only from a code-host row, so the row's own kind IS the draft's — never a fallback host.
+    if (!isCodeHostProvider(hook.kind)) return
+    setReviewSettingsError(null)
+    setReviewSettingsDraft({
+      hookId: hook.id,
+      kind: hook.kind,
+      reviewPolicy: hook.reviewPolicy,
+      reportingMode: hook.reportingMode,
+      labelFilter: hook.labelFilter,
+      skipDrafts: hook.skipDrafts
+    })
+  }
+
+  const closeReviewSettings = () => {
+    if (reviewSettingsSaving) return
+    setReviewSettingsDraft(null)
+    setReviewSettingsError(null)
+  }
+
+  const saveReviewSettings = async () => {
+    if (reviewSettingsSaving || reviewSettingsBlocked || !reviewSettingsDraft || !reviewSettingsHook?.agentId) {
+      return
+    }
+    const agentId = reviewSettingsHook.agentId
+    const hook = reviewSettingsHook
+    const { reviewPolicy, reportingMode, labelFilter, skipDrafts } = reviewSettingsDraft
+    const common = { agentId, name: hook.name, enabled: hook.enabled, events: hook.events, labelFilter }
+    // Each host's PUT re-sends its whole block through its own endpoint; only the dialog's fields move.
+    const writers: Record<CodeHostProvider, (() => Promise<HookDto>) | null> = {
+      gitea: hook.repoId
+        ? () =>
+            updateGiteaHook(hook.id, {
+              ...common,
+              repoId: hook.repoId!,
+              commentFamilies: giteaCommentFamilies(hook.commentFamilies),
+              mentionOnly: hook.mentionOnly,
+              reviewPolicy,
+              reportingMode
+            })
+        : null,
+      github:
+        hook.repoFullName || hook.installationAccount
+          ? () =>
+              updateGithubHook(hook.id, {
+                ...common,
+                ...githubHookScope(hook),
+                commentFamilies: githubCommentFamilies(hook.commentFamilies),
+                mentionOnly: hook.mentionOnly,
+                reviewPolicy,
+                reportingMode,
+                gateMode: 'informational',
+                skipDrafts
+              })
+          : null,
+      gitlab: hook.repoId
+        ? () =>
+            updateGitlabHook(hook.id, {
+              ...common,
+              projectId: hook.repoId!,
+              commentFamilies: gitlabCommentFamilies(hook.commentFamilies),
+              mentionOnly: hook.mentionOnly,
+              reviewPolicy,
+              reportingMode
+            })
+        : null,
+      // No label filter on Azure DevOps (§11.4), so the row's own fields go back without one.
+      'azure-devops': hook.repoId
+        ? () =>
+            updateAzureDevOpsHook(hook.id, {
+              agentId,
+              name: hook.name,
+              enabled: hook.enabled,
+              events: hook.events,
+              repoId: hook.repoId!,
+              commentFamilies: azureDevOpsCommentFamilies(hook.commentFamilies),
+              mentionOnly: hook.mentionOnly,
+              reviewPolicy,
+              reportingMode
+            })
+        : null
+    }
+    const save = writers[reviewSettingsDraft.kind]
+    if (!save) return
+    setReviewSettingsSaving(true)
+    setReviewSettingsError(null)
+    try {
+      // Its own write, so it goes first and a login the host refuses keeps the dialog open on the field's error.
+      if (trustedUsersFlush.current && !(await trustedUsersFlush.current())) return
+      const updated = await save()
+      void mutateHooks((rows) => rows?.map((row) => (row.id === hook.id ? updated : row)), {
+        revalidate: false
+      })
+      setReviewSettingsDraft(null)
+    } catch (error) {
+      setReviewSettingsError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setReviewSettingsSaving(false)
+    }
+  }
+
+  // One review editor per host, chosen by a total table — a new host brings its own pane instead
+  // of inheriting GitHub's. Both arms edit the same draft, so the two handlers are shared. The
+  // label filter follows on every row; the review axes only where the row carries them.
+  const reviewSettingsEditor = (
+    draft: CodeHostReviewSettingsDraft,
+    carriesReviews: boolean,
+    carriesLabels: boolean
+  ): ReactNode => {
+    const onReviewPolicyChange = (reviewPolicy: HookReviewPolicy) => {
+      setReviewSettingsError(null)
+      setReviewSettingsDraft((current) => (current ? { ...current, reviewPolicy } : current))
+    }
+    const onReportingModeChange = (reportingMode: HookReportingMode) => {
+      setReviewSettingsError(null)
+      setReviewSettingsDraft((current) => (current ? { ...current, reportingMode } : current))
+    }
+    const editors: Record<CodeHostProvider, () => ReactNode> = {
+      gitea: () => (
+        <GiteaReviewSettings
+          value={draft}
+          onReviewPolicyChange={onReviewPolicyChange}
+          onReportingModeChange={onReportingModeChange}
+          defaultExpanded
+        />
+      ),
+      github: () => (
+        <GithubReviewSettings
+          value={draft}
+          onReviewPolicyChange={onReviewPolicyChange}
+          onReportingModeChange={onReportingModeChange}
+          repoAccess={reviewSettingsRepoAccess}
+          installation={reviewSettingsInstallation}
+          defaultExpanded
+        />
+      ),
+      gitlab: () => (
+        <GitlabReviewSettings
+          value={draft}
+          onReviewPolicyChange={onReviewPolicyChange}
+          onReportingModeChange={onReportingModeChange}
+          defaultExpanded
+        />
+      ),
+      'azure-devops': () => (
+        <AzureDevOpsReviewSettings
+          value={draft}
+          onReviewPolicyChange={onReviewPolicyChange}
+          onReportingModeChange={onReportingModeChange}
+          defaultExpanded
+        />
+      )
+    }
+    return (
+      <div className="flex flex-col gap-4">
+        {carriesReviews && editors[draft.kind]()}
+        {carriesLabels && (
+          <LabelFilterField
+            value={draft.labelFilter}
+            onChange={(labelFilter) => {
+              setReviewSettingsError(null)
+              setReviewSettingsDraft((current) => (current ? { ...current, labelFilter } : current))
+            }}
+          />
+        )}
+        {carriesReviews && draft.kind === 'github' && (
+          <label className="flex min-w-0 items-center gap-[7px]">
+            <input
+              type="checkbox"
+              checked={draft.skipDrafts}
+              onChange={(event) => {
+                const skipDrafts = event.target.checked
+                setReviewSettingsError(null)
+                setReviewSettingsDraft((current) => (current ? { ...current, skipDrafts } : current))
+              }}
+              className="accent-(--brand)"
+            />
+            <span className="font-sans text-[11.5px] font-medium leading-normal text-(--text-secondary)">
+              {labelFilterT('skipDrafts')}
+            </span>
+          </label>
+        )}
+      </div>
+    )
+  }
+
+  // Edit one github subscription in place (PUT re-sends the whole block); the
+  // SWR row is patched — no full revalidation. The row's family is immutable and
+  // absent from the body; only the create/update/@-mention trigger moves.
+  const [hookBusy, setHookBusy] = useState<string | null>(null)
+  const saveHookEvents = async (h: HookDto, fam: GhFamily, mode: GhTriggerMode) => {
+    if (hookBusy || !h.agentId || !githubHookScopeKey(h)) return
+    setHookBusy(h.id)
+    try {
+      const updated = await updateGithubHook(h.id, {
+        agentId: h.agentId,
+        name: h.name,
+        enabled: h.enabled,
+        ...githubHookScope(h),
+        ...githubFamilySubscription(fam, mode),
+        labelFilter: h.labelFilter,
+        reviewPolicy: h.reviewPolicy,
+        reportingMode: h.reportingMode,
+        gateMode: 'informational'
+      })
+      void mutateHooks((rows) => rows?.map((r) => (r.id === h.id ? updated : r)), { revalidate: false })
+    } catch {
+      /* controls stay as they were — the next refresh interval reconciles */
+    } finally {
+      setHookBusy(null)
+    }
+  }
+  // The GitLab counterpart of saveHookEvents — its own whole-block PUT, no gateMode.
+  const saveGitlabHookEvents = async (h: HookDto, fam: GlFamily, mode: GlTriggerMode) => {
+    if (hookBusy || !h.agentId || !h.repoId) return
+    setHookBusy(h.id)
+    try {
+      const updated = await updateGitlabHook(h.id, {
+        agentId: h.agentId,
+        name: h.name,
+        enabled: h.enabled,
+        projectId: h.repoId,
+        ...gitlabFamilySubscription(fam, mode),
+        reviewPolicy: h.reviewPolicy,
+        reportingMode: h.reportingMode
+      })
+      void mutateHooks((rows) => rows?.map((r) => (r.id === h.id ? updated : r)), { revalidate: false })
+    } catch {
+      /* controls stay as they were — the next refresh interval reconciles */
+    } finally {
+      setHookBusy(null)
+    }
+  }
+  // The Gitea counterpart — its own whole-block PUT, keyed on the numeric repository id.
+  const saveGiteaHookEvents = async (h: HookDto, fam: GtFamily, mode: GtTriggerMode) => {
+    if (hookBusy || !h.agentId || !h.repoId) return
+    setHookBusy(h.id)
+    try {
+      const updated = await updateGiteaHook(h.id, {
+        agentId: h.agentId,
+        name: h.name,
+        enabled: h.enabled,
+        repoId: h.repoId,
+        ...giteaFamilySubscription(fam, mode),
+        reviewPolicy: h.reviewPolicy,
+        reportingMode: h.reportingMode
+      })
+      void mutateHooks((rows) => rows?.map((r) => (r.id === h.id ? updated : r)), { revalidate: false })
+    } catch {
+      /* controls stay as they were — the next refresh interval reconciles */
+    } finally {
+      setHookBusy(null)
+    }
+  }
+  // The same pure helper rule as gitlab: a no-op write is refused, which leaves an
+  // inexpressible stored rule untouched.
+  const setGiteaHookCadence = async (h: HookDto, mode: GtTriggerMode) => {
+    const edit = giteaCadencePick(h, mode)
+    if (edit) await saveGiteaHookEvents(h, edit.family, edit.mode)
+  }
+  // The Azure DevOps counterpart — keyed on the bound repository's surrogate id, with no label filter.
+  const saveAzureDevOpsHookEvents = async (h: HookDto, fam: AzFamily, mode: AzTriggerMode) => {
+    if (hookBusy || !h.agentId || !h.repoId) return
+    setHookBusy(h.id)
+    try {
+      const updated = await updateAzureDevOpsHook(h.id, {
+        agentId: h.agentId,
+        name: h.name,
+        enabled: h.enabled,
+        repoId: h.repoId,
+        ...azureDevOpsFamilySubscription(fam, mode),
+        reviewPolicy: h.reviewPolicy,
+        reportingMode: h.reportingMode
+      })
+      void mutateHooks((rows) => rows?.map((r) => (r.id === h.id ? updated : r)), { revalidate: false })
+    } catch {
+      /* controls stay as they were — the next refresh interval reconciles */
+    } finally {
+      setHookBusy(null)
+    }
+  }
+  const setAzureDevOpsHookCadence = async (h: HookDto, mode: AzTriggerMode) => {
+    const edit = azureDevOpsCadencePick(h, mode)
+    if (edit) await saveAzureDevOpsHookEvents(h, edit.family, edit.mode)
+  }
+  // A pure helper decides the gitlab edit: it refuses a no-op write, which is what leaves an inexpressible stored rule untouched.
+  const setGitlabHookCadence = async (h: HookDto, mode: GlTriggerMode) => {
+    const edit = gitlabCadencePick(h, mode)
+    if (edit) await saveGitlabHookEvents(h, edit.family, edit.mode)
+  }
+  const setHookCadence = async (h: HookDto, mode: GhTriggerMode) => {
+    const fam = githubHookFamily(h)
+    if (!fam) return
+    if (mode === triggerModeOf(h) && !githubHookNeedsNormalization(h)) return
+    await saveHookEvents(h, fam, mode)
+  }
+  // Watch one MORE subject on a watched repo: the family is create-only, so a missing family is a new row, not an edit.
+  const [addFamilyBusy, setAddFamilyBusy] = useState<string | null>(null)
+  const [addFamilyError, setAddFamilyError] = useState<{ key: string; message: string } | null>(null)
+  const addFamilyKey = (repoKey: string, fam: string) => `${repoKey}:${fam}`
+  // `seed` is any row of the repository or installation — the siblings all name the same scope.
+  const addGithubFamily = async (seed: HookDto, repoKey: string, fam: GhFamily) => {
+    const scope = githubHookScopeKey(seed)
+    if (addFamilyBusy || !seed.agentId || !scope) return
+    setAddFamilyBusy(addFamilyKey(repoKey, fam))
+    setAddFamilyError(null)
+    try {
+      await createGithubHook({
+        agentId: seed.agentId,
+        name: scope,
+        ...githubHookScope(seed),
+        family: fam,
+        ...githubFamilySubscription(fam, githubDefaultTriggerMode(fam)),
+        reviewPolicy: 'off',
+        reportingMode: 'off',
+        gateMode: 'informational'
+      })
+      await mutateHooks()
+    } catch (error) {
+      setAddFamilyError({ key: repoKey, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setAddFamilyBusy(null)
+    }
+  }
+  // The GitLab counterpart — its create keys on the numeric project id.
+  const addGitlabFamily = async (seed: HookDto, repoKey: string, fam: GlFamily) => {
+    if (addFamilyBusy || !seed.agentId || !seed.repoId) return
+    setAddFamilyBusy(addFamilyKey(repoKey, fam))
+    setAddFamilyError(null)
+    try {
+      await createGitlabHook({
+        agentId: seed.agentId,
+        name: seed.repoFullName ?? seed.name,
+        projectId: seed.repoId,
+        family: fam,
+        ...gitlabFamilySubscription(fam, gitlabDefaultTriggerMode(fam)),
+        reviewPolicy: 'off',
+        reportingMode: 'off'
+      })
+      await mutateHooks()
+    } catch (error) {
+      setAddFamilyError({ key: repoKey, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setAddFamilyBusy(null)
+    }
+  }
+  // The Gitea counterpart — its create keys on the numeric repository id.
+  const addGiteaFamily = async (seed: HookDto, repoKey: string, fam: GtFamily) => {
+    if (addFamilyBusy || !seed.agentId || !seed.repoId) return
+    setAddFamilyBusy(addFamilyKey(repoKey, fam))
+    setAddFamilyError(null)
+    try {
+      await createGiteaHook({
+        agentId: seed.agentId,
+        name: seed.repoFullName ?? seed.name,
+        repoId: seed.repoId,
+        family: fam,
+        ...giteaFamilySubscription(fam, giteaDefaultTriggerMode(fam)),
+        reviewPolicy: 'off',
+        reportingMode: 'off'
+      })
+      await mutateHooks()
+    } catch (error) {
+      setAddFamilyError({ key: repoKey, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setAddFamilyBusy(null)
+    }
+  }
+  const addAzureDevOpsFamily = async (seed: HookDto, repoKey: string, fam: AzFamily) => {
+    if (addFamilyBusy || !seed.agentId || !seed.repoId) return
+    setAddFamilyBusy(addFamilyKey(repoKey, fam))
+    setAddFamilyError(null)
+    try {
+      await createAzureDevOpsHook({
+        agentId: seed.agentId,
+        name: seed.repoFullName ?? seed.name,
+        repoId: seed.repoId,
+        family: fam,
+        ...azureDevOpsFamilySubscription(fam, azureDevOpsDefaultTriggerMode(fam)),
+        reviewPolicy: 'off',
+        reportingMode: 'off'
+      })
+      await mutateHooks()
+    } catch (error) {
+      setAddFamilyError({ key: repoKey, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setAddFamilyBusy(null)
+    }
+  }
+  // The row's family is a read-only fact now: it labels the row and decides
+  // whether the review/Check surface applies to it at all.
+  const ghRowPill = (h: HookDto) => {
+    const fam = githubHookFamily(h)
+    return fam ? (githubFamilyTile(fam)?.pill ?? fam) : 'no events'
+  }
+  const ghRowCarriesReviews = (h: HookDto) => {
+    const fam = githubHookFamily(h)
+    return !!fam && githubFamilyCarriesReviews(fam)
+  }
+  // The cadences THIS row may pick: a deployment reads its own two.
+  const ghRowTriggerModes = (h: HookDto): readonly GhTriggerMode[] => {
+    const fam = githubHookFamily(h)
+    return fam ? githubTriggerModes(fam) : GH_TRIGGER_MODES
+  }
+  // A release row offers only the cadences its host can express.
+  const glRowTriggerModes = (h: HookDto): readonly GlTriggerMode[] => {
+    const fam = gitlabHookFamily(h)
+    return fam ? gitlabTriggerModes(fam) : GL_TRIGGER_MODES
+  }
+  const gtRowTriggerModes = (h: HookDto): readonly GtTriggerMode[] => {
+    const fam = giteaHookFamily(h)
+    return fam ? giteaTriggerModes(fam) : GT_TRIGGER_MODES
+  }
+  const glRowPill = (h: HookDto) => {
+    const fam = gitlabHookFamily(h)
+    return fam ? (gitlabFamilyTile(fam)?.pill ?? fam) : 'no events'
+  }
+  const glRowCarriesReviews = (h: HookDto) => {
+    const fam = gitlabHookFamily(h)
+    return !!fam && gitlabFamilyCarriesReviews(fam)
+  }
+  const gtRowPill = (h: HookDto) => {
+    const fam = giteaHookFamily(h)
+    return fam ? (giteaFamilyTile(fam)?.pill ?? fam) : 'no events'
+  }
+  const gtRowCarriesReviews = (h: HookDto) => {
+    const fam = giteaHookFamily(h)
+    return !!fam && giteaFamilyCarriesReviews(fam)
+  }
+  const azRowPill = (h: HookDto) => {
+    const fam = azureDevOpsHookFamily(h)
+    return fam ? (azureDevOpsFamilyTile(fam)?.pill ?? fam) : 'no events'
+  }
+  const azRowCarriesReviews = (h: HookDto) => {
+    const fam = azureDevOpsHookFamily(h)
+    return !!fam && azureDevOpsFamilyCarriesReviews(fam)
+  }
+  const azRowTriggerModes = (h: HookDto): readonly AzTriggerMode[] => {
+    const fam = azureDevOpsHookFamily(h)
+    return fam ? azureDevOpsTriggerModes(fam) : AZ_TRIGGER_MODES
+  }
+  const codeHostRowPill = (h: HookDto) =>
+    h.kind === 'github'
+      ? ghRowPill(h)
+      : h.kind === 'gitlab'
+        ? glRowPill(h)
+        : h.kind === 'azure-devops'
+          ? azRowPill(h)
+          : gtRowPill(h)
+  const rowCarriesReviews = (h: HookDto) =>
+    h.kind === 'github'
+      ? ghRowCarriesReviews(h)
+      : h.kind === 'gitlab'
+        ? glRowCarriesReviews(h)
+        : h.kind === 'azure-devops'
+          ? azRowCarriesReviews(h)
+          : gtRowCarriesReviews(h)
+  // Labels are a thread's: a deployment or push row carries none, and no Azure DevOps event reports a label (§11.4).
+  const rowCarriesLabels = (h: HookDto) => {
+    if (h.kind === 'azure-devops') return false
+    const fam = codeHostRowFamily(h)
+    return fam === 'pull_request' || fam === 'merge_request' || fam === 'issues'
+  }
+  const rowHasSettings = (h: HookDto) => rowCarriesReviews(h) || rowCarriesLabels(h)
+  // One open-state drives both agent-actions surfaces: the desktop kebab dropdown
+  // and the mobile bottom sheet (only one is ever visible — CSS gates them).
+  const [actionsOpen, setActionsOpen] = useState(false)
+  const [actionSaving, setActionSaving] = useState(false)
+  const [actionErr, setActionErr] = useState<string | null>(null)
+  const openActions = () => {
+    setActionErr(null)
+    setActionsOpen(true)
+  }
+  const toggleActions = () => {
+    setActionErr(null)
+    setActionsOpen((v) => !v)
+  }
+
+  // Effective agent-call reachability over the whole roster: an A→B edge exists
+  // only when A's outbound AND B's inbound both permit it. The read-only Access
+  // summary shows these intersected sets (not this agent's one-sided policy), so
+  // it never lists a peer as callable when the peer's own policy blocks the edge.
+  const agentReach = useMemo(() => buildAgentReachabilityGraph(agents), [agents])
+
+  const da = getAgent(id)
+  // Hoisted above the not-found return below — a hook may not be called conditionally, and
+  // a deep link renders this before the agents pull settles. The effort row reads the
+  // selected model's own effort vocabulary, which only the single-daemon read carries.
+  const capabilitySource = useDaemonDetail(da ? agentCapabilitySource(da, daemons, memberSets) : undefined)
+  const filterProviders = useCoordinatorFilterProviders(agentFilterPlacement(da))
+  // Unknown id (a stale deep link, or a demo agent that's hidden outside mock mode) —
+  // show a not-found notice rather than crash on the `da.*` reads below. While the
+  // agents pull is still in flight, though, it's not "not found" yet — spin instead.
+  if (!da) {
+    return (
+      <div className="wrap">
+        {agentsLoading ? (
+          <LoadingState fill />
+        ) : (
+          <NotFound
+            icon="bot-off"
+            kind="AGENT"
+            title={t('notFound.title')}
+            pre={`${t('notFound.pre')} `}
+            chip={id}
+            post={t('notFound.post')}
+            actionLabel={t('notFound.back')}
+            actionHref={orgPath('/agents')}
+            searchLabel={t('notFound.search')}
+          />
+        )}
+      </div>
+    )
+  }
+  // Activity is whole for an assistant-mode agent whatever the flag, partial for another whose daemon serves it, else absent and a link to it lands on Integrations.
+  const activity = activityScope(da.assistantMode?.enabled === true, capabilitySource?.caps.features)
+  const activityShown = activity !== null
+  const tab: DetailTab = requestedTab === 'activity' && !activityShown ? 'integrations' : requestedTab
+  // The owning daemon (if placed in the live fleet). Gates the agent's "online" —
+  // an agent can't be online when its daemon is offline — and names the daemon.
+  const owningDaemon = daemons.find((d) => d.daemonId === da.daemon)
+  // `capabilitySource` above is whose reported catalog the config rows read — resolved through
+  // the PLACEMENT, so a pool or group agent reads its set's real catalog via one serving member
+  // instead of the static tables. `owningDaemon` cannot answer that: a set placement names no
+  // member, and the nothing it found is what showed every such agent an em-dash model even when
+  // one was explicitly saved.
+  // Config rows read the daemon-advertised runtime-model catalog so a placed
+  // agent shows the SAME effective model / effort / permission the Edit modal
+  // does (else a blank model reads "Default" here but its resolved default in the
+  // editor). Falls back to the static labels when the daemon reports no catalog.
+  const defaultModelText = agentModelDisplay(capabilitySource, da.runtime, da.model)
+  const coordinatorModel = coordinatorModelOf(da, capabilitySource)
+  const selectedDecision = decisions.find((item) => item.id === da.modelSelection?.decisionId)
+  const decisionModel = da.modelSelection ? (
+    <DecisionModelLabel
+      size={14}
+      name={selectedDecision?.name ?? t('modelByDecision')}
+      selection={da.modelSelection}
+      question={selectedDecision?.question}
+      fallback={{ runtime: da.runtime, model: selectedModelId(capabilitySource, da.runtime, da.model) || da.model }}
+      decisionHref={selectedDecision && orgPath(`/decisions/${encodeURIComponent(selectedDecision.id)}`)}
+      evaluations={modelEvaluationsTarget(da)}
+    />
+  ) : null
+  const ds = status(effectiveAgentStatus(da, owningDaemon))
+  // The agents list's own reading: an agent nothing is serving cannot answer on any integration.
+  const agentOffline = ds.label === 'offline'
+  const ws = da.workspace
+  // Demo agents have no daemon to read git state from, so the workspace card's
+  // live half comes straight from their static mock workspace instead.
+  const mockSource = workspaceSourceOf(ws)
+  // The projection is the single source of a host's display host and name; a Git-URL mock keeps
+  // GitHub's browse host, which is what these demo rows have always shown.
+  const mockHostProjection = CODE_HOST_PROJECTION[isCodeHostProvider(mockSource) ? mockSource : 'github']
+  const mockWorkspaceHeader: WorkspaceHeaderInfo = isGitWorkspace(ws)
+    ? {
+        status: workspaceStatus(ws),
+        ...(ws.commitMsg ? { commit: { sha: ws.commit, time: ws.commitTime, title: ws.commitMsg } } : {}),
+        repoUrl: ws.repoUrl ?? `https://${mockHostProjection.publicHost}/${ws.repo}`,
+        remoteLabel: isCodeHostProvider(mockSource) ? mockHostProjection.label : 'remote'
+      }
+    : { status: workspaceStatus(ws) }
+  // Counts walk the whole mock tree (files are nested under folder children).
+  const allFiles = flattenFiles(ws.files)
+  const changedFiles = allFiles.filter((f) => f.tag).length
+  const filesSummary = allFiles.length
+    ? `${allFiles.length} items${changedFiles ? ` · ${changedFiles} changed` : ''}`
+    : 'empty'
+  // Live integrations owned by THIS agent (the CP-managed ones; demo rows carry no
+  // agentId so they never leak onto a real agent's page).
+  const agentInts = integrations.filter((i) => i.agentId === da.id)
+  // The new-channel default applies only where the card draws a channel list, not a module's own card body.
+  const hasChannelList = agentInts.some((g) => !platformAgentCard(g.platform)?.Body)
+  // Peer agents for the read-only Access card's agent-call summary (self excluded).
+  const agentPeers = agents.filter((peer) => peer.id !== da.id)
+  // The empty Integrations tab renders the SAME grid as the Add-integration modal, under this identical gate.
+  // A bot platform the PLACEMENT does not advertise is greyed out, so a tile never opens a pane it cannot honour.
+  // webhook/github are relay/CP-backed triggers: never gated. No caps source (unplaced, or a set whose members
+  // this viewer cannot see) keeps every platform selectable — the modal and the server gate what needs a daemon.
+  const integrationPlatformAvailable = (key: Platform) =>
+    isCoreTriggerKind(key) || daemonsLoading || !capabilitySource || capabilitySource.caps.platforms.includes(key)
+  // Effective (intersection) peer sets for the read-only Access summary.
+  const inboundEffectiveIds = agentReach.incomingByAgentId.get(da.id) ?? []
+  const outboundEffectiveIds = agentReach.outgoingByAgentId.get(da.id) ?? []
+  // Webhook triggers share the Integrations card (the Add modal offers both);
+  // `agentHooks` is fetched per-agent above.
+  const hasInt = agentInts.length > 0 || agentHooks.length > 0 || apiEntries.length > 0
+  // Match the list's enabled, distinct hook-kind summary. Use the agent snapshot
+  // only until this page's live hook query resolves; hook mutations revalidate
+  // that query immediately, keeping the header and Integrations card in sync.
+  const integrationHookKinds =
+    agentHooksData === undefined
+      ? (da.hookKinds ?? [])
+      : [...new Set(agentHooks.filter((hook) => hook.enabled).map((hook) => hook.kind))]
+  // The API card counts as an integration too, marked by its protocol glyph.
+  const markIntegrations =
+    apiEntries.length > 0 ? [...agentInts, { id: 'api', platform: 'api', revoked: false }] : agentInts
+  const hasIntegrationMarks = markIntegrations.length > 0 || integrationHookKinds.length > 0
+  const sessionCount = MOCK_MODE ? recentSessions.length : agentSessionTotal
+  // Icon upload is available only when the object store is configured (org flag) — the
+  // picker hides Upload otherwise. On success the CP has persisted the new icon; refetch.
+  const onUploadIcon = activeOrg?.iconUploadEnabled
+    ? async (blob: Blob) => {
+        await uploadAgentIcon(da.id, blob)
+        refresh()
+      }
+    : undefined
+  const daemonLabel = agentDaemonLabel(da, daemons, memberSets)
+  // The glyph says WHAT it is placed on — a machine, a group, or the pool — so the line never
+  // draws a set target as the one server that happens to answer for it.
+  const daemonIcon = agentPlacementIcon(da, memberSets)
+  // Append region only when the Agent projection has a real one.
+  const daemonLine = da.region && da.region !== '—' ? `${daemonLabel} · ${da.region}` : daemonLabel
+  // Only a daemon in the viewer's fleet has a working detail route.
+  const daemonHref = orgPath(`/daemons/${da.daemon}`)
+  const outputModeLabel =
+    da.outputMode && da.outputMode !== '—' ? da.outputMode[0]!.toUpperCase() + da.outputMode.slice(1) : da.outputMode
+
+  const onPlayground = () => {
+    // auto-session-mode.md §10: the playground is the member's private coordinator with the agent, on its session once it has one.
+    if (activeOrg && !MOCK_MODE && opensCoordinator(da, daemons, memberSets)) {
+      void openCoordinatorConversation(activeOrg.id, da.id)
+        .catch(() => undefined)
+        .then((entry) => {
+          const id =
+            entry?.sessionId ??
+            openPlayground(
+              da,
+              undefined,
+              entry ? { conversationId: entry.conversationId, coordinator: true } : undefined
+            )
+          router.push(orgPath(`/sessions/${id}`))
+        })
+      return
+    }
+    const pid = openPlayground(da)
+    router.push(orgPath(`/sessions/${pid}`))
+  }
+  const pauseActionLabel = da.pause ? t('actions.unpause') : t('actions.pause')
+  const pauseActionIcon = da.pause ? 'play' : 'pause'
+  const togglePause = async () => {
+    if (actionSaving) return
+    setActionSaving(true)
+    setActionErr(null)
+    try {
+      await updateAgent(da.id, { pause: !da.pause })
+      setActionsOpen(false)
+    } catch (e) {
+      setActionErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setActionSaving(false)
+    }
+  }
+
+  const tabCls = (t: DetailTab) => (tab === t ? 'tab on' : 'tab')
+  const tabHref = (t: DetailTab) => orgPath(t === 'integrations' ? `/agents/${da.id}` : `/agents/${da.id}?tab=${t}`)
+  const botSettingsHref = (botId?: string) =>
+    orgPath(botId ? `/integrations?bot=${encodeURIComponent(botId)}` : '/integrations')
+
+  // ── Single responsive tree. Base classes are the mobile (≤768px) push-detail
+  // body (the Shell provides the top push bar there); `desktop:` variants restore
+  // the ≥769px layout. Fragments whose anatomy genuinely differs between widths
+  // are dual-rendered and CSS-gated (`desktop:hidden` / `hidden desktop:*`).
+  return (
+    <div className="wrap flex max-w-[1240px] flex-col desktop:block">
+      {/* Header identity — dual-rendered: the desktop header (name + displayName mono
+          sub-label, integration chip / "No integration" warning, sessions link,
+          Playground button + kebab dropdown) and the mobile compact identity block +
+          full-width action row differ in anatomy, not just styling. */}
+      <div className="mb-[18px] hidden items-start gap-4 desktop:flex">
+        <AgentIconPicker
+          value={da.icon ?? null}
+          runtime={da.runtime}
+          onCommit={(icon) => void updateAgent(da.id, { icon }).catch(() => {})}
+          onUploadImage={onUploadIcon}
+          disabled={!!da.builtin}
+          size={52}
+          radiusClass="rounded-[12px]"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-[10px]">
+            <h1 className="ptitle">{agentLabel(da)}</h1>
+            {da.displayName && (
+              <span className="mono font-mono text-[12px] font-medium leading-normal text-(--text-tertiary)">
+                {da.name}
+              </span>
+            )}
+            <BuiltinBadge show={!!da.builtin} />
+            <span className="badge" style={{ background: ds.bg, color: ds.text }}>
+              <span className="dot h-[6px] w-[6px]" style={{ background: ds.dot }} />
+              {ds.label}
+            </span>
+          </div>
+          <div className="mt-[9px] flex flex-wrap items-center gap-x-4 gap-y-2">
+            <span className="inline-flex items-center gap-[6px] font-sans text-[12.5px] font-medium leading-normal text-(--text-secondary)">
+              <Icon name="cpu" size={14} color="var(--text-tertiary)" />
+              {decisionModel ?? defaultModelText}
+            </span>
+            {owningDaemon ? (
+              <Link className="lnk font-sans text-[12.5px] font-medium leading-normal" href={daemonHref}>
+                <Icon name={daemonIcon} size={14} color="var(--text-tertiary)" />
+                {daemonLine}
+              </Link>
+            ) : da.daemon === '—' ? (
+              // Unplaced (the preset before placement): an Add CTA instead of the
+              // dash (preset-agents.md §3.4). With no daemon in the org yet it
+              // launches the join-command dialog; otherwise the edit modal carries
+              // the daemon picker + the deferred runtime choice.
+              <button
+                type="button"
+                className="addchip border-0"
+                onClick={() =>
+                  daemons.length === 0
+                    ? openModal('daemon', da, { focusSection: 'runtime' })
+                    : openModal('editAgent', da, { focusSection: 'runtime' })
+                }
+              >
+                <Icon name="plus" size={13} />
+                {t('actions.addDaemon')}
+              </button>
+            ) : (
+              <span className="inline-flex items-center gap-[6px] font-sans text-[12.5px] font-medium leading-normal text-(--text-secondary)">
+                <Icon name={daemonIcon} size={14} color="var(--text-tertiary)" />
+                {daemonLine}
+              </span>
+            )}
+            {hasIntegrationMarks ? (
+              <IntegrationMarks integrations={markIntegrations} hookKinds={integrationHookKinds} />
+            ) : (
+              <span className="inline-flex items-center gap-[6px] font-sans text-[12px] font-semibold leading-normal text-(--amber-500)">
+                <Icon name="triangle-alert" size={14} />
+                {t('noIntegration')}
+              </span>
+            )}
+            {(hasIntegrationMarks || sessionCount > 0) && (
+              <Link
+                className="lnk font-sans text-[12.5px] font-medium leading-normal"
+                href={orgPath(`/sessions?agent=${da.id}`)}
+              >
+                <Icon name="messages-square" size={14} />
+                {t('sessions', { count: sessionCount })}
+                <Icon name="arrow-right" size={13} />
+              </Link>
+            )}
+          </div>
+        </div>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={onPlayground}>
+            <Icon name="message-square-text" size={15} />
+            {t('actions.playground')}
+          </Button>
+          <div className="relative">
+            <button className="iconbtn" onClick={toggleActions} title={t('actions.agentActions')}>
+              <Icon name="ellipsis" size={16} />
+            </button>
+            {actionsOpen && (
+              <>
+                <div onClick={() => setActionsOpen(false)} className="fixed inset-0 z-[45]" />
+                <div className="dmenu" onClick={(e) => e.stopPropagation()}>
+                  {/* Edit lives on the General card now, not here. */}
+                  <button className="dmi" onClick={() => void togglePause()} disabled={actionSaving}>
+                    <Icon name={pauseActionIcon} size={15} />
+                    {actionSaving ? t('actions.saving') : pauseActionLabel}
+                  </button>
+                  {actionErr && (
+                    <div className="px-[14px] py-[8px] font-sans text-[12px] font-normal leading-normal text-(--red-600)">
+                      {actionErr}
+                    </div>
+                  )}
+                  {/* Built-in preset agents are permanent — no Delete (the CP refuses it too). */}
+                  {!da.builtin && (
+                    <>
+                      <div className="dmsep" />
+                      <button
+                        className="dmi danger"
+                        onClick={() => {
+                          setActionsOpen(false)
+                          openModal('deleteAgent', da)
+                        }}
+                      >
+                        <Icon name="trash" size={15} />
+                        {t('actions.delete')}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile identity block */}
+      <div className="flex gap-3 bg-(--surface-card) p-4 desktop:hidden">
+        <AgentIconPicker
+          value={da.icon ?? null}
+          runtime={da.runtime}
+          onCommit={(icon) => void updateAgent(da.id, { icon }).catch(() => {})}
+          onUploadImage={onUploadIcon}
+          disabled={!!da.builtin}
+          size={48}
+          radiusClass="rounded-[12px]"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="font-sans text-[20px] font-semibold leading-normal tracking-[-.02em]">
+              {agentLabel(da)}
+            </span>
+            <BuiltinBadge show={!!da.builtin} />
+            <span
+              className="inline-flex flex-none items-center gap-[5px] rounded-full px-[10px] py-[3px] font-sans text-[12px] font-semibold leading-normal"
+              style={{ background: ds.bg, color: ds.text }}
+            >
+              <span className="h-[6px] w-[6px] rounded-full" style={{ background: ds.dot }} />
+              {ds.label}
+            </span>
+            <button className="iconbtn ml-auto flex-none" onClick={openActions} title={t('actions.agentActions')}>
+              <Icon name="ellipsis" size={18} />
+            </button>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-x-[14px] gap-y-[6px]">
+            <span className="inline-flex items-center gap-[6px] font-mono text-[12px] font-medium leading-normal whitespace-nowrap text-(--text-secondary)">
+              <Icon name="cpu" size={14} color="var(--text-tertiary)" className="flex-none" />
+              {decisionModel ?? defaultModelText}
+            </span>
+            <span className="inline-flex items-center gap-[6px] font-mono text-[12px] font-medium leading-normal whitespace-nowrap text-(--text-secondary)">
+              <Icon name={daemonIcon} size={14} color="var(--text-tertiary)" />
+              {daemonLine}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile action row */}
+      <div className="flex gap-2 bg-(--surface-card) px-4 pt-0 pb-4 desktop:hidden">
+        <button
+          onClick={onPlayground}
+          className="flex h-11 flex-1 cursor-pointer items-center justify-center gap-2 rounded-md border-0 bg-(--brand) font-sans text-[14px] font-semibold leading-normal text-white"
+        >
+          <Icon name="message-square-text" size={18} />
+          {t('actions.playground')}
+        </button>
+        <button
+          onClick={openActions}
+          title={t('actions.agentAction', { action: pauseActionLabel })}
+          className="flex h-11 w-11 flex-none cursor-pointer items-center justify-center rounded-md border border-(--border-default) bg-(--surface-card) text-(--text-secondary)"
+        >
+          <Icon name={pauseActionIcon} size={18} />
+        </button>
+      </div>
+
+      {/* One tab strip: `.tab` styles desktop, `max-desktop:` utilities make it the phone's scrollable strip. */}
+      <div className="flex gap-6 overflow-x-auto border-b border-(--border-default) bg-(--surface-card) px-4 [-webkit-overflow-scrolling:touch] desktop:mb-[18px] desktop:gap-0 desktop:overflow-x-visible desktop:bg-transparent desktop:px-0">
+        {(
+          [
+            ['integrations', t('tabs.integrations')],
+            ['config', t('tabs.configuration')],
+            ['workspace', t('tabs.workspace')],
+            ['memory', t('tabs.memory')],
+            ['knowledge', t('tabs.knowledge')],
+            ['tools', t('tabs.tools')],
+            ...(activityShown ? [['activity', t('tabs.activity')]] : [])
+          ] as [DetailTab, string][]
+        ).map(([t, label]) => {
+          const on = tab === t
+          return (
+            <Link
+              key={t}
+              href={tabHref(t)}
+              className={`${tabCls(t)} whitespace-nowrap no-underline max-desktop:-mb-px max-desktop:mr-0 max-desktop:flex-none max-desktop:border-solid max-desktop:border-b-2 max-desktop:px-0 max-desktop:pt-3 max-desktop:pb-[10px] max-desktop:text-[14px] ${
+                on
+                  ? 'max-desktop:border-b-(--brand) max-desktop:after:hidden'
+                  : 'max-desktop:border-b-transparent max-desktop:text-(--text-tertiary)'
+              }`}
+            >
+              {label}
+            </Link>
+          )
+        })}
+      </div>
+
+      {/* Config tab: mobile stacks the cards in flex order; desktop puts Basics + Runtime left and the rest right. */}
+      {tab === 'config' && (
+        <div className="flex flex-col gap-4 p-4 desktop:grid desktop:grid-cols-[340px_1fr] desktop:items-start desktop:gap-[18px] desktop:p-0">
+          <div className="contents desktop:flex desktop:min-w-0 desktop:flex-col desktop:gap-[18px]">
+            {/* Basics card — identity + placement facts (Name, Daemon, Runtime,
+                Model, Created, Modified). Edit opens the sectioned Edit-agent modal
+                at its Basics anchor. */}
+            <div className="card order-1 overflow-hidden max-desktop:rounded-lg">
+              <div className="flex min-h-[53px] items-center justify-between border-b border-(--border-subtle) px-4 py-3 desktop:min-h-[55px] desktop:py-[13px]">
+                <span className="font-sans text-[14px] font-semibold leading-normal">{t('basics.title')}</span>
+                {!da.name.startsWith(MOCK_PREFIX) && (
+                  <>
+                    <button
+                      onClick={() => openModal('editAgent', da, { focusSection: 'basics' })}
+                      className="flex h-7 cursor-pointer items-center gap-[6px] border-0 bg-transparent px-0 py-0 font-sans text-[14px] font-semibold leading-normal text-(--brand-soft-text) desktop:hidden"
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </button>
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      className="hidden desktop:inline-flex"
+                      onClick={() => openModal('editAgent', da, { focusSection: 'basics' })}
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="desktop:py-[6px]">
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('basics.name')}
+                  </span>
+                  <span className="mono text-[12px] font-medium leading-normal text-(--text-primary) desktop:text-[12.5px] desktop:font-normal">
+                    {da.name}
+                  </span>
+                </div>
+                {/* Daemon row — dual-rendered: mobile is a tappable drill-in button
+                    with a chevron; desktop an inline Link (or plain mono value). */}
+                {owningDaemon ? (
+                  <button
+                    onClick={() => router.push(daemonHref)}
+                    className="box-border flex w-full cursor-pointer items-center justify-between gap-4 border-0 border-b border-(--border-subtle) bg-(--surface-card) px-4 py-3 text-left desktop:hidden"
+                  >
+                    <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('basics.runsOn')}
+                    </span>
+                    <span className="inline-flex min-w-0 items-center gap-[6px]">
+                      <span className="truncate font-mono text-[12px] font-medium leading-normal text-(--text-primary)">
+                        {daemonLine}
+                      </span>
+                      <Icon name="chevron-right" size={14} color="var(--text-tertiary)" />
+                    </span>
+                  </button>
+                ) : (
+                  <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3 desktop:hidden">
+                    <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('basics.runsOn')}
+                    </span>
+                    <span className="font-mono text-[12px] font-medium leading-normal text-(--text-primary)">
+                      {daemonLine}
+                    </span>
+                  </div>
+                )}
+                <div className="hidden items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3 desktop:flex">
+                  <span className="font-sans text-[13px] font-normal leading-normal text-(--text-tertiary)">
+                    {t('basics.runsOn')}
+                  </span>
+                  {owningDaemon ? (
+                    <Link className="lnk font-mono text-[12.5px] font-medium leading-normal" href={daemonHref}>
+                      {daemonLine}
+                    </Link>
+                  ) : da.daemon === '—' ? (
+                    <button
+                      type="button"
+                      className="addchip border-0"
+                      onClick={() =>
+                        daemons.length === 0
+                          ? openModal('daemon', da, { focusSection: 'runtime' })
+                          : openModal('editAgent', da, { focusSection: 'runtime' })
+                      }
+                    >
+                      <Icon name="plus" size={13} />
+                      {t('actions.add')}
+                    </button>
+                  ) : (
+                    <span className="mono text-[12.5px]">{daemonLine}</span>
+                  )}
+                </div>
+                {owningDaemon?.status === 'offline' && (
+                  <div className="flex items-start gap-[9px] border-b border-(--amber-500) bg-(--status-paused-soft) px-4 py-3">
+                    <Icon name="triangle-alert" size={14} color="var(--amber-500)" className="mt-[1px] flex-none" />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                        {t('basics.safeMoveUnavailable')}
+                      </div>
+                      <div className="mt-[3px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--text-secondary)">
+                        {t('basics.safeMoveBody', { daemon: owningDaemon.name })}
+                      </div>
+                      {!da.name.startsWith(MOCK_PREFIX) && da.canEdit && (
+                        <button
+                          type="button"
+                          className="mt-[6px] border-0 bg-transparent p-0 font-sans text-[11.5px] font-semibold leading-normal text-(--brand-soft-text) hover:underline"
+                          onClick={() => openModal('editAgent', da, { focusSection: 'basics' })}
+                        >
+                          {t('basics.openRecovery')}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {/* A fixed runtime reads as its runtime and model; By decision picks both per session, so it names the Decision. */}
+                {da.modelSelection ? (
+                  <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                    <span className="text-[14px] text-(--text-tertiary) desktop:text-[13px]">
+                      {t('basics.runtimeAndModel')}
+                    </span>
+                    <span className="inline-flex min-w-0 font-sans text-[12.5px] font-medium leading-normal">
+                      {decisionModel}
+                    </span>
+                  </div>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                      <span className="text-[14px] text-(--text-tertiary) desktop:text-[13px]">
+                        {t('basics.runtime')}
+                      </span>
+                      <span className="inline-flex items-center gap-[7px] font-sans text-[12.5px] font-medium leading-normal">
+                        <span className="imark h-4 w-4">
+                          <AgentMark model={da.runtime} />
+                        </span>
+                        {runtimeLabel(da.runtime)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                      <span className="text-[14px] text-(--text-tertiary) desktop:text-[13px]">
+                        {t('basics.model')}
+                      </span>
+                      <span className="mono text-[12.5px]">{defaultModelText}</span>
+                    </div>
+                  </>
+                )}
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="text-[14px] text-(--text-tertiary) desktop:text-[13px]">
+                    {t('basics.coordinator')}
+                  </span>
+                  {da.coordinatorDisabled ? (
+                    <span className="inline-flex min-w-0 items-center gap-[7px] font-sans text-[12.5px] font-medium leading-normal text-(--text-tertiary)">
+                      <Icon name="ban" size={14} className="flex-none" />
+                      {t('basics.coordinatorOff')}
+                    </span>
+                  ) : (
+                    <span className="inline-flex min-w-0 items-center gap-[7px] font-sans text-[12.5px] font-medium leading-normal">
+                      <span className="imark h-4 w-4 flex-none">
+                        <AgentMark model={coordinatorModel.runtime} />
+                      </span>
+                      <span className="truncate">
+                        {agentModelDisplay(capabilitySource, coordinatorModel.runtime, coordinatorModel.model)}
+                        {coordinatorModel.model && coordinatorModel.effort && (
+                          <span className="font-mono text-[11.5px] font-normal text-(--text-tertiary)">
+                            {' '}
+                            · {coordinatorModel.effort}
+                          </span>
+                        )}
+                      </span>
+                    </span>
+                  )}
+                </div>
+                {da.coordinatorFilter && !da.coordinatorDisabled && (
+                  <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                    <span className="text-[14px] text-(--text-tertiary) desktop:text-[13px]">
+                      {t('basics.coordinatorFilter')}
+                    </span>
+                    <span className="flex min-w-0 items-center gap-3">
+                      <span className="truncate font-sans text-[12.5px] font-medium leading-normal">
+                        {coordinatorFilterLabel(da.coordinatorFilter, filterProviders)}
+                      </span>
+                      {da.canEdit && !da.name.startsWith(MOCK_PREFIX) && (
+                        <CoordinatorFilterEvaluationsLink agentId={da.id} agentName={da.displayName || da.name} />
+                      )}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('basics.created')}
+                  </span>
+                  <span className="font-sans text-[14px] font-medium leading-normal desktop:text-[12.5px]">
+                    {creatorLabel(da.createdBy, me)}{' '}
+                    <span className="mono text-[12px] font-normal leading-normal text-(--text-tertiary) desktop:text-[12.5px]">
+                      · {da.createdAt}
+                    </span>
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4 px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('basics.modified')}
+                  </span>
+                  <span className="font-sans text-[14px] font-medium leading-normal desktop:text-[12.5px]">
+                    {creatorLabel(da.lastModifiedBy, me)}{' '}
+                    <span className="mono text-[12px] font-normal leading-normal text-(--text-tertiary) desktop:text-[12.5px]">
+                      · {da.lastModifiedAt}
+                    </span>
+                  </span>
+                </div>
+              </div>
+            </div>
+            {/* Runtime behavior card — how the agent runs; Edit opens the Edit-agent modal at its Runtime behavior anchor. */}
+            <div className="card order-2 overflow-hidden max-desktop:rounded-lg">
+              <div className="flex min-h-[53px] items-center justify-between border-b border-(--border-subtle) px-4 py-3 desktop:min-h-[55px] desktop:py-[13px]">
+                <span className="font-sans text-[14px] font-semibold leading-normal">{t('runtime.title')}</span>
+                {!da.name.startsWith(MOCK_PREFIX) && (
+                  <>
+                    <button
+                      onClick={() => openModal('editAgent', da, { focusSection: 'runtime' })}
+                      className="flex h-7 cursor-pointer items-center gap-[6px] border-0 bg-transparent px-0 py-0 font-sans text-[14px] font-semibold leading-normal text-(--brand-soft-text) desktop:hidden"
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </button>
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      className="hidden desktop:inline-flex"
+                      onClick={() => openModal('editAgent', da, { focusSection: 'runtime' })}
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="desktop:py-[6px]">
+                {supportsModes(da.runtime) && (
+                  <>
+                    <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                      <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                        {t('runtime.permissionMode')}
+                      </span>
+                      <span className="badge bg-(--surface-active) text-(--text-secondary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]">
+                        {(() => {
+                          const key = permissionModeLabelKey(da.permissionMode)
+                          return key
+                            ? permissionT(key)
+                            : agentPermissionDisplay(capabilitySource, da.runtime, da.permissionMode)
+                        })()}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                      <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                        {effortField(da.runtime).label}
+                      </span>
+                      <span className="badge bg-(--surface-active) text-(--text-secondary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]">
+                        {agentEffortDisplay(capabilitySource, da.runtime, da.model, da.reasoning)}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                      <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                        {t('runtime.fastMode')}
+                      </span>
+                      <span
+                        className={
+                          da.fastMode
+                            ? 'badge bg-(--brand-soft) text-(--brand-soft-text) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                            : 'badge bg-(--surface-active) text-(--text-tertiary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                        }
+                      >
+                        {da.fastMode ? t('on') : t('off')}
+                      </span>
+                    </div>
+                  </>
+                )}
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {chatActionsT('label')}
+                  </span>
+                  <span
+                    className={
+                      da.chatActions === 'talk'
+                        ? 'badge bg-(--surface-active) text-(--text-tertiary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                        : 'badge bg-(--brand-soft) text-(--brand-soft-text) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                    }
+                  >
+                    {chatActionsT(`option.${da.chatActions}`)}
+                  </span>
+                </div>
+                {/* A pool agent has no strategy to show: its boundary is the pod. */}
+                {!isPoolPlacementKind(da.placementKind, da.setId, orgSetIds) && (
+                  <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                    <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                      {strategyT('label')}
+                    </span>
+                    <span
+                      className="badge bg-(--surface-active) text-(--text-secondary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]"
+                      title={strategyNames.detail(agentStrategyValue(da))}
+                    >
+                      {strategyNames.name(agentStrategyValue(da))}
+                    </span>
+                  </div>
+                )}
+                {/* Pause is a transient runtime action, not a config default — only
+                    surface it when the agent is actually paused (hide the "Off" noise). */}
+                {da.pause && (
+                  <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                    <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                      {t('actions.pause')}
+                    </span>
+                    <span className="badge bg-(--status-paused-soft) text-(--amber-500) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]">
+                      {t('runtime.paused')}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('runtime.outputMode')}
+                  </span>
+                  <span className="badge bg-(--surface-active) text-(--text-secondary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]">
+                    {outputModeLabel}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('runtime.showFooter')}
+                  </span>
+                  <span
+                    className={
+                      da.showFooter
+                        ? 'badge bg-(--brand-soft) text-(--brand-soft-text) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                        : 'badge bg-(--surface-active) text-(--text-tertiary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                    }
+                  >
+                    {da.showFooter ? t('on') : t('off')}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4 border-b border-(--border-subtle) px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('runtime.showStatusBar')}
+                  </span>
+                  <span
+                    className={
+                      da.showStatusBar
+                        ? 'badge bg-(--brand-soft) text-(--brand-soft-text) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                        : 'badge bg-(--surface-active) text-(--text-tertiary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                    }
+                  >
+                    {da.showStatusBar ? t('on') : t('off')}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4 px-4 py-3">
+                  <span className="font-sans text-[14px] font-normal leading-normal text-(--text-tertiary) desktop:text-[13px]">
+                    {t('runtime.introduceOnJoin')}
+                  </span>
+                  <span
+                    className={
+                      da.introduceOnJoin
+                        ? 'badge bg-(--brand-soft) text-(--brand-soft-text) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                        : 'badge bg-(--surface-active) text-(--text-tertiary) max-desktop:px-[10px] max-desktop:py-[3px] max-desktop:text-[12px]'
+                    }
+                  >
+                    {da.introduceOnJoin ? t('on') : t('off')}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="contents desktop:flex desktop:min-w-0 desktop:flex-col desktop:gap-[18px]">
+            {/* Mobile order: Basics, Runtime behavior, Description, Access, Assistant mode, Variables, Secrets. */}
+            <div className="card order-3 overflow-hidden max-desktop:rounded-lg">
+              <div className="flex min-h-[53px] items-center justify-between border-b border-(--border-subtle) px-4 py-3 desktop:min-h-[55px] desktop:py-[13px]">
+                <span className="font-sans text-[14px] font-semibold leading-normal">{t('description')}</span>
+                {!da.name.startsWith(MOCK_PREFIX) && (
+                  <>
+                    <button
+                      onClick={() => openModal('editAgentDesc', da)}
+                      className="flex h-7 cursor-pointer items-center gap-[6px] border-0 bg-transparent px-0 py-0 font-sans text-[14px] font-semibold leading-normal text-(--brand-soft-text) desktop:hidden"
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </button>
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      className="hidden desktop:inline-flex"
+                      onClick={() => openModal('editAgentDesc', da)}
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="min-h-[39px] whitespace-pre-wrap px-4 py-3 font-sans text-[14px] font-normal leading-[1.5] text-(--text-secondary) desktop:text-[13px]">
+                {da.desc}
+              </div>
+            </div>
+
+            {/* Access card (design) — team visibility + agent-call visibility, read
+                only. Edit opens the sectioned Edit-agent modal at its Access anchor. */}
+            <div className="card order-4 overflow-hidden max-desktop:rounded-lg">
+              <div className="flex min-h-[53px] items-center justify-between border-b border-(--border-subtle) px-4 py-3 desktop:min-h-[55px] desktop:py-[13px]">
+                <span className="font-sans text-[14px] font-semibold leading-normal">{t('access')}</span>
+                {!da.name.startsWith(MOCK_PREFIX) && da.canEdit && (
+                  <>
+                    <button
+                      onClick={() => openModal('editAgent', da, { focusSection: 'access' })}
+                      className="flex h-7 cursor-pointer items-center gap-[6px] border-0 bg-transparent px-0 py-0 font-sans text-[14px] font-semibold leading-normal text-(--brand-soft-text) desktop:hidden"
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </button>
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      className="hidden desktop:inline-flex"
+                      onClick={() => openModal('editAgent', da, { focusSection: 'access' })}
+                    >
+                      <Icon name="pencil" size={14} />
+                      {t('actions.edit')}
+                    </Button>
+                  </>
+                )}
+              </div>
+              <div className="px-4 py-[14px]">
+                <div className="font-mono text-[10.5px] font-semibold uppercase tracking-[.08em] text-(--text-tertiary)">
+                  {t('teamVisibility')}
+                </div>
+                <div className="mt-[10px]">
+                  <VisibilityValue visibility={da.visibility} sharedWith={da.sharedWith} />
+                </div>
+              </div>
+              <div className="border-t border-(--border-subtle) px-4 py-[14px]">
+                <div className="font-mono text-[10.5px] font-semibold uppercase tracking-[.08em] text-(--text-tertiary)">
+                  {t('agentVisibility')}
+                </div>
+                {/* The SAME cards the Add/Edit modals render, in read-only mode —
+                    one component, so the two surfaces can't drift apart. Only the
+                    container differs: side by side here (the card is wide), stacked
+                    in the modals (their form pane is narrow). */}
+                <div className="mt-3 grid grid-cols-1 gap-3 desktop:grid-cols-2">
+                  <AgentCallVisibility
+                    variant="section"
+                    direction="inbound"
+                    mode={da.callPolicy}
+                    selectedIds={da.allowedCallerAgentIds}
+                    effectivePeerIds={inboundEffectiveIds}
+                    peers={agentPeers}
+                    daemons={daemons}
+                    groups={memberSets}
+                    target={<span className="font-mono text-[12.5px]">{agentLabel(da)}</span>}
+                    editable={false}
+                    onChange={() => {}}
+                  />
+                  <AgentCallVisibility
+                    variant="section"
+                    direction="outbound"
+                    mode={da.outboundPolicy}
+                    selectedIds={da.allowedTargetAgentIds}
+                    effectivePeerIds={outboundEffectiveIds}
+                    peers={agentPeers}
+                    daemons={daemons}
+                    groups={memberSets}
+                    target={<span className="font-mono text-[12.5px]">{agentLabel(da)}</span>}
+                    editable={false}
+                    onChange={() => {}}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="order-5 min-w-0">
+              <AssistantModePanel
+                agentId={id}
+                canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit}
+                assistantMode={da.assistantMode}
+                runtime={da.runtime}
+                memoryProvider={da.memoryProvider}
+                placement={`${da.placementKind ?? 'daemon'}:${da.setId ?? da.daemon}`}
+                permissionMode={da.permissionMode}
+                askEveryTime={
+                  (da.permissionMode ||
+                    capabilitySource?.runtimeModels.find((r) => r.runtime === da.runtime)?.modelCatalog
+                      ?.defaultPermissionMode ||
+                    permissionModeDefault(da.runtime)) === 'default'
+                }
+              />
+            </div>
+
+            {/* Variables + Secrets: shared editable cards, each with its own inline add/edit affordances. */}
+            <div className="order-6 min-w-0">
+              <AgentEnvCard agent={da} />
+            </div>
+            <div className="order-7 min-w-0">
+              <AgentSecretsCard agent={da} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Integrations tab — moved out of Configuration into its own tab. */}
+      {tab === 'integrations' && (
+        // Two-up on desktop (Home's dashboard split): integration cards left,
+        // this agent's recent sessions right. Mobile keeps the single stack.
+        <div className="grid grid-cols-1 gap-4 p-4 desktop:grid-cols-[1.5fr_1fr] desktop:items-start desktop:gap-[18px] desktop:p-0">
+          {/* Open capability requests head the default tab of an agent with no Activity tab, where they live otherwise; never both. */}
+          {!activityShown && (
+            <div className="empty:hidden desktop:col-span-2" data-capability-requests-slot="integrations">
+              <AgentCapabilityRequestsCard agentId={da.id} className="" />
+            </div>
+          )}
+          <div className="card overflow-hidden max-desktop:rounded-lg">
+            <div className="flex min-h-[53px] items-center justify-between border-b border-(--border-subtle) px-4 py-3 desktop:min-h-[55px] desktop:py-[13px]">
+              <span className="font-sans text-[14px] font-semibold leading-normal">{t('integrations.title')}</span>
+              <button
+                onClick={() => openModal('integration', da)}
+                className="flex h-7 cursor-pointer items-center gap-[6px] border-0 bg-transparent px-0 py-0 font-sans text-[14px] font-semibold leading-normal text-(--brand-soft-text) desktop:hidden"
+              >
+                <Icon name="plus" size={14} />
+                {t('integrations.add')}
+              </button>
+              <Button
+                variant="secondary"
+                size="xs"
+                className="hidden desktop:inline-flex"
+                onClick={() => openModal('integration', da)}
+              >
+                <Icon name="plus" size={14} />
+                {t('integrations.addIntegration')}
+              </Button>
+            </div>
+            {hasInt ? (
+              <>
+                {/* Dual-rendered lists: mobile flat rows (padX 16) vs desktop
+                    bordered sub-cards (padX 14); both unlink from the header. */}
+                <div className="desktop:hidden">
+                  {agentInts.map((g, i) => {
+                    // A module's own card body replaces the generic conversation list and the header's first-channel subline.
+                    const card = platformAgentCard(g.platform)
+                    const AgentCardBody = card?.Body
+                    const CardNotice = card?.Notice
+                    const HeaderActions = card?.HeaderActions
+                    const CardScope = card?.CardProvider ?? PlainCardScope
+                    return (
+                      <div key={i} className={i > 0 ? 'border-t border-(--border-subtle)' : undefined}>
+                        <CardScope integration={g}>
+                          {/* The identity keeps a floor, so a module's extra controls wrap under it rather than squeeze it. */}
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-(--border-subtle) px-4 py-3">
+                            <Link
+                              href={botSettingsHref(g.botId)}
+                              className="group flex min-w-36 flex-1 items-center gap-3"
+                            >
+                              <span className="imark h-9 w-9 flex-none rounded-md border border-(--border-subtle) bg-(--surface-sunken)">
+                                <PlatformMark platform={g.platform} />
+                              </span>
+                              <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                                <span className="flex min-w-0 items-center gap-2">
+                                  <span className="truncate font-sans text-[14px] font-semibold leading-normal group-hover:underline">
+                                    {g.name}
+                                  </span>
+                                  <FeishuRegionBadge integration={g} />
+                                </span>
+                                {!AgentCardBody && g.channels[0] && (
+                                  <span className="font-mono text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                                    {roomGlyph(g.channels[0].kind, g.platform)}
+                                    {rowLabel(g.channels[0])}
+                                  </span>
+                                )}
+                              </span>
+                            </Link>
+                            <span className="ml-auto flex flex-none items-center gap-3">
+                              <IntegrationStatePill integration={g} agentOffline={agentOffline} mobile />
+                              {g.platform === 'discord' && g.discordAppId && (
+                                <a
+                                  href={discordBotInviteUrl(g.discordAppId)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title={t('integrations.inviteDiscord')}
+                                  aria-label={t('integrations.addToDiscord')}
+                                  className="iconbtn h-7 w-7 flex-none"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <Icon name="external-link" size={12} />
+                                </a>
+                              )}
+                              {HeaderActions && <HeaderActions integration={g} />}
+                              <button
+                                className="iconbtn h-7 w-7 flex-none"
+                                title={t('integrations.delete')}
+                                aria-label={t('integrations.deleteNamed', { name: g.name })}
+                                onClick={() => openModal('deleteIntegration', g)}
+                              >
+                                <Icon name="unplug" size={14} />
+                              </button>
+                            </span>
+                          </div>
+                          {CardNotice && <CardNotice integration={g} padX={16} />}
+                          {AgentCardBody ? (
+                            <AgentCardBody integration={g} padX={16} />
+                          ) : (
+                            <IntegrationChannelList
+                              integrationId={g.id}
+                              channels={g.channels}
+                              botId={g.botId}
+                              agentId={da.id}
+                              platform={g.platform}
+                              shareable={g.shareable}
+                              gate={conversationGate(da)}
+                              assistantMode={da.assistantMode?.enabled === true}
+                              padX={16}
+                            />
+                          )}
+                        </CardScope>
+                      </div>
+                    )
+                  })}
+                  {webhookHooks.map((h, i) => (
+                    <div
+                      key={h.id}
+                      className={`flex items-center gap-3 border-b border-(--border-subtle) px-4 py-3 ${
+                        agentInts.length + i > 0 ? 'border-t' : ''
+                      }`}
+                    >
+                      <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md bg-(--surface-inverse)">
+                        <Icon name="webhook" size={18} color="#fff" />
+                      </span>
+                      <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        <span className="font-sans text-[14px] font-semibold leading-normal">{h.name}</span>
+                        <span className="font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                          {h.lastFiredAt ? `fired ${fmtHookAgo(h.lastFiredAt)}` : 'never fired'}
+                        </span>
+                      </span>
+                      <span className="inline-flex flex-none items-center gap-[5px] rounded-full bg-(--surface-active) px-[10px] py-[3px] font-sans text-[12px] font-semibold leading-normal text-(--text-tertiary)">
+                        {t('integrations.webhook')}
+                      </span>
+                    </div>
+                  ))}
+                  {/* The desktop blocks in mobile anatomy: the repo's first row names it, its siblings indent under it. */}
+                  {githubRows.map(({ hook: h, repoKey, first, last, addFamilies }, i) => (
+                    <div
+                      key={h.id}
+                      className={`${codeHostMobileRowCls(first, last)} ${
+                        first && agentInts.length + webhookHooks.length + i > 0 ? 'border-t' : ''
+                      }`}
+                    >
+                      {first && (
+                        <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md border border-(--border-subtle) bg-(--surface-sunken)">
+                          <span className="flex h-[18px] w-[18px] items-center justify-center">
+                            <PlatformMark platform="github" fillPct={100} />
+                          </span>
+                        </span>
+                      )}
+                      <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        {first && (
+                          <span className="flex min-w-0 items-center gap-2">
+                            <RepoName
+                              name={h.repoFullName ?? h.name}
+                              url={repoPageUrl('github', h.repoFullName)}
+                              className="mono min-w-0 truncate text-[13px] font-semibold"
+                            />
+                            {/* The repo's first row offers what it does not watch yet — same + menu as desktop. */}
+                            {addFamilies.length > 0 && (
+                              <RowMoreMenu
+                                ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                icon="plus"
+                                title={t('integrations.watchAnotherSubject')}
+                                triggerClassName={ADD_SUBJECT_BTN}
+                                align="start"
+                                items={addFamilies.map((fam) => ({
+                                  icon: (githubFamilyTile(fam)?.icon ?? 'plus') as Parameters<typeof Icon>[0]['name'],
+                                  label: `Add ${githubFamilyTile(fam)?.label ?? fam}`,
+                                  onClick: () => void addGithubFamily(h, repoKey, fam)
+                                }))}
+                              />
+                            )}
+                            {watchUnauthorized(h) && <UnauthorizedWatchBadge />}
+                          </span>
+                        )}
+                        <span className="flex min-w-0 items-center gap-2">
+                          {/* What this row subscribes to — a label, not a control — then when it runs. */}
+                          <span className="flex-none font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                            {ghRowPill(h)}
+                          </span>
+                          <span className="truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                            {githubTriggerPill(triggerModeOf(h), githubHookFamily(h))}
+                          </span>
+                        </span>
+                        {(h.reviewPolicy !== 'off' || h.reportingMode === 'check') && (
+                          <span className="truncate font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                            {reviewPolicyLabel(h.reviewPolicy)} {t('integrations.review')}
+                            {h.reportingMode === 'check' ? ` · ${t('integrations.informationalCheck')}` : ''}
+                          </span>
+                        )}
+                        <LabelFilterLine labels={h.labelFilter} />
+                        {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                          <span className="font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                            {addFamilyError.message}
+                          </span>
+                        )}
+                      </span>
+                      {rowHasSettings(h) && (
+                        <button
+                          className="iconbtn flex-none"
+                          title={t('integrations.settings')}
+                          onClick={() => openReviewSettings(h)}
+                        >
+                          <Icon name="settings-2" size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {gitlabRows.map(({ hook: h, repoKey, first, last, addFamilies }, i) => (
+                    <div
+                      key={h.id}
+                      className={`${codeHostMobileRowCls(first, last)} ${
+                        first && agentInts.length + webhookHooks.length + githubRows.length + i > 0 ? 'border-t' : ''
+                      }`}
+                    >
+                      {first && (
+                        <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md border border-(--border-subtle) bg-(--surface-sunken)">
+                          <span className="flex h-[18px] w-[18px] items-center justify-center">
+                            <PlatformMark platform="gitlab" fillPct={100} />
+                          </span>
+                        </span>
+                      )}
+                      <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        {first && (
+                          <span className="flex min-w-0 items-center gap-2">
+                            <RepoName
+                              name={h.repoFullName ?? h.name}
+                              url={repoPageUrl('gitlab', h.repoFullName)}
+                              className="mono min-w-0 truncate text-[13px] font-semibold"
+                            />
+                            {/* The project's first row offers what it does not watch yet — same + menu as desktop. */}
+                            {addFamilies.length > 0 && (
+                              <RowMoreMenu
+                                ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                icon="plus"
+                                title={t('integrations.watchAnotherSubject')}
+                                triggerClassName={ADD_SUBJECT_BTN}
+                                align="start"
+                                items={addFamilies.map((fam) => ({
+                                  icon: (gitlabFamilyTile(fam)?.icon ?? 'plus') as Parameters<typeof Icon>[0]['name'],
+                                  label: `Add ${gitlabFamilyTile(fam)?.label ?? fam}`,
+                                  onClick: () => void addGitlabFamily(h, repoKey, fam)
+                                }))}
+                              />
+                            )}
+                          </span>
+                        )}
+                        <span className="flex min-w-0 items-center gap-2">
+                          {/* What this row subscribes to — a label, not a control — then when it runs. */}
+                          <span className="flex-none font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                            {glRowPill(h)}
+                          </span>
+                          <span className="truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                            {GL_TRIGGER_PILL[gitlabTriggerModeOf(h)]}
+                          </span>
+                        </span>
+                        {(h.reviewPolicy !== 'off' || h.reportingMode === 'check') && (
+                          <span className="truncate font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                            {reviewPolicyLabel(h.reviewPolicy)} {t('integrations.review')}
+                            {h.reportingMode === 'check' ? ` · ${t('integrations.runNote')}` : ''}
+                          </span>
+                        )}
+                        <LabelFilterLine labels={h.labelFilter} />
+                        {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                          <span className="font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                            {addFamilyError.message}
+                          </span>
+                        )}
+                      </span>
+                      {rowHasSettings(h) && (
+                        <button
+                          className="iconbtn flex-none"
+                          title={t('integrations.settings')}
+                          onClick={() => openReviewSettings(h)}
+                        >
+                          <Icon name="settings-2" size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {giteaRows.map(({ hook: h, repoKey, first, last, addFamilies }, i) => (
+                    <div
+                      key={h.id}
+                      className={`${codeHostMobileRowCls(first, last)} ${
+                        first && agentInts.length + webhookHooks.length + githubRows.length + gitlabRows.length + i > 0
+                          ? 'border-t'
+                          : ''
+                      }`}
+                    >
+                      {first && (
+                        <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md border border-(--border-subtle) bg-(--surface-sunken)">
+                          <span className="flex h-[18px] w-[18px] items-center justify-center">
+                            <PlatformMark platform="gitea" fillPct={100} />
+                          </span>
+                        </span>
+                      )}
+                      <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        {first && (
+                          <span className="flex min-w-0 items-center gap-2">
+                            <RepoName
+                              name={h.repoFullName ?? h.name}
+                              url={repoPageUrl('gitea', h.repoFullName)}
+                              className="mono min-w-0 truncate text-[13px] font-semibold"
+                            />
+                            {/* The repository's first row offers what it does not watch yet — same + menu as desktop. */}
+                            {addFamilies.length > 0 && (
+                              <RowMoreMenu
+                                ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                icon="plus"
+                                title={t('integrations.watchAnotherSubject')}
+                                triggerClassName={ADD_SUBJECT_BTN}
+                                align="start"
+                                items={addFamilies.map((fam) => ({
+                                  icon: (giteaFamilyTile(fam)?.icon ?? 'plus') as Parameters<typeof Icon>[0]['name'],
+                                  label: `Add ${giteaFamilyTile(fam)?.label ?? fam}`,
+                                  onClick: () => void addGiteaFamily(h, repoKey, fam)
+                                }))}
+                              />
+                            )}
+                          </span>
+                        )}
+                        <span className="flex min-w-0 items-center gap-2">
+                          {/* What this row subscribes to — a label, not a control — then when it runs. */}
+                          <span className="flex-none font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                            {gtRowPill(h)}
+                          </span>
+                          <span className="truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                            {GT_TRIGGER_PILL[giteaTriggerModeOf(h)]}
+                          </span>
+                        </span>
+                        {(h.reviewPolicy !== 'off' || h.reportingMode !== 'off') && (
+                          <span className="truncate font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                            {reviewPolicyLabel(h.reviewPolicy)} {t('integrations.review')}
+                            {h.reportingMode === 'status' ? ` · ${t('integrations.commitStatus')}` : ''}
+                          </span>
+                        )}
+                        <LabelFilterLine labels={h.labelFilter} />
+                        {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                          <span className="font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                            {addFamilyError.message}
+                          </span>
+                        )}
+                      </span>
+                      {rowHasSettings(h) && (
+                        <button
+                          className="iconbtn flex-none"
+                          title={t('integrations.settings')}
+                          onClick={() => openReviewSettings(h)}
+                        >
+                          <Icon name="settings-2" size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {azureDevOpsRows.map(({ hook: h, repoKey, first, last, addFamilies }, i) => (
+                    <div
+                      key={h.id}
+                      data-azure-devops-hook-row={h.id}
+                      className={`${codeHostMobileRowCls(first, last)} ${
+                        first &&
+                        agentInts.length +
+                          webhookHooks.length +
+                          githubRows.length +
+                          gitlabRows.length +
+                          giteaRows.length +
+                          i >
+                          0
+                          ? 'border-t'
+                          : ''
+                      }`}
+                    >
+                      {first && (
+                        <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md border border-(--border-subtle) bg-(--surface-sunken)">
+                          <span className="flex h-[18px] w-[18px] items-center justify-center">
+                            <AzureDevOpsMark fillPct={100} />
+                          </span>
+                        </span>
+                      )}
+                      <span className="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        {first && (
+                          <span className="flex min-w-0 items-center gap-2">
+                            <RepoName
+                              name={h.repoFullName ?? h.name}
+                              url={repoPageUrl('azure-devops', h.repoFullName)}
+                              className="mono min-w-0 truncate text-[13px] font-semibold"
+                            />
+                            {addFamilies.length > 0 && (
+                              <RowMoreMenu
+                                ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                icon="plus"
+                                title={t('integrations.watchAnotherSubject')}
+                                triggerClassName={ADD_SUBJECT_BTN}
+                                align="start"
+                                items={addFamilies.map((fam) => ({
+                                  icon: (azureDevOpsFamilyTile(fam)?.icon ?? 'plus') as Parameters<
+                                    typeof Icon
+                                  >[0]['name'],
+                                  label: `Add ${azureDevOpsFamilyTile(fam)?.label ?? fam}`,
+                                  onClick: () => void addAzureDevOpsFamily(h, repoKey, fam)
+                                }))}
+                              />
+                            )}
+                          </span>
+                        )}
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="flex-none font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                            {azRowPill(h)}
+                          </span>
+                          <span className="truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                            {AZ_TRIGGER_PILL[azureDevOpsTriggerModeOf(h)]}
+                          </span>
+                        </span>
+                        {(h.reviewPolicy !== 'off' || h.reportingMode !== 'off') && (
+                          <span className="truncate font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                            {reviewPolicyLabel(h.reviewPolicy)} {t('integrations.review')}
+                            {h.reportingMode === 'status' ? ` · ${t('integrations.pullRequestStatus')}` : ''}
+                          </span>
+                        )}
+                        {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                          <span className="font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                            {addFamilyError.message}
+                          </span>
+                        )}
+                      </span>
+                      {rowHasSettings(h) && (
+                        <button
+                          className="iconbtn flex-none"
+                          title={t('integrations.settings')}
+                          onClick={() => openReviewSettings(h)}
+                        >
+                          <Icon name="settings-2" size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {apiEntries.length > 0 && (
+                    <AgentApiCard
+                      agent={da}
+                      entries={apiEntries}
+                      mobile
+                      divided={agentInts.length + agentHooks.length > 0}
+                      onChanged={() => {
+                        void mutateApiEntries()
+                        void refresh()
+                      }}
+                    />
+                  )}
+                </div>
+                <div className="hidden flex-col gap-3 px-4 py-[14px] desktop:flex">
+                  {agentInts.map((g, i) => {
+                    const card = platformAgentCard(g.platform)
+                    const AgentCardBody = card?.Body
+                    const CardNotice = card?.Notice
+                    const HeaderActions = card?.HeaderActions
+                    const CardScope = card?.CardProvider ?? PlainCardScope
+                    return (
+                      <div key={i} className="overflow-hidden rounded-[9px] border border-(--border-subtle)">
+                        <CardScope integration={g}>
+                          <div className="flex items-center gap-3 px-[14px] py-3">
+                            <Link
+                              href={botSettingsHref(g.botId)}
+                              className="group flex min-w-0 flex-1 items-center gap-3"
+                            >
+                              <span className="imark h-[34px] w-[34px] rounded-md">
+                                <PlatformMark platform={g.platform} />
+                              </span>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="truncate font-sans text-[13.5px] font-semibold leading-normal group-hover:underline">
+                                    {g.name}
+                                  </span>
+                                  <FeishuRegionBadge integration={g} />
+                                  <IntegrationStatePill integration={g} agentOffline={agentOffline} mobile={false} />
+                                </div>
+                              </div>
+                            </Link>
+                            {g.platform === 'discord' && g.discordAppId && (
+                              <a
+                                href={discordBotInviteUrl(g.discordAppId)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={t('integrations.inviteDiscord')}
+                                aria-label={t('integrations.addToDiscord')}
+                                className="iconbtn flex-none"
+                                onClick={(e) => e.stopPropagation()}
+                              >
+                                <Icon name="external-link" size={14} />
+                              </a>
+                            )}
+                            {HeaderActions && <HeaderActions integration={g} />}
+                            <button
+                              className="iconbtn"
+                              title={t('integrations.delete')}
+                              aria-label={t('integrations.deleteNamed', { name: g.name })}
+                              onClick={() => openModal('deleteIntegration', g)}
+                            >
+                              <Icon name="unplug" size={15} />
+                            </button>
+                          </div>
+                          {CardNotice && <CardNotice integration={g} padX={14} />}
+                          {AgentCardBody ? (
+                            <AgentCardBody integration={g} padX={14} />
+                          ) : (
+                            <IntegrationChannelList
+                              integrationId={g.id}
+                              channels={g.channels}
+                              botId={g.botId}
+                              agentId={da.id}
+                              platform={g.platform}
+                              shareable={g.shareable}
+                              gate={conversationGate(da)}
+                              assistantMode={da.assistantMode?.enabled === true}
+                              padX={14}
+                            />
+                          )}
+                        </CardScope>
+                      </div>
+                    )
+                  })}
+                  {webhookHooks.map((h) => (
+                    <div key={h.id} className="overflow-hidden rounded-[9px] border border-(--border-subtle)">
+                      <div className="flex items-center gap-3 px-[14px] py-3">
+                        <span className="flex h-[34px] w-[34px] flex-none items-center justify-center rounded-md bg-(--surface-inverse)">
+                          <Icon name="webhook" size={17} color="#fff" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-sans text-[13.5px] font-semibold leading-normal">{h.name}</span>
+                            <span className="badge bg-(--surface-active) text-(--text-tertiary)">
+                              {t('integrations.webhook')}
+                            </span>
+                          </div>
+                          {h.url && (
+                            <div className="mono mt-[2px] truncate text-[11.5px] font-normal text-(--text-tertiary)">
+                              {h.url}
+                            </div>
+                          )}
+                        </div>
+                        <span className="flex-none font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                          {h.lastFiredAt ? `fired ${fmtHookAgo(h.lastFiredAt)}` : 'never fired'}
+                        </span>
+                        <button
+                          className="iconbtn"
+                          title={t('integrations.webhookInstructions')}
+                          aria-pressed={hookInstructionsFor === h.id}
+                          onClick={() => setHookInstructionsFor(hookInstructionsFor === h.id ? null : h.id)}
+                        >
+                          <Icon name="pencil" size={15} />
+                        </button>
+                        <button
+                          className="iconbtn"
+                          title={t('integrations.recentDeliveries')}
+                          onClick={() => setHookRunsFor(hookRunsFor === h.id ? null : h.id)}
+                        >
+                          <Icon name={hookRunsFor === h.id ? 'chevron-up' : 'rotate-ccw-clock'} size={15} />
+                        </button>
+                        <button
+                          className="iconbtn"
+                          title={t('integrations.deleteWebhook')}
+                          onClick={() => openModal('deleteHook', h)}
+                        >
+                          <Icon name="trash" size={15} />
+                        </button>
+                      </div>
+                      {hookInstructionsFor === h.id && (
+                        <WebhookInstructionsPanel
+                          hook={h}
+                          onDone={(updated) => {
+                            if (updated)
+                              void mutateHooks((rows) => rows?.map((r) => (r.id === h.id ? updated : r)), {
+                                revalidate: false
+                              })
+                            setHookInstructionsFor(null)
+                          }}
+                        />
+                      )}
+                      {hookRunsFor === h.id && (
+                        <HookRunsPanel hookId={h.id} sessionHref={(sid) => orgPath(`/sessions/${sid}`)} />
+                      )}
+                    </div>
+                  ))}
+                  {/* GitHub group (design): one card, one group per watched repo, a family line per row under it. */}
+                  {githubHooks.length > 0 && (
+                    <div className="overflow-hidden rounded-[9px] border border-(--border-subtle)">
+                      <div className="flex items-center gap-3 px-[14px] py-3">
+                        <span className="flex h-[34px] w-[34px] flex-none items-center justify-center">
+                          <span className="flex h-[26px] w-[26px] items-center justify-center [&>svg]:h-full [&>svg]:w-full">
+                            <GithubMark />
+                          </span>
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-sans text-[13.5px] font-semibold leading-normal">
+                              {t('integrations.github')}
+                            </span>
+                            {githubAppSlug && (
+                              <span className="min-w-0 truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                                {t.rich('integrations.githubVia', {
+                                  slug: () => (
+                                    <a
+                                      className="mono text-inherit underline-offset-2 hover:underline"
+                                      href={githubAppPageUrl(githubAppSlug)}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                    >
+                                      {githubAppSlug}
+                                    </a>
+                                  )
+                                })}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          className="iconbtn"
+                          title={t('integrations.githubApp')}
+                          aria-label={t('integrations.githubApp')}
+                          onClick={githubAppDialog.openDialog}
+                        >
+                          <Icon name="app-window" size={15} />
+                        </button>
+                        <button
+                          className="iconbtn"
+                          title={t('integrations.disconnectGithub')}
+                          onClick={() => openModal('deleteHook', githubHooks)}
+                        >
+                          <Icon name="unplug" size={15} />
+                        </button>
+                      </div>
+                      <div className="border-t border-(--border-subtle) bg-(--surface-app)">
+                        {githubRows.map(({ hook: h, repoKey, first, last, addFamilies }) => {
+                          const routing = routingRowOf(h)
+                          return (
+                            <div key={h.id} className={last ? 'border-b border-(--border-subtle)' : undefined}>
+                              {/* One repo = one attached block: its first row names it, its
+                                  siblings indent to that name and only state their family. */}
+                              <div className={codeHostRowCls(first, last)}>
+                                {first ? (
+                                  <>
+                                    <Icon
+                                      name="folder-git-2"
+                                      size={14}
+                                      color="var(--text-tertiary)"
+                                      className="flex-none"
+                                    />
+                                    <RepoName
+                                      name={h.repoFullName ?? h.name}
+                                      url={repoPageUrl('github', h.repoFullName)}
+                                      className="mono min-w-[90px] max-w-full truncate text-[12px] text-(--text-primary)"
+                                    />
+                                  </>
+                                ) : null}
+                                {/* The repo's first row offers what it does not watch yet — a + menu, so new subjects just add items. */}
+                                {addFamilies.length > 0 && (
+                                  <RowMoreMenu
+                                    ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                    icon="plus"
+                                    title={t('integrations.watchAnotherSubject')}
+                                    triggerClassName={ADD_SUBJECT_BTN}
+                                    align="start"
+                                    items={addFamilies.map((fam) => ({
+                                      icon: (githubFamilyTile(fam)?.icon ?? 'plus') as Parameters<
+                                        typeof Icon
+                                      >[0]['name'],
+                                      label: `Add ${githubFamilyTile(fam)?.label ?? fam}`,
+                                      onClick: () => void addGithubFamily(h, repoKey, fam)
+                                    }))}
+                                  />
+                                )}
+                                {/* Authorization is repo-scoped, so the badge shows once per group. */}
+                                {first && watchUnauthorized(h) && <UnauthorizedWatchBadge />}
+                                <LabelFilterHint labels={h.labelFilter} onClick={() => openReviewSettings(h)} />
+                                {/* What this row subscribes to, stated at the head of its control cluster — a label, not a control. Fixed width so the trigger column aligns across rows. */}
+                                <span className="ml-auto w-[56px] flex-none whitespace-nowrap text-right font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                                  {ghRowPill(h)}
+                                </span>
+                                {routing.entry}
+                                {/* Trigger — the same ⚡ dropdown the IM channel rows carry, mention last. */}
+                                <TriggerSelect
+                                  className="w-[126px] flex-none"
+                                  // Per family: the label cadence exists on issues alone, and a deployment reads its own copy.
+                                  {...routing.trigger(
+                                    {
+                                      options: ghRowTriggerModes(h).map((mode) => ({
+                                        value: mode,
+                                        label: githubTriggerPill(mode, githubHookFamily(h)),
+                                        hint: githubTriggerTooltip(mode, da.name, githubHookFamily(h) ?? undefined),
+                                        description: githubTriggerDescription(
+                                          mode,
+                                          da.name,
+                                          githubHookFamily(h) ?? undefined
+                                        )
+                                      })),
+                                      value: triggerModeOf(h),
+                                      onChange: (mode) => void setHookCadence(h, mode)
+                                    },
+                                    'every'
+                                  )}
+                                  heading={t('integrations.runOn')}
+                                  ariaLabel={`Trigger for ${h.repoFullName ?? h.name} ${ghRowPill(h)}`}
+                                  hint="Trigger — when this agent runs"
+                                  busy={hookBusy === h.id}
+                                />
+                                <span className="inline-flex flex-none gap-[2px]">
+                                  {/* Settings: the label filter on every row, reviews and Checks on the pull-request row. */}
+                                  <RowMoreMenu
+                                    ariaLabel={`More for ${h.repoFullName ?? h.name} ${ghRowPill(h)}`}
+                                    items={[
+                                      ...(rowHasSettings(h)
+                                        ? [
+                                            {
+                                              icon: 'settings-2' as const,
+                                              label: 'Settings…',
+                                              onClick: () => openReviewSettings(h)
+                                            }
+                                          ]
+                                        : []),
+                                      {
+                                        icon: 'rotate-ccw-clock' as const,
+                                        label: hookRunsFor === h.id ? 'Hide recent deliveries' : 'Recent deliveries',
+                                        onClick: () => setHookRunsFor(hookRunsFor === h.id ? null : h.id)
+                                      },
+                                      ...routing.menuItems
+                                    ]}
+                                  />
+                                  <button
+                                    className="iconbtn h-[26px] w-[26px] flex-none"
+                                    title={`Stop watching ${ghRowPill(h)}`}
+                                    onClick={() => openModal('deleteHook', h)}
+                                  >
+                                    <Icon name="x" size={13} />
+                                  </button>
+                                </span>
+                              </div>
+                              {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                                <div className="px-[14px] pb-[9px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                                  {addFamilyError.message}
+                                </div>
+                              )}
+                              {hookRunsFor === h.id && (
+                                <HookRunsPanel hookId={h.id} sessionHref={(sid) => orgPath(`/sessions/${sid}`)} />
+                              )}
+                            </div>
+                          )
+                        })}
+                        <div className="px-[14px] py-2">
+                          {/* Straight to the GitHub pane — this button adds a repo, not a bot. */}
+                          <button
+                            className="lnk text-[12px]"
+                            onClick={() => openModal('integration', da, { platform: 'github' })}
+                          >
+                            <Icon name="plus" size={13} />
+                            {t('integrations.addRepository')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {/* GitLab group — the same one-card, one-row-per-family shape. */}
+                  {gitlabHooks.length > 0 && (
+                    <div className="overflow-hidden rounded-[9px] border border-(--border-subtle)">
+                      <div className="flex items-center gap-3 px-[14px] py-3">
+                        <span className="flex h-[34px] w-[34px] flex-none items-center justify-center">
+                          <span className="flex h-[26px] w-[26px] items-center justify-center">
+                            <GitlabMark fillPct={100} />
+                          </span>
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-sans text-[13.5px] font-semibold leading-normal">
+                              {t('integrations.gitlab')}
+                            </span>
+                          </div>
+                          {gitlabInstanceUrl && (
+                            <div className="mono mt-[3px] text-[11.5px] font-normal text-(--text-tertiary)">
+                              {gitlabInstanceHost(gitlabInstanceUrl)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="border-t border-(--border-subtle) bg-(--surface-app)">
+                        {gitlabRows.map(({ hook: h, repoKey, first, last, addFamilies }) => {
+                          const routing = routingRowOf(h)
+                          return (
+                            <div key={h.id} className={last ? 'border-b border-(--border-subtle)' : undefined}>
+                              {/* One project = one attached block: its first row names it, its
+                                  siblings indent to that name and only state their family. */}
+                              <div className={codeHostRowCls(first, last)}>
+                                {first ? (
+                                  <>
+                                    <Icon
+                                      name="folder-git-2"
+                                      size={14}
+                                      color="var(--text-tertiary)"
+                                      className="flex-none"
+                                    />
+                                    <RepoName
+                                      name={h.repoFullName ?? h.name}
+                                      url={repoPageUrl('gitlab', h.repoFullName)}
+                                      className="mono min-w-[90px] max-w-full truncate text-[12px] text-(--text-primary)"
+                                    />
+                                  </>
+                                ) : null}
+                                {/* The project's first row offers what it does not watch yet — a + menu, so new subjects just add items. */}
+                                {addFamilies.length > 0 && (
+                                  <RowMoreMenu
+                                    ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                    icon="plus"
+                                    title={t('integrations.watchAnotherSubject')}
+                                    triggerClassName={ADD_SUBJECT_BTN}
+                                    align="start"
+                                    items={addFamilies.map((fam) => ({
+                                      icon: (gitlabFamilyTile(fam)?.icon ?? 'plus') as Parameters<
+                                        typeof Icon
+                                      >[0]['name'],
+                                      label: `Add ${gitlabFamilyTile(fam)?.label ?? fam}`,
+                                      onClick: () => void addGitlabFamily(h, repoKey, fam)
+                                    }))}
+                                  />
+                                )}
+                                {gitlabHookNeedsNormalization(h) && (
+                                  <span
+                                    className="badge flex-none bg-(--surface-active) text-(--text-tertiary)"
+                                    title={t('integrations.customRuleHint')}
+                                  >
+                                    {t('integrations.customRule')}
+                                  </span>
+                                )}
+                                <LabelFilterHint labels={h.labelFilter} onClick={() => openReviewSettings(h)} />
+                                {/* What this row subscribes to, stated at the head of its control cluster — a label, not a control. Fixed width so the trigger column aligns across rows. */}
+                                <span className="ml-auto w-[56px] flex-none whitespace-nowrap text-right font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                                  {glRowPill(h)}
+                                </span>
+                                {routing.entry}
+                                {/* Trigger — the same ⚡ dropdown the GitHub rows carry. */}
+                                <TriggerSelect
+                                  className="w-[126px] flex-none"
+                                  {...routing.trigger(
+                                    {
+                                      options: glRowTriggerModes(h).map((mode) => ({
+                                        value: mode,
+                                        label: GL_TRIGGER_PILL[mode],
+                                        hint: gitlabTriggerTooltip(mode, da.name, gitlabHookFamily(h) ?? undefined)
+                                      })),
+                                      value: gitlabTriggerModeOf(h),
+                                      onChange: (mode) => void setGitlabHookCadence(h, mode)
+                                    },
+                                    'every'
+                                  )}
+                                  ariaLabel={`Trigger for ${h.repoFullName ?? h.name} ${glRowPill(h)}`}
+                                  hint="Trigger — when this agent runs"
+                                  busy={hookBusy === h.id}
+                                />
+                                <span className="inline-flex flex-none gap-[2px]">
+                                  {/* Settings: the label filter on every row, reviews and the run note on the merge-request row. */}
+                                  <RowMoreMenu
+                                    ariaLabel={`More for ${h.repoFullName ?? h.name} ${glRowPill(h)}`}
+                                    items={[
+                                      ...(rowHasSettings(h)
+                                        ? [
+                                            {
+                                              icon: 'settings-2' as const,
+                                              label: 'Settings…',
+                                              onClick: () => openReviewSettings(h)
+                                            }
+                                          ]
+                                        : []),
+                                      {
+                                        icon: 'rotate-ccw-clock' as const,
+                                        label: hookRunsFor === h.id ? 'Hide recent deliveries' : 'Recent deliveries',
+                                        onClick: () => setHookRunsFor(hookRunsFor === h.id ? null : h.id)
+                                      },
+                                      ...routing.menuItems
+                                    ]}
+                                  />
+                                  <button
+                                    className="iconbtn h-[26px] w-[26px] flex-none"
+                                    title={`Stop watching ${glRowPill(h)}`}
+                                    onClick={() => openModal('deleteHook', h)}
+                                  >
+                                    <Icon name="x" size={13} />
+                                  </button>
+                                </span>
+                              </div>
+                              {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                                <div className="px-[14px] pb-[9px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                                  {addFamilyError.message}
+                                </div>
+                              )}
+                              {hookRunsFor === h.id && (
+                                <HookRunsPanel hookId={h.id} sessionHref={(sid) => orgPath(`/sessions/${sid}`)} />
+                              )}
+                            </div>
+                          )
+                        })}
+                        <div className="px-[14px] py-2">
+                          {/* Straight to the GitLab pane — this button adds a project, not a bot. */}
+                          <button
+                            className="lnk text-[12px]"
+                            onClick={() => openModal('integration', da, { platform: 'gitlab' })}
+                          >
+                            <Icon name="plus" size={13} />
+                            {t('integrations.addProject')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {/* Gitea group — the same one-card, one-row-per-family shape. */}
+                  {giteaHooks.length > 0 && (
+                    <div className="overflow-hidden rounded-[9px] border border-(--border-subtle)">
+                      <div className="flex items-center gap-3 px-[14px] py-3">
+                        <span className="flex h-[34px] w-[34px] flex-none items-center justify-center">
+                          <span className="flex h-[26px] w-[26px] items-center justify-center">
+                            <GiteaMark fillPct={100} />
+                          </span>
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-sans text-[13.5px] font-semibold leading-normal">
+                              {t('integrations.gitea')}
+                            </span>
+                          </div>
+                          {giteaInstanceUrl && (
+                            <div className="mono mt-[3px] text-[11.5px] font-normal text-(--text-tertiary)">
+                              {giteaInstanceHost(giteaInstanceUrl)}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="border-t border-(--border-subtle) bg-(--surface-app)">
+                        {giteaRows.map(({ hook: h, repoKey, first, last, addFamilies }) => {
+                          const routing = routingRowOf(h)
+                          return (
+                            <div key={h.id} className={last ? 'border-b border-(--border-subtle)' : undefined}>
+                              {/* One repository = one attached block: its first row names it, its
+                                  siblings indent to that name and only state their family. */}
+                              <div className={codeHostRowCls(first, last)}>
+                                {first ? (
+                                  <>
+                                    <Icon
+                                      name="folder-git-2"
+                                      size={14}
+                                      color="var(--text-tertiary)"
+                                      className="flex-none"
+                                    />
+                                    <RepoName
+                                      name={h.repoFullName ?? h.name}
+                                      url={repoPageUrl('gitea', h.repoFullName)}
+                                      className="mono min-w-[90px] max-w-full truncate text-[12px] text-(--text-primary)"
+                                    />
+                                  </>
+                                ) : null}
+                                {/* The repository's first row offers what it does not watch yet. */}
+                                {addFamilies.length > 0 && (
+                                  <RowMoreMenu
+                                    ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                    icon="plus"
+                                    title={t('integrations.watchAnotherSubject')}
+                                    triggerClassName={ADD_SUBJECT_BTN}
+                                    align="start"
+                                    items={addFamilies.map((fam) => ({
+                                      icon: (giteaFamilyTile(fam)?.icon ?? 'plus') as Parameters<
+                                        typeof Icon
+                                      >[0]['name'],
+                                      label: `Add ${giteaFamilyTile(fam)?.label ?? fam}`,
+                                      onClick: () => void addGiteaFamily(h, repoKey, fam)
+                                    }))}
+                                  />
+                                )}
+                                {giteaHookNeedsNormalization(h) && (
+                                  <span
+                                    className="badge flex-none bg-(--surface-active) text-(--text-tertiary)"
+                                    title={t('integrations.customRuleHint')}
+                                  >
+                                    {t('integrations.customRule')}
+                                  </span>
+                                )}
+                                <LabelFilterHint labels={h.labelFilter} onClick={() => openReviewSettings(h)} />
+                                {/* What this row subscribes to, stated at the head of its control cluster. */}
+                                <span className="ml-auto w-[56px] flex-none whitespace-nowrap text-right font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                                  {gtRowPill(h)}
+                                </span>
+                                {routing.entry}
+                                <TriggerSelect
+                                  className="w-[126px] flex-none"
+                                  {...routing.trigger(
+                                    {
+                                      options: gtRowTriggerModes(h).map((mode) => ({
+                                        value: mode,
+                                        label: GT_TRIGGER_PILL[mode],
+                                        hint: giteaTriggerTooltip(mode, da.name, giteaHookFamily(h) ?? undefined)
+                                      })),
+                                      value: giteaTriggerModeOf(h),
+                                      onChange: (mode) => void setGiteaHookCadence(h, mode)
+                                    },
+                                    'every'
+                                  )}
+                                  ariaLabel={`Trigger for ${h.repoFullName ?? h.name} ${gtRowPill(h)}`}
+                                  hint="Trigger — when this agent runs"
+                                  busy={hookBusy === h.id}
+                                />
+                                <span className="inline-flex flex-none gap-[2px]">
+                                  {/* Settings: the label filter on every row, reviews and the commit status on the pull-request row. */}
+                                  <RowMoreMenu
+                                    ariaLabel={`More for ${h.repoFullName ?? h.name} ${gtRowPill(h)}`}
+                                    items={[
+                                      ...(rowHasSettings(h)
+                                        ? [
+                                            {
+                                              icon: 'settings-2' as const,
+                                              label: 'Settings…',
+                                              onClick: () => openReviewSettings(h)
+                                            }
+                                          ]
+                                        : []),
+                                      {
+                                        icon: 'rotate-ccw-clock' as const,
+                                        label: hookRunsFor === h.id ? 'Hide recent deliveries' : 'Recent deliveries',
+                                        onClick: () => setHookRunsFor(hookRunsFor === h.id ? null : h.id)
+                                      },
+                                      ...routing.menuItems
+                                    ]}
+                                  />
+                                  <button
+                                    className="iconbtn h-[26px] w-[26px] flex-none"
+                                    title={`Stop watching ${gtRowPill(h)}`}
+                                    onClick={() => openModal('deleteHook', h)}
+                                  >
+                                    <Icon name="x" size={13} />
+                                  </button>
+                                </span>
+                              </div>
+                              {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                                <div className="px-[14px] pb-[9px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                                  {addFamilyError.message}
+                                </div>
+                              )}
+                              {hookRunsFor === h.id && (
+                                <HookRunsPanel hookId={h.id} sessionHref={(sid) => orgPath(`/sessions/${sid}`)} />
+                              )}
+                            </div>
+                          )
+                        })}
+                        <div className="px-[14px] py-2">
+                          {/* Straight to the Gitea pane — this button adds a repository, not a bot. */}
+                          <button
+                            className="lnk text-[12px]"
+                            onClick={() => openModal('integration', da, { platform: 'gitea' })}
+                          >
+                            <Icon name="plus" size={13} />
+                            {t('integrations.addRepository')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {/* Azure DevOps group — the same shape, without a label filter. */}
+                  {azureDevOpsHooks.length > 0 && (
+                    <div
+                      data-azure-devops-hooks=""
+                      className="overflow-hidden rounded-[9px] border border-(--border-subtle)"
+                    >
+                      <div className="flex items-center gap-3 px-[14px] py-3">
+                        <span className="flex h-[34px] w-[34px] flex-none items-center justify-center">
+                          <span className="flex h-[26px] w-[26px] items-center justify-center">
+                            <AzureDevOpsMark fillPct={100} />
+                          </span>
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="font-sans text-[13.5px] font-semibold leading-normal">
+                            {CODE_HOST_PROJECTION['azure-devops'].label}
+                          </div>
+                          <div className="mono mt-[3px] text-[11.5px] font-normal text-(--text-tertiary)">
+                            {CODE_HOST_PROJECTION['azure-devops'].publicHost}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="border-t border-(--border-subtle) bg-(--surface-app)">
+                        {azureDevOpsRows.map(({ hook: h, repoKey, first, last, addFamilies }) => {
+                          const routing = routingRowOf(h)
+                          return (
+                            <div key={h.id} className={last ? 'border-b border-(--border-subtle)' : undefined}>
+                              <div className={codeHostRowCls(first, last)}>
+                                {first ? (
+                                  <>
+                                    <Icon
+                                      name="folder-git-2"
+                                      size={14}
+                                      color="var(--text-tertiary)"
+                                      className="flex-none"
+                                    />
+                                    <RepoName
+                                      name={h.repoFullName ?? h.name}
+                                      url={repoPageUrl('azure-devops', h.repoFullName)}
+                                      className="mono min-w-[90px] max-w-full truncate text-[12px] text-(--text-primary)"
+                                    />
+                                  </>
+                                ) : null}
+                                {addFamilies.length > 0 && (
+                                  <RowMoreMenu
+                                    ariaLabel={`Watch more on ${h.repoFullName ?? h.name}`}
+                                    icon="plus"
+                                    title={t('integrations.watchAnotherSubject')}
+                                    triggerClassName={ADD_SUBJECT_BTN}
+                                    align="start"
+                                    items={addFamilies.map((fam) => ({
+                                      icon: (azureDevOpsFamilyTile(fam)?.icon ?? 'plus') as Parameters<
+                                        typeof Icon
+                                      >[0]['name'],
+                                      label: `Add ${azureDevOpsFamilyTile(fam)?.label ?? fam}`,
+                                      onClick: () => void addAzureDevOpsFamily(h, repoKey, fam)
+                                    }))}
+                                  />
+                                )}
+                                {azureDevOpsHookNeedsNormalization(h) && (
+                                  <span
+                                    className="badge flex-none bg-(--surface-active) text-(--text-tertiary)"
+                                    title={t('integrations.customRuleHint')}
+                                  >
+                                    {t('integrations.customRule')}
+                                  </span>
+                                )}
+                                <span className="ml-auto w-[56px] flex-none whitespace-nowrap text-right font-sans text-[12px] font-semibold leading-normal text-(--text-primary)">
+                                  {azRowPill(h)}
+                                </span>
+                                {routing.entry}
+                                <TriggerSelect
+                                  className="w-[126px] flex-none"
+                                  {...routing.trigger(
+                                    {
+                                      options: azRowTriggerModes(h).map((mode) => ({
+                                        value: mode,
+                                        label: AZ_TRIGGER_PILL[mode],
+                                        hint: azureDevOpsTriggerTooltip(
+                                          mode,
+                                          da.name,
+                                          azureDevOpsHookFamily(h) ?? undefined
+                                        )
+                                      })),
+                                      value: azureDevOpsTriggerModeOf(h),
+                                      onChange: (mode) => void setAzureDevOpsHookCadence(h, mode)
+                                    },
+                                    'every'
+                                  )}
+                                  ariaLabel={`Trigger for ${h.repoFullName ?? h.name} ${azRowPill(h)}`}
+                                  hint="Trigger — when this agent runs"
+                                  busy={hookBusy === h.id}
+                                />
+                                <span className="inline-flex flex-none gap-[2px]">
+                                  <RowMoreMenu
+                                    ariaLabel={`More for ${h.repoFullName ?? h.name} ${azRowPill(h)}`}
+                                    items={[
+                                      ...(rowHasSettings(h)
+                                        ? [
+                                            {
+                                              icon: 'settings-2' as const,
+                                              label: 'Settings…',
+                                              onClick: () => openReviewSettings(h)
+                                            }
+                                          ]
+                                        : []),
+                                      {
+                                        icon: 'rotate-ccw-clock' as const,
+                                        label: hookRunsFor === h.id ? 'Hide recent deliveries' : 'Recent deliveries',
+                                        onClick: () => setHookRunsFor(hookRunsFor === h.id ? null : h.id)
+                                      },
+                                      ...routing.menuItems
+                                    ]}
+                                  />
+                                  <button
+                                    className="iconbtn h-[26px] w-[26px] flex-none"
+                                    title={`Stop watching ${azRowPill(h)}`}
+                                    onClick={() => openModal('deleteHook', h)}
+                                  >
+                                    <Icon name="x" size={13} />
+                                  </button>
+                                </span>
+                              </div>
+                              {addFamilyError?.key === repoKey && addFamilies.length > 0 && (
+                                <div className="px-[14px] pb-[9px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--status-error)">
+                                  {addFamilyError.message}
+                                </div>
+                              )}
+                              {hookRunsFor === h.id && (
+                                <HookRunsPanel hookId={h.id} sessionHref={(sid) => orgPath(`/sessions/${sid}`)} />
+                              )}
+                            </div>
+                          )
+                        })}
+                        <div className="px-[14px] py-2">
+                          <button
+                            className="lnk text-[12px]"
+                            onClick={() => openModal('integration', da, { platform: 'azure-devops' })}
+                          >
+                            <Icon name="plus" size={13} />
+                            {t('integrations.addRepository')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {apiEntries.length > 0 && (
+                    <AgentApiCard
+                      agent={da}
+                      entries={apiEntries}
+                      mobile={false}
+                      onChanged={() => {
+                        void mutateApiEntries()
+                        void refresh()
+                      }}
+                    />
+                  )}
+                </div>
+                {hasChannelList && (
+                  <NewChannelsDefault
+                    className="px-4 py-[10px] desktop:-mt-1 desktop:pb-[14px] desktop:pt-0"
+                    value={da.newConversationMode}
+                    disabled={!da.canEdit}
+                    onChange={(newConversationMode) => updateAgent(da.id, { newConversationMode })}
+                  />
+                )}
+              </>
+            ) : hooksLoadError ? (
+              <div className="px-5 py-7 text-center font-sans text-[12.5px] font-normal leading-normal text-(--status-error)">
+                {t('integrations.loadError')}
+              </div>
+            ) : hooksLoading ? (
+              <LoadingState padding={42} />
+            ) : (
+              // Each tile opens the integration dialog on that platform.
+              <div className="px-4 py-5 desktop:px-5 desktop:py-6">
+                <div className="text-center">
+                  <div className="font-sans text-[14px] font-semibold leading-normal text-(--text-primary)">
+                    {t('integrations.noneTitle')}
+                  </div>
+                  <div className="mt-1 truncate font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-tertiary)">
+                    {t('integrations.noneDescription', { agent: da.name })}
+                  </div>
+                </div>
+                <div className="mt-4">
+                  <IntegrationPlatformGroups
+                    // Tiles stop at 132px; past that the block centers instead of stretching.
+                    className="mx-auto max-w-[calc(var(--tile-cols)_*_--spacing(33)_+_(var(--tile-cols)_-_1)_*_--spacing(2))]"
+                    renderTile={(p) => {
+                      const available = integrationPlatformAvailable(p.key)
+                      return (
+                        <div
+                          key={p.key}
+                          className={`ptile ${PLATFORM_TILE_WIDTH} flex-none flex-col justify-center gap-[6px] px-2 text-center ${available ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}`}
+                          aria-disabled={!available}
+                          title={available ? INTEGRATION_BLURB[p.key] : 'Not supported by this daemon'}
+                          onClick={available ? () => openModal('integration', da, { platform: p.key }) : undefined}
+                        >
+                          <span className="flex h-[26px] w-[26px] flex-none items-center justify-center">
+                            <PlatformMark platform={p.key} fillPct={100} />
+                          </span>
+                          {/* Mobile tiles are icon-only (the name stays for screen readers); a label area a line and a half tall keeps a two-line name from lifting its icon much. */}
+                          <span className="flex items-center justify-center desktop:min-h-[29px]">
+                            {p.key === 'feishu' ? (
+                              <>
+                                <span className="flex max-desktop:hidden">
+                                  <LarkFeishuSwitcher
+                                    value="lark"
+                                    disabled={!available}
+                                    onSwitch={(feishuRegion) =>
+                                      openModal('integration', da, { platform: 'feishu', feishuRegion })
+                                    }
+                                  />
+                                </span>
+                                <span className="sr-only desktop:hidden">{p.label}</span>
+                              </>
+                            ) : (
+                              <span className="font-sans text-[13px] font-semibold leading-normal max-desktop:sr-only">
+                                {p.label}
+                              </span>
+                            )}
+                          </span>
+                        </div>
+                      )
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-4 desktop:gap-[18px]">
+            {da.canEdit && !da.name.startsWith(MOCK_PREFIX) && (
+              <ApprovalRequestsCard agentId={da.id} className="max-desktop:rounded-lg" />
+            )}
+            {/* This agent's recent sessions — same card as Home's Recent list. */}
+            <RecentSessionsCard
+              title={t('integrations.recentSessions')}
+              sessions={recentSessions}
+              limit={12}
+              loading={agentSessionsLoading}
+              allHref={orgPath(`/sessions?agent=${da.id}`)}
+              emptyText={t('integrations.noSessions')}
+              showAgent={false}
+              className="max-desktop:rounded-lg"
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Workspace tab — the workspace card (source + authorized repos + live git
+          state) sits above the file browser, so the options and the files they
+          configure read as one surface. Live agents get the self-contained
+          GitHub-style browser, which supplies the card's live half; demo (mocked-)
+          agents fill it from their static workspace fields. */}
+      {tab === 'workspace' &&
+        (!da.name.startsWith(MOCK_PREFIX) ? (
+          <div className="flex flex-col gap-4 p-4 desktop:p-0">
+            {/* Keyed by workspace identity: the editor now lives in the card
+                this instance renders, so a replacement must remount the browser
+                instead of leaving the previous tree/preview/git state beneath a
+                refreshed source card. */}
+            <WorkspaceFiles
+              key={workspaceReadModelKey(da, selectedWorktreeSessionId ?? undefined, selectedRepo ?? undefined)}
+              agentId={id}
+              {...(selectedWorktreeSessionId ? { sessionId: selectedWorktreeSessionId } : {})}
+              {...(selectedRepo ? { repo: selectedRepo } : {})}
+              repoOptions={workspaceRepoOptions}
+              {...(isGitWorkspace(da.workspace) ? { primaryRepoLabel: da.workspace.repo } : {})}
+              onRepoChange={selectRepoScope}
+              workdir={da.workdir}
+              canEdit={selectedWorktreeSessionId === null && da.workspace.mode === 'scratch' && da.canEdit}
+              canCreateFolder={capabilitySource?.caps.features.includes('workspace-dir-create-v1') === true}
+              sandboxed={isPoolPlacementKind(da.placementKind)}
+              transfer={transferCapable(capabilitySource?.caps.features)}
+              renderWorkspacePicker={(primaryBranch) =>
+                isGitWorkspace(da.workspace) ? (
+                  <WorkspaceScopePicker
+                    primaryBranch={primaryBranch ?? da.workspace.branch}
+                    isolationLabel={agentSessionIsolationLabel(da, orgSetIds)}
+                    sessions={workspaceSessions}
+                    selectedSessionId={selectedWorktreeSessionId}
+                    selectedSession={selectedWorktreeSession}
+                    loading={workspaceSessionsLoading}
+                    hasMore={workspaceSessionsNextCursor !== null}
+                    loadingMore={workspaceSessionsLoadingMore}
+                    onLoadMore={() => void loadMoreWorkspaceSessions()}
+                    onChange={(sessionId) => {
+                      const next = new URLSearchParams(params)
+                      if (sessionId) next.set('worktree', sessionId)
+                      else next.delete('worktree')
+                      router.replace(`${orgPath(`/agents/${id}`)}?${next.toString()}`, { scroll: false })
+                    }}
+                    orgPath={orgPath}
+                  />
+                ) : undefined
+              }
+              renderHeader={(header) => <WorkspaceCard agent={da} header={header} />}
+            />
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4 p-4 desktop:p-0">
+            <WorkspaceCard agent={da} header={mockWorkspaceHeader} />
+
+            <FileBrowserShell
+              title={t('workspace.files')}
+              headerEnd={
+                isGitWorkspace(ws) ? (
+                  <div className="flex w-1/4 min-w-0 flex-none items-center gap-2 max-desktop:w-[min(210px,56vw)]">
+                    <WorkspaceScopePicker
+                      primaryBranch={ws.branch}
+                      isolationLabel={agentSessionIsolationLabel(da, orgSetIds)}
+                      sessions={[]}
+                      selectedSessionId={null}
+                      loading={false}
+                      hasMore={false}
+                      loadingMore={false}
+                      onLoadMore={() => undefined}
+                      onChange={() => undefined}
+                      orgPath={orgPath}
+                    />
+                  </div>
+                ) : (
+                  <span className="mono text-[11px] text-(--text-tertiary)">{filesSummary}</span>
+                )
+              }
+            >
+              {ws.files.length > 0 ? (
+                <WorkspaceFilesMock files={ws.files} />
+              ) : (
+                <div className="flex flex-col items-center gap-[6px] px-6 py-7 text-center">
+                  <Icon name="folder" size={20} color="var(--text-tertiary)" />
+                  <div className="font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+                    {t('workspace.noFilesReported')}
+                  </div>
+                </div>
+              )}
+            </FileBrowserShell>
+          </div>
+        ))}
+
+      {/* Memory tab — the agent's persistent memory file (view + edit) + backend switch */}
+      {tab === 'memory' && (
+        <MemoryPanel
+          agentId={id}
+          canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit}
+          memoryProvider={da.memoryProvider}
+          autoDistill={da.memoryAutoDistill}
+          memoryHome={da.memoryHome}
+          memoryHomeMigration={da.memoryHomeMigration}
+          memoryDreaming={da.memoryDreaming}
+          canDream={runtimeCanDream(
+            capabilitySource?.runtimeModels.find((r) => r.runtime === da.runtime)?.modelCatalog
+          )}
+          memoryConnectionId={da.memoryConnectionId}
+          memoryRecall={da.memoryRecall}
+          memoryCaptureMode={da.memoryCaptureMode}
+          sessionBasePath={orgPath('/sessions')}
+          sandboxed={isPoolPlacementKind(da.placementKind)}
+          memberSetPlaced={isSetPlacementKind(da.placementKind)}
+          assistantMode={da.assistantMode?.enabled === true}
+        />
+      )}
+
+      {/* Knowledge tab: the Handbook entries and the Library entries this agent reads (assistant-mode.md §5.16). */}
+      {tab === 'knowledge' && <AgentKnowledgePanel agentId={da.id} />}
+
+      {/* Tools tab: the daemon runtime's MCP servers, skills and decisions, then what the workspace loads. */}
+      {tab === 'tools' && (
+        <div className="flex flex-col gap-4 p-4 desktop:gap-[18px] desktop:p-0">
+          <AgentToolsCard
+            agentId={da.id}
+            runtime={da.runtime}
+            daemon={owningDaemon}
+            canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit}
+          />
+          <AgentSkillsCard agentId={da.id} canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit} />
+          <AgentDecisionsCard key={da.id} agentId={da.id} canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit} />
+          {/* Computers are given here: the agent's edit right and each Computer's visibility gate the change. */}
+          {featureFlagEnabled('computer-use') && (
+            <AgentComputersCard
+              agentId={da.id}
+              canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit}
+              canEditAgent={!da.name.startsWith(MOCK_PREFIX) && da.canEdit}
+            />
+          )}
+          <div className="card overflow-hidden max-desktop:rounded-lg desktop:max-w-[760px]">
+            <div className="border-b border-(--border-subtle) px-4 py-3 font-sans text-[14px] font-semibold leading-normal desktop:py-[13px]">
+              {t('tools.loadedFromWorkspace')}
+            </div>
+            <div className="desktop:py-[6px]">
+              {MOCK_MODE ? (
+                <>
+                  <div className="flex items-center gap-[11px] px-4 py-[11px] desktop:py-3">
+                    <Icon name="file-text" size={16} color="var(--text-tertiary)" />
+                    <span className="mono flex-1 text-[12.5px]">{t('integrations.claudeFile')}</span>
+                    <span className="font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('integrations.projectGuide', { size: '2.1 KB' })}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-[11px] border-t border-(--border-subtle) px-4 py-[11px] desktop:py-3">
+                    <Icon name="folder" size={16} color="var(--text-tertiary)" />
+                    <span className="mono flex-1 text-[12.5px]">{t('integrations.skillsDirectory')}</span>
+                    <span className="font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('integrations.skillsCount', { count: 4 })}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-[11px] border-t border-(--border-subtle) px-4 py-[11px] desktop:py-3">
+                    <Icon name="book-open" size={16} color="var(--text-tertiary)" />
+                    <span className="mono flex-1 text-[12.5px]">{t('integrations.runbooksDirectory')}</span>
+                    <span className="font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('integrations.filesIndexed', { count: 12 })}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <LocalSkillsList agentId={da.id} />
+              )}
+            </div>
+            <div className="flex items-center gap-2 border-t border-(--border-subtle) px-4 py-[13px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+              <Icon name="info" size={14} />
+              {t('integrations.plusEverythingIn')}{' '}
+              <Link className="lnk text-[12px]" href={orgPath('/tools')}>
+                {t('integrations.workspaceKnowledge')}
+              </Link>
+              {t('integrations.sharedAcrossAgents')}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Activity tab — what the agent follows, runs and waits on, read from its daemon. */}
+      {tab === 'activity' && (
+        <>
+          <AgentCapabilityRequestsCard agentId={da.id} />
+          <AssistantActivityPanel agentId={da.id} canEdit={!da.name.startsWith(MOCK_PREFIX) && da.canEdit} />
+        </>
+      )}
+
+      {/* One review/check settings surface, rendered as a bottom sheet on mobile
+          and a centered dialog on desktop. The dense repository rows only open
+          it; they do not duplicate policy controls. */}
+      {routingEvaluationsDrawer}
+      {githubAppDialog.dialog}
+
+      {reviewSettingsDraft && reviewSettingsHook && (
+        <div
+          onClick={closeReviewSettings}
+          className="fixed inset-0 z-50 flex items-end bg-[rgba(17,22,29,.5)] backdrop-blur-[2px] desktop:items-center desktop:justify-center desktop:p-6"
+        >
+          <EscapeLayer onEscape={closeReviewSettings} />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="code-host-review-settings-title"
+            onClick={(event) => event.stopPropagation()}
+            className="flex max-h-[88vh] w-full flex-col rounded-t-xl bg-(--surface-card) shadow-[0_-8px_32px_rgba(0,0,0,.18)] desktop:max-w-[620px] desktop:rounded-xl desktop:shadow-(--shadow-xl)"
+          >
+            <div className="flex items-center gap-3 border-b border-(--border-subtle) px-4 py-[13px] desktop:px-5">
+              <span className="flex h-8 w-8 flex-none items-center justify-center rounded-md bg-(--surface-inverse)">
+                <span className="flex h-[17px] w-[17px] items-center justify-center">
+                  {REVIEW_DIALOG_MARK[reviewSettingsDraft.kind]}
+                </span>
+              </span>
+              <div className="min-w-0 flex-1">
+                <div
+                  id="code-host-review-settings-title"
+                  className="font-sans text-[14px] font-semibold leading-normal text-(--text-primary)"
+                >
+                  {rowSettingsTitle(reviewSettingsHook)}
+                </div>
+                <div className="mono mt-[2px] truncate text-[11.5px] text-(--text-tertiary)">
+                  {reviewSettingsHook.repoFullName ?? reviewSettingsHook.name}
+                </div>
+              </div>
+              <button className="iconbtn" title={t('reviewDialog.close')} onClick={closeReviewSettings}>
+                <Icon name="x" size={16} />
+              </button>
+            </div>
+            <div className="overflow-y-auto px-4 py-4 desktop:px-5">
+              {reviewSettingsEditor(
+                reviewSettingsDraft,
+                rowCarriesReviews(reviewSettingsHook),
+                rowCarriesLabels(reviewSettingsHook)
+              )}
+              {/* Repository-wide, so it saves itself rather than riding the row's PUT; an installation row has no repository to keep it on. */}
+              {!reviewSettingsHook.installationAccount && reviewSettingsDraft.kind !== 'azure-devops' && (
+                <div className="mt-4">
+                  <TrustedUsersField
+                    hookId={reviewSettingsHook.id}
+                    provider={reviewSettingsDraft.kind}
+                    flushRef={trustedUsersFlush}
+                  />
+                </div>
+              )}
+              {reviewSettingsError && (
+                <div className="mt-3 flex items-start gap-2 rounded-md border border-(--status-error) bg-(--status-error-soft) px-3 py-[10px] font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+                  <Icon name="triangle-alert" size={14} className="mt-[2px] flex-none" />
+                  {reviewSettingsError}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-(--border-subtle) px-4 pt-3 pb-[calc(12px+env(safe-area-inset-bottom))] desktop:px-5 desktop:py-3">
+              <Button variant="ghost" onClick={closeReviewSettings}>
+                {t('reviewDialog.cancel')}
+              </Button>
+              <button
+                type="button"
+                disabled={reviewSettingsSaving || reviewSettingsBlocked}
+                onClick={() => void saveReviewSettings()}
+                className={`dsbtn dsbtn-primary ${
+                  reviewSettingsSaving || reviewSettingsBlocked ? 'cursor-default opacity-50' : ''
+                }`}
+              >
+                <Icon name="check" size={15} />
+                {reviewSettingsSaving ? t('reviewDialog.saving') : t('reviewDialog.save')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Mobile agent-actions bottom sheet (Pause/Unpause / Delete) — same open-state as the
+          desktop kebab dropdown above; CSS decides which surface shows. */}
+      {actionsOpen && (
+        <div
+          onClick={() => setActionsOpen(false)}
+          className="fixed inset-0 z-40 flex items-end bg-[rgba(17,22,29,.5)] backdrop-blur-[2px] desktop:hidden"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full rounded-t-xl bg-(--surface-card) px-3 pt-2 pb-[calc(12px+env(safe-area-inset-bottom))] shadow-[0_-8px_32px_rgba(0,0,0,.18)]"
+          >
+            <div className="mx-auto mt-1 mb-[10px] h-1 w-10 rounded-full bg-(--border-default)" />
+            <button
+              onClick={() => void togglePause()}
+              disabled={actionSaving}
+              className="flex w-full cursor-pointer items-center gap-3 border-0 bg-transparent px-3 py-[13px] text-left font-sans text-[15px] font-medium leading-normal text-(--text-primary)"
+            >
+              <Icon name={pauseActionIcon} size={18} color="var(--text-secondary)" />
+              {actionSaving ? 'Saving...' : pauseActionLabel}
+            </button>
+            {actionErr && (
+              <div className="px-3 pb-[10px] font-sans text-[12px] font-normal leading-normal text-(--red-600)">
+                {actionErr}
+              </div>
+            )}
+            {/* Built-in preset agents are permanent — no Delete (the CP refuses it too). */}
+            {!da.builtin && (
+              <button
+                onClick={() => {
+                  setActionsOpen(false)
+                  openModal('deleteAgent', da)
+                }}
+                className="flex w-full cursor-pointer items-center gap-3 border-0 bg-transparent px-3 py-[13px] text-left font-sans text-[15px] font-medium leading-normal text-(--red-600)"
+              >
+                <Icon name="trash" size={18} />
+                {t('actions.delete')}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Amber marker for a grandfathered github hook whose watch repo fell outside
+// the agent's authorized set (workspace ∪ authorized-repo grants). Events still
+// fire; only the agent's GitHub write-back on that repo is credential-less.
+function UnauthorizedWatchBadge() {
+  const t = useTranslations('Agents.detail')
+  return (
+    <span
+      className="badge flex-none bg-(--status-paused-soft) text-(--amber-500)"
+      title={t('integrations.unauthorizedRepoHint')}
+    >
+      <Icon name="triangle-alert" size={11} />
+      {t('integrations.unauthorizedRepo')}
+    </span>
+  )
+}
+
+// The add-subject trigger keeps the retired dashed chip's look — transparent ground, tint on hover only.
+const ADD_SUBJECT_BTN =
+  'inline-flex h-[26px] w-[26px] flex-none items-center justify-center rounded-[7px] border border-dashed border-(--border-subtle) bg-transparent text-(--text-tertiary) transition-colors hover:border-(--border-strong) hover:bg-(--surface-hover) hover:text-(--text-secondary)'
+
+// The at-rest label filter on a desktop row: two labels and a "+N", the full list on hover, a click opens the
+// row's settings. It is secondary information, so it takes the row's slack and yields to everything else;
+// an empty filter renders the spacer alone, keeping the pill and trigger columns where they were.
+function LabelFilterHint({ labels, onClick }: { labels: readonly string[]; onClick: () => void }) {
+  if (labels.length === 0) return <span className="ml-auto min-w-0 flex-1" />
+  const more = labels.length - 2
+  return (
+    <button
+      type="button"
+      title={`Label filter: ${labels.join(', ')}`}
+      onClick={onClick}
+      className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-[5px] overflow-hidden border-0 bg-transparent p-0 font-mono text-[11px] font-medium leading-normal text-(--text-tertiary) hover:text-(--text-primary)"
+    >
+      <Icon name="tag" size={11} className="flex-none" />
+      <span className="truncate">
+        {labels.slice(0, 2).join(', ')}
+        {more > 0 ? `  +${more}` : ''}
+      </span>
+    </button>
+  )
+}
+
+// The mobile row's label filter, one line under the cadence — the full list, truncated by the row.
+function LabelFilterLine({ labels }: { labels: readonly string[] }) {
+  if (labels.length === 0) return null
+  return (
+    <span className="flex min-w-0 items-center gap-[5px] font-mono text-[11px] font-medium leading-normal text-(--text-tertiary)">
+      <Icon name="tag" size={11} className="flex-none" />
+      <span className="truncate">{labels.join(', ')}</span>
+    </span>
+  )
+}
+
+// A one-button flyout for row controls: ⋯ folds the secondary actions, + offers the subjects a repo could still watch.
+function RowMoreMenu({
+  ariaLabel,
+  items,
+  icon = 'ellipsis',
+  title = 'More',
+  align = 'end',
+  triggerClassName = 'iconbtn h-[26px] w-[26px] flex-none'
+}: {
+  ariaLabel: string
+  items: { icon: Parameters<typeof Icon>[0]['name']; label: string; onClick: () => void }[]
+  icon?: Parameters<typeof Icon>[0]['name']
+  title?: string
+  align?: 'start' | 'end'
+  triggerClassName?: string
+}) {
+  return (
+    <AnchoredFlyout
+      ariaLabel={ariaLabel}
+      align={align}
+      width={210}
+      estimatedHeight={10 + items.length * 34}
+      triggerClassName="flex"
+      trigger={({ open, menuId, toggle }) => (
+        <button
+          type="button"
+          aria-label={ariaLabel}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          title={title}
+          onClick={toggle}
+          className={triggerClassName}
+        >
+          <Icon name={icon} size={13} />
+        </button>
+      )}
+    >
+      {({ close }) => (
+        <>
+          {items.map((item) => (
+            <button
+              key={item.label}
+              type="button"
+              role="menuitem"
+              className="fopt"
+              onClick={() => {
+                close(true)
+                item.onClick()
+              }}
+            >
+              <Icon name={item.icon} size={14} className="flex-none" />
+              <span className="min-w-0 flex-1 truncate">{item.label}</span>
+            </button>
+          ))}
+        </>
+      )}
+    </AnchoredFlyout>
+  )
+}
+
+// A repo's rows read as one block: the opener carries the name, the siblings indent to it and the pair breathes as one.
+// No wrapping: the right cluster is fixed-width columns, so the truncating repo name absorbs the squeeze instead.
+function codeHostRowCls(first: boolean, last: boolean): string {
+  const base = 'flex flex-nowrap items-center gap-x-2 px-[14px]'
+  return `${base} ${first ? 'pt-[9px]' : 'pt-[3px]'} ${last ? 'pb-[9px]' : 'pb-[3px]'} ${first ? '' : 'pl-[36px]'}`
+}
+
+// The same block on mobile, where the platform mark — not a folder icon — sets the sibling rows' indent.
+function codeHostMobileRowCls(first: boolean, last: boolean): string {
+  const base = 'flex items-center gap-3 border-(--border-subtle) px-4'
+  return `${base} ${first ? 'pt-3' : 'pt-1'} ${last ? 'border-b pb-3' : 'pb-1'} ${first ? '' : 'pl-16'}`
+}
+
+// "3m ago" for a hook's last-fired stamp and its delivery rows.
+function fmtHookAgo(iso: string): string {
+  const min = Math.max(1, Math.round((Date.now() - new Date(iso).getTime()) / 60_000))
+  if (min < 60) return `${min}m ago`
+  const h = Math.round(min / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.round(h / 24)}d ago`
+}
+
+const HOOK_RUN_DOT: Record<HookRunDto['status'], string> = {
+  running: 'bg-(--status-info)',
+  success: 'bg-(--status-online)',
+  failed: 'bg-(--status-error)'
+}
+
+// Recent deliveries for one webhook (GET /hooks/:id/runs), fetched on expand.
+// Link the session a delivery ran in or cleaned up when one is known.
+/** Edit what a generic webhook's agent does with each delivery; empty restores payload-as-instruction. */
+function WebhookInstructionsPanel({ hook, onDone }: { hook: HookDto; onDone: (updated?: HookDto) => void }) {
+  const t = useTranslations('Agents.detail.integrations')
+  const tc = useTranslations('Common.actions')
+  const [draft, setDraft] = useState(hook.instructions ?? '')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const save = async () => {
+    if (saving) return
+    setSaving(true)
+    setErr(null)
+    try {
+      onDone(await updateWebhookInstructions(hook, draft))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+      setSaving(false)
+    }
+  }
+  return (
+    <div className="border-t border-(--border-subtle) bg-(--surface-app) px-[14px] py-3">
+      <textarea
+        className="inp min-h-15 w-full resize-y px-3 py-2 leading-[1.5]"
+        rows={4}
+        maxLength={8000}
+        aria-label={t('webhookInstructions')}
+        placeholder={t('webhookInstructionsPlaceholder')}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        autoFocus
+      />
+      {err && <div className="mt-2 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">{err}</div>}
+      <div className="mt-2 flex justify-end gap-2">
+        <Button variant="ghost" onClick={() => onDone()}>
+          {tc('cancel')}
+        </Button>
+        <Button onClick={() => void save()} className={saving ? 'cursor-default opacity-50' : undefined}>
+          {tc('save')}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function HookRunsPanel({ hookId, sessionHref }: { hookId: string; sessionHref: (sessionId: string) => string }) {
+  const t = useTranslations('Agents.detail')
+  const { activeOrg } = useOrgs()
+  const runsKey = consoleKeys.hookRuns(activeOrg?.id, hookId)
+  const { data: runsData, error } = useSWR(
+    runsKey,
+    ([, orgId, , requestedHookId]) => fetchHookRuns(requestedHookId, orgId),
+    { refreshInterval: HOOK_RUN_REFRESH_MS }
+  )
+  const runs = runsData ?? null
+  const err = runsData === undefined && error ? (error instanceof Error ? error.message : String(error)) : null
+
+  return (
+    <div className="border-t border-(--border-subtle) bg-(--surface-app)">
+      {err ? (
+        <div className="px-[14px] py-3 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)">
+          {err}
+        </div>
+      ) : runs === null ? (
+        <div className="px-[14px] py-3 font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+          {t('integrations.loadingDeliveries')}
+        </div>
+      ) : runs.length === 0 ? (
+        <div className="px-[14px] py-3 font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+          {t('integrations.noDeliveries')}
+        </div>
+      ) : (
+        runs.map((r) => (
+          <div
+            key={r.id}
+            className="flex items-center gap-[10px] border-b border-(--border-subtle) px-[14px] py-[9px] last:border-b-0"
+          >
+            <span className={`h-[7px] w-[7px] flex-none rounded-full ${HOOK_RUN_DOT[r.status]}`} />
+            <span className="flex min-w-0 flex-1 items-center gap-2">
+              {/* Name the event the delivery carried; the provider's delivery id stays in the tooltip. */}
+              <span className="mono min-w-0 truncate text-[12px] text-(--text-secondary)" title={r.deliveryKey}>
+                {r.event ?? r.deliveryKey}
+              </span>
+              {r.sessionId && (
+                <Link href={sessionHref(r.sessionId)} className="lnk flex-none whitespace-nowrap text-[11.5px]">
+                  {t('integrations.openSession')}
+                </Link>
+              )}
+            </span>
+            {r.status === 'failed' && r.reason && (
+              <span className="flex-none font-sans text-[11.5px] font-normal leading-normal text-(--status-error)">
+                {r.reason}
+              </span>
+            )}
+            {r.durationMs !== null && (
+              <span className="flex-none font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                {t('integrations.seconds', { value: (r.durationMs / 1000).toFixed(1) })}
+              </span>
+            )}
+            <span className="flex-none font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+              {fmtHookAgo(r.startedAt)}
+            </span>
+          </div>
+        ))
+      )}
+    </div>
+  )
+}

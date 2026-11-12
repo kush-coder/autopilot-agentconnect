@@ -1,0 +1,72 @@
+import { describe, expect, it } from 'vitest'
+import { SESSION_MODE_AUTO_V1_FEATURE } from '@agentconnect.md/protocol'
+import { autoConversationKinds, openConversationSessionMode, openConversationTrigger } from './conversation-defaults.js'
+
+describe('openConversationTrigger', () => {
+  it('opens a room on Mention and a 1:1 DM On', () => {
+    expect(openConversationTrigger({})).toBe('mention')
+    expect(openConversationTrigger({ kind: 'mpim', externalReason: null })).toBe('mention')
+    expect(openConversationTrigger({ kind: 'im' })).toBe('any')
+  })
+
+  it('starts any place the platform marks external Off', () => {
+    expect(openConversationTrigger({ kind: 'channel', externalReason: 'externallyShared' })).toBe('off')
+    expect(openConversationTrigger({ kind: 'im', externalReason: 'externalMember' })).toBe('off')
+  })
+})
+
+// auto-session-mode.md §3.2: rooms and group DMs start on Auto where the bot's daemon reads it; DMs and Linear never do.
+describe('autoConversationKinds and openConversationSessionMode', () => {
+  it('starts a room and a Slack group DM on Auto for a daemon that reads it, never a DM', () => {
+    const kinds = autoConversationKinds('slack', [SESSION_MODE_AUTO_V1_FEATURE])
+    expect(kinds).toEqual(['channel', 'mpim'])
+    expect(openConversationSessionMode({}, kinds)).toBe('auto')
+    expect(openConversationSessionMode({ kind: 'mpim' }, kinds)).toBe('auto')
+    expect(openConversationSessionMode({ kind: 'im' }, kinds)).toBe('createNew')
+  })
+
+  it('keeps every new row Per thread for a daemon that does not read Auto, or where rooms never append', () => {
+    expect(autoConversationKinds('slack', [])).toEqual([])
+    expect(autoConversationKinds('slack', undefined)).toEqual([])
+    expect(autoConversationKinds('linear', [SESSION_MODE_AUTO_V1_FEATURE])).toEqual([])
+    expect(autoConversationKinds('telegram', [SESSION_MODE_AUTO_V1_FEATURE])).toEqual(['channel'])
+    expect(openConversationSessionMode({ kind: 'channel' }, undefined)).toBe('createNew')
+  })
+})
+
+// An agent's default for its new rooms (agent new-conversation mode): Mention and Off keep them off Auto, Off seeds the trigger Off; DMs keep theirs.
+describe("an agent's new-conversation mode", () => {
+  const reads = [SESSION_MODE_AUTO_V1_FEATURE]
+
+  it('Auto and an unset mode keep the platform default', () => {
+    for (const mode of ['auto', null, undefined] as const) {
+      expect(autoConversationKinds('slack', reads, mode)).toEqual(['channel', 'mpim'])
+      expect(openConversationTrigger({ kind: 'channel' }, mode)).toBe('mention')
+    }
+  })
+
+  // auto-session-mode.md §3.6: an agent whose coordinator is off starts new rooms Per thread whatever its mode.
+  it('starts a room Per thread with the coordinator off', () => {
+    for (const mode of ['auto', null, 'mention'] as const) {
+      expect(autoConversationKinds('slack', reads, mode, true)).toEqual([])
+      expect(openConversationTrigger({ kind: 'channel' }, mode)).toBe('mention')
+    }
+    expect(autoConversationKinds('slack', reads, 'auto', false)).toEqual(['channel', 'mpim'])
+  })
+
+  it('Mention starts a room on Mention, Per thread, even where the daemon reads Auto', () => {
+    expect(autoConversationKinds('slack', reads, 'mention')).toEqual([])
+    expect(openConversationTrigger({ kind: 'channel' }, 'mention')).toBe('mention')
+  })
+
+  it('Off starts a room and a group DM Off, Per thread, and leaves a 1:1 DM On', () => {
+    expect(autoConversationKinds('slack', reads, 'off')).toEqual([])
+    expect(openConversationTrigger({ kind: 'channel' }, 'off')).toBe('off')
+    expect(openConversationTrigger({ kind: 'mpim' }, 'off')).toBe('off')
+    expect(openConversationTrigger({ kind: 'im' }, 'off')).toBe('any')
+  })
+
+  it('never opens an external place', () => {
+    expect(openConversationTrigger({ kind: 'channel', externalReason: 'externallyShared' }, 'mention')).toBe('off')
+  })
+})

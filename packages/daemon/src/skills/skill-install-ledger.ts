@@ -1,0 +1,1596 @@
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { constants as fsConstants, promises as fsp, type BigIntStats } from 'node:fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { under } from '../fs/contained-path.js'
+import { inspectLocalSkillSource } from './skill-source-snapshot.js'
+import {
+  MAX_SKILL_BUNDLES,
+  MAX_SKILL_PATH_BYTES,
+  MAX_SKILL_RECEIPT_FILES,
+  MAX_SKILL_BUNDLE_BYTES,
+  MAX_SKILL_FILE_BYTES
+} from './skill-limits.js'
+import {
+  canonicalSkillMutationRoot,
+  MAX_MUTATION_BATCH_STEPS,
+  runSkillWorkspaceMutation,
+  runSkillWorkspaceMutations
+} from './skill-workspace-mutator.js'
+import { withSkillMutationHelperLease, type SkillMutationHelperLease } from './skill-workspace-lock-lease.js'
+
+// Two sets of 64 bundles × 64 files × 1 KiB paths, source keys and JSON escaping fit below this bounded journal read.
+export const MAX_SKILL_LEDGER_BYTES = 32 * 1024 * 1024
+// The same ceilings the CLI cell and snapshot admit (skill-limits.ts): what staged must publish.
+const MAX_RECEIPT_BYTES = MAX_SKILL_BUNDLE_BYTES
+const MAX_RECEIPT_FILE_BYTES = MAX_SKILL_FILE_BYTES
+const MAX_LAYOUT_SEGMENTS = 8
+const SAFE_LAYOUT_SEGMENT = /^\.?[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?$/
+const SAFE_BUNDLE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9_-])?$/
+const RESERVED_FIRST = new Set(['.git', '.agentconnect'])
+const SAFE_OPERATION = /^[a-f0-9-]{36}$/
+const SAFE_QUARANTINE = /^\.agentconnect-skill-(?:new|old|trash)-[a-f0-9-]{36}$/
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/
+const EXTERNAL_LOCK_WAIT_MS = 60_000
+const EXTERNAL_LOCK_BUSY_MS = 1_000
+
+export interface PathIdentity {
+  dev: string
+  ino: string
+}
+
+export interface SkillFileReceipt {
+  path: string
+  mode: number
+  size: number
+  sha256: string
+}
+
+interface SkillBundleReceipt {
+  relativeRoot: string
+  sourceKey: string
+  treeDigest: string
+  files: SkillFileReceipt[]
+}
+
+export interface OwnedSkillBundle extends SkillBundleReceipt {
+  identity: PathIdentity
+}
+
+export interface CandidateSkillBundle extends SkillBundleReceipt {
+  sourceDir: string
+}
+
+export interface SkillGitResolution {
+  /** SHA-256 of normalized repository + effective ref acquisition identity. */
+  definitionDigest: string
+  /** Exact commit selected when that definition was first acquired. */
+  resolvedCommit: string
+}
+
+interface JournalOperation {
+  relativeRoot: string
+  operationId: string
+  reservationName: string
+  quarantineName: string
+  tombstoneName: string
+  reservationIdentity?: PathIdentity
+  markerIdentity?: PathIdentity
+}
+
+interface ReadyCleanup {
+  operations: JournalOperation[]
+  prior: OwnedSkillBundle[]
+}
+
+interface LedgerBase {
+  version: 3
+  workspaceRealpath: string
+  workspaceIdentity: PathIdentity
+  agentId: string
+  runtime: string
+  cliVersion: string
+  publicationOperationId?: string
+  publicationMac?: string
+}
+
+interface ReadyLedger extends LedgerBase {
+  phase: 'ready'
+  fingerprint?: string
+  owned: OwnedSkillBundle[]
+  gitResolutions: SkillGitResolution[]
+  cleanup?: ReadyCleanup
+}
+
+interface ApplyingLedger extends LedgerBase {
+  phase: 'applying'
+  priorFingerprint?: string
+  priorGitResolutions: SkillGitResolution[]
+  prior: OwnedSkillBundle[]
+  pending: SkillBundleReceipt[]
+  operations: JournalOperation[]
+}
+
+export type SkillInstallLedger = ReadyLedger | ApplyingLedger
+
+export interface SkillLedgerLocation {
+  workspaceRealpath: string
+  workspaceIdentity: PathIdentity
+  file: string
+  /** Where the ledger was kept when its key held the device, read until `file` is first written. */
+  deviceFile?: string
+}
+
+export interface ReconcileSkillBundlesOptions {
+  cwd: string
+  stateDir: string
+  agentId: string
+  runtime: string
+  cliVersion: string
+  fingerprint: string
+  candidates: CandidateSkillBundle[]
+  /** Durable receipts supplied by a trusted coordinator. When present they replace,
+   * rather than merge with, any pod-local ledger before mutation authority is derived. */
+  trustedPrior?: Array<{
+    relativeRoot: string
+    sourceKey: string
+    treeDigest: string
+    files: SkillFileReceipt[]
+  }>
+  /** Same durable journal operation is being replayed after a lost response. */
+  allowDesiredAdoption?: boolean
+  assertMutationAuthority?: () => void
+  mutationSignal?: AbortSignal
+  publicationOperationId?: string
+  publicationKey?: string
+  gitResolutions?: SkillGitResolution[]
+  /** Untrusted compatibility hints from old workspace-local markers. They may
+   * improve a conflict error, but never confer deletion or replacement rights. */
+  legacyOwned?: string[]
+  /** Owned bundles this run could not rebuild but that are STILL DESIRED — a
+   * source whose bytes were unavailable (upstream down, rate-limited, a CLI that
+   * failed). They are left exactly as they are: no operation is planned for them,
+   * so they are neither republished nor removed, and they stay in `owned` for the
+   * next run to rebuild. Anything absent from BOTH the candidates and this list is
+   * no longer desired and is still removed. */
+  preserveOwned?: readonly string[]
+  /** The caller already holds `withSkillWorkspaceLock` across acquisition. */
+  lockHeld?: boolean
+  /** Reports a bundle skipped because its destination is not this ledger's to write. */
+  warn?: (message: string) => void
+}
+
+export interface ReconcileSkillBundlesResult {
+  installed: string[]
+  removed: string[]
+  skipped: 'unchanged' | null
+  /** Destinations left untouched because they are not owned by this ledger. */
+  conflicts: string[]
+  /** Exact in-memory receipt set produced by this reconciliation. */
+  owned: OwnedSkillBundle[]
+}
+
+export class SkillLedgerSafetyError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'SkillLedgerSafetyError'
+  }
+}
+
+export async function hasSkillPublicationOperation(
+  cwd: string,
+  stateDir: string,
+  operationId: string,
+  publicationKey: string
+): Promise<boolean> {
+  const location = await skillLedgerLocation(cwd, stateDir)
+  const ledger = await readSkillLedger(location)
+  return ledger !== null && ledger.publicationOperationId === operationId && publicationMacValid(ledger, publicationKey)
+}
+
+const cwdLocks = new Map<string, Promise<unknown>>()
+
+export async function withSkillWorkspaceLock<T>(cwd: string, fn: () => Promise<T>, stateDir?: string): Promise<T> {
+  // Serialize reincarnations at the same lexical path too. The incarnation is
+  // checked after the lock is acquired and is part of the durable ledger key.
+  const key = await fsp.realpath(cwd).catch(() => resolve(cwd))
+  const prior = cwdLocks.get(key) ?? Promise.resolve()
+  const run = async (): Promise<T> => {
+    const external = stateDir ? await acquireExternalWorkspaceLock(key, stateDir) : undefined
+    try {
+      return await (external ? withSkillMutationHelperLease(external, fn) : fn())
+    } finally {
+      await external?.release()
+    }
+  }
+  const result = prior.then(run, run)
+  const tail = result.then(
+    () => undefined,
+    () => undefined
+  )
+  cwdLocks.set(key, tail)
+  try {
+    return await result
+  } finally {
+    if (cwdLocks.get(key) === tail) cwdLocks.delete(key)
+  }
+}
+
+export async function skillLedgerLocation(cwd: string, stateDir: string): Promise<SkillLedgerLocation> {
+  const lexical = resolve(cwd)
+  const stat = await fsp.lstat(lexical, { bigint: true })
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw safety('skill workspace root is unsafe')
+  const workspaceRealpath = await fsp.realpath(lexical)
+  const workspaceIdentity = identity(stat)
+  await assertWorkspaceIdentity(lexical, workspaceRealpath, workspaceIdentity)
+  // No device: a reboot can renumber a Btrfs subvolume's under unchanged files.
+  const key = (parts: string[]) => createHash('sha256').update(parts.join('\0')).digest('hex')
+  const dir = join(stateDir, 'workspace-skills')
+  await ensureTrustedStateDir(stateDir, dir)
+  return {
+    workspaceRealpath,
+    workspaceIdentity,
+    file: join(dir, `${key([workspaceRealpath, workspaceIdentity.ino])}.json`),
+    deviceFile: join(dir, `${key([workspaceRealpath, workspaceIdentity.dev, workspaceIdentity.ino])}.json`)
+  }
+}
+
+export async function readSkillLedger(location: SkillLedgerLocation): Promise<SkillInstallLedger | null> {
+  try {
+    return await readSkillLedgerFile(location.file, location)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !location.deviceFile) throw error
+  }
+  return readSkillLedgerFile(location.deviceFile, location).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  })
+}
+
+async function readSkillLedgerFile(file: string, location: SkillLedgerLocation): Promise<SkillInstallLedger> {
+  try {
+    const stat = await fsp.lstat(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_SKILL_LEDGER_BYTES) {
+      throw safety('skill ownership ledger is not a bounded regular file')
+    }
+    const value = JSON.parse(await fsp.readFile(file, 'utf8')) as unknown
+    return parseLedger(value, location)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error
+    if (error instanceof SkillLedgerSafetyError) throw error
+    throw safety('skill ownership ledger is unreadable', error)
+  }
+}
+
+export function assertSkillLedgerOwner(ledger: SkillInstallLedger, agentId: string): void {
+  if (ledger.agentId !== agentId) {
+    throw safety(`workspace skill ownership belongs to another agent (${ledger.agentId})`)
+  }
+}
+
+/** Verify daemon-owned live bundles byte-for-byte with the same bounded,
+ * descriptor/no-follow walker used for immutable source snapshots. */
+export async function installedBundlesIntact(
+  cwd: string,
+  bundles: OwnedSkillBundle[],
+  expectedWorkspace?: PathIdentity
+): Promise<boolean> {
+  try {
+    if (expectedWorkspace) await assertCurrentWorkspace(cwd, expectedWorkspace)
+    for (const bundle of bundles) {
+      const found = await bundleIdentity(join(cwd, ...bundle.relativeRoot.split('/')), bundle)
+      if (!found || !sameIdentity(found, bundle.identity)) return false
+    }
+    if (expectedWorkspace) await assertCurrentWorkspace(cwd, expectedWorkspace)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Recover an interrupted mutation to the last durable coherent set. */
+export async function recoverSkillLedger(
+  cwd: string,
+  location: SkillLedgerLocation,
+  ledger: SkillInstallLedger,
+  publicationKey?: string
+): Promise<ReadyLedger> {
+  try {
+    await assertCurrentWorkspace(cwd, location.workspaceIdentity)
+    if (ledger.phase === 'ready') {
+      if (!ledger.cleanup) return ledger
+      await finishReadyCleanup(cwd, location, ledger, ledger.cleanup)
+      const cleaned: ReadyLedger = { ...ledger }
+      delete cleaned.cleanup
+      await writeSkillLedger(location.file, cleaned, publicationKey)
+      return cleaned
+    }
+
+    const priorByPath = new Map(ledger.prior.map((entry) => [entry.relativeRoot, entry]))
+    const vanished = new Set<string>()
+    const operationRoots = new Set(ledger.operations.map((operation) => operation.relativeRoot))
+    for (const operation of [...ledger.operations].reverse()) {
+      const prior = priorByPath.get(operation.relativeRoot)
+      // Edited where it stands and never moved, so nothing of ours is there to discard or restore: give it up and leave it.
+      if (prior && (await editedInPlace(cwd, prior, operation))) {
+        vanished.add(prior.relativeRoot)
+        continue
+      }
+      await mutate(
+        {
+          action: 'discard',
+          cwd,
+          workspaceIdentity: location.workspaceIdentity,
+          relativeRoot: operation.relativeRoot,
+          tombstoneName: operation.tombstoneName,
+          operationId: operation.operationId,
+          reservationName: operation.reservationName,
+          ...(operation.reservationIdentity && operation.markerIdentity
+            ? {
+                reservation: {
+                  identity: operation.reservationIdentity,
+                  markerIdentity: operation.markerIdentity
+                }
+              }
+            : {}),
+          ...(prior ? { prior } : {})
+        },
+        []
+      )
+      if (prior) {
+        // The discard above has settled this path, so neither address holding anything proves the prior is simply gone, not un-restorable.
+        if (await priorHasNoAddress(cwd, operation)) {
+          vanished.add(prior.relativeRoot)
+          continue
+        }
+        await mutate(
+          {
+            action: 'restore',
+            cwd,
+            workspaceIdentity: location.workspaceIdentity,
+            relativeRoot: operation.relativeRoot,
+            operationId: operation.operationId,
+            quarantineName: operation.quarantineName,
+            prior
+          },
+          []
+        )
+      }
+    }
+    for (const prior of ledger.prior) {
+      if (
+        !operationRoots.has(prior.relativeRoot) &&
+        (!(await destinationOccupied(cwd, prior.relativeRoot)) || (await editedInPlace(cwd, prior)))
+      ) {
+        vanished.add(prior.relativeRoot)
+      }
+    }
+    const ready: ReadyLedger = {
+      version: 3,
+      phase: 'ready',
+      workspaceRealpath: location.workspaceRealpath,
+      workspaceIdentity: location.workspaceIdentity,
+      agentId: ledger.agentId,
+      runtime: ledger.runtime,
+      cliVersion: ledger.cliVersion,
+      ...(ledger.publicationOperationId ? { publicationOperationId: ledger.publicationOperationId } : {}),
+      // A set that lost a member no longer answers to the fingerprint that described it, or the next plan would skip reinstalling what vanished.
+      ...(ledger.priorFingerprint && vanished.size === 0 ? { fingerprint: ledger.priorFingerprint } : {}),
+      owned: ledger.prior.filter((entry) => !vanished.has(entry.relativeRoot)),
+      gitResolutions: ledger.priorGitResolutions
+    }
+    if (!(await installedBundlesIntact(cwd, ready.owned, location.workspaceIdentity))) {
+      throw safety('interrupted skill publication could not restore the prior receipt set')
+    }
+    await writeSkillLedger(location.file, ready, publicationKey)
+    return ready
+  } catch (error) {
+    if (error instanceof SkillLedgerSafetyError) throw error
+    throw safety('skill ownership recovery failed', error)
+  }
+}
+
+// Two harnesses name one root differently (.agents/skills vs .claude/skills, commonly symlinked), so key ownership by the real directory.
+async function canonicalizeRelativeRoot(cwd: string, relativeRoot: string): Promise<string> {
+  try {
+    const canonical = await canonicalSkillMutationRoot(cwd, relativeRoot)
+    if (canonical === relativeRoot) return relativeRoot
+    validateRelativeRoot(canonical)
+    return canonical
+  } catch {
+    // An alias that escapes the workspace is still refused where it is written, so keeping the original defers to that check.
+    return relativeRoot
+  }
+}
+
+async function canonicalizeCandidates(
+  cwd: string,
+  candidates: CandidateSkillBundle[]
+): Promise<CandidateSkillBundle[]> {
+  const resolved: CandidateSkillBundle[] = []
+  for (const candidate of candidates) {
+    resolved.push({ ...candidate, relativeRoot: await canonicalizeRelativeRoot(cwd, candidate.relativeRoot) })
+  }
+  return resolved
+}
+
+async function canonicalizeOwned(cwd: string, owned: OwnedSkillBundle[]): Promise<OwnedSkillBundle[]> {
+  const resolved: OwnedSkillBundle[] = []
+  for (const entry of owned) {
+    resolved.push({ ...entry, relativeRoot: await canonicalizeRelativeRoot(cwd, entry.relativeRoot) })
+  }
+  return resolved
+}
+
+async function destinationOccupied(cwd: string, relativeRoot: string): Promise<boolean> {
+  try {
+    await fsp.lstat(join(cwd, ...relativeRoot.split('/')))
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/** Whether a prior still at its own path, with no artifact of its operation beside it, no longer matches its receipt. */
+async function editedInPlace(cwd: string, prior: OwnedSkillBundle, operation?: JournalOperation): Promise<boolean> {
+  if (operation) {
+    const parent = operation.relativeRoot.split('/').slice(0, -1).join('/')
+    for (const name of [operation.quarantineName, operation.tombstoneName]) {
+      if (await destinationOccupied(cwd, `${parent}/${name}`)) return false
+    }
+  }
+  return (await destinationOccupied(cwd, prior.relativeRoot)) && !(await installedBundlesIntact(cwd, [prior]))
+}
+
+/** Whether an operation's prior bundle is at neither of the two addresses recovery can find it at: its own path, or the quarantine a mutation moves it to. */
+async function priorHasNoAddress(cwd: string, operation: JournalOperation): Promise<boolean> {
+  const parent = operation.relativeRoot.split('/').slice(0, -1).join('/')
+  if (await destinationOccupied(cwd, operation.relativeRoot)) return false
+  return !(await destinationOccupied(cwd, `${parent}/${operation.quarantineName}`))
+}
+
+export async function reconcileSkillBundles(
+  options: ReconcileSkillBundlesOptions
+): Promise<ReconcileSkillBundlesResult> {
+  const run = (): Promise<ReconcileSkillBundlesResult> => reconcileSkillBundlesLocked(options)
+  return options.lockHeld ? run() : withSkillWorkspaceLock(options.cwd, run, options.stateDir)
+}
+
+async function reconcileSkillBundlesLocked(
+  options: ReconcileSkillBundlesOptions
+): Promise<ReconcileSkillBundlesResult> {
+  let recoveryLedger: SkillInstallLedger | undefined
+  let location: SkillLedgerLocation | undefined
+  try {
+    location = await skillLedgerLocation(options.cwd, options.stateDir)
+    let ledger = options.trustedPrior ? null : await readSkillLedger(location)
+    if (ledger?.publicationOperationId && !publicationMacValid(ledger, options.publicationKey)) {
+      throw safety('cluster skill publication journal authentication failed')
+    }
+    if (options.trustedPrior) {
+      const owned: OwnedSkillBundle[] = []
+      for (const receipt of options.trustedPrior) {
+        // Missing content confers no mutation rights and can be installed again as a new bundle.
+        if (!(await destinationOccupied(options.cwd, receipt.relativeRoot))) continue
+        const found = await bundleIdentity(join(options.cwd, ...receipt.relativeRoot.split('/')), receipt)
+        if (!found) throw safety(`durable skill receipt does not match ${receipt.relativeRoot}`)
+        owned.push({ ...receipt, identity: found })
+      }
+      ledger = {
+        version: 3,
+        phase: 'ready',
+        workspaceRealpath: location.workspaceRealpath,
+        workspaceIdentity: location.workspaceIdentity,
+        agentId: options.agentId,
+        runtime: options.runtime,
+        cliVersion: options.cliVersion,
+        ...(options.publicationOperationId ? { publicationOperationId: options.publicationOperationId } : {}),
+        owned,
+        gitResolutions: []
+      }
+      await writeSkillLedger(location.file, ledger, options.publicationKey)
+    } else if (ledger) {
+      assertSkillLedgerOwner(ledger, options.agentId)
+      ledger = await recoverSkillLedger(options.cwd, location, ledger, options.publicationKey)
+    }
+    if (
+      ledger?.phase === 'ready' &&
+      ledger.fingerprint === options.fingerprint &&
+      (await installedBundlesIntact(options.cwd, ledger.owned, location.workspaceIdentity))
+    ) {
+      return { installed: [], removed: [], skipped: 'unchanged', conflicts: [], owned: ledger.owned }
+    }
+
+    const deduped = dedupeCandidates(await canonicalizeCandidates(options.cwd, options.candidates))
+    if (deduped.length > MAX_SKILL_BUNDLES) throw safety('skill installation exceeds its bundle limit')
+    const gitResolutions = validateGitResolutions(options.gitResolutions ?? [])
+    for (const candidate of deduped) {
+      validateCandidate(candidate)
+      if (!(await bundleIdentity(candidate.sourceDir, candidate))) {
+        throw safety(`candidate skill receipt does not match ${candidate.relativeRoot}`)
+      }
+    }
+
+    // Canonicalize the recorded set too: a ledger written under another harness names the same directory by its other root.
+    const recorded = await canonicalizeOwned(options.cwd, ledger?.owned ?? [])
+    // An absent recorded bundle is not stale executable content — nothing to quarantine, nothing foreign to protect — so plan its path as a first install.
+    const prior: OwnedSkillBundle[] = []
+    const modified = new Set<string>()
+    for (const entry of recorded) {
+      if (!(await destinationOccupied(options.cwd, entry.relativeRoot))) {
+        options.warn?.(`skills: recorded bundle ${entry.relativeRoot} is gone from the workspace; reinstalling`)
+      } else if (await installedBundlesIntact(options.cwd, [entry])) {
+        prior.push(entry)
+      } else {
+        // Edited since install, so no longer ours to replace or remove: give it up and leave it in place.
+        modified.add(entry.relativeRoot)
+        options.warn?.(`skills: recorded bundle ${entry.relativeRoot} was modified in the workspace; leaving it as is`)
+      }
+    }
+    const priorByPath = new Map(prior.map((entry) => [entry.relativeRoot, entry]))
+    const legacyHints = new Set<string>()
+    for (const hint of options.legacyOwned ?? []) {
+      legacyHints.add(await canonicalizeRelativeRoot(options.cwd, hint))
+    }
+    const conflicts: string[] = []
+    const candidates: CandidateSkillBundle[] = []
+    const adopted: OwnedSkillBundle[] = []
+    const kept = new Map<string, OwnedSkillBundle>()
+    for (const candidate of deduped) {
+      const priorEntry = priorByPath.get(candidate.relativeRoot)
+      if (priorEntry?.treeDigest === candidate.treeDigest) {
+        // Reuse requires both the live receipt and the recorded identity, under a contained path.
+        await canonicalSkillMutationRoot(options.cwd, candidate.relativeRoot)
+        const found = await bundleIdentity(join(options.cwd, ...candidate.relativeRoot.split('/')), candidate)
+        if (found && sameIdentity(found, priorEntry.identity)) {
+          kept.set(candidate.relativeRoot, { ...stripCandidate(candidate), identity: found })
+          continue
+        }
+      }
+      if (priorEntry || !(await destinationOccupied(options.cwd, candidate.relativeRoot))) {
+        candidates.push(candidate)
+        continue
+      }
+      if (options.allowDesiredAdoption) {
+        const found = await bundleIdentity(join(options.cwd, ...candidate.relativeRoot.split('/')), candidate)
+        if (found) {
+          adopted.push({ ...stripCandidate(candidate), identity: found })
+          continue
+        }
+      }
+      const detail = modified.has(candidate.relativeRoot)
+        ? 'it was modified after installation; remove it to reinstall'
+        : legacyHints.has(candidate.relativeRoot)
+          ? 'legacy workspace marker is not trusted; remove or migrate it explicitly'
+          : 'the path is not owned by this daemon ledger'
+      // Skipping leaves the path untouched, which is what refusing wanted; one foreign bundle must not stop every other skill.
+      conflicts.push(candidate.relativeRoot)
+      options.warn?.(`skills: skipped unowned skill ${candidate.relativeRoot}: ${detail}`)
+    }
+
+    // Desired candidates take precedence over retaining a source that could not be rebuilt.
+    const candidateRoots = new Set(candidates.map((entry) => entry.relativeRoot))
+    for (const root of options.preserveOwned ?? []) {
+      const canonical = await canonicalizeRelativeRoot(options.cwd, root)
+      const priorEntry = priorByPath.get(canonical)
+      if (priorEntry && !candidateRoots.has(canonical) && !kept.has(canonical)) kept.set(canonical, priorEntry)
+    }
+    if (adopted.length + kept.size + candidates.length > MAX_SKILL_BUNDLES) {
+      throw safety('skill installation exceeds its bundle limit')
+    }
+    const paths = [
+      ...new Set([
+        ...prior.filter((entry) => !kept.has(entry.relativeRoot)).map((entry) => entry.relativeRoot),
+        ...candidates.map((entry) => entry.relativeRoot)
+      ])
+    ].sort()
+    const operations: JournalOperation[] = paths.map((relativeRoot) => ({
+      relativeRoot,
+      operationId: randomUUID(),
+      reservationName: `.agentconnect-skill-new-${randomUUID()}`,
+      quarantineName: `.agentconnect-skill-old-${randomUUID()}`,
+      tombstoneName: `.agentconnect-skill-trash-${randomUUID()}`
+    }))
+    const nextApplying: ApplyingLedger = {
+      version: 3,
+      phase: 'applying',
+      workspaceRealpath: location.workspaceRealpath,
+      workspaceIdentity: location.workspaceIdentity,
+      agentId: options.agentId,
+      runtime: options.runtime,
+      cliVersion: options.cliVersion,
+      ...(options.publicationOperationId ? { publicationOperationId: options.publicationOperationId } : {}),
+      // A pruned set is no longer what that fingerprint described, and recovery cannot see the prune: leaving it would let the next plan skip the reinstall.
+      ...(ledger?.fingerprint && prior.length === recorded.length ? { priorFingerprint: ledger.fingerprint } : {}),
+      priorGitResolutions: ledger?.gitResolutions ?? [],
+      // Recovery retains every prior receipt, including untouched bundles whose source records may change.
+      prior,
+      pending: candidates.map(stripCandidate),
+      operations
+    }
+    options.assertMutationAuthority?.()
+    await writeSkillLedger(location.file, nextApplying, options.publicationKey)
+    // Recovery gains mutation authority only after the applying journal is durable.
+    recoveryLedger = nextApplying
+
+    const candidatesByPath = new Map(candidates.map((entry) => [entry.relativeRoot, entry]))
+    const owned: OwnedSkillBundle[] = [...adopted, ...kept.values()]
+    // Reserve every candidate's path in as few helper runs as the batch allows, then record every
+    // reservation in ONE journal write, then apply. The order per path is unchanged — reserve, a
+    // durable record of it, apply — so each populate still runs only after both of its inodes are
+    // durable, and a crash before the record leaves only empty/marker-only reservations.
+    const reserving = operations.filter((operation) => candidatesByPath.has(operation.relativeRoot))
+    if (reserving.length > 0) {
+      options.assertMutationAuthority?.()
+      const reserved = await mutateAll(
+        reserving.map((operation) => {
+          const priorEntry = priorByPath.get(operation.relativeRoot)
+          return {
+            action: 'reserve',
+            cwd: options.cwd,
+            workspaceIdentity: location!.workspaceIdentity,
+            relativeRoot: operation.relativeRoot,
+            operationId: operation.operationId,
+            reservationName: operation.reservationName,
+            quarantineName: operation.quarantineName,
+            ...(priorEntry ? { prior: priorEntry } : {})
+          }
+        }),
+        [],
+        options.mutationSignal,
+        options.assertMutationAuthority
+      )
+      for (const [index, operation] of reserving.entries()) {
+        const reservationIdentity = parseIdentity(reserved[index]!.identity)
+        const markerIdentity = parseIdentity(reserved[index]!.markerIdentity)
+        if (!reservationIdentity || !markerIdentity) {
+          throw safety(`skill publisher omitted reservation authority for ${operation.relativeRoot}`)
+        }
+        operation.reservationIdentity = reservationIdentity
+        operation.markerIdentity = markerIdentity
+      }
+      // This fsynced journal update is the deletion-authority boundary. The
+      // populate helper is not invoked until both inodes are durable, so a
+      // crash without them can leave only an empty/marker-only reservation.
+      await writeSkillLedger(location.file, nextApplying, options.publicationKey)
+      recoveryLedger = nextApplying
+    }
+    options.assertMutationAuthority?.()
+    const applied = await mutateAll(
+      operations.map((operation) => {
+        const priorEntry = priorByPath.get(operation.relativeRoot)
+        const candidate = candidatesByPath.get(operation.relativeRoot)
+        return {
+          action: 'apply',
+          cwd: options.cwd,
+          workspaceIdentity: location!.workspaceIdentity,
+          relativeRoot: operation.relativeRoot,
+          operationId: operation.operationId,
+          reservationName: operation.reservationName,
+          quarantineName: operation.quarantineName,
+          ...(operation.reservationIdentity && operation.markerIdentity
+            ? {
+                reservation: {
+                  identity: operation.reservationIdentity,
+                  markerIdentity: operation.markerIdentity
+                }
+              }
+            : {}),
+          ...(!candidate && priorEntry ? { prior: priorEntry } : {}),
+          ...(candidate ? { candidate: { ...stripCandidate(candidate), sourceDir: candidate.sourceDir } } : {})
+        }
+      }),
+      candidates.map((candidate) => candidate.sourceDir),
+      options.mutationSignal,
+      options.assertMutationAuthority
+    )
+    for (const [index, operation] of operations.entries()) {
+      const candidate = candidatesByPath.get(operation.relativeRoot)
+      if (!candidate) continue
+      const targetIdentity = parseIdentity(applied[index]!.targetIdentity)
+      if (!targetIdentity) throw safety(`skill publisher omitted the target identity for ${candidate.relativeRoot}`)
+      if (!sameIdentity(targetIdentity, operation.reservationIdentity!)) {
+        throw safety(`skill publisher changed the reservation identity for ${candidate.relativeRoot}`)
+      }
+      owned.push({ ...stripCandidate(candidate), identity: targetIdentity })
+    }
+
+    const readyWithCleanup: ReadyLedger = {
+      version: 3,
+      phase: 'ready',
+      workspaceRealpath: location.workspaceRealpath,
+      workspaceIdentity: location.workspaceIdentity,
+      agentId: options.agentId,
+      runtime: options.runtime,
+      cliVersion: options.cliVersion,
+      ...(options.publicationOperationId ? { publicationOperationId: options.publicationOperationId } : {}),
+      // A skipped conflict leaves the plan unmet, so keep the fingerprint non-matching and let the next preparation retry once the path is clear.
+      fingerprint: conflicts.length > 0 ? `conflicts:${randomUUID()}` : options.fingerprint,
+      owned,
+      gitResolutions,
+      cleanup: { operations, prior }
+    }
+    options.assertMutationAuthority?.()
+    await writeSkillLedger(location.file, readyWithCleanup, options.publicationKey)
+    recoveryLedger = readyWithCleanup
+    await finishReadyCleanup(
+      options.cwd,
+      location,
+      readyWithCleanup,
+      readyWithCleanup.cleanup!,
+      options.assertMutationAuthority,
+      options.mutationSignal
+    )
+    const ready: ReadyLedger = { ...readyWithCleanup }
+    delete ready.cleanup
+    await writeSkillLedger(location.file, ready, options.publicationKey)
+    if (!(await installedBundlesIntact(options.cwd, owned, location.workspaceIdentity))) {
+      throw safety('published skill set failed final receipt verification')
+    }
+    return {
+      installed: candidates.map((entry) => entry.relativeRoot),
+      // Replaced and vanished prior bundles count as removed; untouched bundles do not.
+      removed: recorded
+        .filter((entry) => !kept.has(entry.relativeRoot) && !modified.has(entry.relativeRoot))
+        .map((entry) => entry.relativeRoot),
+      skipped: null,
+      conflicts,
+      owned
+    }
+  } catch (error) {
+    if (recoveryLedger && location) {
+      try {
+        await recoverSkillLedger(options.cwd, location, recoveryLedger, options.publicationKey)
+      } catch (recoveryError) {
+        // Name the failure that started this too: recovery's own error alone has sent readers hunting the wrong defect.
+        throw safety(
+          `skill installation failed and the prior executable set could not be restored (installation failure: ${messageChain(error)})`,
+          recoveryError
+        )
+      }
+    }
+    if (error instanceof SkillLedgerSafetyError) throw error
+    throw safety('skill ownership reconciliation failed', error)
+  }
+}
+
+async function finishReadyCleanup(
+  cwd: string,
+  location: SkillLedgerLocation,
+  ledger: ReadyLedger,
+  cleanup: ReadyCleanup,
+  assertMutationAuthority?: () => void,
+  mutationSignal?: AbortSignal
+): Promise<void> {
+  const ownedByPath = new Map(ledger.owned.map((entry) => [entry.relativeRoot, entry]))
+  const priorByPath = new Map(cleanup.prior.map((entry) => [entry.relativeRoot, entry]))
+  // The same steps in the same order as one mutation each; only the number of helper runs changes.
+  const steps: Array<{ cwd: string } & Record<string, unknown>> = []
+  for (const operation of cleanup.operations) {
+    const owned = ownedByPath.get(operation.relativeRoot)
+    if (owned) {
+      if (!operation.markerIdentity) throw safety('ready cleanup is missing reservation marker authority')
+      steps.push({
+        action: 'finalize',
+        cwd,
+        workspaceIdentity: location.workspaceIdentity,
+        relativeRoot: operation.relativeRoot,
+        operationId: operation.operationId,
+        markerIdentity: operation.markerIdentity,
+        expected: owned
+      })
+    }
+    const prior = priorByPath.get(operation.relativeRoot)
+    if (prior) {
+      steps.push({
+        action: 'cleanup',
+        cwd,
+        workspaceIdentity: location.workspaceIdentity,
+        relativeRoot: operation.relativeRoot,
+        name: operation.quarantineName,
+        tombstoneName: operation.tombstoneName,
+        expected: prior
+      })
+    }
+  }
+  await mutateAll(steps, [], mutationSignal, assertMutationAuthority)
+  await assertCurrentWorkspace(cwd, location.workspaceIdentity)
+}
+
+async function mutate(
+  spec: { cwd: string } & Record<string, unknown>,
+  readRoots: string[],
+  signal?: AbortSignal
+): Promise<Record<string, unknown>> {
+  try {
+    return await runSkillWorkspaceMutation(spec, readRoots, signal)
+  } catch (error) {
+    throw safety('confined skill workspace mutation was refused', error)
+  }
+}
+
+// Under the helper's own 2 MiB spec cap, with room for the batch envelope.
+const MAX_MUTATION_BATCH_BYTES = 1536 * 1024
+
+/**
+ * Run mutations of one workspace in order, as few helper runs as the batch limits allow. Authority
+ * is asserted before each run; within a run the mutation signal still stops the helper at once.
+ */
+async function mutateAll(
+  specs: Array<{ cwd: string } & Record<string, unknown>>,
+  readRoots: string[],
+  signal?: AbortSignal,
+  assertMutationAuthority?: () => void
+): Promise<Record<string, unknown>[]> {
+  const results: Record<string, unknown>[] = []
+  let batch: typeof specs = []
+  let bytes = 0
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return
+    assertMutationAuthority?.()
+    try {
+      results.push(...(await runSkillWorkspaceMutations(batch, readRoots, signal)))
+    } catch (error) {
+      throw safety('confined skill workspace mutation was refused', error)
+    }
+    batch = []
+    bytes = 0
+  }
+  for (const spec of specs) {
+    const size = Buffer.byteLength(JSON.stringify(spec))
+    if (batch.length >= MAX_MUTATION_BATCH_STEPS || (batch.length > 0 && bytes + size > MAX_MUTATION_BATCH_BYTES)) {
+      await flush()
+    }
+    batch.push(spec)
+    bytes += size
+  }
+  await flush()
+  return results
+}
+
+const BYTECODE_CACHE_DIR = '__pycache__'
+
+/** Python's bytecode cache from running a bundled script is regenerated on demand, so it does not make a bundle
+ *  read as edited; this check stays read-only and the confined mutation helper removes it before a replacement.
+ *  A cache the receipt itself names is installed content and is compared like any other. */
+function withoutBytecodeCaches(files: SkillFileReceipt[], bundle: SkillBundleReceipt): SkillFileReceipt[] {
+  const owned = new Set<string>()
+  for (const file of bundle.files) {
+    const parts = file.path.split('/')
+    for (let index = 1; index < parts.length; index += 1) owned.add(parts.slice(0, index).join('/'))
+  }
+  return files.filter((file) => {
+    const parts = file.path.split('/')
+    return !parts
+      .slice(0, -1)
+      .some((part, index) => part === BYTECODE_CACHE_DIR && !owned.has(parts.slice(0, index + 1).join('/')))
+  })
+}
+
+async function bundleIdentity(root: string, bundle: SkillBundleReceipt): Promise<PathIdentity | null> {
+  try {
+    validateReceipt(bundle)
+    const before = await fsp.lstat(root, { bigint: true })
+    if (!before.isDirectory() || before.isSymbolicLink()) return null
+    const inspected = await inspectLocalSkillSource(root)
+    const files = withoutBytecodeCaches(
+      inspected.files.map((file) => ({
+        path: file.path,
+        mode: file.mode & 0o111 ? 0o700 : 0o600,
+        size: file.size,
+        sha256: file.sha256.replace(/^sha256:/, '')
+      })),
+      bundle
+    )
+    const after = await fsp.lstat(root, { bigint: true })
+    if (!after.isDirectory() || !sameIdentity(identity(before), identity(after))) return null
+    return JSON.stringify(files) === JSON.stringify(bundle.files) && treeDigest(files) === bundle.treeDigest
+      ? identity(after)
+      : null
+  } catch {
+    return null
+  }
+}
+
+/** Verify an externally stored receipt without granting ownership or consulting local state. */
+export async function skillBundleReceiptIntact(
+  cwd: string,
+  bundle: { relativeRoot: string; sourceKey: string; treeDigest: string; files: SkillFileReceipt[] }
+): Promise<boolean> {
+  return (await bundleIdentity(join(cwd, ...bundle.relativeRoot.split('/')), bundle)) !== null
+}
+
+/** Whether the workspace's ready ledger published exactly `roots` under this plan fingerprint, all still intact on disk. */
+export async function publishedSkillSetUnchanged(options: {
+  cwd: string
+  stateDir: string
+  agentId: string
+  runtime: string
+  cliVersion: string
+  fingerprint: string
+  roots: SkillBundleReceipt[]
+}): Promise<boolean> {
+  const receipt = (bundle: SkillBundleReceipt): string =>
+    JSON.stringify([bundle.relativeRoot, bundle.sourceKey, bundle.treeDigest, bundle.files])
+  const set = (bundles: SkillBundleReceipt[]): string => JSON.stringify(bundles.map(receipt).sort())
+  try {
+    return await withSkillWorkspaceLock(
+      options.cwd,
+      async () => {
+        const location = await skillLedgerLocation(options.cwd, options.stateDir)
+        const ledger = await readSkillLedger(location)
+        return (
+          ledger?.phase === 'ready' &&
+          !ledger.cleanup &&
+          ledger.agentId === options.agentId &&
+          ledger.runtime === options.runtime &&
+          ledger.cliVersion === options.cliVersion &&
+          ledger.fingerprint === options.fingerprint &&
+          set(ledger.owned) === set(options.roots) &&
+          (await installedBundlesIntact(options.cwd, ledger.owned, location.workspaceIdentity))
+        )
+      },
+      options.stateDir
+    )
+  } catch {
+    return false
+  }
+}
+
+export function treeDigest(files: SkillFileReceipt[]): string {
+  return createHash('sha256').update(JSON.stringify(files)).digest('hex')
+}
+
+function validateRelativeRoot(value: string): void {
+  if (
+    isAbsolute(value) ||
+    value.includes('\0') ||
+    value.includes('\\') ||
+    Buffer.byteLength(value, 'utf8') > MAX_SKILL_PATH_BYTES
+  ) {
+    throw safety(`unsafe skill receipt path: ${value}`)
+  }
+  const parts = value.split('/')
+  if (
+    parts.length < 2 ||
+    parts.length > MAX_LAYOUT_SEGMENTS ||
+    parts.at(-2) !== 'skills' ||
+    !SAFE_BUNDLE.test(parts.at(-1)!) ||
+    parts.slice(0, -1).some((part) => !SAFE_LAYOUT_SEGMENT.test(part)) ||
+    RESERVED_FIRST.has(parts[0]!.toLowerCase())
+  ) {
+    throw safety(`unsafe skill receipt path: ${value}`)
+  }
+}
+
+function validateReceipt(bundle: SkillBundleReceipt): void {
+  validateRelativeRoot(bundle.relativeRoot)
+  if (
+    typeof bundle.sourceKey !== 'string' ||
+    bundle.sourceKey.length === 0 ||
+    Buffer.byteLength(bundle.sourceKey, 'utf8') > 4_096 ||
+    CONTROL_RE.test(bundle.sourceKey) ||
+    !/^[a-f0-9]{64}$/.test(bundle.treeDigest) ||
+    !Array.isArray(bundle.files) ||
+    bundle.files.length === 0 ||
+    bundle.files.length > MAX_SKILL_RECEIPT_FILES
+  ) {
+    throw safety('invalid skill bundle receipt')
+  }
+  const seen = new Set<string>()
+  let bytes = 0
+  let priorPath = ''
+  for (const file of bundle.files) {
+    const parts = file.path.split('/')
+    if (
+      !file.path ||
+      isAbsolute(file.path) ||
+      file.path.includes('\\') ||
+      file.path.includes('\0') ||
+      CONTROL_RE.test(file.path) ||
+      parts.some((part) => !part || part === '.' || part === '..') ||
+      parts.length > 32 ||
+      Buffer.byteLength(file.path, 'utf8') > MAX_SKILL_PATH_BYTES ||
+      (file.mode !== 0o600 && file.mode !== 0o700) ||
+      !Number.isSafeInteger(file.size) ||
+      file.size < 0 ||
+      file.size > MAX_RECEIPT_FILE_BYTES ||
+      !/^[a-f0-9]{64}$/.test(file.sha256) ||
+      seen.has(file.path) ||
+      (priorPath && priorPath >= file.path)
+    ) {
+      throw safety('invalid skill file receipt')
+    }
+    bytes += file.size
+    if (bytes > MAX_RECEIPT_BYTES) throw safety('skill bundle receipt exceeds its byte limit')
+    seen.add(file.path)
+    priorPath = file.path
+  }
+  if (!seen.has('SKILL.md') || treeDigest(bundle.files) !== bundle.treeDigest) {
+    throw safety('invalid skill tree receipt')
+  }
+}
+
+function validateOwned(bundle: OwnedSkillBundle): void {
+  validateReceipt(bundle)
+  validateIdentity(bundle.identity)
+}
+
+function validateCandidate(bundle: CandidateSkillBundle): void {
+  validateReceipt(bundle)
+  if (typeof bundle.sourceDir !== 'string' || !isAbsolute(bundle.sourceDir))
+    throw safety('invalid candidate source path')
+}
+
+function stripCandidate(candidate: CandidateSkillBundle): SkillBundleReceipt {
+  return {
+    relativeRoot: candidate.relativeRoot,
+    sourceKey: candidate.sourceKey,
+    treeDigest: candidate.treeDigest,
+    files: candidate.files
+  }
+}
+
+function dedupeCandidates(candidates: CandidateSkillBundle[]): CandidateSkillBundle[] {
+  const byExact = new Map<string, CandidateSkillBundle>()
+  const byFold = new Map<string, string>()
+  for (const candidate of candidates) {
+    validateCandidate(candidate)
+    const folded = candidate.relativeRoot.toLowerCase()
+    const prior = byFold.get(folded)
+    if (prior && prior !== candidate.relativeRoot) {
+      throw safety(`case-folded skill destination collision: ${prior} and ${candidate.relativeRoot}`)
+    }
+    byFold.set(folded, candidate.relativeRoot)
+    byExact.set(candidate.relativeRoot, candidate)
+  }
+  return [...byExact.values()].sort((a, b) => a.relativeRoot.localeCompare(b.relativeRoot))
+}
+
+interface LockOwner {
+  pid: number
+  token: string
+  helperPgid?: number
+}
+
+interface ExternalWorkspaceLock extends SkillMutationHelperLease {
+  release(): Promise<void>
+}
+
+async function acquireExternalWorkspaceLock(workspaceKey: string, stateDir: string): Promise<ExternalWorkspaceLock> {
+  const lockRoot = join(stateDir, 'workspace-skill-locks')
+  await ensureTrustedStateDir(stateDir, lockRoot)
+  const key = createHash('sha256').update(workspaceKey).digest('hex')
+  const databaseFile = join(lockRoot, 'leases.sqlite3')
+  await ensureLockDatabaseFile(databaseFile, lockRoot)
+  const token = randomUUID()
+  const deadline = Date.now() + EXTERNAL_LOCK_WAIT_MS
+  const database = await openLockDatabase(databaseFile, deadline)
+
+  try {
+    for (;;) {
+      let acquired = false
+      try {
+        acquired = withImmediateTransaction(database, () => {
+          const existing = readDatabaseLockOwner(database, key)
+          if (
+            existing &&
+            (processAlive(existing.pid) || (existing.helperPgid && mutationHelperAlive(existing.helperPgid)))
+          ) {
+            return false
+          }
+
+          if (existing) {
+            const changed = database
+              .prepare(
+                `UPDATE workspace_skill_leases
+                    SET owner_pid = ?, owner_token = ?, helper_pgid = NULL, updated_at = ?
+                  WHERE workspace_key = ? AND owner_pid = ? AND owner_token = ?`
+              )
+              .run(process.pid, token, Date.now(), key, existing.pid, existing.token).changes
+            if (changed !== 1) throw safety('workspace skill lock ownership changed during reclaim')
+          } else {
+            database
+              .prepare(
+                `INSERT INTO workspace_skill_leases
+                   (workspace_key, owner_pid, owner_token, helper_pgid, updated_at)
+                 VALUES (?, ?, ?, NULL, ?)`
+              )
+              .run(key, process.pid, token, Date.now())
+          }
+          return true
+        })
+      } catch (error) {
+        if (!isSqliteBusy(error)) throw error
+      }
+      if (acquired) break
+      if (Date.now() >= deadline) throw safety('timed out waiting for the workspace skill lock')
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50))
+    }
+  } catch (error) {
+    database.close()
+    if (error instanceof SkillLedgerSafetyError) throw error
+    throw safety('workspace skill lock failed', error)
+  }
+
+  return {
+    async registerHelper(pgid) {
+      if (!Number.isSafeInteger(pgid) || pgid <= 0 || !mutationHelperAlive(pgid)) {
+        throw safety('skill mutation helper is unavailable')
+      }
+      await withImmediateTransactionRetry(database, () => {
+        if (!mutationHelperAlive(pgid)) throw safety('skill mutation helper is unavailable')
+        const owner = readDatabaseLockOwner(database, key)
+        if (!owner || owner.pid !== process.pid || owner.token !== token || owner.helperPgid !== undefined) {
+          throw safety('workspace skill lock ownership changed')
+        }
+        const changed = database
+          .prepare(
+            `UPDATE workspace_skill_leases
+                SET helper_pgid = ?, updated_at = ?
+              WHERE workspace_key = ? AND owner_pid = ? AND owner_token = ? AND helper_pgid IS NULL`
+          )
+          .run(pgid, Date.now(), key, process.pid, token).changes
+        if (changed !== 1) throw safety('workspace skill lock ownership changed')
+      })
+    },
+    async clearHelper(pgid) {
+      if (!Number.isSafeInteger(pgid) || pgid <= 0) throw safety('invalid skill mutation helper process group')
+      if (mutationHelperAlive(pgid)) throw safety('skill mutation helper is still alive')
+      await withImmediateTransactionRetry(database, () => {
+        if (mutationHelperAlive(pgid)) throw safety('skill mutation helper is still alive')
+        const owner = readDatabaseLockOwner(database, key)
+        if (!owner || owner.pid !== process.pid || owner.token !== token || owner.helperPgid !== pgid) {
+          throw safety('workspace skill lock ownership changed')
+        }
+        const changed = database
+          .prepare(
+            `UPDATE workspace_skill_leases
+                SET helper_pgid = NULL, updated_at = ?
+              WHERE workspace_key = ? AND owner_pid = ? AND owner_token = ? AND helper_pgid = ?`
+          )
+          .run(Date.now(), key, process.pid, token, pgid).changes
+        if (changed !== 1) throw safety('workspace skill lock ownership changed')
+      })
+    },
+    async release() {
+      try {
+        await withImmediateTransactionRetry(database, () => {
+          const changed = database
+            .prepare(
+              `DELETE FROM workspace_skill_leases
+                WHERE workspace_key = ? AND owner_pid = ? AND owner_token = ? AND helper_pgid IS NULL`
+            )
+            .run(key, process.pid, token).changes
+          if (changed !== 1) throw safety('workspace skill lock ownership changed')
+        })
+      } finally {
+        database.close()
+      }
+    }
+  }
+}
+
+async function openLockDatabase(path: string, deadline: number): Promise<DatabaseSync> {
+  for (;;) {
+    let database: DatabaseSync | undefined
+    try {
+      database = new DatabaseSync(path, {
+        timeout: EXTERNAL_LOCK_BUSY_MS,
+        allowExtension: false,
+        enableDoubleQuotedStringLiterals: false
+      })
+      database.enableDefensive(true)
+      database.exec(`
+        PRAGMA synchronous = FULL;
+        PRAGMA trusted_schema = OFF;
+        CREATE TABLE IF NOT EXISTS workspace_skill_leases (
+          workspace_key TEXT PRIMARY KEY NOT NULL,
+          owner_pid INTEGER NOT NULL,
+          owner_token TEXT NOT NULL,
+          helper_pgid INTEGER,
+          updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID;
+      `)
+      return database
+    } catch (error) {
+      database?.close()
+      // A peer's commit can outlast the busy timeout on a slow disk; wait it out as the acquire loop does.
+      if (!isSqliteBusy(error) || Date.now() >= deadline) {
+        throw safety('workspace skill lock database is unavailable', error)
+      }
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50))
+  }
+}
+
+async function ensureLockDatabaseFile(path: string, parent: string): Promise<void> {
+  try {
+    const handle = await fsp.open(path, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_RDWR, 0o600)
+    try {
+      await handle.chmod(0o600)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await syncDirectory(parent)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+      throw safety('workspace skill lock database could not be created', error)
+    }
+  }
+
+  const stat = await fsp.lstat(path)
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw safety('workspace skill lock database path is unsafe')
+  }
+  if (typeof process.geteuid === 'function' && stat.uid !== process.geteuid()) {
+    throw safety('workspace skill lock database has another owner')
+  }
+  await fsp.chmod(path, 0o600)
+}
+
+function readDatabaseLockOwner(database: DatabaseSync, key: string): LockOwner | null {
+  const value = database
+    .prepare(
+      `SELECT owner_pid AS pid, owner_token AS token, helper_pgid AS helperPgid
+         FROM workspace_skill_leases
+        WHERE workspace_key = ?`
+    )
+    .get(key) as { pid?: unknown; token?: unknown; helperPgid?: unknown } | undefined
+  if (!value) return null
+  if (
+    !Number.isSafeInteger(value.pid) ||
+    (value.pid as number) <= 0 ||
+    typeof value.token !== 'string' ||
+    value.token.length > 128 ||
+    (value.helperPgid !== null && (!Number.isSafeInteger(value.helperPgid) || (value.helperPgid as number) <= 0))
+  ) {
+    throw safety('workspace skill lock database contains an invalid lease')
+  }
+  return {
+    pid: value.pid as number,
+    token: value.token,
+    ...(value.helperPgid === null ? {} : { helperPgid: value.helperPgid as number })
+  }
+}
+
+function withImmediateTransaction<T>(database: DatabaseSync, fn: () => T): T {
+  database.exec('BEGIN IMMEDIATE')
+  try {
+    const result = fn()
+    database.exec('COMMIT')
+    return result
+  } catch (error) {
+    try {
+      database.exec('ROLLBACK')
+    } catch {
+      // Preserve the original error. SQLite rolls back open transactions when
+      // the connection closes, and the caller fails closed on this lease.
+    }
+    throw error
+  }
+}
+
+async function withImmediateTransactionRetry<T>(database: DatabaseSync, fn: () => T): Promise<T> {
+  const deadline = Date.now() + EXTERNAL_LOCK_WAIT_MS
+  for (;;) {
+    try {
+      return withImmediateTransaction(database, fn)
+    } catch (error) {
+      if (!isSqliteBusy(error)) throw error
+      if (Date.now() >= deadline) throw safety('timed out updating the workspace skill lock', error)
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50))
+    }
+  }
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code
+  return code === 'ERR_SQLITE_ERROR' && /database is locked|database is busy/i.test(String((error as Error).message))
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+function processGroupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+function mutationHelperAlive(id: number): boolean {
+  return process.platform === 'win32' ? processAlive(id) : processGroupAlive(id)
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return
+  const handle = await fsp.open(path, fsConstants.O_RDONLY)
+  try {
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+}
+
+async function ensureTrustedStateDir(stateDir: string, child: string): Promise<void> {
+  await fsp.mkdir(stateDir, { recursive: true, mode: 0o700 })
+  const state = await fsp.lstat(stateDir)
+  if (!state.isDirectory() || state.isSymbolicLink()) throw safety('skill state directory is unsafe')
+  if (typeof process.geteuid === 'function' && state.uid !== process.geteuid()) {
+    throw safety('skill state directory has another owner')
+  }
+  await fsp.chmod(stateDir, 0o700)
+  await fsp.mkdir(child, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'EEXIST') throw error
+  })
+  const childStat = await fsp.lstat(child)
+  if (!childStat.isDirectory() || childStat.isSymbolicLink()) throw safety('skill ledger directory is unsafe')
+  const stateReal = await fsp.realpath(stateDir)
+  const childReal = await fsp.realpath(child)
+  if (!under(stateReal, childReal)) throw safety('skill ledger directory escapes its state root')
+  await fsp.chmod(childReal, 0o700)
+}
+
+function publicationMac(ledger: SkillInstallLedger, key?: string): string {
+  if (!key || !/^[a-f0-9]{64}$/.test(key)) throw safety('cluster skill publication key is unavailable')
+  const { publicationMac: _publicationMac, ...unsigned } = ledger
+  return createHmac('sha256', Buffer.from(key, 'hex')).update(canonicalJson(unsigned)).digest('hex')
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+function publicationMacValid(ledger: SkillInstallLedger, key?: string): boolean {
+  if (!ledger.publicationMac) return false
+  const expected = publicationMac(ledger, key)
+  return timingSafeEqual(Buffer.from(ledger.publicationMac, 'hex'), Buffer.from(expected, 'hex'))
+}
+
+async function writeSkillLedger(file: string, ledger: SkillInstallLedger, publicationKey?: string): Promise<void> {
+  const signed = ledger.publicationOperationId
+    ? { ...ledger, publicationMac: publicationMac(ledger, publicationKey) }
+    : ledger
+  const body = `${JSON.stringify(signed)}\n`
+  if (Buffer.byteLength(body) > MAX_SKILL_LEDGER_BYTES) throw safety('skill ownership ledger exceeds its size limit')
+  const temp = join(dirname(file), `.${basename(file)}.${randomUUID()}.tmp`)
+  const handle = await fsp.open(temp, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600)
+  try {
+    await handle.writeFile(body)
+    await handle.chmod(0o600)
+    await handle.sync()
+  } finally {
+    await handle.close()
+  }
+  try {
+    await fsp.rename(temp, file)
+    await syncDirectory(dirname(file))
+  } catch (error) {
+    await fsp.rm(temp, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
+function parseLedger(value: unknown, location: SkillLedgerLocation): SkillInstallLedger {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw safety('skill ownership ledger is invalid')
+  const row = value as Record<string, unknown>
+  const recorded = parseRequiredIdentity(row.workspaceIdentity)
+  if (
+    row.version !== 3 ||
+    row.workspaceRealpath !== location.workspaceRealpath ||
+    recorded.ino !== location.workspaceIdentity.ino ||
+    (row.phase !== 'ready' && row.phase !== 'applying') ||
+    typeof row.agentId !== 'string' ||
+    row.agentId.length === 0 ||
+    typeof row.runtime !== 'string' ||
+    typeof row.cliVersion !== 'string'
+  ) {
+    throw safety('skill ownership ledger is invalid')
+  }
+  // A reboot can renumber the workspace's device under unchanged files; identities recorded on it move with it.
+  const rebase = (id: PathIdentity): PathIdentity =>
+    id.dev === recorded.dev ? { dev: location.workspaceIdentity.dev, ino: id.ino } : id
+  const base: LedgerBase = {
+    version: 3,
+    workspaceRealpath: location.workspaceRealpath,
+    workspaceIdentity: location.workspaceIdentity,
+    agentId: row.agentId,
+    runtime: row.runtime,
+    cliVersion: row.cliVersion,
+    ...(typeof row.publicationOperationId === 'string' && SAFE_OPERATION.test(row.publicationOperationId)
+      ? { publicationOperationId: row.publicationOperationId }
+      : {}),
+    ...(typeof row.publicationMac === 'string' && /^[a-f0-9]{64}$/.test(row.publicationMac)
+      ? { publicationMac: row.publicationMac }
+      : {})
+  }
+  if (row.publicationOperationId !== undefined && base.publicationOperationId === undefined) {
+    throw safety('skill ownership ledger has an invalid publication operation')
+  }
+  if (row.publicationMac !== undefined && base.publicationMac === undefined) {
+    throw safety('skill ownership ledger has an invalid publication authentication code')
+  }
+  if (row.phase === 'ready') {
+    return {
+      ...base,
+      phase: 'ready',
+      ...(typeof row.fingerprint === 'string' ? { fingerprint: row.fingerprint } : {}),
+      owned: parseOwnedList(row.owned, rebase),
+      gitResolutions: validateGitResolutions(row.gitResolutions ?? []),
+      ...(row.cleanup === undefined ? {} : { cleanup: parseCleanup(row.cleanup, rebase) })
+    }
+  }
+  return {
+    ...base,
+    phase: 'applying',
+    ...(typeof row.priorFingerprint === 'string' ? { priorFingerprint: row.priorFingerprint } : {}),
+    priorGitResolutions: validateGitResolutions(row.priorGitResolutions ?? []),
+    prior: parseOwnedList(row.prior, rebase),
+    pending: parseReceiptList(row.pending),
+    operations: parseOperations(row.operations, rebase)
+  }
+}
+
+function validateGitResolutions(value: unknown): SkillGitResolution[] {
+  if (!Array.isArray(value) || value.length > 64) throw safety('skill ownership ledger has invalid Git resolutions')
+  const seen = new Set<string>()
+  return value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw safety('skill ownership ledger has invalid Git resolutions')
+      }
+      const resolution = entry as SkillGitResolution
+      if (
+        !/^[a-f0-9]{64}$/.test(resolution.definitionDigest) ||
+        !/^[a-f0-9]{40}$/.test(resolution.resolvedCommit) ||
+        seen.has(resolution.definitionDigest)
+      ) {
+        throw safety('skill ownership ledger has invalid Git resolutions')
+      }
+      seen.add(resolution.definitionDigest)
+      return { ...resolution }
+    })
+    .sort((a, b) => a.definitionDigest.localeCompare(b.definitionDigest))
+}
+
+function parseOwnedList(value: unknown, rebase: (id: PathIdentity) => PathIdentity): OwnedSkillBundle[] {
+  if (!Array.isArray(value) || value.length > MAX_SKILL_BUNDLES) throw safety('skill ownership ledger is invalid')
+  return value.map((entry) => {
+    validateOwned(entry as OwnedSkillBundle)
+    return { ...(entry as OwnedSkillBundle), identity: rebase((entry as OwnedSkillBundle).identity) }
+  })
+}
+
+function parseReceiptList(value: unknown): SkillBundleReceipt[] {
+  if (!Array.isArray(value) || value.length > MAX_SKILL_BUNDLES) throw safety('skill ownership ledger is invalid')
+  return value.map((entry) => {
+    validateReceipt(entry as SkillBundleReceipt)
+    return entry as SkillBundleReceipt
+  })
+}
+
+function parseOperations(value: unknown, rebase: (id: PathIdentity) => PathIdentity): JournalOperation[] {
+  if (!Array.isArray(value) || value.length > 128) throw safety('skill ownership ledger is invalid')
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw safety('skill ownership ledger is invalid')
+    const operation = entry as JournalOperation
+    validateRelativeRoot(operation.relativeRoot)
+    if (
+      !SAFE_OPERATION.test(operation.operationId) ||
+      !SAFE_QUARANTINE.test(operation.reservationName) ||
+      !SAFE_QUARANTINE.test(operation.quarantineName) ||
+      !SAFE_QUARANTINE.test(operation.tombstoneName) ||
+      (operation.reservationIdentity === undefined) !== (operation.markerIdentity === undefined)
+    ) {
+      throw safety('skill ownership ledger is invalid')
+    }
+    if (operation.reservationIdentity) validateIdentity(operation.reservationIdentity)
+    if (operation.markerIdentity) validateIdentity(operation.markerIdentity)
+    return {
+      relativeRoot: operation.relativeRoot,
+      operationId: operation.operationId,
+      reservationName: operation.reservationName,
+      quarantineName: operation.quarantineName,
+      tombstoneName: operation.tombstoneName,
+      ...(operation.reservationIdentity && operation.markerIdentity
+        ? {
+            reservationIdentity: rebase(operation.reservationIdentity),
+            markerIdentity: rebase(operation.markerIdentity)
+          }
+        : {})
+    }
+  })
+}
+
+function parseCleanup(value: unknown, rebase: (id: PathIdentity) => PathIdentity): ReadyCleanup {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw safety('skill ownership ledger is invalid')
+  const cleanup = value as Record<string, unknown>
+  return { operations: parseOperations(cleanup.operations, rebase), prior: parseOwnedList(cleanup.prior, rebase) }
+}
+
+function identity(stat: BigIntStats): PathIdentity {
+  return { dev: stat.dev.toString(), ino: stat.ino.toString() }
+}
+
+function parseIdentity(value: unknown): PathIdentity | null {
+  try {
+    validateIdentity(value as PathIdentity)
+    return value as PathIdentity
+  } catch {
+    return null
+  }
+}
+
+function parseRequiredIdentity(value: unknown): PathIdentity {
+  const parsed = parseIdentity(value)
+  if (!parsed) throw safety('skill ownership ledger has an invalid filesystem identity')
+  return parsed
+}
+
+function validateIdentity(value: PathIdentity): void {
+  if (!value || typeof value !== 'object' || !/^\d+$/.test(value.dev) || !/^\d+$/.test(value.ino)) {
+    throw safety('invalid skill filesystem identity')
+  }
+}
+
+function sameIdentity(left: PathIdentity, right: PathIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino
+}
+
+async function assertCurrentWorkspace(cwd: string, expected: PathIdentity): Promise<void> {
+  const lexical = resolve(cwd)
+  const real = await fsp.realpath(lexical)
+  await assertWorkspaceIdentity(lexical, real, expected)
+}
+
+async function assertWorkspaceIdentity(
+  lexical: string,
+  expectedRealpath: string,
+  expected: PathIdentity
+): Promise<void> {
+  const stat = await fsp.lstat(lexical, { bigint: true })
+  if (
+    !stat.isDirectory() ||
+    stat.isSymbolicLink() ||
+    (await fsp.realpath(lexical)) !== expectedRealpath ||
+    !sameIdentity(identity(stat), expected)
+  ) {
+    throw safety('skill workspace incarnation changed')
+  }
+}
+
+function safety(message: string, cause?: unknown): SkillLedgerSafetyError {
+  return new SkillLedgerSafetyError(message, cause === undefined ? undefined : { cause })
+}
+
+/** Every message down a cause chain, so quoting one error never hides the one a reader needs. */
+function messageChain(error: unknown): string {
+  const parts: string[] = []
+  const seen = new Set<unknown>()
+  let current: unknown = error
+  while (current instanceof Error && !seen.has(current) && parts.length < 6) {
+    seen.add(current)
+    parts.push(current.message)
+    current = (current as { cause?: unknown }).cause
+  }
+  return parts.join(': ') || String(error)
+}

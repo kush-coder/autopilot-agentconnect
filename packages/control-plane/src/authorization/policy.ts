@@ -1,0 +1,290 @@
+// Human authorization after authentication and organization selection; see docs/designs/authorization-policy.md.
+import { isAppendCoordinate, isCoordinatorCoordinate, isSubsessionCoordinate } from '@agentconnect.md/protocol'
+import type { SessionExternalAccessSnapshot, SessionVisibility, Shareable, ViewCtx } from '../persistence/ports.js'
+
+export type { Shareable, ViewCtx } from '../persistence/ports.js'
+
+export const AuthorizationAction = {
+  OrganizationWrite: 'organization.write',
+  OrganizationManage: 'organization.manage',
+  OrganizationMembershipRemove: 'organization.membership.remove',
+  UsageAttributeAll: 'usage.attribute.all',
+  ResourceView: 'resource.view',
+  ResourceEdit: 'resource.edit',
+  ResourceManageSharing: 'resource.sharing.manage',
+  DaemonKeyIssue: 'daemon.key.issue',
+  SessionView: 'session.view',
+  SessionChangeVisibility: 'session.visibility.change',
+  SessionContinue: 'session.continue'
+} as const
+
+export type AuthorizationAction = (typeof AuthorizationAction)[keyof typeof AuthorizationAction]
+
+/** The visibility-bearing session fields needed by the policy. */
+export interface SessionViewable {
+  visibility: SessionVisibility
+  ownerIdentity: string | null
+  externalProvider?: string | null
+  externalScopeId?: string | null
+  externalResolution?: 'pending' | 'settled' | 'invalid' | null
+  classifiedPolicyRev?: bigint | null
+  /** The session's thread coordinate; null when it has none. Omitted means unread, which
+   *  `session.visibility.change` treats as an `append` coordinate (fail closed). */
+  thread?: string | null
+  /** The session's platform; unread means not webchat, so a coordinator coordinate stays shared (fail closed). */
+  platform?: string | null
+  /** What recognises an agent's own background work; unread on a `subsession:` coordinate counts as it. */
+  subsession?: SubsessionFacts
+  /** The session owning this one as a task now; a task takes its owner's audience (auto-session-mode.md §6.2). */
+  taskParentSessionId?: string | null
+  /** The webchat coordinator read as this task's owning session; its tasks are their owner's to change (auto-session-mode.md §10). */
+  webchatCoordinatorTaskOf?: string | null
+}
+
+/** The lineage of a session on a `subsession:` coordinate (assistant-mode.md §5.6). */
+export interface SubsessionFacts {
+  parentSessionId: string | null
+  /** The parent session's agent; null when there is no parent row. */
+  parentAgentId: string | null
+  agentId: string
+}
+
+export type AuthorizationRequest =
+  | {
+      action:
+        | typeof AuthorizationAction.OrganizationWrite
+        | typeof AuthorizationAction.OrganizationManage
+        | typeof AuthorizationAction.UsageAttributeAll
+    }
+  | {
+      action: typeof AuthorizationAction.OrganizationMembershipRemove
+      targetUserId: string
+    }
+  | {
+      action:
+        | typeof AuthorizationAction.ResourceView
+        | typeof AuthorizationAction.ResourceEdit
+        | typeof AuthorizationAction.ResourceManageSharing
+      resource: Shareable
+    }
+  | {
+      action: typeof AuthorizationAction.DaemonKeyIssue
+      resource: Shareable & { createdByUserId: string | null }
+    }
+  | {
+      action:
+        | typeof AuthorizationAction.SessionView
+        | typeof AuthorizationAction.SessionChangeVisibility
+        | typeof AuthorizationAction.SessionContinue
+      resource: SessionViewable
+      identitySet: ReadonlySet<string>
+      externalAccess?: SessionExternalAccessSnapshot
+    }
+
+function resourceIsVisible(resource: Shareable, principal: ViewCtx): boolean {
+  return principal.role === 'owner' || resource.visibility === 'org' || resource.sharedWith.includes(principal.userId)
+}
+
+function resourceIsEditable(resource: Shareable, principal: ViewCtx): boolean {
+  return principal.role !== 'viewer' && resourceIsVisible(resource, principal)
+}
+
+/** An agent's own background work, in assistant mode or not, takes its owning session's audience, so none of its viewers may change it. */
+function isOwnSubsession(resource: SessionViewable): boolean {
+  if (!isSubsessionCoordinate(resource.thread)) return false
+  const facts = resource.subsession
+  return facts === undefined || (facts.parentSessionId !== null && facts.parentAgentId === facts.agentId)
+}
+
+/** One member's webchat coordinator (auto-session-mode.md §10) is an append coordinate with no other participant. */
+function isOwnersOnlyAppend(resource: SessionViewable): boolean {
+  return resource.platform === 'webchat' && isCoordinatorCoordinate(resource.thread)
+}
+
+/** A task whose owning session is still the webchat coordinator the route read; unread or re-owned fails closed. */
+function isWebchatCoordinatorTask(resource: SessionViewable): boolean {
+  const owning = resource.taskParentSessionId ?? resource.subsession?.parentSessionId ?? null
+  return owning !== null && resource.webchatCoordinatorTaskOf === owning
+}
+
+function identityOwnsSession(resource: SessionViewable, identitySet: ReadonlySet<string>): boolean {
+  return resource.ownerIdentity !== null && identitySet.has(resource.ownerIdentity)
+}
+
+function externalSessionIsVisible(
+  resource: SessionViewable,
+  snapshot: SessionExternalAccessSnapshot | undefined
+): boolean {
+  const provider = resource.externalProvider
+  if (!provider || !snapshot) return false
+  const policy = snapshot.policies.find((candidate) => candidate.provider === provider)
+  // A supported candidate with no durable policy is never the disabled baseline.
+  if (!policy) return false
+  if (
+    resource.visibility === 'org' &&
+    policy.readFenceRev !== null &&
+    (resource.classifiedPolicyRev == null || resource.classifiedPolicyRev < policy.readFenceRev)
+  ) {
+    return false
+  }
+  if (resource.visibility === 'org') return true
+  if (resource.visibility !== 'external' || resource.externalResolution !== 'settled' || !resource.externalScopeId) {
+    return false
+  }
+  return snapshot.allowedScopes.some((scope) => scope.id === resource.externalScopeId)
+}
+
+// Shared in-memory decisions for role, resource, and session authority.
+export function can(principal: ViewCtx, request: AuthorizationRequest): boolean {
+  switch (request.action) {
+    case AuthorizationAction.OrganizationWrite:
+      return principal.role !== 'viewer'
+    case AuthorizationAction.OrganizationManage:
+    case AuthorizationAction.UsageAttributeAll:
+      return principal.role === 'owner'
+    case AuthorizationAction.OrganizationMembershipRemove:
+      return principal.userId === request.targetUserId || principal.role === 'owner'
+    case AuthorizationAction.ResourceView:
+      return resourceIsVisible(request.resource, principal)
+    case AuthorizationAction.ResourceEdit:
+      return resourceIsEditable(request.resource, principal)
+    case AuthorizationAction.ResourceManageSharing:
+      return resourceIsEditable(request.resource, principal)
+    case AuthorizationAction.DaemonKeyIssue:
+      return (
+        principal.role === 'owner' ||
+        (request.resource.createdByUserId === principal.userId && resourceIsEditable(request.resource, principal))
+      )
+    case AuthorizationAction.SessionView:
+      return request.resource.externalProvider
+        ? request.resource.visibility === 'private'
+          ? identityOwnsSession(request.resource, request.identitySet)
+          : externalSessionIsVisible(request.resource, request.externalAccess)
+        : request.resource.visibility === 'org' || identityOwnsSession(request.resource, request.identitySet)
+    // Re-classification (§4.3) is owner-only: identity match with the recorded
+    // owner, roles grant nothing in either direction — an org owner pulling
+    // someone's published session back to private is as much an intrusion on
+    // the owner's decision as reading their DM would be (mirroring
+    // `session.view`). A row with no recorded owner is re-classifiable by no
+    // one. Deliberately NOT the role-based edit guard: the grant follows
+    // OWNERSHIP, so a viewer-role member keeps control of their own DM.
+    // An `append` session is the whole conversation's long-lived session: its
+    // recorded owner is only the first poster, so its audience is no one's to
+    // change (channel-session-mode.md §9). An unread coordinate counts as one.
+    // A webchat coordinator is one member's conversation, so it and each of its tasks stay its owner's (auto-session-mode.md §10).
+    // The same holds for an agent's own background work (assistant-mode.md §5.6) and for a task while a session owns it (auto-session-mode.md §6.2).
+    case AuthorizationAction.SessionChangeVisibility:
+      return (
+        !request.resource.externalProvider &&
+        request.resource.thread !== undefined &&
+        (!isAppendCoordinate(request.resource.thread) || isOwnersOnlyAppend(request.resource)) &&
+        (isWebchatCoordinatorTask(request.resource) ||
+          (!isOwnSubsession(request.resource) && !request.resource.taskParentSessionId)) &&
+        identityOwnsSession(request.resource, request.identitySet)
+      )
+    // Continuation is an organization WRITE riding on view (webchat-cross-
+    // integration-continuation.md §5.1): viewing a transcript is not authority
+    // to make the bot speak in an external system, so the viewer role is
+    // refused UNIFORMLY — even for a private session the viewer owns (unlike
+    // `session.visibility.change`, this posts through the org's bot). Private
+    // sessions additionally stay owner-only; role never widens that audience.
+    case AuthorizationAction.SessionContinue:
+      if (principal.role === 'viewer') return false
+      if (request.resource.visibility === 'private') {
+        return identityOwnsSession(request.resource, request.identitySet)
+      }
+      return can(principal, {
+        action: AuthorizationAction.SessionView,
+        resource: request.resource,
+        identitySet: request.identitySet,
+        ...(request.externalAccess ? { externalAccess: request.externalAccess } : {})
+      })
+  }
+}
+
+/** Readability adapters used by resource-oriented routes. */
+export function canView(resource: Shareable, principal: ViewCtx): boolean {
+  return can(principal, { action: AuthorizationAction.ResourceView, resource })
+}
+
+export function canEdit(resource: Shareable, principal: ViewCtx): boolean {
+  return can(principal, { action: AuthorizationAction.ResourceEdit, resource })
+}
+
+export function canManageSharing(resource: Shareable, principal: ViewCtx): boolean {
+  return can(principal, { action: AuthorizationAction.ResourceManageSharing, resource })
+}
+
+export function canIssueDaemonKey(
+  resource: Shareable & { createdByUserId: string | null },
+  principal: ViewCtx
+): boolean {
+  return can(principal, { action: AuthorizationAction.DaemonKeyIssue, resource })
+}
+
+/** The BASE identity set — the console identity every caller carries. The BFF
+ *  grows it with the caller's verified platform identities before matching
+ *  through Session-access plugins; that expansion needs I/O, so it stays out of
+ *  this pure policy module. */
+export function identitySetOf(principal: ViewCtx): Set<string> {
+  return new Set([`user:${principal.userId}`])
+}
+
+export function canViewSession(
+  resource: SessionViewable,
+  principal: ViewCtx,
+  identitySet: ReadonlySet<string>,
+  externalAccess?: SessionExternalAccessSnapshot
+): boolean {
+  return can(principal, {
+    action: AuthorizationAction.SessionView,
+    resource,
+    identitySet,
+    ...(externalAccess ? { externalAccess } : {})
+  })
+}
+
+export function canChangeSessionVisibility(
+  resource: SessionViewable,
+  principal: ViewCtx,
+  identitySet: ReadonlySet<string>
+): boolean {
+  return can(principal, {
+    action: AuthorizationAction.SessionChangeVisibility,
+    resource,
+    identitySet
+  })
+}
+
+export function canContinueSession(
+  resource: SessionViewable,
+  principal: ViewCtx,
+  identitySet: ReadonlySet<string>,
+  externalAccess?: SessionExternalAccessSnapshot
+): boolean {
+  return can(principal, {
+    action: AuthorizationAction.SessionContinue,
+    resource,
+    identitySet,
+    ...(externalAccess ? { externalAccess } : {})
+  })
+}
+
+/** The caller is this session's recorded owner, whatever their role: a webchat conversation's owner, whom chat actions name apart from the agent's editors. */
+export function ownsSession(resource: SessionViewable, identitySet: ReadonlySet<string>): boolean {
+  return identityOwnsSession(resource, identitySet)
+}
+
+/**
+ * Prisma list projection of `resource.view`.
+ *
+ * An undefined principal is reserved for internal daemon/orchestration reads
+ * and remains deliberately unfiltered. An owner sees every resource of the
+ * organization; every other human role uses the resource-visibility predicate.
+ */
+export function visibilityWhere(principal?: ViewCtx) {
+  if (!principal || principal.role === 'owner') return {}
+  return {
+    OR: [{ visibility: 'org' as const }, { sharedWith: { has: principal.userId } }]
+  }
+}

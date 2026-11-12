@@ -1,0 +1,549 @@
+'use client'
+
+// Agent-type + IM-platform brand marks.
+// Sized to 60% of their container to match the .av / .imark CSS.
+
+import { useState, type CSSProperties, type ReactNode } from 'react'
+import { useTranslations } from 'next-intl'
+import { Icon } from './ui'
+import { withIconUrl, type AgentIcon } from '@/lib/agent-icon'
+// `logos/gitlab` is the LOGOTYPE (tanuki + wordmark, ~4.6:1); `-icon` is the mark, like `slack-icon`.
+import gitlabIcon from '@iconify-icons/logos/gitlab-icon'
+import kubernetesIcon from '@iconify-icons/logos/kubernetes'
+import microsoftIcon from '@iconify-icons/logos/microsoft-icon'
+import slackIcon from '@iconify-icons/logos/slack-icon'
+import webhooksLogoFillIcon from '@iconify-icons/ph/webhooks-logo-fill'
+import { Icon as IconifyIcon } from '@iconify/react'
+import { FcGoogle } from 'react-icons/fc'
+import { SiDiscord, SiForgejo, SiGitea, SiGithub, SiTelegram, SiVercel } from 'react-icons/si'
+import { VscAzureDevops } from 'react-icons/vsc'
+import { acpRuntime, useAcpRegistry } from '@/lib/acp-registry'
+import { useGiteaProduct } from '@/lib/gitea-product'
+import { LARK_MARK_SRC } from './console/platforms/feishu/mark'
+import { platformMark } from './console/platforms/marks'
+import { markBox, squareMarkBox } from './mark-box'
+import type { SocialLoginTarget } from '@/lib/social-login-providers'
+
+const fill = { width: '60%', height: '60%', display: 'block' } as const
+
+// Dark-mode treatment for the brand logos we can only load as an <img> (ACP registry
+// / lobehub SVGs, so no per-path recoloring): most are `currentColor`-black and have
+// to be flipped to read on the dark surface, but a plain `invert` also rotates the
+// hue of the colored ones (Kiro's purple ghost came out green). The extra 180°
+// rotation puts those hues back; on a pure black glyph it is a no-op.
+const DARK_MARK_FILTER = "[html[data-theme='dark']_&]:invert [html[data-theme='dark']_&]:hue-rotate-180"
+
+export function AgentMark({ model, fillPct = 60 }: { model: string; fillPct?: number }) {
+  const registry = useAcpRegistry()
+  const registryIcon = acpRuntime(registry, model)?.icon
+  if (!registryIcon) return null
+  return (
+    <img
+      src={registryIcon}
+      alt=""
+      style={{ width: `${fillPct}%`, height: `${fillPct}%` }}
+      className={`block object-contain ${DARK_MARK_FILTER}`}
+    />
+  )
+}
+
+const MARK_SLOT = { 14: 'h-[14px] w-[14px]', 15: 'h-[15px] w-[15px]' } as const
+
+// A brand mark centred in a fixed square beside text; a bare mark <img> otherwise sits at its box's top-left.
+export function MarkSlot({ size = 15, children }: { size?: keyof typeof MARK_SLOT; children: ReactNode }) {
+  return <span className={`flex flex-none items-center justify-center ${MARK_SLOT[size]}`}>{children}</span>
+}
+
+// Resolve a provider/model prefix or bare model family; unknown models fall back to the runtime mark.
+const MODEL_PROVIDER_PREFIX: Record<string, string> = {
+  deepseek: 'deepseek',
+  openai: 'openai',
+  anthropic: 'claude',
+  google: 'gemini',
+  'google-vertex': 'gemini',
+  meta: 'meta',
+  'meta-llama': 'meta',
+  mistral: 'mistral',
+  mistralai: 'mistral',
+  qwen: 'qwen',
+  alibaba: 'qwen',
+  moonshot: 'moonshot',
+  moonshotai: 'moonshot',
+  xai: 'grok',
+  'x-ai': 'grok',
+  cohere: 'cohere',
+  groq: 'groq',
+  perplexity: 'perplexity',
+  ollama: 'ollama',
+  openrouter: 'openrouter',
+  typesafe: 'typesafe',
+  'typesafe-ai': 'typesafe'
+}
+
+const MODEL_PROVIDER_ICON_SRC: Record<string, string> = { typesafe: '/brands/typesafe.svg' }
+
+export function modelProviderSlug(model: string): string | null {
+  const m = model.toLowerCase().trim()
+  if (!m) return null
+  const prefix = m.includes('/') ? m.slice(0, m.indexOf('/')) : ''
+  if (prefix && MODEL_PROVIDER_PREFIX[prefix]) return MODEL_PROVIDER_PREFIX[prefix]
+  if (/^jev(?:-|$)/.test(m)) return 'typesafe'
+  if (/deepseek/.test(m)) return 'deepseek'
+  if (/claude|sonnet|opus|haiku/.test(m)) return 'claude'
+  if (/gpt|codex|(?:^|[^a-z])o[134]\b/.test(m)) return 'openai'
+  if (/gemini/.test(m)) return 'gemini'
+  if (/mistral|mixtral|codestral/.test(m)) return 'mistral'
+  if (/qwen/.test(m)) return 'qwen'
+  if (/llama/.test(m)) return 'meta'
+  if (/grok/.test(m)) return 'grok'
+  if (/kimi|moonshot/.test(m)) return 'moonshot'
+  // Unknown `provider/model`: try the raw prefix as a lobehub slug; onError falls back.
+  return prefix || null
+}
+
+// Show the model provider's brand, using a local asset when the shared icon set has none.
+export function ModelMark({
+  model,
+  fallbackRuntime,
+  fillPct = 80
+}: {
+  model: string
+  fallbackRuntime: string
+  fillPct?: number
+}) {
+  const slug = modelProviderSlug(model)
+  // A failed provider icon falls back to the runtime; changing provider attempts the new icon.
+  const [failedSlug, setFailedSlug] = useState<string | null>(null)
+  if (!slug || failedSlug === slug) return <AgentMark model={fallbackRuntime} fillPct={fillPct} />
+  return (
+    <img
+      key={slug}
+      src={
+        MODEL_PROVIDER_ICON_SRC[slug] ??
+        `https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/${slug}.svg`
+      }
+      alt=""
+      onError={() => setFailedSlug(slug)}
+      style={{ width: `${fillPct}%`, height: `${fillPct}%` }}
+      className={`block object-contain ${DARK_MARK_FILTER}`}
+    />
+  )
+}
+
+/**
+ * Agent avatar — renders the stored {@link AgentIcon} descriptor, filling its
+ * parent tile (which owns the box size + border-radius):
+ *  - `glyph` → a white Lucide glyph on a solid color plate. Exception: the
+ *    `agentconnect` brand diamond renders plateless (the native logo; its
+ *    stored `color` is inert).
+ *  - `image` → the image, cover-cropped.
+ *  - `runtime` / null (legacy default) → the runtime brand mark (<AgentMark>) on
+ *    the tile's own background, i.e. today's behavior.
+ * `size` is the tile's pixel size (used to scale the glyph). Distinct from
+ * <AgentMark>, which stays the pure runtime mark for the runtime-select fields.
+ */
+export function AgentIconView({
+  icon,
+  runtime,
+  size,
+  keepImagePlate
+}: {
+  icon?: AgentIcon | null
+  runtime: string
+  size: number
+  /** Keep the white plate under an uploaded image on dark. Org tiles opt in: their
+   * logos are usually dark-on-transparent, so plateless leaves an empty tile. */
+  keepImagePlate?: boolean
+}) {
+  if (icon?.kind === 'glyph') {
+    if (icon.glyph === 'agentconnect') {
+      // The brand diamond (the built-in preset agents' fixed identity) — the
+      // native logo, plateless: no background, `color` is inert. Mirrors the
+      // CP's PNG renderer special case.
+      return (
+        <span data-agent-icon-glyph="true" className="flex h-full w-full items-center justify-center rounded-[inherit]">
+          <LogoMark size={size} />
+        </span>
+      )
+    }
+    return (
+      <span
+        data-agent-icon-glyph="true"
+        className="flex h-full w-full items-center justify-center rounded-[inherit]"
+        style={{ background: icon.color }}
+      >
+        <Icon name={icon.glyph} color="#fff" size={Math.round(size * 0.56)} strokeWidth={2} />
+      </span>
+    )
+  }
+  if (icon?.kind === 'image' && icon.url) {
+    // Inline width/height (not h-full/w-full utilities) so this beats the `.av img`
+    // / `.imark img` 60% descendant rules and the avatar fills its tile. The url is
+    // reassembled from the DTO `iconUrl` at the fetch boundary (agentFromDto/orgFromDto).
+    return (
+      <img
+        src={icon.url}
+        alt=""
+        data-agent-icon-image="true"
+        className={`rounded-[inherit] bg-white object-cover ${keepImagePlate ? '' : "[html[data-theme='dark']_&]:bg-transparent"}`}
+        style={{ width: '100%', height: '100%' }}
+      />
+    )
+  }
+  return <AgentMark model={runtime} />
+}
+
+/** Organization avatar for selectors and other identity surfaces. Uploaded images
+ * and stored glyphs use the shared icon renderer; legacy/invalid descriptors keep
+ * the existing deterministic initial fallback instead of leaving an empty tile. */
+export function OrgIconView({
+  icon,
+  iconUrl,
+  label,
+  fallbackColor,
+  size,
+  className
+}: {
+  icon?: AgentIcon | null
+  iconUrl?: string | null
+  label: string
+  fallbackColor: string
+  size: number
+  className: string
+}) {
+  const resolved = withIconUrl(icon, iconUrl)
+  const renderable = resolved?.kind === 'glyph' || (resolved?.kind === 'image' && Boolean(resolved.url))
+
+  return (
+    <span
+      className={`flex flex-none items-center justify-center overflow-hidden font-sans font-semibold leading-normal text-white ${className}`}
+      style={{ width: size, height: size, background: renderable ? undefined : fallbackColor }}
+    >
+      {renderable ? (
+        <AgentIconView icon={resolved} runtime="" size={size} keepImagePlate />
+      ) : (
+        label.charAt(0).toUpperCase()
+      )}
+    </span>
+  )
+}
+
+// GitHub octocat mark — rendered on the workspace tiles and cards instead of
+// <Icon name="github" /> (which lucide no longer ships).
+export function GithubMark({ color = 'currentColor', fillPct = 60 }: { color?: string; fillPct?: number }) {
+  return (
+    <SiGithub style={{ width: `${fillPct}%`, height: `${fillPct}%`, display: 'block' }} color={color} aria-hidden />
+  )
+}
+
+// GitLab tanuki mark — {@link GithubMark}'s multi-color counterpart, hence no `color`; `ssr` draws it before mount.
+export function GitlabMark({ fillPct = 60 }: { fillPct?: number }) {
+  return <IconifyIcon icon={gitlabIcon} ssr style={markBox(fillPct)} aria-hidden />
+}
+
+// Gitea mark — the simple-icons glyph in its brand color, Forgejo's when the instance is Forgejo; `color` overrides it for a monochrome surface.
+export const GITEA_BRAND_COLOR = '#609926'
+export const FORGEJO_BRAND_COLOR = '#FB923C'
+export function GiteaMark({ color, fillPct = 60 }: { color?: string; fillPct?: number }) {
+  return <GiteaProductGlyph style={{ width: `${fillPct}%`, height: `${fillPct}%`, display: 'block' }} color={color} />
+}
+
+// Azure DevOps mark — the codicon glyph of its logo in the brand blue; `color` overrides it for a monochrome surface.
+export const AZURE_DEVOPS_BRAND_COLOR = '#0078D4'
+export function AzureDevOpsMark({
+  color = AZURE_DEVOPS_BRAND_COLOR,
+  fillPct = 60
+}: {
+  color?: string
+  fillPct?: number
+}) {
+  return (
+    <VscAzureDevops
+      style={{ width: `${fillPct}%`, height: `${fillPct}%`, display: 'block' }}
+      color={color}
+      aria-hidden
+    />
+  )
+}
+
+function GiteaProductGlyph({ style, color }: { style: CSSProperties; color?: string }) {
+  if (useGiteaProduct() === 'forgejo')
+    return <SiForgejo style={style} color={color ?? FORGEJO_BRAND_COLOR} aria-hidden />
+  return <SiGitea style={style} color={color ?? GITEA_BRAND_COLOR} aria-hidden />
+}
+
+/** The Kubernetes wheel — what a SELF-HOSTED pool is: the operator's own cluster, named by the
+ *  thing they actually run. Cloud is the same pool as a product and keeps its own cloud glyph. */
+export function KubernetesMark({ fillPct = 100 }: { fillPct?: number }) {
+  return <IconifyIcon icon={kubernetesIcon} ssr style={markBox(fillPct)} aria-hidden />
+}
+
+// AG-UI's kite and ACP's glyph, copied from each protocol's own logo SVG; both are single-color, so they take the text color.
+const AG_UI_KITE =
+  'M0,25.9335975 L16.5448881,6.52325783e-15 C40.848296,5.37332138 53,8.05998207 53,8.05998207 L43.1229639,62 L0,25.9335975 Z'
+const ACP_GLYPH =
+  'M130.75.385c5.428 0 10.297 2.81 13.011 7.511l14.214 24.618-.013-.005c2.599 4.504 2.707 9.932.28 14.513-2.618 4.944-7.862 8.015-13.679 8.015h-31.811c-.452 0-.873-.242-1.103-.637a1.268 1.268 0 0 1 0-1.274l3.919-6.78c.223-.394.65-.636 1.102-.636h28.288a5.622 5.622 0 0 0 4.925-2.849 5.615 5.615 0 0 0 0-5.69l-14.214-24.617a5.621 5.621 0 0 0-4.925-2.848 5.621 5.621 0 0 0-4.925 2.848l-14.214 24.618a6.267 6.267 0 0 0-.319.643.998.998 0 0 1-.069.14L101.724 54.4l-.823 1.313-2.529 4.39a1.27 1.27 0 0 1-1.103.636h-7.83c-.452 0-.873-.242-1.102-.637-.23-.394-.23-.879 0-1.274l2.188-3.791H66.803c-3.32 0-6.454-1.122-8.818-3.167a17.141 17.141 0 0 1-3.394-3.96 1.261 1.261 0 0 1-.091-.137L34.2 12.573a5.622 5.622 0 0 0-4.925-2.849 5.621 5.621 0 0 0-4.924 2.85L10.137 37.19a5.615 5.615 0 0 0 0 5.69 5.63 5.63 0 0 0 4.925 2.841h29.862a1.276 1.276 0 0 1 1.102 1.912l-3.912 6.778a1.27 1.27 0 0 1-1.102.638H14.495c-3.32 0-6.454-1.128-8.817-3.173-5.906-5.104-7.36-12.883-3.62-19.363L16.267 7.89C18.872 3.385 23.517.583 28.697.39c.184-.006.356-.006.534-.006 5.378 0 10.45 3.007 13.246 7.85l12.986 22.372L68.58 7.891C71.186 3.385 75.83.582 81.01.39c.185-.006.358-.006.536-.006 4.453 0 8.71 2.039 11.672 5.588.337.407.388.98.127 1.446l-3.765 6.6a1.268 1.268 0 0 1-2.205.006l-.847-1.465a5.623 5.623 0 0 0-4.926-2.848 5.622 5.622 0 0 0-4.924 2.848L62.464 37.18a5.614 5.614 0 0 0 0 5.689 5.628 5.628 0 0 0 4.925 2.842H95.91L117.76 7.87c2.714-4.683 7.575-7.486 12.99-7.486Z'
+
+/** A chat API protocol's mark in the text color: AI SDK UI under ai-sdk.dev's Vercel triangle, AG-UI and ACP from their logos. */
+export function ApiProtocolMark({ protocol }: { protocol: string }) {
+  const sq = squareMarkBox(100)
+  switch (protocol) {
+    case 'ai-sdk-ui':
+      return <SiVercel style={sq} color="currentColor" aria-hidden />
+    case 'ag-ui':
+      // A hairline at this size, so the stroke holds one screen width instead of scaling with the artwork.
+      return (
+        <svg viewBox="0 0 57 66" style={sq} fill="none" stroke="currentColor" aria-hidden>
+          <g transform="translate(2 2)" strokeWidth={1.25}>
+            <path d={AG_UI_KITE} strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+            <line x1="16.5828221" y1="-1.07552856e-15" x2="43.2453988" y2="62" vectorEffect="non-scaling-stroke" />
+            <line x1="0" y1="25.9335975" x2="53" y2="8.48421053" vectorEffect="non-scaling-stroke" />
+          </g>
+        </svg>
+      )
+    case 'acp-2':
+      return (
+        <svg viewBox="0 0 160 61" style={markBox(100)} fill="currentColor" aria-hidden>
+          <path d={ACP_GLYPH} />
+        </svg>
+      )
+    default:
+      return <Icon name="code-xml" className="h-full w-full" />
+  }
+}
+
+/**
+ * A mark for one integration surface. The CORE kinds (github / gitlab / webhook /
+ * schedule / memory dream / playground+webchat) are the host's own; the chat platforms
+ * come from their modules (§10 {@link WebPlatformModule.Mark}) through the light
+ * `platforms/marks` lookup — see the note there on why this is not a read through
+ * `platformRegistry`.
+ *
+ * Core kinds are still matched by SUBSTRING because their ids are synthesized in
+ * several places (`sessionPlatform` folds `playground`→`webchat`, `hook`+github→
+ * `github`; `sessionChannelDisplay` mints `schedule`). Chat platforms are matched
+ * by EXACT id: those values come off the wire, where the vocabulary is closed.
+ * Order is load-bearing — `hook` must be tested before `web`, or `webhook` would
+ * take the playground arm.
+ */
+export function PlatformMark({ platform, fillPct = 60 }: { platform: string; fillPct?: number }) {
+  const x = (platform || '').toLowerCase()
+  // `s` is for glyphs whose artwork carries padding; `sq` caps full-bleed brand artwork, as every platform module's mark does.
+  const s = fillPct === 60 ? fill : markBox(fillPct)
+  const sq = squareMarkBox(fillPct)
+  if (x.includes('github')) {
+    return <SiGithub style={sq} color="currentColor" aria-hidden />
+  }
+  // The other code hosts, capped the same way: both are full-bleed glyphs too.
+  if (x.includes('gitlab')) {
+    return <IconifyIcon icon={gitlabIcon} ssr style={sq} aria-hidden />
+  }
+  if (x.includes('gitea')) {
+    return <GiteaProductGlyph style={sq} />
+  }
+  if (x.includes('azure-devops')) {
+    return <VscAzureDevops style={sq} color={AZURE_DEVOPS_BRAND_COLOR} aria-hidden />
+  }
+  if (x.includes('hook')) {
+    return <IconifyIcon icon={webhooksLogoFillIcon} style={sq} color="var(--brand)" aria-hidden />
+  }
+  // The agent's chat API tile, a protocol rather than a platform.
+  if (x === 'api') {
+    return (
+      <span style={{ width: s.width, height: s.height }} className="flex items-center justify-center" aria-hidden>
+        <Icon name="code-xml" className="h-full w-full" color="var(--text-secondary)" />
+      </span>
+    )
+  }
+  // Headless schedule fires — no real platform channel behind them.
+  if (x.includes('sched')) {
+    return (
+      <span style={{ width: s.width, height: s.height }} className="flex items-center justify-center" aria-hidden>
+        <Icon name="calendar-clock" className="h-full w-full" />
+      </span>
+    )
+  }
+  if (x.includes('dream')) {
+    return (
+      <span style={{ width: s.width, height: s.height }} className="flex items-center justify-center" aria-hidden>
+        {/* --brand, not --brand-soft-text: that token swings with the theme (a pale tint
+            on dark, a deep wine on light), while one magenta reads on both surfaces —
+            and matches the webhook mark above, the other brand-colored glyph here. */}
+        <Icon name="moon" className="h-full w-full text-(--brand)" />
+      </span>
+    )
+  }
+  // 'playground' (live) and 'webchat' (its persisted session) share the sandbox mark.
+  if (x.includes('play') || x.includes('web')) {
+    return (
+      <span
+        style={{ width: s.width, height: s.height }}
+        className="flex items-center justify-center rounded-[27%] bg-(--brand)"
+        aria-hidden
+      >
+        <Icon name="flask-conical" size={16} color="#fff" className="h-[64%] w-[64%]" />
+      </span>
+    )
+  }
+  const Mark = platformMark(x)
+  if (Mark) return <Mark fillPct={fillPct} />
+  return (
+    <span style={{ width: s.width, height: s.height }} className="flex items-center justify-center" aria-hidden>
+      <Icon name="plug" className="h-full w-full" />
+    </span>
+  )
+}
+
+// Social sign-in brand marks shared by the login page and Profile's sign-in methods.
+export function SocialLoginMark({ target, size }: { target: SocialLoginTarget; size?: number }) {
+  if (target === 'telegram') return <SiTelegram size={size} color="#26A5E4" aria-hidden />
+  if (target === 'discord') return <SiDiscord size={size} color="#5865F2" aria-hidden />
+  if (target === 'github') return <SiGithub size={size} aria-hidden />
+  if (target === 'gitlab')
+    return <IconifyIcon icon={gitlabIcon} {...(size ? { width: size, height: size } : {})} aria-hidden />
+  if (target === 'slack')
+    return <IconifyIcon icon={slackIcon} {...(size ? { width: size, height: size } : {})} aria-hidden />
+  if (target === 'azuread')
+    return <IconifyIcon icon={microsoftIcon} {...(size ? { width: size, height: size } : {})} aria-hidden />
+  if (target === 'lark' || target === 'feishu')
+    return (
+      <img src={LARK_MARK_SRC} alt="" width={size ?? 18} height={size ?? 18} className="object-contain" aria-hidden />
+    )
+  return <FcGoogle size={size} aria-hidden />
+}
+
+// The diamond's four facets — geometry + brand fills shared by the static logo, the
+// wordmark lockup, and the spinner, so the artwork exists in exactly one place.
+const FACETS = [
+  { points: '24,5 43,24 24,24', fill: '#f2c64a' },
+  { points: '43,24 24,43 24,24', fill: '#f4793a' },
+  { points: '24,43 5,24 24,24', fill: '#7c3ca2' },
+  { points: '5,24 24,5 24,24', fill: '#d83f96' }
+] as const
+
+// The opacity a facet rests at in the spinner — reused as the depth of the hover fade below.
+const FACET_DIM = 0.22
+
+// Point at one facet of the static diamond and only that facet fades, to FACET_DIM
+// (the literal is duplicated because Tailwind scans class strings, not values).
+function DiamondFacets() {
+  return (
+    <>
+      {FACETS.map((f) => (
+        <polygon key={f.points} points={f.points} fill={f.fill} className="transition-opacity hover:opacity-[0.22]" />
+      ))}
+    </>
+  )
+}
+
+export function Wordmark({ height = 36, inverse = false }: { height?: number; inverse?: boolean }) {
+  const t = useTranslations('Common.marks')
+  const textFill = inverse ? '#ffffff' : '#3a2a4d'
+  const accentFill = inverse ? '#ef7eb4' : '#c62a78'
+  return (
+    <svg
+      height={height}
+      viewBox="0 0 230 48"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      role="img"
+      aria-label={t('brand')}
+    >
+      <DiamondFacets />
+      <text
+        x="58"
+        y="31"
+        fontFamily="Geist, -apple-system, sans-serif"
+        fontSize="21"
+        fontWeight="600"
+        letterSpacing="-0.02em"
+        fill={textFill}
+      >
+        {t('brandAgent')}
+        <tspan fill={accentFill}>{t('brandConnect')}</tspan>
+      </text>
+    </svg>
+  )
+}
+
+export function LogoMark({ size = 27 }: { size?: number }) {
+  const t = useTranslations('Common.marks')
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 48 48"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      role="img"
+      aria-label={t('brand')}
+    >
+      <DiamondFacets />
+    </svg>
+  )
+}
+
+// Loading spinner: the four logo facets chase in opacity around the diamond.
+// `begin` is indexed by FACETS — one entry per facet, in that order, each an eighth of a cycle behind the last.
+const SPIN = {
+  dur: '1.4s',
+  keyTimes: '0;0.18;0.7;1',
+  values: `${FACET_DIM};1;${FACET_DIM};${FACET_DIM}`,
+  begin: ['0s', '0.175s', '0.35s', '0.525s']
+} as const
+
+export function Spinner({ size = 48 }: { size?: number }) {
+  const t = useTranslations('Common.marks')
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 48 48"
+      role="img"
+      aria-label={t('loading')}
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      {FACETS.map((f, i) => (
+        <polygon key={f.points} points={f.points} fill={f.fill} opacity={FACET_DIM}>
+          <animate
+            attributeName="opacity"
+            dur={SPIN.dur}
+            repeatCount="indefinite"
+            begin={SPIN.begin[i]}
+            keyTimes={SPIN.keyTimes}
+            values={SPIN.values}
+          />
+        </polygon>
+      ))}
+    </svg>
+  )
+}
+
+// Centered spinner for a page/card body that is still waiting on its data pull.
+// Shared so every view's loading state looks the same (cf. Usage / daemon detail).
+//
+// `fill` is for a WHOLE-VIEW loader (the sole thing on screen while a list/detail
+// first loads): it reserves the content region and centres the spinner vertically,
+// so a refresh doesn't strand it at the top of the tall mobile viewport. Leave it
+// off for compact in-card section loaders (they keep the small top-padded box).
+export function LoadingState({
+  size = 30,
+  padding = 48,
+  fill = false
+}: {
+  size?: number
+  padding?: number
+  fill?: boolean
+}) {
+  if (fill)
+    return (
+      <div className="loadfill">
+        <Spinner size={size} />
+      </div>
+    )
+  return (
+    <div className="flex justify-center" style={{ padding }}>
+      <Spinner size={size} />
+    </div>
+  )
+}

@@ -1,0 +1,2954 @@
+/**
+ * Per-channel trigger config, end to end on the CP side:
+ *
+ *  - `integration/channels` (D→C EVT) converges `integration_channel` to either
+ *    an authoritative membership snapshot or a partial observed-conversation
+ *    report. New channels default to '@-mention', authoritative omissions drop
+ *    channels, and the operator's trigger choice SURVIVES every re-report.
+ *  - The handler is daemon-scoped: a report from a daemon that does not own the
+ *    integration's agent is dropped.
+ *  - `PATCH /integrations/:id/channels/:channelId {trigger}` persists the choice,
+ *    surfaces it on `GET /integrations`, and pushes `integration/upsert` whose
+ *    recomputed bindRules carry one channel-scoped `auto` rule per 'any' channel.
+ */
+import { describe, it, expect, afterEach } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { prisma } from '../setup.db.js'
+import { seedDaemon, seedAgent, seedDutyGroup } from '../fixtures/seed.js'
+import { seedPoolMember } from '../fakes/member-set.js'
+import { buildHttpApp, type HttpApp } from '../fakes/build-http.js'
+import { installNewBot } from '../../src/http/install-bot.js'
+import {
+  PgAgentRepo,
+  PgBotRepo,
+  PgDaemonRepo,
+  PgIntegrationRepo,
+  PgIntegrationChannelRepo
+} from '../../src/persistence/index.js'
+import { PgOrgRepo } from '../../src/persistence/repositories/org.repo.js'
+import { gatedDmSeeds, type GatedDmSeedResolver } from '../../src/orchestrator/linkedDm.js'
+import { linearTeamSeedTrigger, seedLinearTeamRows } from '../../src/platforms/linear/teams.js'
+import { reconcileAgentLinkedDms, reconcileLinkedDms } from '../../src/orchestrator/linkedDmReconcile.js'
+import type { SlackIdentity } from '../../src/github/logto-identity.js'
+import { PgUserRepo } from '../../src/persistence/repositories/user.repo.js'
+import { PgDutyGroupRepo } from '../../src/persistence/repositories/duty-group.repo.js'
+import { systemClock } from '../../src/domain/clock.js'
+import { handleIntegrationChannels } from '../../src/ws/handlers/index.js'
+import { convergeIntegrationGating } from '../../src/orchestrator/integrationPush.js'
+import { IntegrationId } from '../../src/domain/ids.js'
+import type { DaemonConnection } from '../../src/ws/connection.js'
+import type { DaemonWsDeps } from '../../src/ws/deps.js'
+import type { ControlSender } from '../../src/orchestrator/outbound.js'
+import { AgentMutationGate } from '../../src/orchestrator/agentMutationGate.js'
+import { NoConnection } from '../../src/orchestrator/outbound.js'
+import { CollabRoutesService } from '../../src/orchestrator/collabRoutes.service.js'
+import type { RelayControlSender } from '../../src/orchestrator/relayControl.js'
+import { SESSION_MODE_AUTO_V1_FEATURE } from '@agentconnect.md/protocol'
+import type { AnyFrame, CollabRoutesSnapshot, IntegrationUpsert, IntegrationChannel } from '@agentconnect.md/protocol'
+import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from '../../prisma/seed.js'
+
+// Console routes are org-scoped: /orgs/:orgId/… (devAuth = seeded owner of the default org).
+const ORG = `/api/v1/orgs/${DEFAULT_ORG_ID}`
+
+let running: HttpApp | undefined
+
+afterEach(async () => {
+  await running?.close()
+  running = undefined
+  reporterFeatures = undefined
+})
+
+// §14.8 OIDC subjects — the key a linked Slack identity is resolved by.
+const ALICE_SUB = 'oidc-alice'
+const BOB_SUB = 'oidc-bob'
+const CAROL_SUB = 'oidc-carol'
+
+const DAEMON = 'd1d1d1d1-dddd-4ddd-8ddd-dddddddddddd'
+const OTHER_DAEMON = 'd2d2d2d2-dddd-4ddd-8ddd-dddddddddddd'
+const SLACK = { botToken: 'xoxb-abc-123', appToken: 'xapp-1-def-456' }
+/** The connected Linear organization — the channel itself, since the workspace IS the channel. */
+const LINEAR_WORKSPACE = '5f3a0c9e-1c2b-4a7d-9e10-6b5c4d3e2f10'
+/** A connected workspace's teams — the conversations a Linear bot routes on (§4.5). */
+const LINEAR_TEAMS = [
+  { id: 'team_eng', key: 'ENG', name: 'Engineering' },
+  { id: 'team_design', key: 'DES', name: 'Design' }
+]
+
+class SpyControl {
+  readonly upserts: Array<{ daemonId: string; u: IntegrationUpsert }> = []
+  readonly collaboration: Array<{ daemonId: string; snapshot: CollabRoutesSnapshot }> = []
+  readonly leaves: Array<{ daemonId: string; l: unknown }> = []
+  readonly forgets: Array<{ daemonId: string; f: { integrationId: string; channels: string[] } }> = []
+  /** What the fake daemon answers the next leave with — a platform refusal by default
+   *  would be surprising, so it succeeds unless a test says otherwise. */
+  leaveVerdict: { ok: boolean; error?: string } = { ok: true }
+  async integrationUpsert(daemonId: string, u: IntegrationUpsert): Promise<void> {
+    this.upserts.push({ daemonId, u })
+  }
+  async integrationLeave(daemonId: string, l: unknown): Promise<{ ok: boolean; error?: string }> {
+    this.leaves.push({ daemonId, l })
+    return this.leaveVerdict
+  }
+  /** Set to simulate an unreachable daemon — the suppression then cannot be made durable. */
+  forgetThrows: Error | null = null
+  async integrationForget(
+    daemonId: string,
+    f: { integrationId: string; channels: string[] }
+  ): Promise<{ ok: boolean; reason?: string }> {
+    if (this.forgetThrows) throw this.forgetThrows
+    this.forgets.push({ daemonId, f })
+    return { ok: true }
+  }
+  async integrationRemove(): Promise<void> {}
+  async collaborationRoutes(daemonId: string, snapshot: CollabRoutesSnapshot): Promise<void> {
+    this.collaboration.push({ daemonId, snapshot })
+  }
+}
+
+/** Install an integration on a placed agent; returns its id. */
+async function install(app: HttpApp): Promise<string> {
+  const agentId = randomUUID()
+  await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+  const res = await app.app.inject({
+    method: 'POST',
+    url: `${ORG}/integrations`,
+    payload: { name: 'acme-bot', platform: 'slack', agentId, slack: SLACK }
+  })
+  expect(res.statusCode).toBe(201)
+  return (res.json() as { id: string }).id
+}
+
+/** Connect a LINEAR workspace through the REAL create tail the OAuth callback uses
+ *  (`installNewBot` with the provider's team seeder) — the seat that writes the team rows. */
+async function installLinear(
+  app: HttpApp,
+  opts: { restricted?: boolean } = {}
+): Promise<{ integrationId: string; botId: string; agentId: string }> {
+  const agentId = randomUUID()
+  await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+  if (opts.restricted) {
+    await prisma.agent.update({
+      where: { id: agentId },
+      data: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+  }
+  const agent = await prisma.agent.findUniqueOrThrow({ where: { id: agentId } })
+  const { integration } = await installNewBot(app.deps, { debug: () => {} }, {
+    orgId: DEFAULT_ORG_ID as never,
+    agent: agent as never,
+    platform: 'linear',
+    name: 'Acme',
+    transport: 'http',
+    secrets: { botToken: 'client-secret', appToken: null, signingSecret: 'lin_wh_secret' },
+    bot: {
+      shareable: true,
+      workspaceId: LINEAR_WORKSPACE,
+      workspaceName: 'Acme',
+      botUserId: 'lin-app-user'
+    },
+    seedConversations: (integration: { id: string }) =>
+      seedLinearTeamRows(app.deps.repos.integrationChannel, integration.id as never, LINEAR_TEAMS, {
+        trigger: linearTeamSeedTrigger([agent as never]),
+        owner: agentId as never,
+        workspaceName: 'Acme'
+      })
+  } as never)
+  return { integrationId: integration.id, botId: integration.botId, agentId }
+}
+
+/** Add a SECOND agent to a connected Linear workspace, exactly as the add-member route does: the
+ *  membership row, then the `syncBot` whose compile replicates each team's ownerless sibling row. */
+async function addLinearMember(app: HttpApp, botId: string): Promise<{ integrationId: string; agentId: string }> {
+  const agentId = randomUUID()
+  await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+  const admission = await app.deps.repos.integration.addBotMembership({
+    id: IntegrationId(randomUUID()),
+    orgId: DEFAULT_ORG_ID as never,
+    agentId: agentId as never,
+    botId: botId as never,
+    platform: 'linear',
+    name: 'Acme'
+  } as never)
+  if (!('integration' in admission)) throw new Error(`unexpected membership outcome: ${admission.outcome}`)
+  await app.deps.httpBot.syncBot(botId)
+  return { integrationId: admission.integration.id, agentId }
+}
+
+/** Install a TELEGRAM integration — the platform whose rows are session-derived, so
+ *  the only one where a durable suppression is what makes a removal stick. */
+async function installTelegram(app: HttpApp): Promise<string> {
+  const agentId = randomUUID()
+  await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+  const res = await app.app.inject({
+    method: 'POST',
+    url: `${ORG}/integrations`,
+    payload: { name: 'acme-tg', platform: 'telegram', agentId, telegram: { botToken: '123456:AAE-xyz' } }
+  })
+  expect(res.statusCode).toBe(201)
+  return (res.json() as { id: string }).id
+}
+
+/** Install a DISCORD integration — the one platform whose bot joins a SPACE
+ *  rather than individual conversations (§5 `leaveGranularity: 'space'`), so the
+ *  only one whose leave requests take the mirror-image arms of the two refusals
+ *  below. */
+async function installDiscord(app: HttpApp): Promise<string> {
+  const agentId = randomUUID()
+  await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+  const res = await app.app.inject({
+    method: 'POST',
+    url: `${ORG}/integrations`,
+    payload: {
+      name: 'acme-dc',
+      platform: 'discord',
+      agentId,
+      discord: { botToken: 'MTIzNDU2Nzg5MDEyMzQ1Njc4.fixture.not-a-secret' }
+    }
+  })
+  expect(res.statusCode).toBe(201)
+  return (res.json() as { id: string }).id
+}
+
+/** What the reporting daemon advertises; unset, it is not connected and every new row stays Per thread. */
+let reporterFeatures: string[] | undefined
+
+/** Dispatch a hand-built `integration/channels` EVT through the real handler. */
+async function report(
+  daemonId: string,
+  integrationId: string,
+  channels: IntegrationChannel[],
+  agentMutations = new AgentMutationGate(),
+  collabRoutes = { broadcast: async () => undefined } as unknown as CollabRoutesService,
+  authoritative?: boolean,
+  removed?: string[],
+  /** §14.8: OIDC subject → the Slack identity that console account carries. Given, the
+   *  report runs the REAL seed resolver over these links instead of none. */
+  links?: Record<string, SlackIdentity>,
+  /** §14.8: records the re-converge a report that opened a DM has to trigger. */
+  integrationConverge?: (agent: unknown) => Promise<void>,
+  migrated?: { from: string; to: string }[]
+): Promise<void> {
+  const frame = {
+    v: 1,
+    id: randomUUID(),
+    ts: new Date().toISOString(),
+    type: 'integration/channels',
+    payload: {
+      integrationId,
+      channels,
+      ...(authoritative === undefined ? {} : { authoritative }),
+      ...(removed === undefined ? {} : { removed }),
+      ...(migrated === undefined ? {} : { migrated })
+    }
+  } as AnyFrame
+  const users = new PgUserRepo(prisma)
+  const deps = {
+    integration: new PgIntegrationRepo(prisma),
+    integrationChannel: new PgIntegrationChannelRepo(prisma),
+    agent: new PgAgentRepo(prisma),
+    bot: new PgBotRepo(prisma),
+    // Admission is the served set now — placement ∪ the duties this member holds.
+    dutyLease: new PgDutyGroupRepo(prisma),
+    clock: systemClock,
+    agentMutations,
+    collabRoutes,
+    connReg: {
+      get: () => (reporterFeatures ? { state: 'READY', capabilities: { features: reporterFeatures } } : undefined)
+    },
+    ...(links
+      ? {
+          gatedDmSeeds: ((reported, agent, bot) =>
+            gatedDmSeeds(reported, agent, bot, {
+              users,
+              identity: { slackIdentityFor: async (sub: string) => links[sub] ?? null }
+            })) satisfies GatedDmSeedResolver
+        }
+      : {}),
+    ...(integrationConverge ? { integrationConverge } : {})
+  } as unknown as DaemonWsDeps
+  await handleIntegrationChannels(frame, { daemonId } as DaemonConnection, deps)
+}
+
+/**
+ * Wrap a Prisma client so the FIRST channel-row read is held until `release()` — letting
+ * a test pin down the interleaving a pair of fire-and-forget reports can produce: reader
+ * takes a stale snapshot, a second writer commits, and only then does the reader write.
+ * `taken` resolves when that read is intercepted; a caller that classifies inside its
+ * write never takes one, so `taken` simply never resolves (callers race it with a
+ * timeout) and `release()` is a no-op.
+ */
+function holdFirstRead(db: typeof prisma): { db: typeof prisma; taken: Promise<void>; release: () => void } {
+  let held = false
+  let markTaken = () => {}
+  let release = () => {}
+  const taken = new Promise<void>((resolve) => {
+    markTaken = resolve
+  })
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const channelProxy = new Proxy(db.integrationChannel, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver)
+      if (prop !== 'findMany' || typeof value !== 'function') {
+        return typeof value === 'function' ? value.bind(target) : value
+      }
+      return async (...args: unknown[]) => {
+        const rows = await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args)
+        if (!held) {
+          held = true
+          markTaken()
+          await gate
+        }
+        return rows
+      }
+    }
+  })
+  const proxied = new Proxy(db, {
+    get(target, prop, receiver) {
+      if (prop === 'integrationChannel') return channelProxy
+      const value = Reflect.get(target, prop, receiver)
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
+  return { db: proxied, taken, release }
+}
+
+describe('integration/channels EVT → integration_channel convergence', () => {
+  it('inserts reported channels with the default @-mention trigger', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'C2', name: 'releases', isPrivate: true }
+    ])
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: unknown[] }[]
+    expect(dto!.channels).toEqual([
+      {
+        channelId: 'C1',
+        name: 'deploys',
+        spaceId: null,
+        space: null,
+        icon: null,
+        color: null,
+        key: null,
+        url: null,
+        isPrivate: false,
+        kind: 'channel',
+        sessionMode: 'createNew',
+        trigger: 'mention',
+        isCodeSession: false,
+        decisionBinding: null,
+        decision: null,
+        agentId: null,
+        externalReason: null
+      },
+      {
+        channelId: 'C2',
+        name: 'releases',
+        spaceId: null,
+        space: null,
+        icon: null,
+        color: null,
+        key: null,
+        url: null,
+        isPrivate: true,
+        kind: 'channel',
+        sessionMode: 'createNew',
+        trigger: 'mention',
+        isCodeSession: false,
+        decisionBinding: null,
+        decision: null,
+        agentId: null,
+        externalReason: null
+      }
+    ])
+  })
+
+  it('keeps the reported space (the Discord server) and never blanks it on a report without one', async () => {
+    // A Discord bot spans several servers, each with its own "#general" — the space is
+    // what makes the row identifiable. It resolves lazily at the edge, so a later report
+    // that carries no space must leave the known server name standing.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'C1', name: 'general', spaceId: 'G1', space: 'Acme HQ' }],
+      undefined,
+      undefined,
+      false
+    )
+    await report(DAEMON, id, [{ id: 'C1', name: 'general' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; space: string | null }[] }[]
+    expect(dto!.channels).toEqual([expect.objectContaining({ channelId: 'C1', spaceId: 'G1', space: 'Acme HQ' })])
+  })
+
+  it('preserves Code session classification across observations and removes archived memberships', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', isCodeSession: true }, { id: 'C2' }])
+    await report(DAEMON, id, [{ id: 'C1', name: 'Task' }], undefined, undefined, false)
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    expect(res.json()[0].channels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ channelId: 'C1', isCodeSession: true }),
+        expect.objectContaining({ channelId: 'C2', isCodeSession: false })
+      ])
+    )
+    await report(DAEMON, id, [{ id: 'C2' }])
+    const refreshed = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    expect(refreshed.json()[0].channels).toEqual([expect.objectContaining({ channelId: 'C2' })])
+  })
+
+  it('keeps a reported glyph, exposes it on the DTO, and never blanks it on a report without one', async () => {
+    // A Linear team carries its own icon and colour, which the console draws it by. Like the
+    // space, it is learned once: a reporter that could not resolve it must leave the row drawn.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: 'team-1', name: 'Acme / Engineering', icon: 'Feather', color: '#5E6AD2' },
+        { id: 'team-2', name: 'Acme / Design' }
+      ],
+      undefined,
+      undefined,
+      false
+    )
+    await report(DAEMON, id, [{ id: 'team-1', name: 'Acme / Engineering' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; icon: string | null; color: string | null }[] }[]
+    const byId = new Map(dto!.channels.map((c) => [c.channelId, c]))
+    expect(byId.get('team-1')).toMatchObject({ icon: 'Feather', color: '#5E6AD2' })
+    // A row the platform gives no glyph reads as two nulls rather than an absent pair.
+    expect(byId.get('team-2')).toMatchObject({ icon: null, color: null })
+  })
+
+  it('keeps a reported handle and link, exposes both on the DTO, and never blanks them', async () => {
+    // The team's key and its page in Linear ride the row as their own fields (§4.5) — the
+    // console prints the key after the name and links the name — and are learned once.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    const linked = {
+      id: 'team-1',
+      name: 'Acme / Engineering',
+      key: 'ENG',
+      url: 'https://linear.app/example-workspace/team/ENG'
+    }
+    await report(DAEMON, id, [linked, { id: 'team-2', name: 'Acme / Design' }], undefined, undefined, false)
+    await report(DAEMON, id, [{ id: 'team-1', name: 'Acme / Engineering' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; key: string | null; url: string | null }[] }[]
+    const byId = new Map(dto!.channels.map((c) => [c.channelId, c]))
+    expect(byId.get('team-1')).toMatchObject({ key: 'ENG', url: 'https://linear.app/example-workspace/team/ENG' })
+    // A row the platform gives neither reads as two nulls rather than an absent pair.
+    expect(byId.get('team-2')).toMatchObject({ key: null, url: null })
+  })
+
+  it('lets an enumerating writer CLEAR a glyph, while an omission still leaves the row drawn', async () => {
+    // The tri-state at the repository: absent is "unknown" (a daemon lookup that resolved
+    // nothing), `null` is "the platform says it has none" — only the second may blank the row.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    const glyphOf = async () => {
+      const row = (await channels.listForIntegration(IntegrationId(id))).find((c) => c.channelId === 'team-1')
+      return { icon: row?.icon ?? undefined, color: row?.color ?? undefined }
+    }
+
+    await channels.upsertConversation(IntegrationId(id), {
+      id: 'team-1',
+      name: 'Acme / Engineering',
+      icon: 'Feather',
+      color: '#5E6AD2',
+      kind: 'channel'
+    })
+    expect(await glyphOf()).toEqual({ icon: 'Feather', color: '#5E6AD2' })
+
+    // An omitting write is a name-only refresh and must not blank what is already drawn.
+    await channels.upsertConversation(IntegrationId(id), { id: 'team-1', name: 'Acme / Eng', kind: 'channel' })
+    expect(await glyphOf()).toEqual({ icon: 'Feather', color: '#5E6AD2' })
+
+    // An explicit null is the enumerating writer saying the team dropped its icon.
+    await channels.upsertConversation(IntegrationId(id), {
+      id: 'team-1',
+      name: 'Acme / Eng',
+      icon: null,
+      color: null,
+      key: null,
+      url: null,
+      kind: 'channel'
+    })
+    expect(await glyphOf()).toEqual({ icon: undefined, color: undefined })
+  })
+
+  it('puts the handle and link on the same tri-state — an omission keeps them, a null clears', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    const linkOf = async () => {
+      const row = (await channels.listForIntegration(IntegrationId(id))).find((c) => c.channelId === 'team-1')
+      return { key: row?.key ?? undefined, url: row?.url ?? undefined }
+    }
+
+    const url = 'https://linear.app/example-workspace/team/ENG'
+    await channels.upsertConversation(IntegrationId(id), {
+      id: 'team-1',
+      name: 'Acme / Engineering',
+      key: 'ENG',
+      url,
+      kind: 'channel'
+    })
+    expect(await linkOf()).toEqual({ key: 'ENG', url })
+
+    await channels.upsertConversation(IntegrationId(id), { id: 'team-1', name: 'Acme / Eng', kind: 'channel' })
+    expect(await linkOf()).toEqual({ key: 'ENG', url })
+
+    await channels.upsertConversation(IntegrationId(id), {
+      id: 'team-1',
+      name: 'Acme / Eng',
+      key: null,
+      url: null,
+      kind: 'channel'
+    })
+    expect(await linkOf()).toEqual({ key: undefined, url: undefined })
+  })
+
+  it("a restricted agent's fresh conversations default to OFF, and DM rows survive a membership re-report (§14)", async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'D1', name: '@alice', kind: 'im' }
+    ])
+    let res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    let [dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    const byId = new Map(dto!.channels.map((c) => [c.channelId, c]))
+    expect(byId.get('C1')).toMatchObject({ kind: 'channel', trigger: 'off' })
+    expect(byId.get('D1')).toMatchObject({ kind: 'im', trigger: 'off', name: '@alice' })
+
+    // A later membership-only snapshot (bot left C1; D1 not re-reported) must drop
+    // C1 but KEEP the DM row — the snapshot governs kind='channel' rows only.
+    await report(DAEMON, id, [{ id: 'C2', name: 'ops' }])
+    res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    ;[dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    expect(dto!.channels.map((c) => c.channelId).sort()).toEqual(['C2', 'D1'])
+
+    // A KIND-LESS re-report of the same id (telegram/discord observed-channel
+    // snapshots carry no kind) must not downgrade the established im row.
+    await report(DAEMON, id, [{ id: 'C2', name: 'ops' }, { id: 'D1' }])
+    res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    ;[dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    expect(dto!.channels.find((c) => c.channelId === 'D1')).toMatchObject({ kind: 'im' })
+  })
+
+  it('seeds the Linear TEAM rows AT INSTALL, through the ordinary §14 gating arm', async () => {
+    // A team is a channel, so its rows take the same seed every other conversation does: born
+    // `mention` under an unrestricted linking agent and `off` under a gated one, for an operator
+    // to enable. They are written by the install path itself, so the install's own syncBot
+    // already publishes the routes that follow from them.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const restricted = (await installLinear(running, { restricted: true })).integrationId
+    const open = (await installLinear(running)).integrationId
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const byId = new Map(
+      (res.json() as { id: string; channels: { channelId: string; name: string; trigger: string }[] }[]).map((d) => [
+        d.id,
+        d.channels
+      ])
+    )
+    const sorted = (id: string) => [...byId.get(id)!].sort((a, b) => a.channelId.localeCompare(b.channelId))
+    expect(sorted(open)).toEqual([
+      expect.objectContaining({ channelId: 'team_design', name: 'Acme / Design', trigger: 'mention' }),
+      expect.objectContaining({ channelId: 'team_eng', name: 'Acme / Engineering', trigger: 'mention' })
+    ])
+    expect(sorted(restricted).map((c) => [c.channelId, c.trigger])).toEqual([
+      ['team_design', 'off'],
+      ['team_eng', 'off']
+    ])
+  })
+
+  it("a daemon's observed report refreshes a team name without touching the seeded trigger", async () => {
+    // The wire report carries no trigger and `replaceSnapshot` preserves the stored one, so the
+    // backstop cannot fight the seed — a gated agent's Off row stays Off through a rename.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = (await installLinear(running, { restricted: true })).integrationId
+
+    await report(DAEMON, id, [{ id: 'team_eng', name: 'Acme / Platform' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const dto = (res.json() as { id: string; channels: { channelId: string; name: string; trigger: string }[] }[]).find(
+      (d) => d.id === id
+    )
+    expect(dto!.channels).toContainEqual(
+      expect.objectContaining({ channelId: 'team_eng', name: 'Acme / Platform', trigger: 'off' })
+    )
+  })
+
+  it('still starts a restricted agent OFF on a platform whose install grants nothing', async () => {
+    // The Linear arm above must not have widened the §14 default for everyone else.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const dto = (res.json() as { id: string; channels: { channelId: string; trigger: string }[] }[]).find(
+      (d) => d.id === id
+    )
+    expect(dto!.channels).toEqual([expect.objectContaining({ channelId: 'C1', trigger: 'off' })])
+  })
+
+  /** §14.8 fixture: a private agent shared with `audience`, on a bot in workspace T_ACME.
+   *  The seeded owner gets an OIDC subject so their own link can be resolved. */
+  async function privateAgentInWorkspace(app: HttpApp, audience: string[]): Promise<string> {
+    const id = await install(app)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { visibility: 'restricted', sharedWith: audience }
+    })
+    await prisma.bot.update({ where: { id: integration.botId }, data: { teamId: 'T_ACME' } })
+    await prisma.user.update({ where: { id: DEFAULT_OWNER_ID }, data: { oidcSubject: ALICE_SUB } })
+    return id
+  }
+
+  /** A second console account in the default org, for the multi-member audience. */
+  async function seedMember(sub: string): Promise<string> {
+    const users = new PgUserRepo(prisma)
+    const email = `${sub}@example.test`
+    const { userId } = await users.provisionOidcUser({ oidcSubject: sub, email, emailVerified: true })
+    await users.addMemberByEmail(DEFAULT_ORG_ID, email, 'collaborator')
+    return userId
+  }
+
+  /** Real repos + a stubbed identity service keyed by OIDC subject. */
+  const reconcileDeps = (links: Record<string, SlackIdentity>) => ({
+    users: new PgUserRepo(prisma),
+    orgs: new PgOrgRepo(prisma),
+    agents: new PgAgentRepo(prisma),
+    integrations: new PgIntegrationRepo(prisma),
+    bots: new PgBotRepo(prisma),
+    channels: new PgIntegrationChannelRepo(prisma),
+    identity: { slackIdentityFor: async (sub: string) => links[sub] ?? null },
+    push: async () => {}
+  })
+
+  const triggersOf = async (id: string): Promise<Map<string, string>> =>
+    new Map(
+      (await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))).map((row) => [
+        row.channelId,
+        row.trigger
+      ])
+    )
+
+  it("opens a private agent's DM with every audience member who linked their Slack identity (§14.8)", async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const bob = await seedMember(BOB_SUB)
+    const carol = await seedMember(CAROL_SUB)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID, bob, carol])
+
+    // Alice (the owner), Bob and Carol are the audience and all three linked; Dave is a
+    // workspace member who is not, and Erin is in the audience but never linked.
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: 'C1', name: 'deploys' },
+        { id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' },
+        { id: 'D_BOB', name: '@bob', kind: 'im', dmUserId: 'U_BOB' },
+        { id: 'D_CAROL', name: '@carol', kind: 'im', dmUserId: 'U_CAROL' },
+        { id: 'D_DAVE', name: '@dave', kind: 'im', dmUserId: 'U_DAVE' }
+      ],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        [ALICE_SUB]: { teamId: 'T_ACME', userId: 'U_ALICE' },
+        [BOB_SUB]: { teamId: 'T_ACME', userId: 'U_BOB' },
+        [CAROL_SUB]: { teamId: 'T_ACME', userId: 'U_CAROL' }
+      }
+    )
+
+    const triggers = await triggersOf(id)
+    expect(triggers.get('D_ALICE')).toBe('any')
+    expect(triggers.get('D_BOB')).toBe('any')
+    expect(triggers.get('D_CAROL')).toBe('any')
+    // The two arms that must NOT open: a channel (its membership is a room, not a
+    // person) and a DM from someone outside the audience.
+    expect(triggers.get('C1')).toBe('off')
+    expect(triggers.get('D_DAVE')).toBe('off')
+  })
+
+  /** An installed agent switched into assistant mode with the given visibility, on a bot in workspace T_ACME. */
+  async function assistantAgentInWorkspace(app: HttpApp, visibility: 'org' | 'restricted'): Promise<string> {
+    const id = await install(app)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: {
+        visibility,
+        sharedWith: visibility === 'restricted' ? [DEFAULT_OWNER_ID] : [],
+        assistantMode: { enabled: true }
+      }
+    })
+    await prisma.bot.update({ where: { id: integration.botId }, data: { teamId: 'T_ACME' } })
+    return id
+  }
+
+  // #2979 B7: assistant mode gates nothing, so an Everyone agent in it takes the defaults any Everyone agent takes.
+  it('gives an Everyone assistant-mode agent the open defaults and leaves an existing Off row Off', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await assistantAgentInWorkspace(running, 'org')
+    // A room seeded Off under the old gating, which nothing reopens.
+    await report(DAEMON, id, [{ id: 'C_OFF', name: 'quiet' }])
+    await prisma.integrationChannel.update({
+      where: { integrationId_channelId: { integrationId: id, channelId: 'C_OFF' } },
+      data: { trigger: 'off' }
+    })
+
+    await report(DAEMON, id, [
+      { id: 'C_OFF', name: 'quiet' },
+      { id: 'C1', name: 'deploys' },
+      { id: 'G1', name: '@@alice, bob', kind: 'mpim' },
+      { id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' },
+      { id: 'C_EXT', name: 'partners', externalReason: 'externallyShared' }
+    ])
+
+    const triggers = await triggersOf(id)
+    expect(triggers.get('C1')).toBe('mention')
+    expect(triggers.get('G1')).toBe('mention')
+    expect(triggers.get('D_ALICE')).toBe('any')
+    expect(triggers.get('C_EXT')).toBe('off')
+    expect(triggers.get('C_OFF')).toBe('off')
+  })
+
+  it('keeps a restricted assistant-mode agent gated: its new conversations start Off', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await assistantAgentInWorkspace(running, 'restricted')
+
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'D_DAVE', name: '@dave', kind: 'im', dmUserId: 'U_DAVE' }
+    ])
+
+    const triggers = await triggersOf(id)
+    expect(triggers.get('C1')).toBe('off')
+    expect(triggers.get('D_DAVE')).toBe('off')
+  })
+
+  // The other regression the review caught. On a direct/socket integration this handler
+  // is the ONLY path where a REPORT creates an enabled row: the reporting daemon still
+  // holds bindRules with no scoped rule for that DM, and it has already cached the
+  // conversation, so nothing re-reports and the DM stays refused until an unrelated
+  // reconnect. Opening a row therefore has to push.
+  it('re-converges the reporting daemon when a report opens a gated DM (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    const links = { [ALICE_SUB]: { teamId: 'T_ACME', userId: 'U_ALICE' } }
+    const converged: unknown[] = []
+    const converge = async (agent: unknown) => void converged.push(agent)
+
+    // A channel-only report changes no gating, so it must NOT push.
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'C1', name: 'deploys' }],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      links,
+      converge
+    )
+    expect(converged).toHaveLength(0)
+
+    // The DM that opens does.
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' }],
+      undefined,
+      undefined,
+      false,
+      undefined,
+      links,
+      converge
+    )
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('any')
+    expect(converged).toHaveLength(1)
+  })
+
+  it('keeps the Off default for an audience member who linked a DIFFERENT workspace (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' }],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { [ALICE_SUB]: { teamId: 'T_OTHER', userId: 'U_ALICE' } }
+    )
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('off')
+  })
+
+  it('opens an already-Off DM when its counterpart links afterwards, and pushes (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    // The real order of events: the DM is discovered and refused BEFORE the link.
+    await report(DAEMON, id, [{ id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' }])
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('off')
+
+    const pushed: string[] = []
+    const opened = await reconcileLinkedDms(DEFAULT_OWNER_ID, ALICE_SUB, {
+      users: new PgUserRepo(prisma),
+      orgs: new PgOrgRepo(prisma),
+      agents: new PgAgentRepo(prisma),
+      integrations: new PgIntegrationRepo(prisma),
+      bots: new PgBotRepo(prisma),
+      channels: new PgIntegrationChannelRepo(prisma),
+      identity: { slackIdentityFor: async () => ({ teamId: 'T_ACME', userId: 'U_ALICE' }) },
+      push: async (agent) => {
+        pushed.push(agent.id)
+      }
+    })
+    expect(opened).toBe(1)
+    expect(pushed).toHaveLength(1)
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('any')
+  })
+
+  it('opens an already-Off DM when its counterpart JOINS the audience afterwards (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const bob = await seedMember(BOB_SUB)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    await report(DAEMON, id, [{ id: 'D_BOB', name: '@bob', kind: 'im', dmUserId: 'U_BOB' }])
+    expect((await triggersOf(id)).get('D_BOB')).toBe('off')
+
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const agent = await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { sharedWith: [DEFAULT_OWNER_ID, bob] }
+    })
+    const opened = await reconcileAgentLinkedDms(
+      agent as unknown as Parameters<typeof reconcileAgentLinkedDms>[0],
+      [bob],
+      reconcileDeps({ [BOB_SUB]: { teamId: 'T_ACME', userId: 'U_BOB' } })
+    )
+    expect(opened).toBe(1)
+    expect((await triggersOf(id)).get('D_BOB')).toBe('any')
+  })
+
+  // The regression the review caught: the catch-up is a DEFAULT for a pair that just
+  // became eligible, not a standing rule. Re-deriving it from the whole current
+  // audience on every later sharing edit would silently revert an editor's own Off.
+  it('a later sharing edit never reopens a DM the editor closed (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const bob = await seedMember(BOB_SUB)
+    const carol = await seedMember(CAROL_SUB)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID, bob])
+    const links = {
+      [BOB_SUB]: { teamId: 'T_ACME', userId: 'U_BOB' },
+      [CAROL_SUB]: { teamId: 'T_ACME', userId: 'U_CAROL' }
+    }
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: 'D_BOB', name: '@bob', kind: 'im', dmUserId: 'U_BOB' },
+        { id: 'D_CAROL', name: '@carol', kind: 'im', dmUserId: 'U_CAROL' }
+      ],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      links
+    )
+    expect((await triggersOf(id)).get('D_BOB')).toBe('any')
+
+    // The editor reconsiders and closes Bob's DM.
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'D_BOB', { trigger: 'off' })
+
+    // Carol is added later. Only Carol's DM opens; Bob's stays where the editor put it.
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const agent = await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { sharedWith: [DEFAULT_OWNER_ID, bob, carol] }
+    })
+    await reconcileAgentLinkedDms(
+      agent as unknown as Parameters<typeof reconcileAgentLinkedDms>[0],
+      [carol],
+      reconcileDeps(links)
+    )
+    const triggers = await triggersOf(id)
+    expect(triggers.get('D_CAROL')).toBe('any')
+    expect(triggers.get('D_BOB')).toBe('off')
+  })
+
+  // The link path cannot prove a link just landed — the browser writes it at the
+  // provider BEFORE calling refresh — so it runs on every call. `triggerChosen` is what
+  // makes that safe: an editor's Off is a decision, not a pending authorization.
+  it('a repeated identity refresh never reopens a DM the editor closed (§14.8)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    const links = { [ALICE_SUB]: { teamId: 'T_ACME', userId: 'U_ALICE' } }
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'D_ALICE', name: '@alice', kind: 'im', dmUserId: 'U_ALICE' }],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      links
+    )
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('any')
+
+    // The editor closes it through the console route, which records the choice.
+    const closed = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/D_ALICE`,
+      payload: { trigger: 'off' }
+    })
+    expect(closed.statusCode).toBe(200)
+
+    // Any number of later refreshes leave it closed.
+    for (let i = 0; i < 3; i += 1) {
+      expect(await reconcileLinkedDms(DEFAULT_OWNER_ID, ALICE_SUB, reconcileDeps(links))).toBe(0)
+    }
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('off')
+  })
+
+  it('never re-closes a DM an operator turned Off after §14.8 opened it', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await privateAgentInWorkspace(running, [DEFAULT_OWNER_ID])
+    const links = { [ALICE_SUB]: { teamId: 'T_ACME', userId: 'U_ALICE' } }
+    const dm = { id: 'D_ALICE', name: '@alice', kind: 'im' as const, dmUserId: 'U_ALICE' }
+    await report(DAEMON, id, [dm], undefined, undefined, undefined, undefined, links)
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('any')
+
+    // The seed is a DEFAULT, not a standing rule: once a row exists, its trigger is
+    // the operator's, and a re-report must not reassert the open state.
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'D_ALICE', { trigger: 'off' })
+    await report(DAEMON, id, [dm], undefined, undefined, undefined, undefined, links)
+    expect((await triggersOf(id)).get('D_ALICE')).toBe('off')
+  })
+
+  it('stores a public DM as On, then atomically closes it when the agent becomes restricted (§14.3)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+
+    // Public agent: the DM is discovered (and a channel alongside it, for contrast).
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'D1', name: '@alice', kind: 'im' }
+    ])
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    const byId = new Map(dto!.channels.map((c) => [c.channelId, c]))
+    expect(byId.get('D1')).toMatchObject({ kind: 'im', trigger: 'any' })
+    expect(byId.get('C1')).toMatchObject({ kind: 'channel', trigger: 'mention' })
+
+    spy.upserts.length = 0
+    const put = await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${integration.agentId}/sharing`,
+      payload: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+    expect(put.statusCode).toBe(200)
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.gated).toBe(true)
+    // No dm rule for D1: the private agent answers that DM only once enabled.
+    expect(u0.core!.bindRules).toEqual([{ channel: 'C1', match: { kind: 'mention' } }])
+    expect(
+      (await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))).find(
+        (c) => c.channelId === 'D1'
+      )
+    ).toMatchObject({ trigger: 'off' })
+  })
+
+  it('applies the public On default when a row misclassified as a channel converts to a DM (§14.3)', async () => {
+    // Session-history discovery cannot tell a DM from a group, so a DM could already be
+    // stored as a channel carrying a channel's trigger. That is not an operator's DM
+    // choice, so the conversion receives the public DM default instead.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice' }], undefined, undefined, false)
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'D1', { trigger: 'off' })
+    // The daemon now knows it is a DM and re-reports it as one.
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice', kind: 'im' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    expect(dto!.channels).toEqual([expect.objectContaining({ channelId: 'D1', kind: 'im', trigger: 'any' })])
+
+    spy.upserts.length = 0
+    await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${integration.agentId}/sharing`,
+      payload: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.bindRules).toEqual([])
+  })
+
+  it('defaults a public group DM to Mention and preserves later choices (§14.3)', async () => {
+    // Slack classifies a group DM late: an `app_mention` payload carries no
+    // channel_type, so the conversation first lands as a channel with a channel's
+    // trigger. That is not an operator's choice for this conversation, so resolving it
+    // must receive the group-DM default — and an authoritative channel snapshot (which can never list a
+    // group DM) must not delete the row.
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma)
+    const id = await install(running)
+
+    await report(DAEMON, id, [{ id: 'G1', name: 'mpim-alice--bob-1' }], undefined, undefined, false)
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'G1', { trigger: 'any' })
+    await report(DAEMON, id, [{ id: 'G1', name: 'mpim-alice--bob-1', kind: 'mpim' }], undefined, undefined, false)
+
+    const channelsOf = async () => {
+      const res = await running!.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+      const [dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+      return new Map(dto!.channels.map((c) => [c.channelId, c]))
+    }
+    expect((await channelsOf()).get('G1')).toMatchObject({ kind: 'mpim', trigger: 'mention' })
+
+    // An operator enables it; a later authoritative channel snapshot leaves it alone.
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'G1', { trigger: 'any' })
+    await report(DAEMON, id, [{ id: 'C1', name: 'general' }])
+    expect((await channelsOf()).get('G1')).toMatchObject({ kind: 'mpim', trigger: 'any' })
+
+    // A daemon restart loses the classification cache, so the next app_mention is
+    // re-reported as a provisional channel — and the daemon stamps a kind on every
+    // observed row, so this arrives as an EXPLICIT 'channel', not the absent-kind case
+    // the existing preservation rule covers. Accepting it would flip the row twice and
+    // reset the operator's trigger to Off on every restart.
+    await report(DAEMON, id, [{ id: 'G1', name: 'mpim-alice--bob-1', kind: 'channel' }], undefined, undefined, false)
+    expect((await channelsOf()).get('G1')).toMatchObject({ kind: 'mpim', trigger: 'any' })
+    // The daemon's own conversations.info correction lands afterwards and is a no-op.
+    await report(DAEMON, id, [{ id: 'G1', name: 'mpim-alice--bob-1', kind: 'mpim' }], undefined, undefined, false)
+    expect((await channelsOf()).get('G1')).toMatchObject({ kind: 'mpim', trigger: 'any' })
+  })
+
+  it('an enabled DM row survives a provisional channel re-report too (§14.3)', async () => {
+    // Same durability rule, on the kind that already existed: session-history discovery
+    // can re-observe a DM without knowing it is one.
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma)
+    const id = await install(running)
+
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice', kind: 'im' }], undefined, undefined, false)
+    await new PgIntegrationChannelRepo(prisma).setTrigger(IntegrationId(id), 'D1', { trigger: 'any' })
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice', kind: 'channel' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const [dto] = res.json() as { channels: { channelId: string; kind: string; trigger: string }[] }[]
+    expect(dto!.channels).toEqual([expect.objectContaining({ channelId: 'D1', kind: 'im', trigger: 'any' })])
+  })
+
+  it('keeps the public DM default deterministic when a kind-less and an IM report OVERLAP (§14.3)', async () => {
+    // Channel reports are fire-and-forget and their handlers run concurrently: a daemon
+    // start emits a kind-less observed snapshot, and the resolver's later verdict emits
+    // the same conversation as a DM. Deciding the conversion from a read taken BEFORE the
+    // write loses that race — the reader sees no row, the kind-less report then creates
+    // channel/mention, and the DM write flips only the kind, inheriting a trigger no
+    // operator ever chose for a DM. A later gate would honour it.
+    //
+    // The sequence is pinned rather than left to the scheduler: the DM report's pre-write
+    // read is held, the kind-less report commits underneath it, then the DM write lands.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+
+    const gate = holdFirstRead(prisma)
+    const dmReport = new PgIntegrationChannelRepo(gate.db).replaceSnapshot(
+      IntegrationId(id),
+      [{ id: 'D1', name: '@alice', kind: 'im' }],
+      { authoritative: false }
+    )
+    // Resolves as soon as a pre-write read is taken; an implementation that takes none
+    // is let through by the timeout (its write may land in either order — both are safe).
+    await Promise.race([gate.taken, new Promise((r) => setTimeout(r, 300))])
+    await new PgIntegrationChannelRepo(prisma).replaceSnapshot(IntegrationId(id), [{ id: 'D1', name: '@alice' }], {
+      authoritative: false
+    })
+    gate.release()
+    await dmReport
+
+    const [row] = await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))
+    expect(row).toMatchObject({ channelId: 'D1', kind: 'im', trigger: 'any' })
+
+    spy.upserts.length = 0
+    await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${integration.agentId}/sharing`,
+      payload: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.bindRules).toEqual([])
+  })
+
+  it('enabling conversations on a GATED integration pushes conversation-scoped rules ONLY (§14)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await prisma.agent.update({
+      where: { id: integration.agentId },
+      data: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'D1', name: '@alice', kind: 'im' }
+    ])
+    spy.upserts.length = 0
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { trigger: 'mention' }
+    })
+    expect(res.statusCode).toBe(200)
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.gated).toBe(true)
+    expect(u0.core!.bindRules).toEqual([{ channel: 'C1', match: { kind: 'mention' } }])
+
+    await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/D1`,
+      payload: { trigger: 'any' }
+    })
+    const u1 = spy.upserts[1]!.u
+    if (u1.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u1.core!.bindRules).toHaveLength(2)
+    expect(u1.core!.bindRules).toEqual(
+      expect.arrayContaining([
+        { channel: 'C1', match: { kind: 'mention' } },
+        { channel: 'D1', match: { kind: 'dm' } }
+      ])
+    )
+  })
+
+  it('flipping agent visibility re-pushes the integration spec with the derived gate (§14.4)', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }]) // org agent ⇒ default mention
+    spy.upserts.length = 0
+
+    const put = await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${integration.agentId}/sharing`,
+      payload: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+    })
+    expect(put.statusCode).toBe(200)
+    expect(spy.upserts).toHaveLength(1)
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.gated).toBe(true)
+    // The pre-flip channel row keeps its 'mention' trigger — grandfathered enabled.
+    expect(u0.core!.bindRules).toEqual([{ channel: 'C1', match: { kind: 'mention' } }])
+
+    const back = await running.app.inject({
+      method: 'PUT',
+      url: `${ORG}/agents/${integration.agentId}/sharing`,
+      payload: { visibility: 'org', sharedWith: [] }
+    })
+    expect(back.statusCode).toBe(200)
+    const u1 = spy.upserts[1]!.u
+    if (u1.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u1.core!.gated).toBe(false)
+    expect(u1.core!.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+  })
+
+  it('a re-report preserves the trigger, refreshes names, and drops left channels', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'C2', name: 'releases' }
+    ])
+    await channels.setTrigger(IntegrationId(id), 'C2', { trigger: 'any' })
+
+    // Bot renamed #deploys → #ship, left #releases… but C2's trigger must survive
+    // while it is still a member; here it left, so the row (and its trigger) go.
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'ship' },
+      { id: 'C2', name: 'releases' }
+    ])
+    let rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows.find((c) => c.channelId === 'C2')!.trigger).toBe('any') // preserved
+    expect(rows.find((c) => c.channelId === 'C1')!.name).toBe('ship') // refreshed
+
+    await report(DAEMON, id, [{ id: 'C1', name: 'ship' }])
+    rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows.map((c) => c.channelId)).toEqual(['C1']) // C2 dropped
+  })
+
+  it('a non-authoritative observed-conversation report upserts without deleting missing channels', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(DAEMON, id, [{ id: '-1001', name: 'First group' }], undefined, undefined, false)
+    await report(DAEMON, id, [{ id: '-1002', name: 'Second group' }], undefined, undefined, false)
+    await report(DAEMON, id, [{ id: '-1001' }], undefined, undefined, false)
+
+    const rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows.map((c) => c.channelId).sort()).toEqual(['-1001', '-1002'])
+    expect(rows.find((c) => c.channelId === '-1001')?.name).toBe('First group')
+  })
+
+  // A non-authoritative reporter's omissions carry no meaning — which is why these
+  // rows accumulated — so leaving a chat has to be stated by naming it.
+  it('a non-authoritative report DELETES the conversations it names as removed', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: '-1001', name: 'First group' },
+        { id: '-1002', name: 'Second group' }
+      ],
+      undefined,
+      undefined,
+      false
+    )
+    // The bot left the first group; the report both retracts it and refreshes the rest.
+    await report(DAEMON, id, [{ id: '-1002', name: 'Second group' }], undefined, undefined, false, ['-1001'])
+
+    const rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows.map((c) => c.channelId)).toEqual(['-1002'])
+  })
+
+  it('a retraction wins over the same conversation still listed in the report', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(DAEMON, id, [{ id: '-1001', name: 'First group' }], undefined, undefined, false)
+    // A stale snapshot may still carry the chat it is simultaneously retracting; the
+    // more specific statement has to win, or the row would be resurrected each time.
+    await report(DAEMON, id, [{ id: '-1001', name: 'First group' }], undefined, undefined, false, ['-1001'])
+
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  // A Telegram group upgraded to a supergroup changes id; its settings must follow, not reset to a fresh row.
+  it('a migration moves the old conversation settings onto the new id and drops the old row', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    const converged: unknown[] = []
+    const converge = async (agent: unknown) => {
+      converged.push(agent)
+    }
+
+    await report(DAEMON, id, [{ id: '-1001', name: 'Ops group' }], undefined, undefined, false)
+    await channels.setTrigger(IntegrationId(id), '-1001', { trigger: 'any' }, { chosen: true })
+    await channels.setSessionMode(IntegrationId(id), '-1001', 'append')
+    const migrate = () =>
+      report(
+        DAEMON,
+        id,
+        [{ id: '-1002001', name: 'Ops group' }],
+        undefined,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        converge,
+        [{ from: '-1001', to: '-1002001' }]
+      )
+    await migrate()
+
+    const rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows).toEqual([
+      expect.objectContaining({
+        channelId: '-1002001',
+        name: 'Ops group',
+        trigger: 'any',
+        sessionMode: 'append',
+        triggerChosen: true
+      })
+    ])
+    expect(converged).toHaveLength(1)
+    // Both sides of the upgrade report it; the second finds nothing left to move.
+    await migrate()
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual(rows)
+    expect(converged).toHaveLength(1)
+  })
+
+  it('a migration keeps a choice an editor already made on the new id', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: '-1001', name: 'Ops group' },
+        { id: '-1002001', name: 'Ops group' }
+      ],
+      undefined,
+      undefined,
+      false
+    )
+    await channels.setTrigger(IntegrationId(id), '-1001', { trigger: 'any' }, { chosen: true })
+    await channels.setTrigger(IntegrationId(id), '-1002001', { trigger: 'off' }, { chosen: true })
+    await report(
+      DAEMON,
+      id,
+      [{ id: '-1002001', name: 'Ops group' }],
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      undefined,
+      [{ from: '-1001', to: '-1002001' }]
+    )
+
+    const rows = await channels.listForIntegration(IntegrationId(id))
+    expect(rows).toEqual([expect.objectContaining({ channelId: '-1002001', trigger: 'off', triggerChosen: true })])
+  })
+
+  // §14.3 DM rows are exempt from authoritative deletion (no snapshot can list them),
+  // so an explicit retraction is the ONLY way one ever goes.
+  it('retracts a DM row, which no authoritative snapshot could delete', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice', kind: 'im' }], undefined, undefined, false)
+    expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['D1'])
+
+    await report(DAEMON, id, [], undefined, undefined, false, ['D1'])
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  it('hot-pushes collaboration routes after both channel joins and removals', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const collabRoutes = new CollabRoutesService(
+      new PgDaemonRepo(prisma),
+      new PgIntegrationRepo(prisma),
+      new PgAgentRepo(prisma),
+      { collabRoutes: () => undefined } as unknown as RelayControlSender,
+      spy as unknown as ControlSender
+    )
+
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }], new AgentMutationGate(), collabRoutes)
+    expect(spy.collaboration.at(-1)).toMatchObject({
+      daemonId: DAEMON,
+      snapshot: {
+        channels: [
+          {
+            orgId: DEFAULT_ORG_ID,
+            platform: 'slack',
+            channelId: 'C1',
+            agents: [{ agentId: integration.agentId, integrationId: id, daemonId: DAEMON }]
+          }
+        ]
+      }
+    })
+
+    await report(DAEMON, id, [], new AgentMutationGate(), collabRoutes)
+    expect(spy.collaboration.at(-1)).toMatchObject({
+      daemonId: DAEMON,
+      snapshot: { channels: [] }
+    })
+  })
+
+  it('keeps an accepted membership snapshot when its best-effort route push fails', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    await expect(
+      report(DAEMON, id, [{ id: 'C1', name: 'deploys' }], new AgentMutationGate(), {
+        broadcast: async () => Promise.reject(new Error('offline'))
+      } as unknown as CollabRoutesService)
+    ).resolves.toBeUndefined()
+    expect(await prisma.integrationChannel.count({ where: { integrationId: id, channelId: 'C1' } })).toBe(1)
+  })
+
+  it('drops a report from a daemon that does not own the integration', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedDaemon(prisma, OTHER_DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    await report(OTHER_DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    expect(await prisma.integrationChannel.count()).toBe(0)
+  })
+
+  it('drops a source report while the integration agent is moving', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const mutations = new AgentMutationGate()
+    const releaseMove = mutations.tryBeginMove(integration.agentId)!
+    try {
+      await report(DAEMON, id, [{ id: 'C1', name: 'stale-source' }], mutations)
+      expect(await prisma.integrationChannel.count()).toBe(0)
+    } finally {
+      releaseMove()
+    }
+  })
+
+  it('rechecks daemon ownership after taking the mutation lease', async () => {
+    await seedDaemon(prisma, DAEMON)
+    await seedDaemon(prisma, OTHER_DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const stored = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const agents = new PgAgentRepo(prisma)
+    let firstRead = true
+    const frame = {
+      v: 1,
+      id: randomUUID(),
+      ts: new Date().toISOString(),
+      type: 'integration/channels',
+      payload: { integrationId: id, channels: [{ id: 'C1', name: 'late-source' }] }
+    } as AnyFrame
+    // The served set is what admission reads, so the move lands between its two evaluations.
+    const deps = {
+      integration: new PgIntegrationRepo(prisma),
+      agent: {
+        listForDaemon: async (daemonId: Parameters<typeof agents.listForDaemon>[0]) => {
+          const rows = await agents.listForDaemon(daemonId)
+          if (firstRead) {
+            firstRead = false
+            await prisma.agent.update({ where: { id: stored.agentId }, data: { daemonId: OTHER_DAEMON } })
+          }
+          return rows
+        },
+        listByIds: (ids: Parameters<typeof agents.listByIds>[0]) => agents.listByIds(ids),
+        getUnscoped: (agentId: Parameters<typeof agents.getUnscoped>[0]) => agents.getUnscoped(agentId)
+      },
+      clock: systemClock,
+      integrationChannel: new PgIntegrationChannelRepo(prisma),
+      agentMutations: new AgentMutationGate()
+    } as unknown as DaemonWsDeps
+
+    await handleIntegrationChannels(frame, { daemonId: DAEMON } as DaemonConnection, deps)
+    expect(await prisma.integrationChannel.count()).toBe(0)
+  })
+})
+
+describe('PATCH /integrations/:id/channels/:channelId — a Linear team row', () => {
+  const patch = async (integrationId: string, body: Record<string, unknown>, channelId = 'team_eng') =>
+    await running!.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${integrationId}/channels/${channelId}`,
+      payload: body
+    })
+
+  it('takes a TRIGGER write like any other conversation, and mutes only that team', async () => {
+    // "review-bot handles ENG but stays out of DESIGN" is one row's setting (§15), so Off is open
+    // here — and it is per team for the whole bot, never a per-member value.
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const { integrationId } = await installLinear(running)
+
+    expect((await patch(integrationId, { trigger: 'off' })).statusCode).toBe(200)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const dto = (res.json() as { id: string; channels: { channelId: string; trigger: string }[] }[]).find(
+      (d) => d.id === integrationId
+    )
+    expect(dto!.channels).toContainEqual(expect.objectContaining({ channelId: 'team_eng', trigger: 'off' }))
+    expect(dto!.channels).toContainEqual(expect.objectContaining({ channelId: 'team_design', trigger: 'mention' }))
+  })
+
+  it('moves one team’s owner and leaves every other team’s where it was', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const first = await installLinear(running)
+    const second = await addLinearMember(running, first.botId)
+
+    const res = await patch(first.integrationId, { agentId: second.agentId })
+    expect(res.statusCode).toBe(200)
+
+    const list = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const rows = (list.json() as { id: string; channels: { channelId: string; agentId: string }[] }[]).filter((d) =>
+      [first.integrationId, second.integrationId].includes(d.id)
+    )
+    for (const dto of rows) {
+      expect(dto.channels).toContainEqual(expect.objectContaining({ channelId: 'team_eng', agentId: second.agentId }))
+      expect(dto.channels).toContainEqual(expect.objectContaining({ channelId: 'team_design', agentId: first.agentId }))
+    }
+  })
+
+  it('leaves both writes working on an ordinary platform', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { trigger: 'off' }
+    })
+    expect(res.statusCode).toBe(200)
+    const list = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const dto = (list.json() as { id: string; channels: { channelId: string; trigger: string }[] }[]).find(
+      (d) => d.id === id
+    )
+    expect(dto!.channels).toEqual([expect.objectContaining({ channelId: 'C1', trigger: 'off' })])
+  })
+})
+
+describe('PATCH /integrations/:id/channels/:channelId', () => {
+  it('projects and updates one shared-channel owner consistently across member integrations', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const alice = randomUUID()
+    const bob = randomUUID()
+    const botId = randomUUID()
+    const aliceIntegration = randomUUID()
+    const bobIntegration = randomUUID()
+    await seedAgent(prisma, alice, { daemonId: DAEMON })
+    await seedAgent(prisma, bob, { daemonId: DAEMON })
+    await prisma.bot.create({
+      data: {
+        id: botId,
+        orgId: DEFAULT_ORG_ID,
+        platform: 'slack',
+        name: 'shared-bot',
+        shareable: true,
+        transport: 'http'
+      }
+    })
+    await prisma.integration.createMany({
+      data: [
+        {
+          id: aliceIntegration,
+          orgId: DEFAULT_ORG_ID,
+          agentId: alice,
+          botId,
+          platform: 'slack',
+          name: 'shared-bot'
+        },
+        {
+          id: bobIntegration,
+          orgId: DEFAULT_ORG_ID,
+          agentId: bob,
+          botId,
+          platform: 'slack',
+          name: 'shared-bot'
+        }
+      ]
+    })
+    await prisma.integrationChannel.createMany({
+      data: [
+        {
+          integrationId: aliceIntegration,
+          channelId: 'C1',
+          name: 'deploys',
+          trigger: 'any',
+          agentId: alice
+        },
+        {
+          integrationId: bobIntegration,
+          channelId: 'C1',
+          name: 'deploys',
+          trigger: 'mention',
+          agentId: null
+        },
+        {
+          integrationId: aliceIntegration,
+          channelId: 'D1',
+          name: '@Alice',
+          kind: 'im',
+          trigger: 'off',
+          agentId: alice
+        },
+        {
+          integrationId: bobIntegration,
+          channelId: 'D1',
+          name: '@Alice',
+          kind: 'im',
+          trigger: 'any',
+          agentId: bob
+        }
+      ]
+    })
+    running = buildHttpApp(prisma)
+
+    let listed = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    let shared = (
+      listed.json() as Array<{
+        botId: string
+        channels: Array<{ channelId: string; agentId: string; trigger: string }>
+      }>
+    ).filter((integration) => integration.botId === botId)
+    expect(shared).toHaveLength(2)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'C1')?.agentId === alice
+      )
+    ).toBe(true)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'C1')?.trigger === 'any'
+      )
+    ).toBe(true)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'D1')?.agentId === alice
+      )
+    ).toBe(true)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'D1')?.trigger === 'off'
+      )
+    ).toBe(true)
+
+    const changed = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${aliceIntegration}/channels/C1`,
+      payload: { agentId: bob }
+    })
+    expect(changed.statusCode).toBe(200)
+    expect(changed.json()).toMatchObject({ agentId: bob, trigger: 'any' })
+
+    const stored = await prisma.integrationChannel.findMany({
+      where: { integration: { botId }, channelId: 'C1' }
+    })
+    expect(stored.find((channel) => channel.integrationId === aliceIntegration)?.agentId).toBeNull()
+    expect(stored.find((channel) => channel.integrationId === bobIntegration)).toMatchObject({
+      agentId: bob,
+      trigger: 'any'
+    })
+
+    await prisma.integrationChannel.delete({
+      where: { integrationId_channelId: { integrationId: bobIntegration, channelId: 'D1' } }
+    })
+    const directChanged = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${aliceIntegration}/channels/D1`,
+      payload: { agentId: bob }
+    })
+    expect(directChanged.statusCode).toBe(200)
+    expect(directChanged.json()).toMatchObject({ kind: 'im', agentId: bob, trigger: 'off' })
+
+    const directStored = await prisma.integrationChannel.findMany({
+      where: { integration: { botId }, channelId: 'D1' }
+    })
+    expect(directStored.find((channel) => channel.integrationId === aliceIntegration)?.agentId).toBeNull()
+    expect(directStored.find((channel) => channel.integrationId === bobIntegration)).toMatchObject({
+      kind: 'im',
+      agentId: bob,
+      trigger: 'off'
+    })
+
+    listed = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    shared = (
+      listed.json() as Array<{
+        botId: string
+        channels: Array<{ channelId: string; agentId: string; trigger: string }>
+      }>
+    ).filter((integration) => integration.botId === botId)
+    expect(
+      shared.every((integration) => integration.channels.find((channel) => channel.channelId === 'C1')?.agentId === bob)
+    ).toBe(true)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'C1')?.trigger === 'any'
+      )
+    ).toBe(true)
+    expect(
+      shared.every((integration) => integration.channels.find((channel) => channel.channelId === 'D1')?.agentId === bob)
+    ).toBe(true)
+    expect(
+      shared.every(
+        (integration) => integration.channels.find((channel) => channel.channelId === 'D1')?.trigger === 'off'
+      )
+    ).toBe(true)
+
+    const cleared = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${aliceIntegration}/channels/C1`,
+      payload: { agentId: null }
+    })
+    expect(cleared.statusCode).toBe(400)
+
+    // Simulate a new install whose membership snapshot has not arrived, then
+    // remove the sole-row owner. Pre-delete convergence must backfill the
+    // survivor with both channel metadata and the effective trigger.
+    await prisma.integrationChannel.delete({
+      where: { integrationId_channelId: { integrationId: aliceIntegration, channelId: 'C1' } }
+    })
+    const removed = await running.app.inject({
+      method: 'DELETE',
+      url: `${ORG}/integrations/${bobIntegration}`
+    })
+    expect(removed.statusCode).toBe(204)
+    expect(
+      await prisma.integrationChannel.findUnique({
+        where: { integrationId_channelId: { integrationId: aliceIntegration, channelId: 'C1' } }
+      })
+    ).toMatchObject({ agentId: alice, trigger: 'any' })
+  })
+
+  it('projects a hidden canonical owner but refuses to mutate it through a visible sibling', async () => {
+    const users = new PgUserRepo(prisma)
+    const subject = `channel-auth-${randomUUID()}`
+    const email = `${subject}@acme.dev`
+    const { userId } = await users.provisionOidcUser({ oidcSubject: subject, email, emailVerified: true })
+    await users.addMemberByEmail(DEFAULT_ORG_ID, email, 'collaborator')
+
+    await seedDaemon(prisma, DAEMON)
+    const alice = randomUUID()
+    const bob = randomUUID()
+    const botId = randomUUID()
+    const aliceIntegration = randomUUID()
+    const bobIntegration = randomUUID()
+    await seedAgent(prisma, alice, { daemonId: DAEMON })
+    await seedAgent(prisma, bob, {
+      daemonId: DAEMON,
+      visibility: 'restricted',
+      sharedWith: [DEFAULT_OWNER_ID]
+    })
+    await prisma.bot.create({
+      data: {
+        id: botId,
+        orgId: DEFAULT_ORG_ID,
+        platform: 'slack',
+        name: 'restricted-owner-bot',
+        shareable: true,
+        transport: 'http'
+      }
+    })
+    await prisma.integration.createMany({
+      data: [
+        {
+          id: aliceIntegration,
+          orgId: DEFAULT_ORG_ID,
+          agentId: alice,
+          botId,
+          platform: 'slack',
+          name: 'restricted-owner-bot'
+        },
+        {
+          id: bobIntegration,
+          orgId: DEFAULT_ORG_ID,
+          agentId: bob,
+          botId,
+          platform: 'slack',
+          name: 'restricted-owner-bot'
+        }
+      ]
+    })
+    await prisma.integrationChannel.createMany({
+      data: [
+        {
+          integrationId: aliceIntegration,
+          channelId: 'C1',
+          name: 'deploys',
+          trigger: 'mention',
+          agentId: null
+        },
+        {
+          integrationId: bobIntegration,
+          channelId: 'C1',
+          name: 'deploys',
+          trigger: 'any',
+          agentId: bob
+        }
+      ]
+    })
+    running = buildHttpApp(prisma, { DEFAULT_OWNER_ID: userId })
+
+    const listed = await running.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const visible = (
+      listed.json() as Array<{
+        agentId: string
+        botId: string
+        channels: Array<{ agentId: string; trigger: string }>
+      }>
+    ).filter((integration) => integration.botId === botId)
+    expect(visible).toHaveLength(1)
+    expect(visible[0]).toMatchObject({
+      agentId: alice,
+      channels: [expect.objectContaining({ agentId: bob, trigger: 'any' })]
+    })
+
+    const denied = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${aliceIntegration}/channels/C1`,
+      payload: { trigger: 'mention' }
+    })
+    expect(denied.statusCode).toBe(403)
+    expect(
+      await prisma.integrationChannel.findUnique({
+        where: { integrationId_channelId: { integrationId: bobIntegration, channelId: 'C1' } }
+      })
+    ).toMatchObject({ agentId: bob, trigger: 'any' })
+
+    await prisma.integrationChannel.update({
+      where: { integrationId_channelId: { integrationId: bobIntegration, channelId: 'C1' } },
+      data: { agentId: null }
+    })
+    await prisma.integrationChannel.update({
+      where: { integrationId_channelId: { integrationId: aliceIntegration, channelId: 'C1' } },
+      data: { agentId: alice, trigger: 'any' }
+    })
+    const deniedTarget = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${aliceIntegration}/channels/C1`,
+      payload: { agentId: bob }
+    })
+    expect(deniedTarget.statusCode).toBe(403)
+  })
+
+  it("persists the trigger and pushes integration/upsert with the channel-scoped 'auto' rule", async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'C2', name: 'releases' }
+    ])
+    spy.upserts.length = 0
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C2`,
+      payload: { trigger: 'any' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({
+      channelId: 'C2',
+      name: 'releases',
+      spaceId: null,
+      space: null,
+      icon: null,
+      color: null,
+      key: null,
+      url: null,
+      isPrivate: false,
+      kind: 'channel',
+      sessionMode: 'createNew',
+      trigger: 'any',
+      isCodeSession: false,
+      decisionBinding: null,
+      decision: null,
+      agentId: null,
+      externalReason: null
+    })
+
+    // The daemon got the recomputed rule set: defaults + ONE auto rule for C2.
+    expect(spy.upserts).toHaveLength(1)
+    expect(spy.upserts[0]!.daemonId).toBe(DAEMON)
+    const u0 = spy.upserts[0]!.u
+    if (u0.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u0.core!.bindRules).toEqual([
+      { match: { kind: 'mention' } },
+      { match: { kind: 'dm' } },
+      { channel: 'C2', match: { kind: 'auto' } }
+    ])
+
+    // Flipping back to mention removes the auto rule again.
+    await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C2`,
+      payload: { trigger: 'mention' }
+    })
+    const u1 = spy.upserts[1]!.u
+    if (u1.platform !== 'slack') throw new Error('expected slack integration')
+    expect(u1.core!.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+  })
+
+  it('404s on an unknown channel or integration', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+
+    const missChannel = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/CUNKNOWN`,
+      payload: { trigger: 'any' }
+    })
+    expect(missChannel.statusCode).toBe(404)
+
+    const missIntegration = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${randomUUID()}/channels/C1`,
+      payload: { trigger: 'any' }
+    })
+    expect(missIntegration.statusCode).toBe(404)
+  })
+})
+
+/**
+ * The per-conversation SESSION MODE (channel-session-mode.md §5). It rides beside the
+ * trigger on the same row and the same PATCH, but answers a different question — which
+ * session an activation joins, not whether one happens — so what is pinned here is that
+ * the two never disturb each other, and that the choice reaches the daemon's spec.
+ */
+describe('PATCH /integrations/:id/channels/:channelId — session mode', () => {
+  const modesOf = async (id: string): Promise<Map<string, string>> =>
+    new Map(
+      (await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))).map((row) => [
+        row.channelId,
+        row.sessionMode
+      ])
+    )
+
+  it('defaults to createNew and is absent from the pushed spec until someone departs from it', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    spy.upserts.length = 0
+
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+
+    // A trigger-only patch must not mint a sessionModes entry: the sparse list is what
+    // keeps the common spec free of a row per conversation.
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { trigger: 'any' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().sessionMode).toBe('createNew')
+    expect(spy.upserts[0]!.u.core!.sessionModes).toEqual([])
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+  })
+
+  it('a sessionMode-only patch persists, echoes, and reaches the daemon without touching the trigger', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { trigger: 'any' }
+    })
+    spy.upserts.length = 0
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ channelId: 'C1', trigger: 'any', sessionMode: 'append' })
+    expect((await modesOf(id)).get('C1')).toBe('append')
+    // The trigger the earlier patch chose survives, and still drives its own bindRule.
+    const pushed = spy.upserts[0]!.u
+    expect(pushed.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+    expect(pushed.core!.bindRules).toEqual(expect.arrayContaining([{ channel: 'C1', match: { kind: 'auto' } }]))
+  })
+
+  it('a patch carrying both fields commits both', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    spy.upserts.length = 0
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { trigger: 'off', sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ trigger: 'off', sessionMode: 'append' })
+    const pushed = spy.upserts[0]!.u
+    expect(pushed.core!.mutedChannels).toEqual(['C1'])
+    expect(pushed.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+  })
+
+  it('404s on a conversation the integration does not have', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C_MISSING`,
+      payload: { sessionMode: 'append' }
+    })
+    expect(res.statusCode).toBe(404)
+  })
+
+  // The choice is the operator's, exactly like the trigger: a daemon re-reporting its
+  // conversations refreshes metadata and must never reset it.
+  it('survives a re-report of the conversation', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C1`,
+      payload: { sessionMode: 'append' }
+    })
+
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys-renamed' }])
+    expect((await modesOf(id)).get('C1')).toBe('append')
+  })
+
+  it('returns null rather than throwing when the row is gone', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    expect(await new PgIntegrationChannelRepo(prisma).setSessionMode(IntegrationId(id), 'C_GONE', 'append')).toBeNull()
+  })
+
+  // auto-session-mode.md §3.1: auto is accepted only while the serving daemon advertises it.
+  it('refuses auto until every connected daemon serving the agent advertises it, then pushes it', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    let conn: { state: string; capabilities: { features: string[] } } | undefined
+    running = buildHttpApp(prisma, undefined, { get: () => conn } as never, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    spy.upserts.length = 0
+    const setAuto = () =>
+      running!.app.inject({
+        method: 'PATCH',
+        url: `${ORG}/integrations/${id}/channels/C1`,
+        payload: { sessionMode: 'auto' }
+      })
+
+    const offline = await setAuto()
+    expect(offline.statusCode).toBe(409)
+    expect(offline.json()).toMatchObject({ code: 'SESSION_MODE_UNSUPPORTED' })
+    conn = { state: 'READY', capabilities: { features: [] } }
+    const older = await setAuto()
+    expect(older.statusCode).toBe(409)
+    expect(older.json()).toMatchObject({ code: 'SESSION_MODE_UNSUPPORTED', message: 'Upgrade the daemon to use Auto.' })
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+    expect(spy.upserts).toEqual([])
+
+    conn = { state: 'READY', capabilities: { features: [SESSION_MODE_AUTO_V1_FEATURE] } }
+    const res = await setAuto()
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ channelId: 'C1', sessionMode: 'auto' })
+    expect((await modesOf(id)).get('C1')).toBe('auto')
+    expect(spy.upserts.at(-1)!.u.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'auto' }])
+  })
+
+  // auto-session-mode.md §3.6: with the coordinator off Auto is refused and an Auto row runs Single session; its stored mode returns with it.
+  it('runs an Auto row as Single session while the coordinator is off and refuses Auto until it is back on', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    const conn = { state: 'READY', capabilities: { features: [SESSION_MODE_AUTO_V1_FEATURE] } }
+    running = buildHttpApp(prisma, undefined, { get: () => conn } as never, spy as unknown as ControlSender)
+    const id = await install(running)
+    const { agentId } = await prisma.integration.findUniqueOrThrow({ where: { id }, select: { agentId: true } })
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'C2', name: 'support' }
+    ])
+    const setAuto = (channel: string) =>
+      running!.app.inject({
+        method: 'PATCH',
+        url: `${ORG}/integrations/${id}/channels/${channel}`,
+        payload: { sessionMode: 'auto' }
+      })
+    const coordinator = (coordinatorDisabled: boolean) =>
+      running!.app.inject({ method: 'PATCH', url: `${ORG}/agents/${agentId}`, payload: { coordinatorDisabled } })
+    expect((await setAuto('C1')).statusCode).toBe(200)
+
+    spy.upserts.length = 0
+    const off = await coordinator(true)
+    expect(off.statusCode).toBe(200)
+    expect(off.json()).toMatchObject({ coordinatorDisabled: true })
+    expect(spy.upserts.at(-1)!.u.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+    expect((await modesOf(id)).get('C1')).toBe('auto')
+    const refused = await setAuto('C2')
+    expect(refused.statusCode).toBe(409)
+    expect(refused.json()).toMatchObject({ code: 'SESSION_MODE_UNSUPPORTED' })
+
+    spy.upserts.length = 0
+    const on = await coordinator(false)
+    expect(on.json()).toMatchObject({ coordinatorDisabled: false })
+    expect(spy.upserts.at(-1)!.u.core!.sessionModes).toEqual([{ channel: 'C1', mode: 'auto' }])
+    expect((await setAuto('C2')).statusCode).toBe(200)
+  })
+
+  // auto-session-mode.md §3.2: new rooms and group DMs start on Auto where the bot's daemon reads it; DMs and known rows never change.
+  it('starts a new room and group DM on Auto for a daemon that reads it, and pushes them', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C0', name: 'before' }])
+    const pushes: unknown[] = []
+    const converge = async (agent: unknown) => void pushes.push(agent)
+
+    reporterFeatures = [SESSION_MODE_AUTO_V1_FEATURE]
+    await report(
+      DAEMON,
+      id,
+      [
+        { id: 'C0', name: 'before' },
+        { id: 'C1', name: 'deploys' },
+        { id: 'G1', name: 'mpim-alice--bob-1', kind: 'mpim' },
+        { id: 'D1', name: '@alice', kind: 'im' }
+      ],
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      converge
+    )
+    expect(Object.fromEntries(await modesOf(id))).toEqual({
+      C0: 'createNew',
+      C1: 'auto',
+      G1: 'auto',
+      D1: 'createNew'
+    })
+    expect(pushes).toHaveLength(1)
+
+    // A re-report creates nothing, so it pushes nothing.
+    await report(
+      DAEMON,
+      id,
+      [{ id: 'C1', name: 'deploys' }],
+      undefined,
+      undefined,
+      false,
+      undefined,
+      undefined,
+      converge
+    )
+    expect(pushes).toHaveLength(1)
+  })
+
+  it('keeps new rows Per thread for a daemon that does not read Auto', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma)
+    const id = await install(running)
+    reporterFeatures = []
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    expect((await modesOf(id)).get('C1')).toBe('createNew')
+  })
+
+  it('gives a room that turns out to be a DM the DM’s mode, never the room’s Auto, and pushes it', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma)
+    const id = await install(running)
+    const pushes: unknown[] = []
+    const converge = async (agent: unknown) => void pushes.push(agent)
+    const reportOne = (channel: IntegrationChannel) =>
+      report(DAEMON, id, [channel], undefined, undefined, false, undefined, undefined, converge)
+    reporterFeatures = [SESSION_MODE_AUTO_V1_FEATURE]
+    await reportOne({ id: 'D1', name: '@alice' })
+    expect((await modesOf(id)).get('D1')).toBe('auto')
+    expect(pushes).toHaveLength(1)
+    await reportOne({ id: 'D1', name: '@alice', kind: 'im' })
+    expect((await modesOf(id)).get('D1')).toBe('createNew')
+    // The daemon still lists the row as Auto, so the conversion reaches it at once.
+    expect(pushes).toHaveLength(2)
+    await reportOne({ id: 'D1', name: '@alice', kind: 'im' })
+    expect(pushes).toHaveLength(2)
+  })
+
+  // An agent's new-conversation mode (PATCH /agents/:id) decides what its new rooms start at, ahead of the daemon's Auto default; DMs and known rows never change.
+  it("starts new rooms at the agent's new-conversation mode, set through PATCH /agents/:id", async () => {
+    await seedDaemon(prisma, DAEMON)
+    const http = buildHttpApp(prisma)
+    running = http
+    const id = await install(http)
+    await report(DAEMON, id, [{ id: 'C0', name: 'before' }])
+    const { agentId } = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const setMode = async (newConversationMode: string | null) => {
+      const res = await http.app.inject({
+        method: 'PATCH',
+        url: `${ORG}/agents/${agentId}`,
+        payload: { newConversationMode }
+      })
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toMatchObject({ newConversationMode })
+    }
+    const rows = async () =>
+      Object.fromEntries(
+        (await prisma.integrationChannel.findMany({ where: { integrationId: id } })).map((row) => [
+          row.channelId,
+          `${row.trigger}/${row.sessionMode}`
+        ])
+      )
+    const seen = (ids: string[]) => ids.map((channelId) => ({ id: channelId, name: channelId }))
+    // The daemon mutes an Off room only once its spec lists it, so a report that seeds one pushes the spec.
+    let pushes = 0
+    const reportPushing = (channels: IntegrationChannel[]) =>
+      report(DAEMON, id, channels, undefined, undefined, false, undefined, undefined, async () => void pushes++)
+    reporterFeatures = [SESSION_MODE_AUTO_V1_FEATURE]
+
+    await setMode('off')
+    await reportPushing([...seen(['C0', 'C1']), { id: 'D1', name: '@alice', kind: 'im' }])
+    expect(pushes).toBe(1)
+    await reportPushing(seen(['C1']))
+    expect(pushes).toBe(1)
+    await setMode('mention')
+    await reportPushing(seen(['C2']))
+    expect(pushes).toBe(1)
+    await setMode(null)
+    await reportPushing(seen(['C3']))
+    expect(pushes).toBe(2)
+
+    expect(await rows()).toEqual({
+      C0: 'mention/createNew',
+      C1: 'off/createNew',
+      D1: 'any/createNew',
+      C2: 'mention/createNew',
+      C3: 'mention/auto'
+    })
+  })
+})
+
+/**
+ * The two console actions that end a conversation's listing. They are deliberately
+ * different things: forgetting touches only AgentConnect, leaving touches the
+ * platform — so they are tested for what each does NOT do as much as what it does.
+ */
+describe('DELETE …/channels/:channelId (forget) and POST …/leave (platform)', () => {
+  it('forgets a row without asking the daemon to touch the platform', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    await report(DAEMON, id, [
+      { id: 'C1', name: 'deploys' },
+      { id: 'C2', name: 'releases' }
+    ])
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/C1` })
+
+    expect(res.statusCode).toBe(204)
+    expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['C2'])
+    expect(spy.leaves).toEqual([]) // the bot was never touched on Slack
+    // Slack re-lists its membership authoritatively, so that listing governs the row
+    // and a tombstone would add nothing — demanding one would only make Forget fail
+    // whenever a Slack daemon is offline.
+    expect(spy.forgets).toEqual([])
+    // It still gets the recomputed spec, or its routing would keep the row.
+    expect(spy.upserts.at(-1)!.daemonId).toBe(DAEMON)
+  })
+
+  it('404s a row that is not there, so a double-click cannot read as success', async () => {
+    await seedDaemon(prisma, DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, new SpyControl() as unknown as ControlSender)
+    const id = await install(running)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/nope` })
+    expect(res.statusCode).toBe(404)
+  })
+
+  it('asks the owning daemon to leave, then forgets the row', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await installTelegram(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }], undefined, undefined, false)
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'conversation', channel: 'C1' } }
+    })
+
+    expect(res.statusCode).toBe(204)
+    expect(spy.leaves).toEqual([
+      { daemonId: DAEMON, l: { integrationId: id, target: { kind: 'conversation', channel: 'C1' } } }
+    ])
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  // The useful half of a failure: a missing scope or a last-member channel is
+  // something the operator can act on, so it must survive to the response.
+  it("relays the platform's own refusal as 502 and keeps the row", async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    spy.leaveVerdict = { ok: false, error: 'missing_scope' }
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'conversation', channel: 'C1' } }
+    })
+
+    expect(res.statusCode).toBe(502)
+    expect((res.json() as { message: string }).message).toBe('missing_scope')
+    // Still a member as far as anyone knows, so the row stays.
+    expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['C1'])
+  })
+
+  // A cold move re-places the agent and rebuilds its channel state on the new daemon.
+  // Dispatching the platform call to the pre-move daemon and then deleting rows the
+  // move has already rewritten would leave the new daemon believing it is still in a
+  // channel the bot has actually left.
+  it('refuses to leave while an agent move holds the lease, and never reaches the platform', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    const mutations = new AgentMutationGate()
+    running = buildHttpApp(
+      prisma,
+      undefined,
+      undefined,
+      spy as unknown as ControlSender,
+      {
+        agentMutations: mutations
+      } as never
+    )
+    const id = await install(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    const stored = await prisma.integration.findUniqueOrThrow({ where: { id } })
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    const releaseMove = mutations.tryBeginMove(stored.agentId)!
+    try {
+      const res = await running.app.inject({
+        method: 'POST',
+        url: `${ORG}/integrations/${id}/leave`,
+        payload: { target: { kind: 'conversation', channel: 'C1' } }
+      })
+      expect(res.statusCode).toBe(409)
+      expect(spy.leaves).toEqual([]) // the platform was never told anything
+      // …and the row is untouched, so the two sides cannot disagree.
+      expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['C1'])
+    } finally {
+      releaseMove()
+    }
+  })
+
+  // §14.3 gives each install its OWN DM row, so fanning a forget across the bot
+  // would let an editor of one agent silently drop another agent's direct message.
+  it('forgets a DM row on this install only, never across the bot', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const channels = new PgIntegrationChannelRepo(prisma)
+    await report(DAEMON, id, [{ id: 'D1', name: '@alice', kind: 'im' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/D1` })
+
+    expect(res.statusCode).toBe(204)
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  // The suppression is what makes the removal stick, so a daemon that never got it
+  // WILL list the conversation again — reporting 204 would be a lie found out later.
+  it('refuses to forget when the suppression cannot reach the daemon', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    spy.forgetThrows = new NoConnection(DAEMON)
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await installTelegram(running)
+    await report(DAEMON, id, [{ id: 'C1', name: 'deploys' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/C1` })
+
+    expect(res.statusCode).toBe(502)
+    expect((res.json() as { message: string }).message).toContain('offline')
+    // The row must SURVIVE. Deleting it and then reporting failure would leave the
+    // console empty while telling the operator it failed — and the advised retry would
+    // 404 on the already-deleted row instead of re-attempting the suppression.
+    const channels = new PgIntegrationChannelRepo(prisma)
+    expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['C1'])
+
+    // …so the retry the message advises actually works once the daemon is back.
+    spy.forgetThrows = null
+    const retried = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/C1` })
+    expect(retried.statusCode).toBe(204)
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  // The rule the two cases above encode, stated once: suppression exists only for the
+  // platforms whose rows are rebuilt from session history.
+  it('pushes the suppression for a session-derived platform', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await installTelegram(running)
+    await report(DAEMON, id, [{ id: '-100123', name: 'Team' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/-100123` })
+
+    expect(res.statusCode).toBe(204)
+    expect(spy.forgets).toEqual([{ daemonId: DAEMON, f: { integrationId: id, channels: ['-100123'] } }])
+  })
+
+  // The two arms below are one rule read off the §5 manifest's
+  // `leaveGranularity` (audit F12): a request whose target shape the platform
+  // cannot serve is refused HERE — before an owner resolves, before the mutation
+  // lease, before any daemon is reached — so neither ever dispatches.
+  it('refuses a space-scoped leave on a platform whose bot leaves conversations', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running) // Slack
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'space', spaceId: 'G1' } }
+    })
+
+    expect(res.statusCode).toBe(400)
+    expect(spy.leaves).toEqual([]) // never reached the daemon
+  })
+
+  it('refuses a conversation-scoped leave on a platform whose bot joins a space', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await installDiscord(running)
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'conversation', channel: 'C1' } }
+    })
+
+    expect(res.statusCode).toBe(400)
+    expect(spy.leaves).toEqual([])
+  })
+
+  it('dispatches a space-scoped leave on the platform that has one', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await installDiscord(running)
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'space', spaceId: 'G1' } }
+    })
+
+    expect(res.statusCode).toBe(204)
+    expect(spy.leaves).toEqual([
+      { daemonId: DAEMON, l: { integrationId: id, target: { kind: 'space', spaceId: 'G1' } } }
+    ])
+  })
+})
+
+/**
+ * The pool half of every conversation path (#1026, #1027): a POOL agent is placed and names no
+ * machine, so a snapshot admitted by `agent.daemonId` was dropped in silence, and Forget / Leave
+ * refused on a column that could never be filled.
+ */
+describe('conversation paths for a POOL agent', () => {
+  const MEMBER = 'd9999999-9999-4999-8999-999999999999'
+  const GROUP = '00000000-0000-4000-8000-0000000009d1'
+
+  /** A pool agent whose duty MEMBER holds, with a Telegram install (the session-derived
+   *  platform, so Forget must reach a daemon) — plus the id of that install. */
+  async function heldInstall(app: HttpApp, platform: 'slack' | 'telegram'): Promise<string> {
+    const setId = await seedPoolMember(prisma, MEMBER)
+    const agentId = randomUUID()
+    await seedAgent(prisma, agentId, { setId, createdByUserId: DEFAULT_OWNER_ID })
+    await seedDutyGroup(prisma, GROUP, MEMBER, [agentId])
+    const res = await app.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations`,
+      payload:
+        platform === 'slack'
+          ? { name: 'pool-bot', platform, agentId, slack: SLACK }
+          : { name: 'pool-tg', platform, agentId, telegram: { botToken: '123456:AAE-xyz' } }
+    })
+    expect(res.statusCode).toBe(201)
+    return (res.json() as { id: string }).id
+  }
+
+  it('accepts a channel snapshot from the member holding the duty, and no one else (#1027)', async () => {
+    await seedDaemon(prisma, OTHER_DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await heldInstall(running, 'slack')
+    const channels = new PgIntegrationChannelRepo(prisma)
+
+    // A daemon that holds no duty for the agent writes nothing — silently, as before.
+    await report(OTHER_DAEMON, id, [{ id: 'C1', name: 'deploys' }])
+    expect(await channels.listForIntegration(IntegrationId(id))).toEqual([])
+
+    await report(MEMBER, id, [{ id: 'C1', name: 'deploys' }])
+    expect((await channels.listForIntegration(IntegrationId(id))).map((c) => c.channelId)).toEqual(['C1'])
+  })
+
+  it('pushes Forget to the duty holder instead of refusing as undeliverable (#1026)', async () => {
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await heldInstall(running, 'telegram')
+    await report(MEMBER, id, [{ id: '-100123', name: 'Team' }], undefined, undefined, false)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}/channels/-100123` })
+
+    expect(res.statusCode).toBe(204)
+    expect(spy.forgets).toEqual([{ daemonId: MEMBER, f: { integrationId: id, channels: ['-100123'] } }])
+    expect(await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))).toEqual([])
+  })
+
+  it('dispatches Leave to the duty holder (#1026)', async () => {
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await heldInstall(running, 'telegram')
+    await report(MEMBER, id, [{ id: 'C1', name: 'deploys' }], undefined, undefined, false)
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/integrations/${id}/leave`,
+      payload: { target: { kind: 'conversation', channel: 'C1' } }
+    })
+
+    expect(res.statusCode).toBe(204)
+    expect(spy.leaves).toEqual([
+      { daemonId: MEMBER, l: { integrationId: id, target: { kind: 'conversation', channel: 'C1' } } }
+    ])
+  })
+})
+
+// assistant-mode.md §5.3: an enabled place is internal unless the platform detects it as external.
+describe('detected external places', () => {
+  const externalOf = async (id: string): Promise<Map<string, string | null>> => {
+    const res = await running!.app.inject({ method: 'GET', url: `${ORG}/integrations` })
+    const integration = (
+      res.json() as Array<{ id: string; channels: Array<{ channelId: string; externalReason: string | null }> }>
+    ).find((i) => i.id === id)
+    return new Map(integration!.channels.map((c) => [c.channelId, c.externalReason]))
+  }
+
+  it('records a Slack Connect channel, lifts it when the share is gone, and pushes only on a change', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const converged: unknown[] = []
+    const converge = async (agent: unknown) => void converged.push(agent)
+    const reportExternal = (channels: IntegrationChannel[]) =>
+      report(DAEMON, id, channels, undefined, undefined, undefined, undefined, undefined, converge)
+
+    await reportExternal([
+      { id: 'C1', name: 'partners', externalReason: 'externallyShared' },
+      { id: 'C2', name: 'deploys', externalReason: null }
+    ])
+    expect(await externalOf(id)).toEqual(
+      new Map([
+        ['C1', 'externallyShared'],
+        ['C2', null]
+      ])
+    )
+    expect(converged).toHaveLength(1)
+
+    // The same listing again changes nothing; a report that checked nothing keeps the detection.
+    await reportExternal([
+      { id: 'C1', name: 'partners', externalReason: 'externallyShared' },
+      { id: 'C2', name: 'deploys', externalReason: null }
+    ])
+    await reportExternal([
+      { id: 'C1', name: 'partners' },
+      { id: 'C2', name: 'deploys' }
+    ])
+    expect((await externalOf(id)).get('C1')).toBe('externallyShared')
+    expect(converged).toHaveLength(1)
+
+    // A listing that no longer reports the share lifts it.
+    await reportExternal([
+      { id: 'C1', name: 'partners', externalReason: null },
+      { id: 'C2', name: 'deploys', externalReason: null }
+    ])
+    expect((await externalOf(id)).get('C1')).toBeNull()
+    expect(converged).toHaveLength(2)
+  })
+
+  it('keeps a guest or an outside member through every later report, and pushes only when the set changes', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    const converged: unknown[] = []
+    const converge = async (agent: unknown) => void converged.push(agent)
+    const reportPartial = (channels: IntegrationChannel[]) =>
+      report(DAEMON, id, channels, undefined, undefined, false, undefined, undefined, converge)
+    const listing = (c1: IntegrationChannel['externalReason']) =>
+      report(
+        DAEMON,
+        id,
+        [
+          { id: 'C1', name: 'partners', externalReason: c1 },
+          { id: 'C2', name: 'deploys', externalReason: null },
+          { id: 'C3', name: 'support', externalReason: null }
+        ],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        converge
+      )
+    await listing(null)
+    expect(converged).toHaveLength(0)
+
+    // A daemon's detection is a partial report: it touches no other row.
+    await reportPartial([{ id: 'C1', externalReason: 'guestMember' }])
+    await reportPartial([{ id: 'C2', externalReason: 'externalMember' }])
+    expect(await externalOf(id)).toEqual(
+      new Map([
+        ['C1', 'guestMember'],
+        ['C2', 'externalMember'],
+        ['C3', null]
+      ])
+    )
+    expect(converged).toHaveLength(2)
+
+    // A listing that finds no share, or a share, neither lifts nor replaces them; nothing re-pushes.
+    await listing(null)
+    await listing('externallyShared')
+    expect((await externalOf(id)).get('C1')).toBe('guestMember')
+    expect((await externalOf(id)).get('C2')).toBe('externalMember')
+    expect(converged).toHaveLength(2)
+
+    // A share turning sticky changes the reason, not the set, so it does not re-push either.
+    await reportPartial([{ id: 'C3', externalReason: 'externallyShared' }])
+    expect(converged).toHaveLength(3)
+    await reportPartial([{ id: 'C3', externalReason: 'guestMember' }])
+    await listing(null)
+    expect((await externalOf(id)).get('C3')).toBe('guestMember')
+    expect(converged).toHaveLength(3)
+  })
+
+  it('carries the detected set to the daemon with the spec', async () => {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const id = await install(running)
+    await report(DAEMON, id, [
+      { id: 'C1', externalReason: 'externallyShared' },
+      { id: 'C2', externalReason: null }
+    ])
+    spy.upserts.length = 0
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/integrations/${id}/channels/C2`,
+      payload: { trigger: 'any' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect(spy.upserts.at(-1)!.u.core.externalChannels).toEqual(['C1'])
+  })
+})
+
+// resource-visibility.md §14.9: "Everyone" is the organization, so a place the platform marks external starts closed.
+describe('external places start closed', () => {
+  const rowsOf = async (id: string) =>
+    new Map(
+      (await new PgIntegrationChannelRepo(prisma).listForIntegration(IntegrationId(id))).map((r) => [r.channelId, r])
+    )
+
+  /** A report through the real handler whose re-converge is the production push, so the spec it sends is observable. */
+  async function setUp(opts: { restricted?: boolean } = {}) {
+    await seedDaemon(prisma, DAEMON)
+    const spy = new SpyControl()
+    running = buildHttpApp(prisma, undefined, undefined, spy as unknown as ControlSender)
+    const app = running
+    const id = await install(app)
+    if (opts.restricted) {
+      const integration = await prisma.integration.findUniqueOrThrow({ where: { id } })
+      await prisma.agent.update({
+        where: { id: integration.agentId },
+        data: { visibility: 'restricted', sharedWith: [DEFAULT_OWNER_ID] }
+      })
+    }
+    spy.upserts.length = 0
+    const converge = (agent: unknown) => convergeIntegrationGating(app.deps as never, agent as never)
+    const send = (channels: IntegrationChannel[]) =>
+      report(DAEMON, id, channels, undefined, undefined, undefined, undefined, undefined, converge)
+    return { spy, id, send }
+  }
+
+  it('seeds an external channel Off, undecided, and pushes the spec that fences it', async () => {
+    const { spy, id, send } = await setUp()
+    await send([
+      { id: 'C_EXT', name: 'partners', externalReason: 'externallyShared' },
+      { id: 'C_INT', name: 'deploys', externalReason: null }
+    ])
+    const rows = await rowsOf(id)
+    expect(rows.get('C_EXT')).toMatchObject({ trigger: 'off', triggerChosen: false })
+    expect(rows.get('C_INT')).toMatchObject({ trigger: 'mention', triggerChosen: false })
+    const core = spy.upserts.at(-1)!.u.core
+    expect(core.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+    expect(core.mutedChannels).toEqual(['C_EXT'])
+  })
+
+  it('leaves an internal report on the ordinary defaults and pushes nothing', async () => {
+    const { spy, id, send } = await setUp()
+    await send([
+      { id: 'C_INT', name: 'deploys', externalReason: null },
+      { id: 'D1', name: '@alice', kind: 'im' }
+    ])
+    const rows = await rowsOf(id)
+    expect(rows.get('C_INT')?.trigger).toBe('mention')
+    expect(rows.get('D1')?.trigger).toBe('any')
+    expect(spy.upserts).toHaveLength(0)
+  })
+
+  it("keeps a restricted agent's own gate", async () => {
+    const { spy, id, send } = await setUp({ restricted: true })
+    await send([{ id: 'C_EXT', name: 'partners', externalReason: 'externallyShared' }])
+    expect((await rowsOf(id)).get('C_EXT')?.trigger).toBe('off')
+    const core = spy.upserts.at(-1)!.u.core
+    expect(core.gated).toBe(true)
+    expect(core.bindRules).toEqual([])
+  })
+
+  it('never touches an existing row that turns external later', async () => {
+    const { id, send } = await setUp()
+    await send([{ id: 'C1', name: 'deploys', externalReason: null }])
+    await send([{ id: 'C1', name: 'deploys', externalReason: 'externallyShared' }])
+    expect((await rowsOf(id)).get('C1')).toMatchObject({ trigger: 'mention', externalReason: 'externallyShared' })
+  })
+
+  it('enabling the row records the choice, and an Off chosen afterwards mutes it again', async () => {
+    const { spy, id, send } = await setUp()
+    await send([{ id: 'C_EXT', name: 'partners', externalReason: 'externallyShared' }])
+    const patch = (trigger: string) =>
+      running!.app.inject({ method: 'PATCH', url: `${ORG}/integrations/${id}/channels/C_EXT`, payload: { trigger } })
+
+    expect((await patch('mention')).statusCode).toBe(200)
+    expect((await rowsOf(id)).get('C_EXT')).toMatchObject({ trigger: 'mention', triggerChosen: true })
+    let core = spy.upserts.at(-1)!.u.core
+    expect(core.mutedChannels).toEqual([])
+
+    expect((await patch('off')).statusCode).toBe(200)
+    core = spy.upserts.at(-1)!.u.core
+    expect(core.mutedChannels).toEqual(['C_EXT'])
+  })
+
+  it('seeds an external conversation Off on the incremental path and keeps the detection', async () => {
+    const id = (await setUp()).id
+    const row = await new PgIntegrationChannelRepo(prisma).upsertConversation(IntegrationId(id), {
+      id: 'G_EXT',
+      kind: 'mpim',
+      externalReason: 'externallyShared'
+    })
+    expect(row).toMatchObject({ trigger: 'off', triggerChosen: false, externalReason: 'externallyShared' })
+  })
+
+  describe('a reused bot remembers', () => {
+    /** Free the bot through the console's DELETE, then connect it to a new agent with "Use an existing bot". */
+    async function reuse(id: string): Promise<string> {
+      const { botId } = await prisma.integration.findUniqueOrThrow({ where: { id } })
+      expect((await running!.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}` })).statusCode).toBe(204)
+      const agentId = randomUUID()
+      await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+      const res = await running!.app.inject({
+        method: 'POST',
+        url: `${ORG}/integrations`,
+        payload: { platform: 'slack', agentId, botId }
+      })
+      expect(res.statusCode).toBe(201)
+      return (res.json() as { id: string }).id
+    }
+
+    it('seeds a place the bot found external Off, undecided, for the next agent, and fences it in the spec', async () => {
+      const { spy, id, send } = await setUp()
+      await send([
+        { id: 'C_EXT', name: 'shared', externalReason: null },
+        { id: 'C_INT', name: 'deploys', externalReason: null }
+      ])
+      // An outside member's join is seen once; no later report repeats it.
+      await report(DAEMON, id, [{ id: 'C_EXT', externalReason: 'externalMember' }], undefined, undefined, false)
+      const off = await running!.app.inject({
+        method: 'PATCH',
+        url: `${ORG}/integrations/${id}/channels/C_EXT`,
+        payload: { trigger: 'off' }
+      })
+      expect(off.statusCode).toBe(200)
+
+      spy.upserts.length = 0
+      const next = await reuse(id)
+      const rows = await rowsOf(next)
+      expect(rows.get('C_EXT')).toMatchObject({
+        name: 'shared',
+        trigger: 'off',
+        triggerChosen: false,
+        externalReason: 'externalMember'
+      })
+      expect(rows.has('C_INT')).toBe(false)
+      const core = spy.upserts.at(-1)!.u.core
+      expect(core.mutedChannels).toEqual(['C_EXT'])
+      expect(core.externalChannels).toEqual(['C_EXT'])
+
+      // The new agent's daemon reports the place without a reason; the row stays Off.
+      await report(
+        DAEMON,
+        next,
+        [{ id: 'C_EXT', name: 'shared-ops', externalReason: null }],
+        undefined,
+        undefined,
+        false
+      )
+      expect((await rowsOf(next)).get('C_EXT')).toMatchObject({
+        name: 'shared-ops',
+        trigger: 'off',
+        externalReason: 'externalMember'
+      })
+    })
+
+    it('forgets a share the platform lifted', async () => {
+      const { id, send } = await setUp()
+      await send([{ id: 'C1', name: 'partners', externalReason: 'externallyShared' }])
+      await send([{ id: 'C1', name: 'partners', externalReason: null }])
+      expect((await rowsOf(await reuse(id))).has('C1')).toBe(false)
+    })
+
+    it('seeds a shared-bot membership the same way', async () => {
+      const { id } = await setUp()
+      await report(
+        DAEMON,
+        id,
+        [{ id: 'G_EXT', kind: 'mpim', externalReason: 'guestMember' }],
+        undefined,
+        undefined,
+        false
+      )
+      const { botId, orgId } = await prisma.integration.findUniqueOrThrow({ where: { id } })
+      expect((await running!.app.inject({ method: 'DELETE', url: `${ORG}/integrations/${id}` })).statusCode).toBe(204)
+      const agentId = randomUUID()
+      await seedAgent(prisma, agentId, { daemonId: DAEMON, createdByUserId: DEFAULT_OWNER_ID })
+      const admission = await new PgIntegrationRepo(prisma).addBotMembership({
+        id: IntegrationId(randomUUID()),
+        orgId: orgId as never,
+        agentId: agentId as never,
+        botId: botId as never,
+        platform: 'slack',
+        name: 'acme-bot'
+      })
+      if (!('integration' in admission)) throw new Error(`unexpected membership outcome: ${admission.outcome}`)
+      expect((await rowsOf(admission.integration.id)).get('G_EXT')).toMatchObject({
+        kind: 'mpim',
+        trigger: 'off',
+        triggerChosen: false,
+        externalReason: 'guestMember'
+      })
+    })
+  })
+})

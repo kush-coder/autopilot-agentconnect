@@ -1,0 +1,1862 @@
+/**
+ * `HttpBotOrchestrator` (shared-bot-relay.md §4.2 / §5 / §10) — the CP convergence
+ * seam for HTTP-transport bots. It broadcasts each bot's ingress assignment to the
+ * relay pool, compiles the ATTRIBUTED routing table (conversation ownership → keyword →
+ * default agent), and delivers the send-only integration spec (wire mode `shared`)
+ * to each member agent's daemon.
+ *
+ * It is invoked on every event that can change an HTTP bot's assignment or routes:
+ * an install / uninstall, a transport or shareable toggle, a
+ * per-conversation default-agent change, and — for failover — a relay (re)register or
+ * sweep. Every method is idempotent: it recomputes from the DB and pushes the
+ * result, so a missed push self-heals on the next call.
+ *
+ * "CP never sees message content" is preserved: this only ever ships credentials
+ * + routing tables to relays and send-only specs to daemons — never a message.
+ * Secret material (`secrets`, tokens) MUST NEVER be logged.
+ */
+import type {
+  AttributedRoute,
+  BotRevocationEvidence,
+  ChannelDecisionGate,
+  DecisionBundleDefinition,
+  IntegrationSpec,
+  RcBotAssign,
+  RcRoutedConversation,
+  SharedBotDecisionRouting,
+  RcBotCredentialCheck,
+  RcConversationDefault,
+  BindMatch,
+  RcThreadAssign,
+  RcThreadParticipant,
+  RcThreadLookup,
+  RcThreadLookupOk,
+  DecisionReadiness
+} from '@agentconnect.md/protocol'
+import { decisionRoutingAgentIds, manifestFor, DECISION_CHAIN_V1_FEATURE } from '@agentconnect.md/protocol'
+import type {
+  BotRepo,
+  BotRecord,
+  BotSecretStore,
+  BotCredentialWriter,
+  BotSecretMaterial,
+  IntegrationRepo,
+  IntegrationRecord,
+  IntegrationChannelRepo,
+  IntegrationChannelRecord,
+  ChannelTrigger,
+  SeedTrigger,
+  NewConversationMode,
+  ChannelActivation,
+  ConversationKind,
+  ReportedChannel,
+  AgentRepo,
+  AgentRecord,
+  ThreadAffinityStore,
+  SessionRepo,
+  ChannelSessionMode,
+  BotDecisionRoutingRecord,
+  BotDecisionRoutingRepo,
+  DaemonRepo,
+  OrgRepo,
+  ViewCtx
+} from '../persistence/ports.js'
+import type { RelayChannel, RelayRegistry } from '../ws/relay-registry.js'
+import { ControlSender, NoConnection } from './outbound.js'
+import { defaultMemberOf, isGatedAgent, httpIntegrationToSpec, placedMembers } from './placement.js'
+import type { GatedDmSeedResolver } from './linkedDm.js'
+import type { AgentDelivery } from './agentDelivery.js'
+import { PLACEMENT_ONLY, type PlacementResolver } from './placementResolver.js'
+import { autoConversationKinds } from '../domain/conversation-defaults.js'
+import type { CpPlatformRegistry, CpTenantLearning } from '../platforms/provider.js'
+import { AgentId, BotId, DaemonId } from '../domain/ids.js'
+import {
+  autoSessionModeSupported,
+  decisionRoutingSupported,
+  decisionTriggerSupported,
+  encodeRelayRoutesForPeer,
+  relayRoutingSupported
+} from '../domain/decision-trigger-features.js'
+import { activationOf, decisionGateState, decisionRoutingState, isRoutedChannel } from './decisionBundle.js'
+import {
+  planRoutedConversations,
+  resolveEvaluationHost,
+  routingConfigState,
+  sharedBotRoutingFor,
+  type EvaluationHost,
+  type RoutedConversationInput,
+  type RoutedConversationPlan,
+  type RoutingConfigState,
+  type RoutingHold
+} from './decisionRouting.js'
+
+// Key-order-independent JSON, since jsonb does not preserve the order a binding was written in.
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object')
+    return `{${Object.keys(value)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`)
+      .join(',')}}`
+  return JSON.stringify(value)
+}
+
+/** Whether a row already carries this trigger write, binding and review flag included. */
+function sameActivation(
+  row: Pick<IntegrationChannelRecord, 'trigger' | 'decisionBinding' | 'decisionNeedsReview'>,
+  activation: ChannelActivation
+): boolean {
+  if (row.trigger !== activation.trigger) return false
+  if (activation.trigger !== 'decision') return row.decisionBinding === null
+  return (
+    row.decisionNeedsReview === activation.decisionNeedsReview &&
+    canonicalJson(row.decisionBinding) === canonicalJson(activation.decisionBinding)
+  )
+}
+
+export interface HttpBotLog {
+  info(obj: unknown, msg?: string): void
+  warn(obj: unknown, msg?: string): void
+  debug?(obj: unknown, msg?: string): void
+}
+
+/** The compiled routing table for one HTTP bot (relay-agnostic). */
+interface Compiled {
+  /** The bot row's own OPEN platform id (S1a `Platform` policy) — rides
+   *  `rc/bot-assign.platform` verbatim; the relay's assign handler refuses an
+   *  id it has no ingress plugin for, gracefully. */
+  platform: string
+  members: { daemonId: string; agentIds: string[] }[]
+  /** Member directory (id→name→daemon) for the relay's config-modal selector. */
+  agents: { agentId: string; name: string; daemonId: string; integrationId: string }[]
+  routes: AttributedRoute[]
+  defaultAgentId?: string
+  defaultDaemonId?: string
+  /** Members whose ingress is conversation-gated (resource-visibility.md §14). */
+  gatedAgentIds: string[]
+  /** Every Off conversation — the relay's subtractive fence over the rungs no missing
+   *  route can suppress (keyword, `defaultAgentId`, thread continuity). */
+  mutedChannels: string[]
+  /** The muted conversations that are Off (not a held decision): an addressed message there gets the §14.3 notice. */
+  offChannels: string[]
+  /** Every membership row of the bot, read once for the compile and reused by the
+   *  spec push (both need the per-install trigger state). */
+  botChannels: IntegrationChannelRecord[]
+  /** Placed member integrations (spec push targets: daemonId + integration). */
+  placed: { integration: IntegrationRecord; agent: AgentRecord; daemonId: string; gated: boolean }[]
+  /** Per-conversation defaults (linear-integration.md §6.2): each row's owner, on a
+   *  platform whose rows compile to the relay's default rung instead of to an ownership
+   *  route. Empty everywhere else, where the owner is a channel-scoped route. */
+  conversationDefaults: RcConversationDefault[]
+  /** Whether that projection is what this platform does with a row's owner — carried on
+   *  the assignment so the relay picks the terminal affinity refusal without a platform name. */
+  ownerAsDefault: boolean
+  /** Executable routed conversations and their one evaluation host (message-intake.md §6). */
+  routedConversations: RcRoutedConversation[]
+  /** The router plan every member spec and the host's extra bundle are shaped from; null without routed rows. */
+  routing: RoutingPlan | null
+  /** Daemons whose missing decision-trigger-v1 held a conversation, and daemons a routing host depends on. */
+  heldFor: Set<string>
+  routingDependents: Set<string>
+  /** Owner daemons not known to read Auto, whose Auto conversations keep their own trigger until they do. */
+  autoHeldFor: Set<string>
+}
+
+/** The bot router as one compile planned it. */
+interface RoutingPlan {
+  record: BotDecisionRoutingRecord | null
+  state: RoutingConfigState
+  plan: RoutedConversationPlan[]
+  defaultDaemonId?: string
+  candidateDaemonIds: string[]
+}
+
+/** The read-only routing plan behind GET /bots/:id/decision-routing. */
+export interface RoutingDescription {
+  record: BotDecisionRoutingRecord | null
+  state: RoutingConfigState
+  evaluationHost: (EvaluationHost & { status: 'ready' | 'daemon_offline' | 'unsupported' }) | null
+  relay: 'ready' | 'pending_sync' | 'unsupported'
+  channels: Array<{
+    channelId: string
+    name: string | null
+    defaultAgentId: string | null
+    evaluationDaemonId: string | null
+    hold: RoutingHold | null
+    readiness: DecisionReadiness
+  }>
+  readiness: DecisionReadiness
+}
+
+/** A routing save's scope: removals carry their replacement trigger and optional replacement default agent. */
+export interface RoutingSaveInput {
+  config: SharedBotDecisionRouting
+  channelIds: string[]
+  removals: Array<{ channelId: string; trigger: SeedTrigger; agentId?: string }>
+}
+
+const READINESS_RANK: Record<DecisionReadiness['status'], number> = {
+  ready: 0,
+  pending_sync: 1,
+  insufficient_credits: 2,
+  missing_credentials: 2,
+  daemon_offline: 3,
+  unsupported: 4,
+  needs_review: 5
+}
+
+/** Resolve a persisted owner marker to its active integration, falling back to
+ * the earliest active install for new or legacy ownerless conversations. */
+export function pickConversationOwner(
+  installs: IntegrationRecord[],
+  rows: IntegrationChannelRecord[]
+): IntegrationRecord | undefined {
+  const assigned = new Set(rows.flatMap((row) => (row.agentId ? [row.agentId] : [])))
+  return installs.find((integration) => assigned.has(integration.agentId)) ?? installs[0]
+}
+
+export function conversationOwnerRow(
+  owner: IntegrationRecord | undefined,
+  rows: IntegrationChannelRecord[]
+): IntegrationChannelRecord | undefined {
+  return owner
+    ? (rows.find((row) => row.agentId === owner.agentId) ??
+        rows.find((row) => row.integrationId === owner.id) ??
+        rows[0])
+    : undefined
+}
+
+export class HttpBotOrchestrator {
+  private readonly conversationMutationChains = new Map<string, Promise<unknown>>()
+  // daemonId → bots whose last compile held a By decision conversation because that daemon lacked the feature.
+  private readonly decisionHeldBots = new Map<string, Set<string>>()
+  // daemonId → bots whose routed conversations' evaluation host depends on that daemon's liveness or features.
+  private readonly routingDependents = new Map<string, Set<string>>()
+  // daemonId → bots whose last compile kept an Auto conversation on its trigger because that daemon was not known to read Auto.
+  private readonly autoHeldBots = new Map<string, Set<string>>()
+
+  constructor(
+    /** Every bot read here is `getUnscoped`: this is the orchestration trust
+     *  domain (org-scoped-data-layer.md §4) — convergence is driven by a bot id
+     *  that arrived from relay ingress, a relay-reported lifecycle event, or a
+     *  route that already resolved the row through its own org fence, and the
+     *  organization is derived from the row itself. */
+    private readonly bots: BotRepo,
+    private readonly botSecret: BotSecretStore,
+    private readonly botCredential: BotCredentialWriter,
+    private readonly integrations: IntegrationRepo,
+    private readonly channels: IntegrationChannelRepo,
+    private readonly agents: AgentRepo,
+    private readonly relayReg: RelayRegistry,
+    private readonly control: ControlSender,
+    private readonly threads: ThreadAffinityStore,
+    private readonly sessions: SessionRepo,
+    private readonly log: HttpBotLog,
+    /** §9 platform providers — the ONLY source of the `rc/bot-assign` credential
+     *  and demux bags, and (through `httpIntegrationToSpec`) of a send-only
+     *  spec's payload. Late-bound in the composition root; every read happens at
+     *  sync/replay time. */
+    private readonly platforms: CpPlatformRegistry,
+    /** Resolves where a dependent of an agent goes (placement ∪ duty holders).
+     *  Used ONLY for the send-only spec and its removal — the relay's own
+     *  `rc/assign` target is one member, resolved below. */
+    private readonly agentDelivery: AgentDelivery,
+    /** Names the one member the relay addresses ingress to: placement, a pool agent's duty holder, or a live member to claim it. */
+    private readonly placement: Pick<PlacementResolver, 'routableDaemon' | 'dispatchDaemon'> = PLACEMENT_ONLY,
+    /** §14.8: which of a gated install's reported DMs seed to the ordinary DM default
+     *  because their counterpart is in the agent's own audience. Late-bound in the
+     *  composition root; absent ⇒ every gated conversation keeps the §14.2 Off default. */
+    private readonly gatedDmSeeds?: GatedDmSeedResolver,
+    /** The bot router store and daemon rows (for `createdAt`); absent ⇒ every routed conversation is held. */
+    private readonly routing?: {
+      routings: Pick<BotDecisionRoutingRepo, 'getUnscoped' | 'save'>
+      daemons: Pick<DaemonRepo, 'getUnscoped'>
+    },
+    private readonly orgs?: Pick<OrgRepo, 'slugById'>
+  ) {}
+
+  // Broadcast installation ingress to the relay pool and send-only specs to placed members.
+  async syncBot(botId: string): Promise<void> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    if (!bot) {
+      for (const provider of this.platforms.all()) {
+        const assign = await provider.unclaimedIngress?.get(botId)
+        if (assign) this.broadcast((ch) => ch.send('rc/bot-assign', assign))
+      }
+      return
+    }
+    if (!this.relayHosted(bot)) {
+      await this.unassign(bot)
+      return
+    }
+    const compiled = await this.compile(bot)
+    if (!compiled) {
+      await this.unassign(bot)
+      return
+    }
+    const secret = await this.botSecret.get(bot.orgId, bot.id)
+    if (!secret) {
+      this.log.warn({ botId }, 'http-bot: no secret for http bot — cannot assign')
+      return
+    }
+    const missing = this.missingAssignSecrets(bot, secret)
+    if (missing.length > 0) {
+      // The relay would arm an ingress it cannot verify. Which slots are load-
+      // bearing is the platform's declaration (§9 `secretShape.httpAssignRequires`),
+      // not core's knowledge.
+      this.log.warn(
+        { botId, platform: bot.platform, missing },
+        'http-bot: incomplete callback credentials — cannot assign'
+      )
+      return
+    }
+
+    if (this.relayReg.all().length === 0) {
+      // No connected relay to host the ingest — the register replay re-fans when one
+      // (re)connects (reconcileAll / replayTo).
+      this.log.warn({ botId }, 'http-bot: no connected relay available — deferring placement')
+      return
+    }
+
+    const assign = await this.buildAssign(bot, compiled, secret)
+    if (!assign) {
+      // No `projectBotAssign` ⇒ no relay path for this platform (§9). Nothing to
+      // broadcast, and no send-only spec either: an unassigned bot has no ingress.
+      this.log.warn({ botId, platform: bot.platform }, 'http-bot: platform contributes no relay ingress — skipping')
+      return
+    }
+    this.broadcast((ch) =>
+      ch.send('rc/bot-assign', encodeRelayRoutesForPeer(assign, ch.features, { ownerAsDefault: assign.ownerAsDefault }))
+    )
+    this.log.info(
+      { botId: bot.id, members: compiled.members.length, routes: compiled.routes.length },
+      'http-bot: broadcast assign to relay pool'
+    )
+    await this.pushSpecs(compiled, secret, bot)
+  }
+
+  /** A daemon reached READY or changed features: recompile bots held for its missing feature or hosted by its liveness. */
+  async daemonReady(daemonId: string): Promise<void> {
+    const bots = new Set(this.routingDependents.get(daemonId) ?? [])
+    const held = this.decisionHeldBots.get(daemonId)
+    if (held && decisionTriggerSupported(this.control.daemonFeatures?.(daemonId))) {
+      this.decisionHeldBots.delete(daemonId)
+      for (const botId of held) bots.add(botId)
+    }
+    const autoHeld = this.autoHeldBots.get(daemonId)
+    if (autoHeld && autoSessionModeSupported(this.control.daemonFeatures?.(daemonId))) {
+      this.autoHeldBots.delete(daemonId)
+      for (const botId of autoHeld) bots.add(botId)
+    }
+    await this.resyncBots(bots, daemonId, 'http-bot: decision resync deferred')
+  }
+
+  /** A daemon's connection closed: move the evaluation host of every routed conversation that depended on it. */
+  async daemonOffline(daemonId: string): Promise<void> {
+    const bots = new Set(this.routingDependents.get(daemonId) ?? [])
+    await this.resyncBots(bots, daemonId, 'http-bot: routing host resync deferred')
+  }
+
+  private async resyncBots(bots: ReadonlySet<string>, daemonId: string, message: string): Promise<void> {
+    for (const botId of bots) {
+      await this.syncRoutes(botId).catch((err: unknown) => this.log.warn({ err, botId, daemonId }, message))
+    }
+  }
+
+  private recordDecisionHolds(botId: string, heldFor: ReadonlySet<string>): void {
+    HttpBotOrchestrator.recordIndex(this.decisionHeldBots, botId, heldFor)
+  }
+
+  private static recordIndex(index: Map<string, Set<string>>, botId: string, daemonIds: ReadonlySet<string>): void {
+    for (const [daemonId, bots] of index) {
+      if (daemonIds.has(daemonId)) continue
+      bots.delete(botId)
+      if (bots.size === 0) index.delete(daemonId)
+    }
+    for (const daemonId of daemonIds) {
+      const bots = index.get(daemonId) ?? new Set<string>()
+      bots.add(botId)
+      index.set(daemonId, bots)
+    }
+  }
+
+  /**
+   * A routes-only change (a per-conversation default agent, a trigger flip) on an
+   * already-placed bot: hot-update the relay's table via `rc/routes` (no ingest
+   * re-open). Falls back to a full `syncBot` if the bot isn't placed on a
+   * connected relay yet.
+   */
+  async syncRoutes(botId: string): Promise<void> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    if (!bot || !this.relayHosted(bot)) return this.syncBot(botId)
+    if (this.relayReg.all().length === 0) return this.syncBot(botId) // nobody connected → defer
+    const compiled = await this.compile(bot)
+    if (!compiled) return this.unassign(bot)
+    this.broadcast((ch) =>
+      ch.send(
+        'rc/routes',
+        encodeRelayRoutesForPeer(
+          {
+            botId: bot.id,
+            members: compiled.members,
+            agents: compiled.agents,
+            routes: compiled.routes,
+            ...(compiled.defaultAgentId ? { defaultAgentId: compiled.defaultAgentId } : {}),
+            ...(compiled.defaultDaemonId ? { defaultDaemonId: compiled.defaultDaemonId } : {}),
+            gatedAgentIds: compiled.gatedAgentIds,
+            mutedChannels: compiled.mutedChannels,
+            offChannels: compiled.offChannels,
+            // An owner edit converges here without a re-assign, so the defaults must ride the hot
+            // update too — otherwise a connected relay keeps the old default, and the old grant.
+            conversationDefaults: compiled.conversationDefaults,
+            routedConversations: compiled.routedConversations,
+            ...(this.noticeAuthorityFor(bot.id) ? { noticeAuthority: this.noticeAuthorityFor(bot.id) } : {})
+          },
+          ch.features,
+          { ownerAsDefault: compiled.ownerAsDefault }
+        )
+      )
+    )
+    const secret = await this.botSecret.get(bot.orgId, bot.id)
+    if (secret) await this.pushSpecs(compiled, secret, bot)
+  }
+
+  /** Release a bot from the relay pool (transport flipped / uninstalled / last
+   *  install removed): broadcast `rc/bot-unassign` to every connected relay. */
+  async unassign(bot: BotRecord, opts?: { credentialRevision?: number }): Promise<void> {
+    this.broadcast((ch) =>
+      ch.send('rc/bot-unassign', {
+        botId: bot.id,
+        // Only a REVOCATION stamps this: it is the one release that races a
+        // re-install, and the relay drops it if it already holds a newer
+        // assignment. Transport flips / un-shares / last-install-removed are
+        // unconditional (they do not describe a credential generation).
+        ...(opts?.credentialRevision !== undefined ? { credentialRevision: opts.credentialRevision } : {})
+      })
+    )
+  }
+
+  /** A workspace uninstalled the app or revoked its tokens (`rc/bot-revoked` from a relay, `integration/revoked` from a daemon socket): revoke the bot + its installs in one fenced transaction (preset-agents.md §5.3), then release its relay ingest if it has one and pull the specs off member daemons. */
+  async revokeBot(
+    botId: string,
+    reason: 'app_uninstalled' | 'tokens_revoked',
+    fence: { revision?: number; eventAtMs?: number } = {},
+    proof: { evidence?: BotRevocationEvidence; code?: string } = {}
+  ): Promise<{ applied: boolean }> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    // Unclaimed installations belong to their provider; an unknown id is terminal for the reporting relay.
+    if (!bot) {
+      for (const provider of this.platforms.all()) {
+        if (await provider.unclaimedIngress?.revoke(botId, fence)) {
+          this.broadcast((ch) =>
+            ch.send('rc/bot-unassign', {
+              botId,
+              ...(fence.revision !== undefined ? { credentialRevision: fence.revision } : {})
+            })
+          )
+          return { applied: true }
+        }
+      }
+      return { applied: false }
+    }
+    // Snapshot members BEFORE the flip — listForBot is active-only.
+    const installs = await this.integrations.listForBot(bot.id)
+    // A reporter that names no evidence predates the field, and only lifecycle events existed then.
+    const record = { reason, evidence: proof.evidence ?? 'event', code: proof.code ?? null } as const
+    const { applied } = await this.botCredential.revoke(
+      bot.id,
+      new Date(),
+      {
+        ...(fence.revision !== undefined ? { revision: fence.revision } : {}),
+        ...(fence.eventAtMs !== undefined ? { eventAt: new Date(fence.eventAtMs) } : {})
+      },
+      record
+    )
+    if (!applied) {
+      this.log.info(
+        { botId: bot.id, reason, reportedRevision: fence.revision, currentRevision: bot.credentialRevision },
+        'http-bot: stale revoke ignored — credential was replaced since the event'
+      )
+      return { applied: false }
+    }
+    // Re-check after the commit: a re-install may have taken the row lock the
+    // moment we released it, in which case IT owns the live state and has
+    // already broadcast a fresh assign. Emitting the teardown now would tear
+    // down a credential we no longer describe.
+    const after = await this.bots.getUnscoped(bot.id)
+    if (after && after.credentialRevision !== bot.credentialRevision) {
+      this.log.info(
+        { botId: bot.id, reason, from: bot.credentialRevision, to: after.credentialRevision },
+        'http-bot: revoke committed but the credential was replaced — skipping teardown effects'
+      )
+      // The revocation itself DID commit, so the report is settled.
+      return { applied: true }
+    }
+    // Only an http bot has relay ingest; the stamped generation lets a relay holding a newer assignment drop this release.
+    if (bot.transport === 'http') await this.unassign(bot, { credentialRevision: bot.credentialRevision })
+    for (const integration of installs) {
+      const agent = await this.agents.getUnscoped(integration.agentId)
+      if (!agent) continue
+      await this.agentDelivery.integrationRemove(agent, integration.id, integration.orgId, (err) => {
+        if (!(err instanceof NoConnection)) throw err
+        this.log.debug?.({ integrationId: integration.id }, 'http-bot: revoke spec removal skipped — daemon offline')
+      })
+    }
+    this.log.info(
+      {
+        botId: bot.id,
+        reason,
+        evidence: record.evidence,
+        code: record.code,
+        transport: bot.transport,
+        installs: installs.length
+      },
+      'http-bot: bot revoked by workspace'
+    )
+    return { applied: true }
+  }
+
+  /** `rc/bot-tenant`: record what the bot's platform makes of a tenant key its own traffic named, then re-sync the row (google-chat-integration.md §10.3). */
+  async recordTenant(botId: string, tenantId: string): Promise<{ applied: boolean }> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    const learn = bot ? this.platforms.get(bot.platform)?.learnTenant : undefined
+    if (!bot || !learn) return { applied: false }
+    const outcome: { verdict?: CpTenantLearning } = {}
+    const written = await this.bots.mergeBotIdentity(bot.orgId, bot.id, (current) => {
+      outcome.verdict = learn(bot, current, tenantId)
+      return outcome.verdict.kind === 'record' ? outcome.verdict.change : {}
+    })
+    if (outcome.verdict?.kind === 'refused') {
+      this.log.warn({ botId: bot.id, reason: outcome.verdict.reason }, 'http-bot: tenant report refused')
+      return { applied: false }
+    }
+    // A known key re-syncs too: the row commits before the push, so a push that failed is redone by the relay's redelivery, never acknowledged unfenced.
+    await this.syncBot(bot.id)
+    return { applied: written }
+  }
+
+  /** `rc/bot-credential-check` from `relayId`: records that relay's observation and re-aggregates the mark — never a revocation, an integration flip, a spec pull or a release. */
+  async recordCredentialCheck(m: RcBotCredentialCheck, relayId: string): Promise<{ applied: boolean }> {
+    const observedAt = new Date(m.observedAtMs)
+    const check =
+      m.result === 'rejected'
+        ? { result: m.result, code: m.code, revision: m.credentialRevision, observedAt }
+        : { result: m.result, revision: m.credentialRevision, observedAt }
+    const applied = await this.bots.recordCredentialCheck(BotId(m.botId), relayId, check)
+    const log = { botId: m.botId, relayId, result: m.result, revision: m.credentialRevision, applied }
+    if (applied && m.result === 'rejected') this.log.warn({ ...log, code: m.code }, 'http-bot: credential rejected')
+    else this.log.info(log, 'http-bot: credential check recorded')
+    return { applied }
+  }
+
+  // Converge active HTTP bots and provider-owned installation UI without bindings.
+  async reconcileAll(): Promise<void> {
+    for (const provider of this.platforms.all()) {
+      for (const assign of (await provider.unclaimedIngress?.list()) ?? []) {
+        this.broadcast((ch) => ch.send('rc/bot-assign', assign))
+      }
+    }
+    const http = await this.bots.listHttpActive(this.unboundIngressPlatforms())
+    for (const b of http) await this.syncBot(b.id)
+  }
+
+  /**
+   * Per-relay register replay (whole-pool seed): send `rc/bot-assign` for every
+   * http bot with ≥1 active install, plus each persisted thread binding, to ONLY the
+   * freshly-registered relay `ch` (no re-broadcast to the whole pool). Sibling of
+   * `HookService.replayTo`.
+   *
+   * KNOWN (low-severity, self-healing): this reads a `listForBot` snapshot and a
+   * concurrent live `rc/assign` broadcast to the same just-registered relay could
+   * interleave, transiently leaving it one version behind for a thread whose owner
+   * changed mid-replay. It re-converges on that thread's next report / this relay's
+   * next reconnect; not worth a per-binding version on the wire.
+   */
+  async replayTo(ch: RelayChannel): Promise<void> {
+    for (const provider of this.platforms.all()) {
+      for (const assign of (await provider.unclaimedIngress?.list()) ?? []) ch.send('rc/bot-assign', assign)
+    }
+    const bots = await this.bots.listHttpActive(this.unboundIngressPlatforms())
+    for (const bot of bots) {
+      if (!this.relayHosted(bot)) continue
+      const compiled = await this.compile(bot)
+      if (!compiled) continue
+      const secret = await this.botSecret.get(bot.orgId, bot.id)
+      if (!secret) continue
+      if (this.missingAssignSecrets(bot, secret).length > 0) continue
+      // Built OUTSIDE the try on purpose: the catch below means "dead socket",
+      // and a projector rejection swallowed there would be a lost error rather
+      // than a dropped send. A null assign is the platform having no relay path
+      // (§9) — nothing to replay for this bot.
+      const assign = await this.buildAssign(bot, compiled, secret)
+      if (!assign) continue
+      try {
+        ch.send(
+          'rc/bot-assign',
+          encodeRelayRoutesForPeer(assign, ch.features, { ownerAsDefault: assign.ownerAsDefault })
+        )
+        for (const t of await this.threads.listForBot(bot.id)) {
+          ch.send('rc/assign', { botId: bot.id, sessionKey: t.sessionKey, agentId: t.agentId, daemonId: t.daemonId })
+        }
+        for (const t of await this.threads.participantsForBot(bot.id)) {
+          ch.send('rc/participant-assign', {
+            botId: bot.id,
+            sessionKey: t.sessionKey,
+            agentId: t.agentId,
+            daemonId: t.daemonId
+          })
+        }
+      } catch {
+        // dead socket — its onClose removes it from the registry
+      }
+    }
+  }
+
+  /**
+   * Durable thread-affinity REPORT leg (§10 step 3): persist the (botId, sessionKey)
+   * → {agentId, daemonId} binding a relay just reported (rc/thread-assign) and
+   * BROADCAST it back to every relay (rc/assign) so any pool pod routes the same
+   * thread to the same agent. The CP is the single writer.
+   */
+  async recordThreadAssign(m: RcThreadAssign): Promise<void> {
+    await this.threads.upsert(BotId(m.botId), m.sessionKey, AgentId(m.agentId), DaemonId(m.daemonId))
+    await this.threads.upsertParticipant(BotId(m.botId), m.sessionKey, AgentId(m.agentId), DaemonId(m.daemonId))
+    this.broadcast((ch) =>
+      ch.send('rc/assign', { botId: m.botId, sessionKey: m.sessionKey, agentId: m.agentId, daemonId: m.daemonId })
+    )
+  }
+
+  /** Persist and broadcast one room member without changing single-owner affinity. */
+  async recordThreadParticipant(m: RcThreadParticipant): Promise<void> {
+    await this.threads.upsertParticipant(BotId(m.botId), m.sessionKey, AgentId(m.agentId), DaemonId(m.daemonId))
+    this.broadcast((ch) =>
+      ch.send('rc/participant-assign', {
+        botId: m.botId,
+        sessionKey: m.sessionKey,
+        agentId: m.agentId,
+        daemonId: m.daemonId
+      })
+    )
+  }
+
+  /** Pull-on-miss BACKSTOP leg (§10): answer a relay's `rc/thread-lookup` from the
+   *  persisted binding (`target: null` ⇒ the CP holds none). A binding to a GATED
+   *  agent is honoured only while its conversation is still enabled (§14) — a
+   *  thread bound before the gate was applied must not keep re-seeding relay
+   *  affinity forever.
+   *
+   *  `mode: 'stop'` answers GRANT-BLIND (linear-integration.md §9.3): a stop can only end
+   *  work, so it must still reach the runtime that holds the session after a conversation's
+   *  default moved off its gated holder. It also carries the holder's `integrationId` on
+   *  this bot, because the relay pre-addresses the interaction it builds from the answer.
+   *  Participants stay out of it: a stop is delivered to the one holder, never fanned. */
+  async lookupThread(m: RcThreadLookup): Promise<RcThreadLookupOk> {
+    if (m.mode === 'stop') return this.lookupBoundThread(m)
+    const channel = m.sessionKey.slice(0, Math.max(m.sessionKey.indexOf('/'), 0)) || m.sessionKey
+    const participants = (
+      await Promise.all(
+        (await this.threads.participants(BotId(m.botId), m.sessionKey)).map(async (participant) =>
+          (await this.threadTargetAllowed(m.botId, channel, participant.agentId)) ? participant : null
+        )
+      )
+    ).filter((participant): participant is NonNullable<typeof participant> => participant !== null)
+    const t = await this.threads.get(BotId(m.botId), m.sessionKey)
+    if (t) {
+      if (!(await this.threadTargetAllowed(m.botId, channel, t.agentId))) {
+        return { botId: m.botId, sessionKey: m.sessionKey, target: null, participants }
+      }
+      return {
+        botId: m.botId,
+        sessionKey: m.sessionKey,
+        target: { agentId: t.agentId, daemonId: t.daemonId },
+        participants
+      }
+    }
+    // Affinity miss: fall back to session metadata. A session an agent created directly on the
+    // daemon (e.g. its own channel-root post, session-concept §7.2 case 2a) never went through
+    // the relay's mention/switch REPORT leg, so no `thread-assign` seeded the affinity store —
+    // but the daemon reported the session's (channel, thread, agentId, daemonId). Resolve it so an
+    // un-mentioned follow-up in that thread still routes to the owning agent instead of dropping.
+    // sessionKey is `channel/thread` (relay `sessionKeyOf`); split on the FIRST '/'.
+    const slash = m.sessionKey.indexOf('/')
+    if (slash > 0) {
+      const channel = m.sessionKey.slice(0, slash)
+      const thread = m.sessionKey.slice(slash + 1)
+      const owner = await this.sessions.findThreadOwner(BotId(m.botId), channel, thread)
+      const ambiguous = owner ? await this.sessionOwnerHasSiblingBot(m.botId, owner.agentId) : false
+      if (ambiguous && owner) {
+        this.log.debug?.(
+          { botId: m.botId, agentId: owner.agentId, channel },
+          'http-bot: SessionMeta thread owner is ambiguous across bots — leaving the thread unowned'
+        )
+      }
+      // The session names the agent; the member serving it is resolved live, so this fallback
+      // covers a pool agent — whose row names no machine — as well as a machine-placed one.
+      const target = owner && !ambiguous ? await this.threadOwnerTarget(m.botId, channel, owner.agentId) : null
+      if (target) {
+        return {
+          botId: m.botId,
+          sessionKey: m.sessionKey,
+          target,
+          participants: participants.some((participant) => participant.agentId === target.agentId)
+            ? participants
+            : [...participants, target]
+        }
+      }
+    }
+    return { botId: m.botId, sessionKey: m.sessionKey, target: null, participants }
+  }
+
+  /** The Stop-mode answer: the same affinity → `session_meta` ladder, with the §14 grant
+   *  check skipped and the holder's install on this bot attached. */
+  private async lookupBoundThread(m: RcThreadLookup): Promise<RcThreadLookupOk> {
+    const bound = await this.threads.get(BotId(m.botId), m.sessionKey)
+    let agentId: string | undefined = bound?.agentId
+    if (agentId === undefined) {
+      // sessionKey is `channel/thread` (relay `sessionKeyOf`); split on the FIRST '/'.
+      const slash = m.sessionKey.indexOf('/')
+      if (slash <= 0) return { botId: m.botId, sessionKey: m.sessionKey, target: null, participants: [] }
+      const owner = await this.sessions.findThreadOwner(
+        BotId(m.botId),
+        m.sessionKey.slice(0, slash),
+        m.sessionKey.slice(slash + 1)
+      )
+      // The cross-bot ambiguity guard survives the grant-blind mode: it protects against
+      // naming the wrong bot's holder, which no stop may do either.
+      if (!owner || (await this.sessionOwnerHasSiblingBot(m.botId, owner.agentId))) {
+        return { botId: m.botId, sessionKey: m.sessionKey, target: null, participants: [] }
+      }
+      agentId = owner.agentId
+    }
+    const agent = await this.agents.getUnscoped(AgentId(agentId))
+    const daemonId = agent ? await this.placement.routableDaemon({ ...agent, id: agent.id }) : null
+    if (!daemonId) return { botId: m.botId, sessionKey: m.sessionKey, target: null, participants: [] }
+    const install = (await this.integrations.listForBot(BotId(m.botId))).find((i) => i.agentId === agentId)
+    return {
+      botId: m.botId,
+      sessionKey: m.sessionKey,
+      target: { agentId, daemonId, ...(install ? { integrationId: install.id } : {}) },
+      participants: []
+    }
+  }
+
+  /** Refuse a bot-agnostic SessionMeta fallback when another live bot can route the same agent in this tenant. */
+  private async sessionOwnerHasSiblingBot(botId: string, agentId: string): Promise<boolean> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    if (!bot) return false
+    const provider = this.platforms.get(bot.platform)
+    const realmOf = (candidate: BotRecord): string | null =>
+      provider?.threadFallbackRealm
+        ? provider.threadFallbackRealm(candidate)
+        : (candidate.externalTenantId ?? candidate.workspaceId ?? candidate.teamId)
+    const realm = realmOf(bot)
+    if (!realm) return false
+    return (await this.bots.listForOrg(bot.orgId)).some((candidate) => {
+      return (
+        candidate.id !== bot.id &&
+        candidate.revokedAt === null &&
+        candidate.platform === bot.platform &&
+        realmOf(candidate) === realm &&
+        candidate.agentIds.some((id) => id === agentId)
+      )
+    })
+  }
+
+  /** The addressable target for a thread owner, or null when the gate refuses it or nothing is
+   *  routable. `routableDaemon` and not `servingDaemon`: this seeds relay ingress affinity, so a
+   *  member that holds the agent but has not yet reported it must not be named. */
+  private async threadOwnerTarget(
+    botId: string,
+    channel: string,
+    agentId: string
+  ): Promise<{ agentId: string; daemonId: string } | null> {
+    if (!(await this.threadTargetAllowed(botId, channel, agentId))) return null
+    const agent = await this.agents.getUnscoped(AgentId(agentId))
+    if (!agent) return null
+    const daemonId = await this.placement.routableDaemon({ ...agent, id: agent.id })
+    return daemonId ? { agentId, daemonId } : null
+  }
+
+  /** §14 conversation-gating check for the thread-lookup backstop: a non-gated
+   *  target is always allowed; a gated target needs its install's row for this
+   *  conversation to be enabled (trigger ≠ off). Fail-closed on missing rows. */
+  private async threadTargetAllowed(botId: string, channel: string, agentId: string): Promise<boolean> {
+    const agent = await this.agents.getUnscoped(AgentId(agentId))
+    if (!agent) return false
+    if (!isGatedAgent(agent)) return true
+    const installs = await this.integrations.listForBot(BotId(botId))
+    const install = installs.find((i) => i.agentId === agentId)
+    if (!install) return false
+    const rows = await this.channels.listForBot(BotId(botId))
+    const row = rows.find((c) => c.integrationId === install.id && c.channelId === channel)
+    return !!row && row.trigger !== 'off'
+  }
+
+  /** Is at least one relay connected right now? The install-time gate: an HTTP
+   *  install with no relay to host the ingest is a deployment misconfig (§6 409). */
+  hasConnectedRelay(): boolean {
+    return this.relayReg.all().length > 0
+  }
+
+  /** How many connected relays advertise a feature, and how many do not. */
+  relayFeatureSupport(feature: string): { connected: number; missing: number } {
+    const relays = this.relayReg.all()
+    return { connected: relays.length, missing: relays.filter((ch) => !ch.features?.includes(feature)).length }
+  }
+
+  /** Apply the authoritative channel-membership snapshot reported by an HTTP
+   *  ingest. Every active integration of the bot represents the same app-level
+   *  membership, so fan the snapshot across them, preserving per-install
+   *  trigger/owner fields in the repository, then hot-refresh relay routes.
+   *
+   *  Gated on the §5 manifest's `membershipEnumeration: 'authoritative'` — the
+   *  declaration that a platform HAS one cheap whole-bot membership snapshot —
+   *  rather than on the platform name. A platform whose set is discovered from
+   *  traffic (`'observed'`) has no snapshot to apply and its rows must not be
+   *  replaced wholesale; an unknown id gets the fail-closed default and is
+   *  ignored, exactly as the retired `!== 'slack'` did.
+   *
+   *  For an HTTP bot, route compilation converges every reported channel to
+   *  exactly one owner. A new or ownerless channel is assigned to the bot's
+   *  creating (earliest active) agent, while an existing owner is preserved.
+   */
+  async replaceChannels(botId: string, channels: ReportedChannel[]): Promise<void> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    if (!bot || manifestFor(bot.platform).membershipEnumeration !== 'authoritative' || bot.transport !== 'http') {
+      this.log.warn(
+        { botId },
+        'http-bot: channel snapshot for an unknown bot, a non-http transport, or a platform without authoritative membership — ignored'
+      )
+      return
+    }
+    const installs = await this.integrations.listForBot(bot.id)
+    for (const integration of installs) {
+      // Conversation gating (§14): a gated install's fresh channels start Off — an
+      // editor must enable them in the console before the compiler emits a route.
+      const owner = await this.agents.getUnscoped(integration.agentId)
+      const defaultTrigger = owner && isGatedAgent(owner) ? ('off' as const) : undefined
+      const autoKinds = owner ? await this.autoConversationKinds(owner, bot.platform) : []
+      await this.channels.replaceSnapshot(integration.id, channels, this.seedOptions(defaultTrigger, autoKinds, owner))
+    }
+    await this.syncRoutes(botId)
+  }
+
+  /** The kinds an install's new conversation starts on Auto in: the daemon the relay addresses its agent on must read it (auto-session-mode.md §3.2). */
+  private async autoConversationKinds(agent: AgentRecord, platform: string): Promise<readonly ConversationKind[]> {
+    const daemonId = await this.placement.dispatchDaemon(agent)
+    return autoConversationKinds(
+      platform,
+      daemonId ? this.control.daemonFeatures?.(daemonId) : undefined,
+      agent.newConversationMode,
+      agent.coordinatorDisabled
+    )
+  }
+
+  /** The seed a new conversation row of this install takes: a gated install's Off, the Auto kinds, and the agent's default for new rooms. */
+  private seedOptions(
+    defaultTrigger: SeedTrigger | undefined,
+    autoKinds: readonly ConversationKind[],
+    agent: Pick<AgentRecord, 'newConversationMode'> | null
+  ):
+    | {
+        defaultTrigger?: SeedTrigger
+        autoKinds?: readonly ConversationKind[]
+        newConversationMode?: NewConversationMode
+      }
+    | undefined {
+    const newConversationMode = agent?.newConversationMode
+    if (!defaultTrigger && !autoKinds.length && !newConversationMode) return undefined
+    return {
+      ...(defaultTrigger ? { defaultTrigger } : {}),
+      ...(autoKinds.length ? { autoKinds } : {}),
+      ...(newConversationMode ? { newConversationMode } : {})
+    }
+  }
+
+  /** §14.3: the relay that posts a bot's channel gating notices, chosen deterministically from the connected roster at (re)assign time; undefined ⇒ no relay. */
+  private noticeAuthorityFor(botId: string): string | undefined {
+    const ids = this.relayReg
+      .all()
+      .map((ch) => ch.relayId)
+      .sort()
+    if (ids.length === 0) return undefined
+    let h = 0
+    for (const c of botId) h = (h * 31 + c.charCodeAt(0)) >>> 0
+    return ids[h % ids.length]
+  }
+
+  /**
+   * What a GATED owner's conversation defaults to. Off is §14.2's answer for a room —
+   * its membership is a place, and only an editor can vouch for it. A 1:1 DM with a
+   * member of the agent's own `sharedWith` audience is §14.8's exception: that person
+   * can already see, edit and run the agent in the Console, so closing their DM hides
+   * it from someone it was explicitly shared with. Everything else, including every
+   * unresolvable case, stays Off.
+   */
+  private async gatedConversationTrigger(
+    agent: AgentRecord,
+    bot: Pick<BotRecord, 'platform' | 'teamId'>,
+    conversation: { id: string; kind?: ConversationKind; dmUserId?: string | null }
+  ): Promise<SeedTrigger> {
+    if (!this.gatedDmSeeds || conversation.kind !== 'im' || !conversation.dmUserId) return 'off'
+    const seeds = await this.gatedDmSeeds(
+      [{ id: conversation.id, kind: 'im', dmUserId: conversation.dmUserId }],
+      agent,
+      bot
+    )
+    return seeds.get(conversation.id) ?? 'off'
+  }
+
+  /**
+   * Fan an INCREMENTAL direct-conversation report across every install as a
+   * `kind:'im'` / `kind:'mpim'` membership row. The shared bot converges the rows to
+   * one owner and trigger, just like an enumerated channel; restricted installs still
+   * start Off and public installs default a 1:1 DM On or a group DM to Mention.
+   */
+  async reportConversation(botId: string, conversation: ReportedChannel): Promise<void> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    // A conversation report can only originate from relay ingress, so the gate is
+    // the same §9 signal the assign builder runs on: a platform with no
+    // `projectBotAssign` has no relay path and no relay can be reporting for it.
+    // (This retires the hand-written `slack | feishu` list that used to sit here.)
+    if (!bot || !this.platforms.get(bot.platform)?.projectBotAssign || bot.transport !== 'http') {
+      this.log.warn({ botId }, 'http-bot: conversation report for a non-http/unknown IM bot — ignored')
+      return
+    }
+    const installs = await this.integrations.listForBot(bot.id)
+    for (const install of installs) {
+      const agent = await this.agents.getUnscoped(install.agentId)
+      if (!agent) continue
+      const kind = conversation.kind === 'mpim' ? ('mpim' as const) : ('im' as const)
+      const reported = { ...conversation, kind }
+      // Per install, since installs have different audiences; an ungated one takes the repository's open default (§14.9).
+      const defaultTrigger = isGatedAgent(agent) ? await this.gatedConversationTrigger(agent, bot, reported) : undefined
+      const autoKinds = await this.autoConversationKinds(agent, bot.platform)
+      await this.channels.upsertConversation(install.id, reported, this.seedOptions(defaultTrigger, autoKinds, agent))
+    }
+    await this.syncRoutes(botId)
+  }
+
+  /**
+   * Update a multi-agent conversation through its bot-level ownership boundary. The selected
+   * agent becomes the sole owner, and the conversation trigger follows the conversation when
+   * ownership changes instead of reverting to a stale per-install value.
+   */
+  async updateConversation(
+    botId: string,
+    channelId: string,
+    patch: {
+      agentId?: string
+      trigger?: ChannelTrigger
+      decisionBinding?: ChannelDecisionGate
+      sessionMode?: ChannelSessionMode
+    },
+    options: { expectedOwnerAgentId?: string; source?: 'console' | 'slack' } = {}
+  ): Promise<IntegrationChannelRecord | null> {
+    return this.serializeConversationMutation(botId, channelId, async () => {
+      const bot = await this.bots.getUnscoped(BotId(botId))
+      if (bot?.transport !== 'http') {
+        this.log.warn({ botId }, 'http-bot: update-channel for a non-http/unknown bot — ignored')
+        return null
+      }
+      const installs = await this.integrations.listForBot(bot.id)
+      if (installs.length === 0) return null
+      const rows = (await this.channels.listForBot(bot.id)).filter((row) => row.channelId === channelId)
+      const currentOwner = pickConversationOwner(installs, rows)
+      if (options.expectedOwnerAgentId && currentOwner?.agentId !== options.expectedOwnerAgentId) {
+        this.log.warn(
+          { botId, channelId, expectedOwnerAgentId: options.expectedOwnerAgentId },
+          'http-bot: conversation owner changed before update — ignored'
+        )
+        return null
+      }
+      const owner = patch.agentId ? installs.find((i) => i.agentId === patch.agentId) : currentOwner
+      if (!owner) {
+        this.log.warn(
+          { botId, agentId: patch.agentId },
+          'http-bot: update-conversation for a non-member agent — ignored'
+        )
+        return null
+      }
+
+      const currentRow = conversationOwnerRow(currentOwner, rows)
+      const targetAgent = options.source === 'slack' ? await this.agents.getUnscoped(owner.agentId) : null
+      let updated = await this.persistConversationOwner(installs, channelId, owner, rows[0])
+      // The trigger and its Decision binding replicate together, exactly like the session mode below.
+      let activation: ChannelActivation
+      if (targetAgent && isGatedAgent(targetAgent)) activation = { trigger: 'off' }
+      else if (patch.trigger === 'decision') {
+        if (!patch.decisionBinding) throw new Error('trigger decision requires a decisionBinding')
+        activation = { trigger: 'decision', decisionBinding: patch.decisionBinding, decisionNeedsReview: false }
+      } else if (patch.trigger) activation = { trigger: patch.trigger }
+      else activation = activationOf(currentRow ?? rows[0] ?? updated)
+      // This call IS the human's action (console patch or the in-Slack modal), so the
+      // resulting trigger is a decision on every sibling row, not a default (§14.8).
+      await this.syncConversationTrigger(installs, channelId, activation, rows, { chosen: true })
+      updated = {
+        ...updated,
+        trigger: activation.trigger,
+        decisionBinding: activation.trigger === 'decision' ? activation.decisionBinding : null,
+        decisionNeedsReview: activation.trigger === 'decision' ? activation.decisionNeedsReview : false,
+        decisionDefinition: null
+      }
+      // The session mode is bot-scoped for the same reason the trigger is: every sibling
+      // row repeats it, so deleting the canonical owner does not discard the choice.
+      const sessionMode = patch.sessionMode ?? currentRow?.sessionMode ?? rows[0]?.sessionMode ?? updated.sessionMode
+      await this.syncConversationSessionMode(installs, channelId, sessionMode, rows)
+      updated = { ...updated, sessionMode }
+      // Re-read the owner row so the response carries the joined Decision definition.
+      const fresh = (await this.channels.listForBot(bot.id)).find(
+        (row) => row.integrationId === owner.id && row.channelId === channelId
+      )
+      await this.syncRoutes(botId)
+      return fresh ?? updated
+    })
+  }
+
+  /** The in-Slack config modal changes only the owner. A workspace user must
+   * never enable a restricted agent, so that target always starts Off. */
+  async setChannelAgent(botId: string, channelId: string, agentId: string): Promise<void> {
+    await this.updateConversation(botId, channelId, { agentId }, { source: 'slack' })
+  }
+
+  /** Preserve bot-scoped conversation state before an owner integration is deleted. */
+  async prepareIntegrationRemoval(botId: string): Promise<void> {
+    const bot = await this.bots.getUnscoped(BotId(botId))
+    if (bot?.transport !== 'http') return
+    const installs = await this.integrations.listForBot(bot.id)
+    await this.ensureConversationOwners(bot.id, installs)
+  }
+
+  /** Save the router and its scope under every affected conversation's lock (§6.2); null when an owner changed. */
+  async saveDecisionRouting(
+    bot: BotRecord,
+    input: RoutingSaveInput,
+    options: { expectedOwners: ReadonlyMap<string, string>; actor: ViewCtx }
+  ): Promise<BotDecisionRoutingRecord | null> {
+    if (!this.routing) throw new Error('decision routing store is not wired')
+    const routings = this.routing.routings
+    const keys = [...input.channelIds, ...input.removals.map((r) => r.channelId), ...options.expectedOwners.keys()]
+    return this.serializeConversationMutations(bot.id, keys, async () => {
+      const installs = await this.integrations.listForBot(bot.id)
+      const rows = await this.channels.listForBot(bot.id)
+      for (const [channelId, expected] of options.expectedOwners) {
+        const owner = pickConversationOwner(
+          installs,
+          rows.filter((row) => row.channelId === channelId)
+        )
+        if (owner?.agentId !== expected) {
+          this.log.warn({ botId: bot.id, channelId }, 'http-bot: conversation owner changed before routing save')
+          return null
+        }
+      }
+      const removals = []
+      for (const removal of input.removals) {
+        const owner = removal.agentId ? installs.find((i) => i.agentId === removal.agentId) : undefined
+        if (removal.agentId && !owner) return null
+        removals.push({
+          channelId: removal.channelId,
+          activation: { trigger: removal.trigger },
+          ...(owner ? { ownerIntegrationId: owner.id } : {})
+        })
+      }
+      const saved = await routings.save(
+        bot.orgId,
+        bot.id,
+        { config: input.config, channelIds: input.channelIds, removals },
+        options.actor
+      )
+      await this.syncRoutes(bot.id)
+      return saved
+    })
+  }
+
+  /** The read-only routing plan: the compile's planner without its owner-convergence writes. */
+  async describeRouting(bot: BotRecord): Promise<RoutingDescription> {
+    const integrations = await this.integrations.listForBot(bot.id)
+    const record = (await this.routing?.routings.getUnscoped(bot.id)) ?? null
+    const { placed } = await this.readPlacement(integrations)
+    const chans = integrations.length > 0 ? await this.channels.listForBot(bot.id) : []
+    const planned = await this.planRouting(bot, integrations, chans, placed, record, { describe: true })
+    const state = planned?.state ?? routingConfigState(record, new Set(integrations.map((i) => i.agentId)), false)
+    const relays = this.relayReg.all()
+    const relay: RoutingDescription['relay'] =
+      relays.length === 0
+        ? 'pending_sync'
+        : relays.some((ch) => !relayRoutingSupported(ch.features) || !decisionTriggerSupported(ch.features))
+          ? 'unsupported'
+          : 'ready'
+    const reviewIssues = state.executable || state.disabledReason === 'paused' ? undefined : state.issues
+    const paused = state.disabledReason === 'paused'
+    const readinessOf = (hold: RoutingHold | null): DecisionReadiness => {
+      let r: DecisionReadiness
+      if (reviewIssues) r = { status: 'needs_review', issues: reviewIssues }
+      else if (hold === 'needs_review' || hold === 'access_revoked')
+        r = { status: 'needs_review', reason: 'This conversation cannot use By decision routing.' }
+      else if (hold === 'owner_unavailable')
+        r = { status: 'daemon_offline', reason: "No daemon serving this conversation's default agent is connected." }
+      else if (hold === 'host_offline')
+        r = { status: 'daemon_offline', reason: 'No daemon that can evaluate this conversation is connected.' }
+      else if (hold === 'host_unsupported')
+        r = { status: 'unsupported', reason: 'The evaluation host daemon does not support By decision routing yet.' }
+      else if (relay === 'pending_sync') r = { status: 'pending_sync', reason: 'No relay is connected.' }
+      else if (relay === 'unsupported')
+        r = { status: 'unsupported', reason: 'Upgrade the relay to use By decision routing.' }
+      else r = { status: 'ready' }
+      return paused && r.status !== 'needs_review' ? { ...r, reason: 'Routing is paused.' } : r
+    }
+    const names = new Map(chans.map((c) => [c.channelId, c.name]))
+    const channels = (planned?.plan ?? []).map((entry) => ({
+      channelId: entry.channel,
+      name: names.get(entry.channel) ?? null,
+      defaultAgentId: entry.defaultAgentId ?? null,
+      evaluationDaemonId: entry.evaluationDaemonId,
+      hold: entry.hold,
+      readiness: readinessOf(entry.hold)
+    }))
+    // The bot-level host: rule 1, else rule 2 over every candidate of the bot's router.
+    let evaluationHost: RoutingDescription['evaluationHost'] = null
+    if (planned) {
+      const host = resolveEvaluationHost({
+        defaultDaemonId: planned.defaultDaemonId,
+        candidateDaemonIds: planned.candidateDaemonIds,
+        live: (id) => this.daemonLive(id),
+        createdAt: planned.createdAt
+      })
+      if (host)
+        evaluationHost = {
+          ...host,
+          status: this.routingHostSupported(host.daemonId, !!planned.record?.config.steps?.length)
+            ? 'ready'
+            : 'unsupported'
+        }
+      else if (planned.defaultDaemonId)
+        evaluationHost = { daemonId: planned.defaultDaemonId, source: 'default_agent', status: 'daemon_offline' }
+    }
+    let readiness: DecisionReadiness
+    if (reviewIssues) readiness = { status: 'needs_review', issues: reviewIssues }
+    else if (channels.length > 0)
+      readiness = channels
+        .map((c) => c.readiness)
+        .reduce((worst, next) => (READINESS_RANK[next.status] > READINESS_RANK[worst.status] ? next : worst))
+    else
+      readiness = readinessOf(
+        !evaluationHost || evaluationHost.status === 'daemon_offline'
+          ? 'host_offline'
+          : evaluationHost.status === 'unsupported'
+            ? 'host_unsupported'
+            : null
+      )
+    return { record, state, evaluationHost, relay, channels, readiness }
+  }
+
+  private daemonLive(daemonId: string): boolean {
+    return this.control.daemonLive?.(daemonId) ?? this.control.daemonFeatures?.(daemonId) !== undefined
+  }
+
+  /** A routing host must advertise both routing and trigger support, or its conversations are held. */
+  private routingHostSupported(daemonId: string, chained = false): boolean {
+    const features = this.control.daemonFeatures?.(daemonId)
+    return (
+      decisionRoutingSupported(features) &&
+      decisionTriggerSupported(features) &&
+      (!chained || !!features?.includes(DECISION_CHAIN_V1_FEATURE))
+    )
+  }
+
+  // ── internals ──────────────────────────────────────────────────────────────
+
+  /** Serialize the owner check and write per conversation. Console authorization
+   * happens before this boundary and supplies the owner it authorized; a queued
+   * Slack move therefore makes that Console mutation fail closed. */
+  private serializeConversationMutation<T>(botId: string, channelId: string, run: () => Promise<T>): Promise<T> {
+    return this.serializeConversationMutations(botId, [channelId], run)
+  }
+
+  /** Every key is chained synchronously before `run` starts, so a multi-conversation save cannot interleave a PATCH. */
+  private serializeConversationMutations<T>(
+    botId: string,
+    channelIds: readonly string[],
+    run: () => Promise<T>
+  ): Promise<T> {
+    const keys = [...new Set(channelIds)].map((channelId) => `${botId}\u0000${channelId}`)
+    const previous = Promise.all(keys.map((key) => this.conversationMutationChains.get(key) ?? Promise.resolve()))
+    const result = previous.then(run, run)
+    const settled = result.then(
+      () => undefined,
+      () => undefined
+    )
+    for (const key of keys) {
+      this.conversationMutationChains.set(key, settled)
+      void settled.finally(() => {
+        if (this.conversationMutationChains.get(key) === settled) this.conversationMutationChains.delete(key)
+      })
+    }
+    return result
+  }
+
+  /** Store one canonical owner row and clear every sibling install's copy. */
+  private async persistConversationOwner(
+    installs: IntegrationRecord[],
+    channelId: string,
+    owner: IntegrationRecord,
+    template?: IntegrationChannelRecord
+  ): Promise<IntegrationChannelRecord> {
+    const ownerAgent = await this.agents.getUnscoped(owner.agentId)
+    const defaultTrigger = ownerAgent && isGatedAgent(ownerAgent) ? ('off' as const) : undefined
+    const updated = await this.channels.upsertAgent(owner.id, channelId, owner.agentId, {
+      ...(defaultTrigger ? { defaultTrigger } : {}),
+      ...(template ? { kind: template.kind } : {})
+    })
+    // Establish the replacement before clearing stale markers: even if a later
+    // cleanup write fails, the conversation never regresses to having no owner.
+    for (const integration of installs) {
+      if (integration.id === owner.id) continue
+      await this.channels.setAgent(integration.id, channelId, null)
+    }
+    return updated
+  }
+
+  /** Keep the effective trigger on every active membership row, creating a
+   * missing sibling from the best available conversation metadata. Ownership is
+   * canonical, but complete repeated state lets owner deletion preserve the
+   * channel and trigger even before a new install reports its own snapshot. */
+  private async syncConversationTrigger(
+    installs: IntegrationRecord[],
+    channelId: string,
+    activation: ChannelActivation,
+    knownRows: IntegrationChannelRecord[],
+    opts?: { chosen?: boolean }
+  ): Promise<void> {
+    const known = new Map(knownRows.map((row) => [row.integrationId, row]))
+    // Conversation-level metadata, taken PER FIELD from whichever sibling knows it: one
+    // row may carry the name while another carries the DM counterpart, and picking a
+    // single template row would silently drop whatever that row happens not to know. A
+    // committed direct kind wins over 'channel' for the same reason `replaceSnapshot`
+    // never downgrades one.
+    const first = <T>(get: (row: IntegrationChannelRecord) => T | null | undefined): T | undefined => {
+      for (const row of knownRows) {
+        const value = get(row)
+        if (value !== null && value !== undefined) return value
+      }
+      return undefined
+    }
+    const template = {
+      name: first((row) => row.name),
+      spaceId: first((row) => row.spaceId),
+      space: first((row) => row.space),
+      dmUserId: first((row) => row.dmUserId),
+      isPrivate: first((row) => row.isPrivate) ?? false,
+      isCodeSession: knownRows.some((row) => row.isCodeSession),
+      kind: knownRows.find((row) => row.kind !== 'channel')?.kind ?? knownRows[0]?.kind ?? 'channel'
+    }
+    for (const integration of installs) {
+      const row = known.get(integration.id)
+      // A human decision has to reach EVERY sibling row, including one that already
+      // carries the value and one this call is about to create. `triggerChosen` is what
+      // tells a decision from an untouched default later (§14.8), so under `chosen` a
+      // trigger that needs no change is still a write — otherwise the marker would be
+      // missing on exactly the rows the shared-bot paths converge, and a later catch-up
+      // would read a deliberate Off as pending and reopen it.
+      const marked = opts?.chosen !== true || row?.triggerChosen === true
+      if (row && sameActivation(row, activation) && marked) continue
+      if (!row) {
+        // The template carries the CONVERSATION's own metadata, so a sibling gets all
+        // of it rather than a subset. `dmUserId` is the load-bearing one: it is the
+        // whole §14.8 input, and a sibling that inherits `kind:'im'` without it becomes
+        // a DM whose counterpart is unknown — so when owner removal leaves that sibling
+        // as the only surviving row, a linked audience member re-derives to Off, and
+        // the later report that finally supplies the id cannot reopen a row that
+        // already exists.
+        const backfilled = await this.channels.upsertConversation(
+          integration.id,
+          {
+            id: channelId,
+            ...(template.name ? { name: template.name } : {}),
+            ...(template.spaceId ? { spaceId: template.spaceId } : {}),
+            ...(template.space ? { space: template.space } : {}),
+            ...(template.dmUserId ? { dmUserId: template.dmUserId } : {}),
+            isPrivate: template.isPrivate,
+            isCodeSession: template.isCodeSession,
+            kind: template.kind
+          },
+          // A backfill is created Off and then carries the binding in setTrigger, so the CHECK always holds.
+          { defaultTrigger: activation.trigger === 'decision' ? 'off' : activation.trigger }
+        )
+        if (sameActivation(backfilled, activation) && opts?.chosen !== true) continue
+      }
+      await this.channels.setTrigger(integration.id, channelId, activation, opts)
+    }
+  }
+
+  /** Repeat the conversation's session mode across every sibling install, so deleting the
+   *  canonical owner leaves the choice on the rows that survive. Runs after
+   *  {@link syncConversationTrigger}, which is what backfills a missing sibling row — this
+   *  only writes rows that already exist, and skips the ones already carrying the value. */
+  private async syncConversationSessionMode(
+    installs: IntegrationRecord[],
+    channelId: string,
+    sessionMode: ChannelSessionMode,
+    knownRows: IntegrationChannelRecord[]
+  ): Promise<void> {
+    const known = new Map(knownRows.map((row) => [row.integrationId, row]))
+    for (const integration of installs) {
+      if (known.get(integration.id)?.sessionMode === sessionMode) continue
+      await this.channels.setSessionMode(integration.id, channelId, sessionMode)
+    }
+  }
+
+  /** Converge every observed conversation to one canonical owner. */
+  private async ensureConversationOwners(botId: BotId, installs: IntegrationRecord[]): Promise<void> {
+    if (installs.length === 0) return
+    const rows = await this.channels.listForBot(botId)
+    const conversationIds = [...new Set(rows.map((row) => row.channelId))]
+    // Only the gated arm below reads it, and only for a conversation whose owner is
+    // not yet persisted — so it is fetched once and lazily rather than per row.
+    let bot: BotRecord | null | undefined
+    for (const channelId of conversationIds) {
+      const conversationRows = rows.filter((row) => row.channelId === channelId)
+      const owner = pickConversationOwner(installs, conversationRows)
+      if (!owner) continue
+      const persistedOwner = conversationRows.some((row) => row.agentId === owner.agentId)
+      const ownerRow = conversationOwnerRow(owner, conversationRows)
+      // Provenance is CONVERSATION-level, exactly like the trigger it qualifies, and is
+      // read from ANY row: a human decides a conversation once, but the decision is
+      // repeated per install, and the row that recorded it can be deleted with its
+      // integration while siblings survive. Reading it from the owner row alone would
+      // lose the decision on precisely the owner-removal path this method exists for.
+      const chosen = conversationRows.some((row) => row.triggerChosen)
+      let trigger: ChannelActivation | undefined = ownerRow ? activationOf(ownerRow) : undefined
+      // A decision outranks every default: a conversation a human has ruled on is not
+      // re-derived, whoever ends up owning it. Only an undecided one falls through to
+      // the gated rule below.
+      if (!persistedOwner && !chosen) {
+        const ownerAgent = await this.agents.getUnscoped(owner.agentId)
+        // A gated agent inheriting a conversation it never owned fails closed — with
+        // §14.8's one exception, re-derived here rather than trusted from the row: the
+        // audience may have changed since the row was seeded, and this is the write
+        // that would otherwise freeze a stale answer in as the owner's trigger.
+        if (ownerAgent && isGatedAgent(ownerAgent)) {
+          if (bot === undefined) bot = await this.bots.getUnscoped(botId)
+          const direct = conversationRows.find((row) => row.kind === 'im' && row.dmUserId)
+          trigger = {
+            trigger: bot
+              ? await this.gatedConversationTrigger(ownerAgent, bot, {
+                  id: channelId,
+                  kind: direct?.kind,
+                  dmUserId: direct?.dmUserId
+                })
+              : 'off'
+          }
+        }
+      }
+      const canonical = conversationRows.some((row) => row.integrationId === owner.id && row.agentId === owner.agentId)
+      const conflicting = conversationRows.some(
+        (row) => row.agentId !== null && (row.integrationId !== owner.id || row.agentId !== owner.agentId)
+      )
+      if (!canonical || conflicting)
+        await this.persistConversationOwner(installs, channelId, owner, conversationRows[0])
+      // Replicating, not introducing: `chosen` came from the rows themselves, so a
+      // sibling backfilled here — including one added long after the decision — carries
+      // the same provenance as the value it is given.
+      if (trigger !== undefined) {
+        await this.syncConversationTrigger(installs, channelId, trigger, conversationRows, { chosen })
+        // The session mode replicates on the SAME backfill, and for the same reason the
+        // trigger does: an install added after the choice — or the only one left after the
+        // owner is deleted — must not silently read back the createNew default.
+        //
+        // The OWNER ROW is authoritative, exactly as `trigger` above reads it, and for a
+        // reason `chosen` does not share: `chosen` is monotonic, so ORing it across rows
+        // can only ever be right, while a session mode can be turned BACK to createNew.
+        // Scanning every row for a non-default would let a sibling this conversation's own
+        // downgrade has not reached yet resurrect the `append` the operator just cleared.
+        // The sibling scan survives only for the case it was written for: no owner row
+        // exists yet, so there is no authoritative value to prefer.
+        await this.syncConversationSessionMode(
+          installs,
+          channelId,
+          ownerRow?.sessionMode ??
+            conversationRows.find((row) => row.sessionMode !== 'createNew')?.sessionMode ??
+            'createNew',
+          conversationRows
+        )
+      }
+    }
+  }
+
+  /** Compile the attributed routing table after converging conversation ownership, then record its holds. */
+  private async compile(bot: BotRecord): Promise<Compiled | null> {
+    const integrations = await this.integrations.listForBot(bot.id)
+    if (integrations.length === 0 && !this.platforms.get(bot.platform)?.retainUnboundIngress) return null
+    await this.ensureConversationOwners(bot.id, integrations)
+    const compiled = await this.plan(bot, integrations)
+    this.recordDecisionHolds(bot.id, compiled?.heldFor ?? new Set())
+    HttpBotOrchestrator.recordIndex(this.routingDependents, bot.id, compiled?.routingDependents ?? new Set())
+    HttpBotOrchestrator.recordIndex(this.autoHeldBots, bot.id, compiled?.autoHeldFor ?? new Set())
+    return compiled
+  }
+
+  /** The members ingress may be addressed at, and every member agent record. */
+  private async readPlacement(integrations: IntegrationRecord[]) {
+    const agentById = new Map<string, AgentRecord>()
+    for (const i of integrations) {
+      const a = await this.agents.getUnscoped(i.agentId)
+      if (a) agentById.set(i.agentId, a)
+    }
+    // A vacant pool agent goes to a live member that claims it on receipt; dropping it made the relay ack its messages unrouted.
+    const placed = await placedMembers(
+      integrations,
+      (agentId) => agentById.get(agentId),
+      (agent) => this.placement.dispatchDaemon(agent)
+    )
+    return { agentById, placed }
+  }
+
+  /** Plan each routed conversation's host (message-intake.md §6) over placed rule targets plus its default agent. */
+  private async planRouting(
+    bot: BotRecord,
+    integrations: IntegrationRecord[],
+    chans: IntegrationChannelRecord[],
+    placed: Awaited<ReturnType<HttpBotOrchestrator['readPlacement']>>['placed'],
+    preloaded?: BotDecisionRoutingRecord | null,
+    opts: { describe?: boolean } = {}
+  ): Promise<(RoutingPlan & { createdAt: (daemonId: string) => number | undefined }) | null> {
+    const byConversation = new Map<string, IntegrationChannelRecord[]>()
+    for (const c of chans) byConversation.set(c.channelId, [...(byConversation.get(c.channelId) ?? []), c])
+    const routed: Array<{ channel: string; ownerRow: IntegrationChannelRecord; owner?: IntegrationRecord }> = []
+    for (const [channel, rows] of byConversation) {
+      const owner = pickConversationOwner(integrations, rows)
+      const ownerRow = conversationOwnerRow(owner, rows)
+      if (ownerRow && isRoutedChannel(ownerRow)) routed.push({ channel, ownerRow, ...(owner ? { owner } : {}) })
+    }
+    const record =
+      preloaded !== undefined
+        ? preloaded
+        : routed.length > 0
+          ? ((await this.routing?.routings.getUnscoped(bot.id)) ?? null)
+          : null
+    if (routed.length === 0 && !opts.describe) return null
+    const botShared = bot.transport === 'http' && bot.shareable
+    const state = routingConfigState(record, new Set(integrations.map((i) => i.agentId)), botShared)
+    const byAgent = new Map<string, (typeof placed)[number]>(placed.map((p) => [p.integration.agentId, p]))
+    const defaultDaemonId = defaultMemberOf(placed)?.daemonId
+    const targets = record ? decisionRoutingAgentIds(record.config) : []
+    const targetDaemons = targets.flatMap((id) => (byAgent.get(id) ? [byAgent.get(id)!.daemonId] : []))
+    const ownerAsDefault = manifestFor(bot.platform).ownerAsDefault
+    const conversations: RoutedConversationInput[] = routed.map(({ channel, ownerRow, owner }) => {
+      const ownerPlaced = owner ? byAgent.get(owner.agentId) : undefined
+      const rowState = decisionRoutingState(ownerRow)
+      return {
+        channel,
+        ...(ownerPlaced ? { defaultAgentId: ownerPlaced.integration.agentId } : {}),
+        candidateDaemonIds: [...targetDaemons, ...(ownerPlaced ? [ownerPlaced.daemonId] : [])],
+        // A direct conversation or an owner-as-default platform has no candidate route to route through.
+        ...(ownerAsDefault || (rowState && !rowState.enabled && !rowState.disabledReason)
+          ? { rowHold: 'needs_review' as const }
+          : {})
+      }
+    })
+    const candidateDaemonIds = [...new Set(conversations.flatMap((c) => c.candidateDaemonIds))]
+    const daemonIds = [...new Set([...candidateDaemonIds, ...(defaultDaemonId ? [defaultDaemonId] : [])])]
+    const created = new Map<string, number>()
+    if (this.routing) {
+      for (const id of daemonIds) {
+        const row = await this.routing.daemons.getUnscoped(DaemonId(id))
+        if (row) created.set(id, row.createdAt.getTime())
+      }
+    }
+    const createdAt = (id: string) => created.get(id)
+    // A paused router is described with the status it would have running, so its readiness stays actionable.
+    const planState = opts.describe && state.disabledReason === 'paused' ? { executable: true, issues: [] } : state
+    const plan = planRoutedConversations({
+      config: { decisionId: record?.config.decisionId ?? '' },
+      state: planState,
+      conversations,
+      defaultDaemonId,
+      live: (id) => this.daemonLive(id),
+      createdAt,
+      hostSupported: (id) => this.routingHostSupported(id, !!record?.config.steps?.length)
+    })
+    return {
+      record,
+      state,
+      plan,
+      ...(defaultDaemonId ? { defaultDaemonId } : {}),
+      candidateDaemonIds: [...new Set([...targetDaemons, ...candidateDaemonIds])],
+      createdAt
+    }
+  }
+
+  /** The attributed routing table from the current reads; no writes and no hold bookkeeping. */
+  private async plan(bot: BotRecord, integrations: IntegrationRecord[]): Promise<Compiled | null> {
+    const { agentById, placed } = await this.readPlacement(integrations)
+    if (placed.length === 0 && !this.platforms.get(bot.platform)?.retainUnboundIngress) return null
+    // linear-integration.md §6.2: a row's owner rides the relay's PER-CONVERSATION default
+    // rung instead of a channel-scoped route — which would otherwise shadow keyword selection
+    // and thread continuity on a platform whose every event marks the app as mentioned.
+    const ownerAsDefault = manifestFor(bot.platform).ownerAsDefault
+
+    // members: daemonId → agentIds (the daemon connections the relay expects).
+    const memberMap = new Map<string, Set<string>>()
+    for (const p of placed) {
+      const set = memberMap.get(p.daemonId) ?? new Set<string>()
+      set.add(p.integration.agentId)
+      memberMap.set(p.daemonId, set)
+    }
+    const members = [...memberMap].map(([daemonId, ids]) => ({ daemonId, agentIds: [...ids] }))
+
+    const byAgent = new Map(placed.map((p) => [p.integration.agentId, p]))
+    const routes: AttributedRoute[] = []
+
+    // 1. conversation ownership (§10.1, the primary path): an observed conversation
+    //    routes to one owner, respecting its trigger. Emit scoped rules first.
+    const chans = await this.channels.listForBot(bot.id)
+    const heldFor = new Set<string>()
+    const autoHeldFor = new Set<string>()
+    const conversationOwner = new Map<string, AgentId>()
+    for (const c of chans) {
+      if (c.agentId && !conversationOwner.has(c.channelId)) conversationOwner.set(c.channelId, c.agentId)
+    }
+    // Off or unavailable ownership closes unscoped fallback rungs.
+    const offConversationIds = new Set(chans.filter((c) => c.trigger === 'off').map((c) => c.channelId))
+    const muted = new Set(offConversationIds)
+    // A held By decision conversation (a disabled gate) is Off, never Any.
+    for (const c of chans) {
+      if (c.trigger !== 'decision' || isRoutedChannel(c)) continue
+      if (!decisionGateState(c)?.enabled) muted.add(c.channelId)
+    }
+    // A routed conversation is held unless its plan names a supported, live evaluation host.
+    const routing = await this.planRouting(bot, integrations, chans, placed)
+    const routedPlan = new Map((routing?.plan ?? []).map((entry) => [entry.channel, entry]))
+    // The agents the routing can select: saving it needed edit rights on each, so a gated one is enabled where it routes.
+    const routingTargets = routing?.record ? decisionRoutingAgentIds(routing.record.config).slice(0, 64) : []
+    for (const c of chans) {
+      if (!isRoutedChannel(c)) continue
+      const entry = routedPlan.get(c.channelId)
+      if (ownerAsDefault || !entry || entry.hold) muted.add(c.channelId)
+    }
+    const routedConversations: RcRoutedConversation[] = []
+    for (const [channelId, ownerId] of conversationOwner) {
+      if (!byAgent.has(ownerId)) muted.add(channelId)
+    }
+
+    for (const c of chans) {
+      if (!c.agentId) continue
+      const p = byAgent.get(c.agentId)
+      if (!p) continue
+      if (c.trigger === 'off') continue
+      // Such an owner rides the default rung below; a By decision owner's route is seated there by the relay.
+      if (ownerAsDefault && c.trigger !== 'decision') continue
+      if (c.trigger === 'decision') {
+        // Hold only for a daemon KNOWN to lack the feature; an offline one gets the route and the relay fails closed per delivery.
+        const features = this.control.daemonFeatures?.(p.daemonId)
+        const downgraded = features !== undefined && !decisionTriggerSupported(features)
+        if (downgraded) heldFor.add(p.daemonId)
+        if (isRoutedChannel(c)) {
+          const entry = routedPlan.get(c.channelId)
+          if (!entry || entry.hold || !entry.evaluationDaemonId || downgraded) {
+            muted.add(c.channelId)
+            continue
+          }
+          // The owner's decision route, gate-shaped, so relay fan-out is unchanged until 5b forwards to the host.
+          routes.push({
+            agentId: p.integration.agentId,
+            daemonId: p.daemonId,
+            integrationId: p.integration.id,
+            scope: { channel: c.channelId },
+            match: { kind: 'decision' },
+            decisionId: entry.decisionId
+          })
+          routedConversations.push({
+            channel: c.channelId,
+            decisionId: entry.decisionId,
+            evaluationDaemonId: entry.evaluationDaemonId,
+            ...(routingTargets.length > 0 ? { targetAgentIds: routingTargets } : {})
+          })
+          continue
+        }
+        const g = decisionGateState(c)
+        if (!g?.enabled || !g.gate || downgraded) {
+          muted.add(c.channelId)
+          continue
+        }
+        routes.push({
+          agentId: p.integration.agentId,
+          daemonId: p.daemonId,
+          integrationId: p.integration.id,
+          scope: { channel: c.channelId },
+          match: { kind: 'decision' },
+          decisionId: g.gate.decisionId
+        })
+        continue
+      }
+      let match: BindMatch = c.trigger === 'any' ? { kind: 'auto' } : { kind: 'mention' }
+      // Under Auto the owner's coordinator decides every message (auto-session-mode.md §3.3), once its daemon reads Auto; with it off the row keeps its trigger (§3.6).
+      if (c.sessionMode === 'auto' && match.kind !== 'auto' && !agentById.get(c.agentId)?.coordinatorDisabled) {
+        if (autoSessionModeSupported(this.control.daemonFeatures?.(p.daemonId))) match = { kind: 'auto' }
+        else autoHeldFor.add(p.daemonId)
+      }
+      routes.push({
+        agentId: p.integration.agentId,
+        daemonId: p.daemonId,
+        integrationId: p.integration.id,
+        scope: { channel: c.channelId },
+        match
+      })
+    }
+    const mutedChannels = [...muted]
+    const offChannels = [...offConversationIds]
+    // Every daemon a routed conversation's host could move to or from resyncs this bot when it comes and goes.
+    const routingDependents = new Set<string>(
+      routing ? [...(routing.defaultDaemonId ? [routing.defaultDaemonId] : []), ...routing.candidateDaemonIds] : []
+    )
+
+    // 2. keyword disambiguation (§10.2): one keyword rule per agent = its slug, so
+    //    "@bot <slug> …" routes to that agent. No unscoped mention rule — that would
+    //    starve keyword arbitration (§10.4).
+    for (const p of placed) {
+      const a = agentById.get(p.integration.agentId)
+      if (!a) continue
+      // Conversation gating (§14): no UNSCOPED rung may name a gated agent — the keyword slug
+      // would make "@bot <slug>" fail-open in every conversation.
+      if (p.gated) continue
+      routes.push({
+        agentId: p.integration.agentId,
+        daemonId: p.daemonId,
+        integrationId: p.integration.id,
+        match: { kind: 'keyword', value: a.name }
+      })
+    }
+
+    // 3. default agent (§10.3): the earliest NON-GATED install a daemon serves catches
+    //    a bare @bot + DMs. Delivered as `defaultAgentId` (the relay's fallback
+    //    rung), not a route, so it never pre-empts keyword/channel arbitration.
+    const first = defaultMemberOf(placed)
+    // Each row's owner as the relay's per-conversation default (§6.2) — the rung between the
+    // keyword slug and `defaultAgentId`, and, for a gated owner, its grant in that channel.
+    // An Off row contributes none: a muted channel resolves to nothing at every rung.
+    const conversationDefaults: RcConversationDefault[] = ownerAsDefault
+      ? chans.flatMap((c) => {
+          if (!c.agentId || c.trigger === 'off' || c.trigger === 'decision') return []
+          const p = byAgent.get(c.agentId)
+          if (!p) return []
+          return [
+            {
+              channel: c.channelId,
+              agentId: p.integration.agentId,
+              daemonId: p.daemonId,
+              integrationId: p.integration.id
+            }
+          ]
+        })
+      : []
+    const agents = placed.map((p) => {
+      const a = agentById.get(p.integration.agentId)
+      return {
+        agentId: p.integration.agentId,
+        name: a?.displayName || a?.name || p.integration.agentId,
+        daemonId: p.daemonId,
+        integrationId: p.integration.id
+      }
+    })
+    return {
+      // The row's own id, verbatim. The pre-flatten ternary narrowed it into the
+      // closed wire enum and coerced anything unrecognized to 'feishu' — with the
+      // open `Platform` (S1a) the honest value rides instead, and the relay's
+      // plugin-registry lookup is the consumer that refuses an unserved id
+      // (`relay-ingress-manager.assign`: warn + skip, never the socket). The arm
+      // stays unreachable either way: the create route admits only registered ids.
+      platform: bot.platform,
+      members,
+      agents,
+      routes,
+      ...(first ? { defaultAgentId: first.integration.agentId, defaultDaemonId: first.daemonId } : {}),
+      gatedAgentIds: placed.filter((p) => p.gated).map((p) => p.integration.agentId),
+      mutedChannels,
+      offChannels,
+      conversationDefaults,
+      ownerAsDefault,
+      routedConversations,
+      routing: routing ? { ...routing } : null,
+      heldFor,
+      routingDependents,
+      autoHeldFor,
+      botChannels: chans,
+      placed: placed.map((p) => ({
+        integration: p.integration,
+        agent: p.agent,
+        daemonId: p.daemonId,
+        gated: p.gated
+      }))
+    }
+  }
+
+  /** Deliver the HTTP-transport send-only spec to each member agent's daemon (best-effort).
+   *  `shareable` rides each spec so the daemon knows whether to expose "Switch agent". */
+  private async pushSpecs(compiled: Compiled, secret: BotSecretMaterial, bot: BotRecord): Promise<void> {
+    // A gated install's spec carries its conversation-scoped rules for the daemon's
+    // last-hop admission backstop (§14.3), and EVERY install carries its Off channels
+    // for the same backstop. The compile already read the bot's rows; they are keyed
+    // per install, so filter by integrationId.
+    for (const { integration, agent } of compiled.placed) {
+      const channels = compiled.botChannels.filter((c) => c.integrationId === integration.id)
+      const spec = await httpIntegrationToSpec(this.platforms, this.sessions, integration, bot, secret, channels, agent)
+      // No deliverable spec ⇒ the provider's own credential for this bot is gone (a revoked or
+      // swept grant). PULL the send-only bundle instead of leaving the daemon on the last good
+      // one — the same teardown `revokeBot` performs for a credential the workspace revoked.
+      if (!spec) {
+        this.log.info(
+          { integrationId: integration.id, botId: String(bot.id) },
+          'http-bot: no deliverable spec — pulling the send-only bundle'
+        )
+        await this.agentDelivery.integrationRemove(agent, integration.id, integration.orgId, (err) => {
+          if (!(err instanceof NoConnection)) throw err
+          this.log.debug?.({ integrationId: integration.id }, 'http-bot: spec removal skipped — daemon offline')
+        })
+        continue
+      }
+      // The relay still addresses ingress to `daemonId`; the send-only credential
+      // bundle goes to every daemon serving the agent, so a duty holder is not
+      // left signing egress with a credential the workspace has since rotated.
+      await this.agentDelivery.integrationUpsert(
+        agent,
+        spec,
+        (err, target) => {
+          if (!(err instanceof NoConnection)) throw err
+          this.log.debug?.(
+            { integrationId: integration.id, daemonId: target },
+            'http-bot: spec push skipped — daemon offline'
+          )
+        },
+        (daemonId) => this.routingHostSpec(compiled, bot, spec, daemonId)
+      )
+    }
+  }
+
+  /** Only the evaluation host's copy carries the router and its definition (decisions.md §7.1); every other target gets `spec`. */
+  private routingHostSpec(
+    compiled: Compiled,
+    bot: BotRecord,
+    spec: IntegrationSpec,
+    daemonId: string
+  ): IntegrationSpec {
+    const record = compiled.routing?.record
+    if (!record?.definition) return spec
+    const projection = sharedBotRoutingFor(compiled.routing!.plan, { botId: bot.id, config: record.config }, daemonId)
+    if (!projection) return spec
+    const decisions = spec.core.decisions ?? { bindings: [], definitions: [] }
+    const definitions: DecisionBundleDefinition[] = [
+      ...new Map(
+        [...decisions.definitions, ...(record.definitions ?? [record.definition])].map((d) => [d.id, d])
+      ).values()
+    ]
+    return { ...spec, core: { ...spec.core, decisions: { ...decisions, definitions, sharedBotRouting: projection } } }
+  }
+
+  /** An installed HTTP bot its platform lets the relay host; any other is released. */
+  private relayHosted(bot: BotRecord): boolean {
+    if (bot.transport !== 'http' || bot.revokedAt) return false
+    const provider = this.platforms.get(bot.platform)
+    if (bot.agentIds.length === 0 && !provider?.retainUnboundIngress) return false
+    return provider?.relayAssignable?.(bot) !== false
+  }
+
+  private unboundIngressPlatforms(): string[] {
+    return this.platforms
+      .all()
+      .filter((provider) => provider.retainUnboundIngress)
+      .map((provider) => provider.platformId)
+  }
+
+  /**
+   * The declared secret slots an `rc/bot-assign` needs that this bot's stored
+   * credential does not have (§9 `secretShape.httpAssignRequires`) — the
+   * completeness gate `syncBot` and `replayTo` run BEFORE asking the provider to
+   * project the bags. It replaces the two hand-written platform arms core used to
+   * hold (Slack ⇒ `signingSecret`, Feishu ⇒ `verificationToken` + `appToken`):
+   * same slots, now read off the platform that owns them, so a fifth platform's
+   * requirement arrives with its provider.
+   *
+   * A platform with no registered provider yields no requirements — exactly as
+   * the old two-arm form did for a foreign row; `buildAssign` is the fence that
+   * refuses it a moment later (no projector ⇒ no assign).
+   */
+  private missingAssignSecrets(bot: BotRecord, secret: BotSecretMaterial): string[] {
+    const required = this.platforms.get(bot.platform)?.secretShape.httpAssignRequires ?? []
+    return required.filter((slot) => !secret[slot])
+  }
+
+  /**
+   * Assemble the `rc/bot-assign` frame (credentials + attributed routing table).
+   * Secret — NEVER log the result.
+   *
+   * `null` ⇒ **this platform has no relay path** and no frame exists to send.
+   * `projectBotAssign` is OPTIONAL by design (§9 erratum): a platform whose
+   * inbound transport is a daemon-owned long-lived connection simply does not
+   * declare it, and the create route already refuses `transport: 'http'` for
+   * exactly those platforms on exactly this signal
+   * (`http/routes/integrations.ts`). So no such bot row can carry the http
+   * transport and this arm is unreachable — which is why absence must neither
+   * fabricate an empty assign (the relay would arm an ingress it cannot verify)
+   * nor throw (a composition-shaped platform set would take down `syncBot` for
+   * every OTHER bot). It joins the two existing "cannot assign" outcomes below:
+   * the caller logs and moves on, and the next reconcile retries.
+   */
+  private async buildAssign(
+    bot: BotRecord,
+    compiled: Compiled,
+    secret: BotSecretMaterial
+  ): Promise<RcBotAssign | null> {
+    // §6.7: the opaque ingress bag is the ONE carrier of the demux identity —
+    // the bag-preferring reader shipped first (#545), emission flipped with
+    // #556, and the S3 protocol cleanup removed the legacy named top-level
+    // fields from the wire schema outright.
+    //
+    // §9 projector adoption (S3): the two bags come from the platform provider,
+    // so the four-way platform fork is gone — core assembles everything else on
+    // the frame (the compiled routing table, the member directory, the gating
+    // fences, `credentialRevision`) and merely awaits the provider's output.
+    const bags = await this.platforms.get(bot.platform)?.projectBotAssign?.(bot, secret)
+    if (!bags) return null
+    const { secrets, ingress } = bags
+    const orgSlug = await this.orgs?.slugById(bot.orgId)
+    return {
+      botId: bot.id,
+      ...(orgSlug ? { orgSlug } : {}),
+      installedAgentIds: bot.agentIds,
+      platform: compiled.platform,
+      // §6.1: a bot assignment is always a CHAT platform; carried so an older
+      // relay can classify an id a newer CP introduces.
+      originKind: 'chat',
+      ingress,
+      // Generation of the credentials below — echoed back on `rc/bot-revoked` so a
+      // revocation observed under a REPLACED credential cannot kill this one.
+      credentialRevision: bot.credentialRevision,
+      secrets,
+      members: compiled.members,
+      agents: compiled.agents,
+      routes: compiled.routes,
+      ...(compiled.defaultAgentId ? { defaultAgentId: compiled.defaultAgentId } : {}),
+      ...(compiled.defaultDaemonId ? { defaultDaemonId: compiled.defaultDaemonId } : {}),
+      gatedAgentIds: compiled.gatedAgentIds,
+      mutedChannels: compiled.mutedChannels,
+      offChannels: compiled.offChannels,
+      conversationDefaults: compiled.conversationDefaults,
+      ownerAsDefault: compiled.ownerAsDefault,
+      routedConversations: compiled.routedConversations,
+      ...(this.noticeAuthorityFor(bot.id) ? { noticeAuthority: this.noticeAuthorityFor(bot.id) } : {})
+    }
+  }
+
+  /** Fan a C→R EVT to EVERY connected relay, per-socket isolated (a dead socket's
+   *  error is swallowed; its onClose removes it from the registry). */
+  private broadcast(send: (ch: RelayChannel) => void): void {
+    for (const ch of this.relayReg.all()) {
+      try {
+        send(ch)
+      } catch {
+        // dead socket — its onClose removes it from the registry
+      }
+    }
+  }
+}

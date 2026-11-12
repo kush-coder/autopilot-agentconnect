@@ -1,0 +1,279 @@
+// @vitest-environment happy-dom
+
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const AGENT = '22222222-2222-4222-8222-222222222222'
+const INTEGRATION = '33333333-3333-4333-8333-333333333333'
+
+type Row = { channelId: string; name: string; kind?: 'channel' | 'im' | 'mpim'; trigger: string }
+
+const mocks = vi.hoisted(() => ({
+  updateAgent: vi.fn(),
+  admission: { admitted: true, refusals: [] } as {
+    admitted: boolean
+    refusals: string[]
+    conversations?: Array<{ integrationId: string; channelId: string; name: string | null }>
+  },
+  responsible: vi.fn(async (): Promise<{ userId: string | null }> => ({ userId: 'usr_1' })),
+  fetchAdmission: vi.fn(),
+  channels: [] as Row[]
+}))
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    updateAgent: mocks.updateAgent,
+    members: [
+      {
+        userId: 'usr_1',
+        email: 'ada@example.test',
+        name: 'Ada',
+        picture: null,
+        role: 'owner',
+        isCurrentUser: true,
+        joinedAt: '2026-01-01T00:00:00.000Z'
+      }
+    ],
+    integrations: [
+      {
+        id: INTEGRATION,
+        agentId: AGENT,
+        name: 'team',
+        platform: 'slack',
+        kind: 'Custom app',
+        workspace: 'example.test',
+        daemon: 'edge',
+        status: 'online',
+        revoked: false,
+        get channels() {
+          return mocks.channels
+        }
+      }
+    ]
+  })
+}))
+
+vi.mock('@/lib/api', () => ({
+  fetchAgentAssistantModeAdmission: mocks.fetchAdmission,
+  fetchAgentAssistantResponsibleUser: mocks.responsible,
+  memberDisplayName: (m: { name: string | null }) => m.name ?? 'Member'
+}))
+
+import { AssistantModePanel, assistantModeDraft, assistantModePolicyForDraft } from './AssistantModePanel'
+
+let root: Root | undefined
+let container: HTMLDivElement | undefined
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+
+beforeEach(() => {
+  mocks.updateAgent.mockReset().mockResolvedValue(undefined)
+  mocks.admission = { admitted: true, refusals: [] }
+  mocks.fetchAdmission.mockReset().mockImplementation(async () => mocks.admission)
+  mocks.responsible.mockReset().mockResolvedValue({ userId: 'usr_1' })
+  mocks.channels = [
+    { channelId: 'C1', name: 'general', trigger: 'off' },
+    { channelId: 'D1', name: '@ada', kind: 'im', trigger: 'any' }
+  ]
+})
+
+afterEach(async () => {
+  if (root) await act(async () => root?.unmount())
+  container?.remove()
+  root = undefined
+  container = undefined
+})
+
+async function mount(props: Partial<Parameters<typeof AssistantModePanel>[0]> = {}) {
+  container = document.createElement('div')
+  document.body.append(container)
+  root = createRoot(container)
+  await act(async () => {
+    root?.render(
+      <AssistantModePanel
+        agentId={AGENT}
+        canEdit
+        runtime="claude-acp"
+        memoryProvider="managed"
+        placement="daemon:edge"
+        permissionMode=""
+        askEveryTime={false}
+        {...props}
+      />
+    )
+  })
+  return container
+}
+
+const clickButton = async (host: HTMLElement, label: string) => {
+  const button = [...host.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent?.trim() === label)
+  expect(button, `${label} button`).toBeTruthy()
+  await act(async () => button?.click())
+}
+
+describe('assistant mode draft', () => {
+  it('round-trips a policy and keeps the fields the panel does not edit', () => {
+    const persisted = { enabled: true, instructions: 'Keep it short.', limits: { permissionWaitHours: 24 } }
+    const draft = assistantModeDraft(persisted)
+    expect(assistantModePolicyForDraft(draft, persisted)).toEqual(persisted)
+    expect(
+      assistantModePolicyForDraft({ ...draft, limits: { ...draft.limits, permissionWaitHours: '' } }, persisted)
+    ).toEqual({ enabled: true, instructions: 'Keep it short.' })
+  })
+
+  it('needs nothing but the switch to turn on, and names a limit out of range', () => {
+    const draft = assistantModeDraft(undefined)
+    expect(assistantModePolicyForDraft({ ...draft, enabled: true }, undefined)).toEqual({ enabled: true })
+    expect(
+      assistantModePolicyForDraft({ ...draft, limits: { ...draft.limits, dailyCheckBudget: '501' } }, undefined)
+    ).toBe('invalidLimit')
+    expect(assistantModePolicyForDraft(draft, undefined)).toEqual({ enabled: false })
+  })
+})
+
+describe('AssistantModePanel', () => {
+  it('locks the switch with each reason when admission fails', async () => {
+    mocks.admission = { admitted: false, refusals: ['runtime-not-admitted', 'memory-provider'] }
+    const host = await mount({ runtime: 'qwen-code', memoryProvider: 'native' })
+    expect(host.querySelector('[data-assistant-mode-locked]')).toBeTruthy()
+    expect(
+      [...host.querySelectorAll('[data-assistant-mode-refusal]')].map((n) =>
+        n.getAttribute('data-assistant-mode-refusal')
+      )
+    ).toEqual(['runtime-not-admitted', 'memory-provider'])
+    expect(host.querySelector('[data-assistant-mode-refusal="runtime-not-admitted"]')?.textContent).toContain(
+      'resume a session after a restart'
+    )
+    await clickButton(host, 'Edit')
+    const toggle = host.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    expect(toggle?.disabled).toBe(true)
+  })
+
+  // assistant-mode.md §5.18 ①: the routing check names each conversation to change, by id where its name is unknown.
+  it('names the conversations the routing check refuses, and asks again once one leaves By decision', async () => {
+    mocks.channels = [
+      { channelId: 'C1', name: 'general', trigger: 'decision' },
+      { channelId: 'C2', name: 'random', trigger: 'mention' }
+    ]
+    mocks.admission = {
+      admitted: false,
+      refusals: ['routing'],
+      conversations: [
+        { integrationId: INTEGRATION, channelId: 'C1', name: 'general' },
+        { integrationId: INTEGRATION, channelId: 'C9', name: null }
+      ]
+    }
+    const host = await mount()
+    expect(host.querySelector('[data-assistant-mode-locked]')).toBeTruthy()
+    expect(host.querySelector('[data-assistant-mode-refusal="routing"]')?.textContent).toBe(
+      'Stop using By decision or shared-bot routing in these conversations first: general, C9.'
+    )
+    await clickButton(host, 'Edit')
+    expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(true)
+
+    // An editor moves the conversation to Mention; the panel asks again and unlocks.
+    expect(mocks.fetchAdmission).toHaveBeenCalledTimes(1)
+    mocks.channels = [{ ...mocks.channels[0]!, trigger: 'mention' }, mocks.channels[1]!]
+    mocks.admission = { admitted: true, refusals: [] }
+    await act(async () =>
+      root?.render(
+        <AssistantModePanel
+          agentId={AGENT}
+          canEdit
+          runtime="claude-acp"
+          memoryProvider="managed"
+          placement="daemon:edge"
+          permissionMode=""
+          askEveryTime={false}
+        />
+      )
+    )
+    expect(mocks.fetchAdmission).toHaveBeenCalledTimes(2)
+    expect(host.querySelector('[data-assistant-mode-locked]')).toBeNull()
+    expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(false)
+  })
+
+  it('marks the mode Beta beside the card title and beside the switch, and nowhere else', async () => {
+    const host = await mount()
+    const badges = () => [...host.querySelectorAll('[data-assistant-mode-beta]')].map((b) => b.textContent)
+    expect(badges()).toEqual(['Beta'])
+    await clickButton(host, 'Edit')
+    expect(badges()).toEqual(['Beta', 'Beta'])
+    expect(host.querySelector('label [data-assistant-mode-beta]')?.parentElement?.textContent).toContain(
+      'Turn on assistant mode'
+    )
+  })
+
+  it('turns on with the switch alone and saves the policy', async () => {
+    const host = await mount()
+    await clickButton(host, 'Edit')
+    await act(async () => host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click())
+    await clickButton(host, 'Save assistant mode')
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT, { assistantMode: { enabled: true } })
+  })
+
+  // assistant-mode.md §5.1: the responsible user is derived, so it is shown, never chosen.
+  it('shows the derived responsible user read-only, with no responsible-user or fallback select', async () => {
+    const on = await mount({ assistantMode: { enabled: true } })
+    expect(mocks.responsible).toHaveBeenCalledWith(AGENT)
+    expect(on.textContent).toContain('On · Responsible: Ada')
+    await clickButton(on, 'Edit')
+    expect(on.querySelectorAll('select')).toHaveLength(0)
+    expect(on.textContent).not.toContain('Responsible user')
+    expect(on.textContent).not.toContain('Fallback conversation')
+
+    await act(async () => root?.unmount())
+    root = undefined
+    mocks.responsible.mockClear()
+    const off = await mount()
+    expect(mocks.responsible).not.toHaveBeenCalled()
+    expect(off.textContent).not.toContain('Responsible:')
+  })
+
+  it('names nobody when the Control Plane derives no one', async () => {
+    mocks.responsible.mockResolvedValue({ userId: null })
+    const host = await mount({ assistantMode: { enabled: true } })
+    expect(host.textContent).not.toContain('Responsible:')
+  })
+
+  // #2979 B7: turning on gates nothing, so it saves at once over rooms and group DMs already enabled.
+  it('turns on over enabled rooms and group DMs with no warning', async () => {
+    mocks.channels = [
+      { channelId: 'C1', name: 'general', trigger: 'mention' },
+      { channelId: 'C2', name: 'random', trigger: 'off' },
+      { channelId: 'G1', name: '@ada, bob', kind: 'mpim', trigger: 'mention' },
+      { channelId: 'D1', name: '@ada', kind: 'im', trigger: 'any' }
+    ]
+    const host = await mount()
+    await clickButton(host, 'Edit')
+    await act(async () => host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click())
+    await clickButton(host, 'Save assistant mode')
+    expect(host.querySelector('[role="dialog"]')).toBeNull()
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT, { assistantMode: { enabled: true } })
+  })
+
+  it('warns when the agent asks before every action', async () => {
+    const host = await mount({ askEveryTime: true, assistantMode: { enabled: true } })
+    expect(host.querySelector('[data-assistant-mode-ask-warning]')?.textContent).toContain('wait for approval')
+  })
+
+  // assistant-mode.md §1.8: turning on moves an asking mode to the runtime's auto mode, so only a kept mode warns first.
+  it('warns while turning on only when the runtime keeps the asking mode', async () => {
+    const turningOn = async (props: Partial<Parameters<typeof AssistantModePanel>[0]>) => {
+      const host = await mount({ askEveryTime: true, permissionMode: 'default', ...props })
+      await clickButton(host, 'Edit')
+      await act(async () => host.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click())
+      const warned = host.querySelector('[data-assistant-mode-ask-warning]') !== null
+      await act(async () => root?.unmount())
+      root = undefined
+      return warned
+    }
+    expect(await turningOn({})).toBe(false)
+    expect(await turningOn({ permissionMode: '' })).toBe(false)
+    expect(await turningOn({ runtime: 'example-runtime' })).toBe(true)
+    // Codex moves to Auto review; OpenCode has no auto or full-access mode, so it keeps its mode and warns.
+    expect(await turningOn({ runtime: 'codex-acp', permissionMode: 'workspace-write' })).toBe(false)
+    expect(await turningOn({ runtime: 'opencode', permissionMode: 'build' })).toBe(true)
+  })
+})

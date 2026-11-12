@@ -1,0 +1,271 @@
+/**
+ * `routeAgentMsg` — the relay's `rd/agentmsg` routing + authorization (agent-collaboration
+ * §2.3 / §6.2 / §6.4). The security-critical seam: it turns an UNTRUSTED cross-daemon
+ * agent-call into a TRUSTED forward, or a typed NAK.
+ *
+ * Steps (§2.5 / §6.2):
+ *  a) bind the request to the socket's AUTHENTICATED `fromDaemonId` (passed in — never
+ *     the frame's `claimedFromAgentId`);
+ *  b) validate `claimedFromAgentId` actually belongs to that daemon via the org-scoped
+ *     collaboration directory (a forged claim → reject);
+ *  b2) verify the INTEGRITY of the asserted `msg.coords`: if the snapshot knows any
+ *     membership at that (org, channel id) — under ANY platform, since the woken session's
+ *     key is computed from a narrowed platform — the caller must be a member of one of
+ *     them. Membership no longer AUTHORIZES the call, but `coords` is still the woken
+ *     peer's session key, so an unchecked assertion would let a caller resume a session in
+ *     a channel it cannot reach. An UNKNOWN coordinate on a persisted IM platform fails
+ *     CLOSED; an unknown one on a channel-free platform (webchat/dream) is admitted and the
+ *     TARGET daemon keys the woken session off the trusted caller instead;
+ *  c) resolve the TARGET `toAgentId` in the SAME org → owning daemonId. Channel-free:
+ *     A2A delivery is postless, so caller and target need share no channel (and an
+ *     integration-less peer has none). `msg.coords` still rides along as the DELIVERY
+ *     coordinate for the woken session, not as an authorization input;
+ *  d) check the caller's outbound policy AND the target's inbound policy
+ *     (cross-org / either denial → typed NAK);
+ *  e) increment hopCount (inbound+1, capped at MAX_AGENT_CALL_HOPS, §2.4);
+ *  f) forward `rd/agentmsg/fwd` with a TRUSTED caller claim (trustedFromAgentId + org/
+ *     channel assertion) to the owning daemon and relay its admission verdict back.
+ *
+ * Per-hop dedup on the stable `deliveryId` (§6.4): a retransmit of the same deliveryId
+ * replays the prior verdict without a second forward (no double-wake). The one verdict
+ * NEVER cached is the retryable `not_ready` — a PENDING directory entry (a pool member
+ * holding an unconfirmed grant, or a lapsed lease a live member is about to claim), or
+ * the target daemon answering it — so the SOURCE daemon's bounded retry of the same
+ * deliveryId is re-evaluated against the current directory instead of replaying a miss.
+ *
+ * Retransmit for the other verdicts is NOT implemented — this is ACK/NAK + per-hop dedup
+ * + the 5s correlator timeout (the forward's `rd/agentmsg/fwd` inherits the connection's
+ * ACK_TIMEOUT_MS).
+ */
+import {
+  hasReachedAgentCallHopLimit,
+  isRetryableAgentMsgAck,
+  RD_AGENTMSG_NOT_READY,
+  RD_AGENT_SESSION_CALL_V1,
+  RD_SESSION_MESSAGE_V1,
+  RD_HEADLESS_AGENT_DELIVERY_V1,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  type RdAgentMsg,
+  type RdAgentMsgAck,
+  type RdAgentMsgReason
+} from '@agentconnect.md/protocol'
+import type { CollaborationRouter } from './collaboration-router.js'
+import { inboundAdmits, outboundAdmits } from './collaboration-router.js'
+import type { RelayDaemonServer } from './relay-daemon-server.js'
+import type { Logger } from './log.js'
+
+export interface AgentMsgRouterDeps {
+  router: CollaborationRouter
+  daemons: () => RelayDaemonServer | undefined
+  log: Logger
+}
+
+export function createAgentMsgRouter(deps: AgentMsgRouterDeps) {
+  // Per-hop dedup (§6.4): deliveryId → the verdict we already returned.
+  const seen = new Map<string, RdAgentMsgAck>()
+
+  function nak(deliveryId: string, reason: RdAgentMsgReason): RdAgentMsgAck {
+    return { deliveryId, delivered: false, reason }
+  }
+
+  return async function routeAgentMsg(fromDaemonId: string, msg: RdAgentMsg): Promise<RdAgentMsgAck> {
+    // Namespace the dedup key by the AUTHENTICATED source daemon: `deliveryId` is only
+    // unique within one daemon process (it's `String(Date.now())`), so two independent
+    // source daemons routinely mint the same millisecond value. A bare-deliveryId key
+    // would let daemon B's call collide with an unrelated prior call from daemon A.
+    const dedupKey = `${fromDaemonId}:${msg.deliveryId}`
+    const prior = seen.get(dedupKey)
+    if (prior) {
+      deps.log.debug(`relay: rd/agentmsg dup ${dedupKey} — replaying verdict`)
+      return prior
+    }
+
+    const verdict = await route(fromDaemonId, msg)
+    if (isRetryableAgentMsgAck(verdict)) return verdict // not yet, not never — the retry must re-route
+    if (seen.size >= 4000) seen.clear() // bound the dedup window
+    seen.set(dedupKey, verdict)
+    return verdict
+  }
+
+  async function route(fromDaemonId: string, msg: RdAgentMsg): Promise<RdAgentMsgAck> {
+    const { router } = deps
+    // (b) Validate the UNTRUSTED claimedFromAgentId against the ORG-SCOPED directory: the
+    // claimed id must exist and its placement must be owned by the AUTHENTICATED sending
+    // daemon — that daemon-ownership check, not channel membership, is what makes the claim
+    // unforgeable. Org is bound from the caller's own entry (the frame carries no org).
+    const caller = router.agent(msg.claimedFromAgentId)
+    // A PENDING caller (no confirmed member yet) binds to no socket: refuse retryably, not as forged.
+    if (caller && caller.daemonId === undefined) {
+      deps.log.info(`relay: rd/agentmsg not_ready — caller ${msg.claimedFromAgentId} has no confirmed member yet`)
+      return nak(msg.deliveryId, RD_AGENTMSG_NOT_READY)
+    }
+    if (!caller || caller.daemonId !== fromDaemonId) {
+      deps.log.warn(
+        `relay: rd/agentmsg rejected — forged/unknown caller ${msg.claimedFromAgentId} on daemon ${fromDaemonId}`
+      )
+      return nak(msg.deliveryId, 'not_allowed')
+    }
+    const orgId = caller.orgId
+
+    // (b2) COORDINATE INTEGRITY. Channel is no longer an authorization key, but it is still
+    // the DELIVERY coordinate the target daemon derives the woken session's key from — so an
+    // unchecked `coords` lets a caller name a channel it cannot reach and RESUME the target's
+    // existing session there (with `needsReply`, reading that conversation back into its own).
+    // Same threat model as the `caller.daemonId !== fromDaemonId` check above: a compromised or
+    // buggy source daemon asserting something the relay is the only one able to falsify.
+    // ONE decision (see CollaborationRouter.coordsDecision): a KNOWN coordinate demands
+    // membership; an UNKNOWN one on a PERSISTED IM platform fails CLOSED, because an
+    // unrecorded Slack/Telegram/Discord/Feishu conversation — a DM whose row this snapshot
+    // has not caught up with, a channel the bot left, an id the caller simply guessed — is
+    // precisely how a caller aliases an existing platform session; an UNKNOWN one on a
+    // channel-free platform is admitted, and the TARGET DAEMON (not the relay) replaces the
+    // asserted channel with a caller-derived one when it mints the session key. The relay
+    // therefore forwards `coords` verbatim and acts only on `reject`.
+    // A LINEAGE REPLY (§5.3, `lineageReplyTo`) is exempt from this gate: it never keys or
+    // creates a session from `coords` — the TARGET daemon dispatches into the exact session
+    // named by the high-entropy id and terminally validates possession + ownership — so the
+    // aliasing threat the gate closes is absent, and membership would wrongly reject a
+    // replier that does not share the origin's channel (an explicitly supported org-scoped
+    // case). Org membership (c) and the hop cap (e) still apply.
+    if (
+      msg.lineageReplyTo === undefined &&
+      router.coordsDecision(orgId, msg.coords.platform, msg.coords.channel, msg.claimedFromAgentId).verdict === 'reject'
+    ) {
+      deps.log.warn(
+        `relay: rd/agentmsg not_allowed — ${msg.claimedFromAgentId} may not assert coords ${msg.coords.platform}:${msg.coords.channel}`
+      )
+      return nak(msg.deliveryId, 'not_allowed')
+    }
+
+    // (c) Resolve the TARGET in the SAME org, channel-free: A2A delivery is postless, so a
+    // shared channel is neither required nor evidence of anything. Absent/cross-org ⇒ not_found
+    // (cross-org is indistinguishable from nonexistent by design — no cross-org probing).
+    const target = router.agent(msg.toAgentId)
+    if (!target || target.orgId !== orgId) return nak(msg.deliveryId, 'not_found')
+
+    // (d) Ordinary calls need both directional grants; parent replies use source-checked origin authority.
+    if (msg.lineageReplyTo === undefined && !outboundAdmits(caller, msg.toAgentId)) {
+      deps.log.info(
+        `relay: rd/agentmsg not_allowed — ${msg.claimedFromAgentId} outbound policy excludes ${msg.toAgentId}`
+      )
+      return nak(msg.deliveryId, 'not_allowed')
+    }
+    if (msg.lineageReplyTo === undefined && !inboundAdmits(target, msg.claimedFromAgentId)) {
+      deps.log.info(`relay: rd/agentmsg not_allowed — ${msg.claimedFromAgentId} → ${msg.toAgentId} (target selected)`)
+      return nak(msg.deliveryId, 'not_allowed')
+    }
+
+    // (e) Hop increment + cap (§2.4).
+    const hopCount = msg.hopCount + 1
+    if (hasReachedAgentCallHopLimit(hopCount)) return nak(msg.deliveryId, 'hop_limit')
+
+    // (f) Resolve the owning daemon connection and forward with a TRUSTED caller claim.
+    // A PENDING target (authorized, no member confirmed yet) is the retryable miss the source re-sends.
+    if (target.daemonId === undefined) {
+      deps.log.info(`relay: rd/agentmsg not_ready — target ${msg.toAgentId} has no confirmed member yet`)
+      return nak(msg.deliveryId, RD_AGENTMSG_NOT_READY)
+    }
+    const conn = deps.daemons()?.get(target.daemonId)
+    if (!conn) return nak(msg.deliveryId, 'offline')
+
+    // Losing either a reply target or explicit private origin would change the caller's output audience.
+    if (
+      (msg.originCodeHostReplyTarget !== undefined || msg.codeHostReplyTarget !== undefined) &&
+      !conn.supports(RD_CODEHOST_REPLY_TARGET_V1)
+    ) {
+      return nak(msg.deliveryId, 'unsupported')
+    }
+
+    // (f0) send-message-routing-rework.md §8.4 — capability gate for `session-reply`. A
+    // daemon that never advertised this predates the delivery kind entirely: it would key
+    // the reply by coordinates instead of dispatching into the named parent session. The
+    // reply is REFUSED — `unsupported`, distinct from `offline` because the target is
+    // reachable and the caller can act on the difference. (The gate was introduced when
+    // this kind ALSO required muting the resumed parent turn, which §7 no longer asks for.)
+    if (msg.deliveryKind === 'session-reply' && !conn.supports(RD_HEADLESS_AGENT_DELIVERY_V1)) {
+      deps.log.warn(
+        `relay: rd/agentmsg refused — daemon ${target.daemonId} does not support ${RD_HEADLESS_AGENT_DELIVERY_V1}; ` +
+          `it cannot dispatch a reply into the named parent session`
+      )
+      return nak(msg.deliveryId, 'unsupported')
+    }
+
+    // send-message-guide.md §9.2: an existing-session call needs its session, and a target that admits it into that session alone.
+    if (msg.deliveryKind === 'session-call' && msg.targetSessionId === undefined)
+      return nak(msg.deliveryId, 'not_found')
+    if (msg.deliveryKind === 'session-call' && !conn.supports(RD_AGENT_SESSION_CALL_V1)) {
+      deps.log.warn(
+        `relay: rd/agentmsg refused — daemon ${target.daemonId} does not support ${RD_AGENT_SESSION_CALL_V1}`
+      )
+      return nak(msg.deliveryId, 'unsupported')
+    }
+
+    // send-message-guide.md §9.3: an older target gets the pre-id delivery; once the supported daemon floor advertises session-message-v1, this and the framing below go and the relay only forwards.
+    const sessionMessage =
+      (msg.messageId === undefined && msg.messageKind === undefined && msg.inReplyTo === undefined) ||
+      conn.supports(RD_SESSION_MESSAGE_V1)
+    const label = caller.displayName?.trim() || caller.name || msg.claimedFromAgentId
+    // A pre-id daemon shows a call's text as is, so it carries its sender the way a pre-id sender framed it.
+    const text = sessionMessage || msg.messageKind !== 'call' ? msg.text : `From ${label}: ${msg.text}`
+
+    // Delivery detail, NOT authorization: the DEFINITE reply integration (§6.2). The same
+    // agent can reach two channels via two different bots, so prefer its placement in the
+    // coords channel and fall back to the directory entry when it has no row there (an
+    // integration-less peer legitimately has none).
+    const { platform, channel } = msg.coords
+    const integrationId = router.resolve(orgId, platform, channel, msg.toAgentId)?.integrationId ?? target.integrationId
+
+    try {
+      return await conn.forwardAgentMsg({
+        trustedFromAgentId: msg.claimedFromAgentId, // now VALIDATED — the target may trust it
+        orgId,
+        toAgentId: msg.toAgentId,
+        ...(integrationId !== undefined ? { integrationId } : {}),
+        text,
+        coords: msg.coords,
+        hopCount,
+        deliveryId: msg.deliveryId,
+        // Visible-post ts (if any), forwarded opaquely so the target can dedup the wake against
+        // the post it fetches from the shared thread.
+        ...(msg.transcriptTs !== undefined ? { transcriptTs: msg.transcriptTs } : {}),
+        // Origin lineage (session-concept §5.3) is the caller's own, forwarded opaquely —
+        // the relay neither mints nor validates it; it only lets the woken child reply back.
+        ...(msg.originSessionId !== undefined ? { originSessionId: msg.originSessionId } : {}),
+        ...(msg.initiator !== undefined ? { initiator: msg.initiator } : {}),
+        ...(msg.originCodeHostReplyTarget !== undefined
+          ? { originCodeHostReplyTarget: msg.originCodeHostReplyTarget }
+          : {}),
+        ...(msg.codeHostReplyTarget !== undefined ? { codeHostReplyTarget: msg.codeHostReplyTarget } : {}),
+        ...(msg.originCoords !== undefined ? { originCoords: msg.originCoords } : {}),
+        ...(msg.externalOrigin !== undefined ? { externalOrigin: msg.externalOrigin } : {}),
+        // §5.3 lineage reply target — opaque to the relay; the TARGET daemon terminally
+        // validates it. Coordinate integrity above still applied to `coords` unchanged.
+        ...(msg.lineageReplyTo !== undefined ? { lineageReplyTo: msg.lineageReplyTo } : {}),
+        // §5.4 report-back request, forwarded opaquely for the same reason: it is an instruction
+        // about the caller's OWN lineage, so the relay carries it without minting or validating it.
+        ...(msg.needsReply !== undefined ? { needsReply: msg.needsReply } : {}),
+        // session-visibility.md §5.1 privacy hint — again the caller's own fact
+        // about its own lineage, forwarded verbatim. The relay stores nothing.
+        ...(msg.parentPrivate !== undefined ? { parentPrivate: msg.parentPrivate } : {}),
+        // §8.3: forwarded so the TARGET treats the delivery exactly as the same-daemon path
+        // does — dispatch into the named parent session. The capability check above already
+        // ran, so a target receiving `session-reply` is known to understand it.
+        ...(msg.deliveryKind !== undefined ? { deliveryKind: msg.deliveryKind } : {}),
+        // §9.2: the target session and the calling turn's people, which the target daemon judges participation by.
+        ...(msg.targetSessionId !== undefined ? { targetSessionId: msg.targetSessionId } : {}),
+        ...(msg.callerAskers !== undefined ? { callerAskers: msg.callerAskers } : {}),
+        // §9.3–§9.4: the message's id, kind and answered message, which a target that records them checks.
+        ...(sessionMessage && msg.messageId !== undefined ? { messageId: msg.messageId } : {}),
+        ...(sessionMessage && msg.messageKind !== undefined ? { messageKind: msg.messageKind } : {}),
+        ...(sessionMessage && msg.inReplyTo !== undefined ? { inReplyTo: msg.inReplyTo } : {})
+      })
+    } catch (err) {
+      // Forward timed out / socket dropped mid-flight → treat as offline (retransmit is
+      // a follow-up). The source's dedup cache still holds this verdict.
+      deps.log.warn(`relay: rd/agentmsg forward to ${target.daemonId} failed: ${(err as Error).message}`)
+      return nak(msg.deliveryId, 'offline')
+    }
+  }
+}
+
+export type RouteAgentMsg = ReturnType<typeof createAgentMsgRouter>

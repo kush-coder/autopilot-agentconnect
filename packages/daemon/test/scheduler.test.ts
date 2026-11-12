@@ -1,0 +1,336 @@
+import { describe, it, expect, vi } from 'vitest'
+import {
+  buildSyntheticMessage,
+  cronAnchorText,
+  cronNextRunText,
+  isHeadlessCronSession,
+  missedOccurrence,
+  scheduleFingerprint,
+  scheduledRunContext,
+  Scheduler
+} from '../src/scheduler/scheduler.js'
+import type { ScheduleDefinition } from '../src/scheduler/scheduler.js'
+import type { CronDef } from '../src/agents/agent-schema.js'
+
+const cron = (id: string, over: Partial<CronDef> = {}): CronDef => ({
+  id,
+  schedule: '0 9 * * *',
+  target: { platform: 'slack', channel: 'C1' },
+  trigger: 'post health report',
+  enabled: true,
+  ...over
+})
+
+// 17:58 UTC is already the NEXT day in Shanghai — the straddle that dated a nightly digest to
+// yesterday, because the host clock and the schedule's clock disagreed about what day it was.
+const FIRED_AT = new Date('2026-08-29T17:58:10.000Z')
+
+describe('buildSyntheticMessage', () => {
+  it('builds a cron-sourced NormalizedMessage targeting the cron channel', () => {
+    const { agentId, msg } = buildSyntheticMessage('bot-a', cron('daily'), 'trace-1', FIRED_AT)
+    expect(agentId).toBe('bot-a')
+    expect(msg.source).toBe('cron')
+    expect(msg.trigger).toBe('cron')
+    expect(msg.channel).toBe('C1')
+    expect(msg.sender.isBot).toBe(false)
+    expect(msg.headless).toBeUndefined()
+  })
+
+  it('leads with the firing clock and keeps the operator’s prompt intact below it', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily', { timezone: 'Asia/Shanghai' }), 't', FIRED_AT)
+    expect(msg.text).toBe(
+      "Scheduled run: 2026-08-30 01:58 Asia/Shanghai — the schedule's own clock; this host's may differ.\n\npost health report"
+    )
+  })
+
+  // `msg.text` is also the fallback session title (`deriveTitle` takes its first line), so with the
+  // stamp leading, every scheduled run would otherwise be born named after its own timestamp.
+  it('names the session by what the schedule does, not by the stamp that now leads its text', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily'), 't', FIRED_AT)
+    expect(msg.initialSessionTitle).toBe('post health report')
+    expect(msg.text.split('\n')[0]).toContain('Scheduled run:')
+  })
+
+  // `initialSessionTitle` is taken as written apart from a trim, and a schedule prompt is routinely
+  // long and multi-line — so the trigger goes through the same rule the derived title always used.
+  it('normalizes that title instead of persisting a whole multi-line prompt', () => {
+    const trigger = ['', `  ${'x'.repeat(120)}  `, 'a second line'].join('\n')
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily', { trigger }), 't', FIRED_AT)
+    expect(msg.initialSessionTitle).toBe(`${'x'.repeat(80)}…`)
+    expect(msg.initialSessionTitle).not.toContain('\n')
+    // The prompt itself is untouched — only the title is normalized.
+    expect(msg.text.endsWith(trigger)).toBe(true)
+  })
+
+  it('leaves the session untitled when the trigger is only whitespace', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily', { trigger: '  \n  ' }), 't', FIRED_AT)
+    expect(msg.initialSessionTitle).toBeUndefined()
+  })
+
+  it('a target-less cron builds a HEADLESS message with a synthetic channel key', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily', { target: undefined }), 'trace-1', FIRED_AT)
+    expect(msg.headless).toBe(true)
+    expect(msg.channel).toBe('cron:daily')
+    // The key is platform-shaped for continuity, so the message has to SAY it reaches no conversation.
+    expect(msg.syntheticChannel).toBe(true)
+    expect(msg.text.endsWith('post health report')).toBe(true)
+  })
+
+  it("recognizes a headless fire's session by its channel being its own cron sender", () => {
+    const headless = buildSyntheticMessage('bot-a', cron('daily', { target: undefined }), 't', FIRED_AT).msg
+    expect(isHeadlessCronSession({ channel: headless.channel, triggeredBy: headless.sender.id })).toBe(true)
+    const anchored = buildSyntheticMessage('bot-a', cron('daily'), 't', FIRED_AT).msg
+    expect(isHeadlessCronSession({ channel: anchored.channel, triggeredBy: anchored.sender.id })).toBe(false)
+    // A Telegram private chat shares its id with its sender, and is still a real conversation.
+    expect(isHeadlessCronSession({ channel: '12345', triggeredBy: '12345' })).toBe(false)
+    expect(isHeadlessCronSession({ channel: 'cron:daily', triggeredBy: null })).toBe(false)
+  })
+
+  it('an anchored cron posts to a real channel, so it mints nothing', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily'), 'trace-1', FIRED_AT)
+    expect(msg.channel).toBe('C1')
+    expect(msg.headless).toBeUndefined()
+    expect(msg.syntheticChannel).toBeUndefined()
+  })
+
+  it('carries the schedule’s own zone for the run’s local time, and none for one on the host’s clock', () => {
+    const own = buildSyntheticMessage('bot-a', cron('daily', { timezone: 'asia/shanghai' }), 't', FIRED_AT)
+    expect(own.msg.scheduleTimeZone).toBe('Asia/Shanghai')
+    expect(buildSyntheticMessage('bot-a', cron('daily'), 't', FIRED_AT).msg).not.toHaveProperty('scheduleTimeZone')
+    const unknown = cron('daily', { timezone: 'Not/AZone' })
+    expect(buildSyntheticMessage('bot-a', unknown, 't', FIRED_AT).msg).not.toHaveProperty('scheduleTimeZone')
+  })
+})
+
+describe('cronAnchorText', () => {
+  it('shows the schedule’s name and its fire time on the schedule’s clock, never the prompt', () => {
+    const text = cronAnchorText(cron('daily', { name: 'Health report', timezone: 'Asia/Shanghai' }), FIRED_AT)
+    expect(text).toBe('⏰ Health report · 2026-08-30 01:58 Asia/Shanghai')
+    expect(text).not.toContain('post health report')
+  })
+
+  it('falls back to a hand-authored cron’s id, and to a generic label for an unnamed console cron', () => {
+    expect(cronAnchorText(cron('daily', { timezone: 'UTC' }), FIRED_AT)).toBe('⏰ daily · 2026-08-29 17:58 UTC')
+    const unnamed = cron('5b2c7c1e-0000-4000-8000-000000000000', { timezone: 'UTC', origin: 'cp', name: '  ' })
+    expect(cronAnchorText(unnamed, FIRED_AT)).toBe('⏰ Scheduled task · 2026-08-29 17:58 UTC')
+  })
+
+  it('leaves the session prompt as the trigger', () => {
+    const { msg } = buildSyntheticMessage('bot-a', cron('daily', { name: 'Health report' }), 't', FIRED_AT)
+    expect(msg.text.endsWith('\n\npost health report')).toBe(true)
+  })
+})
+
+describe('scheduledRunContext', () => {
+  it('reads the fire on the schedule’s clock, which can be a different day than the host’s', () => {
+    expect(scheduledRunContext(cron('d', { timezone: 'Asia/Shanghai' }), FIRED_AT)).toContain('2026-08-30 01:58')
+    expect(scheduledRunContext(cron('d', { timezone: 'UTC' }), FIRED_AT)).toContain('2026-08-29 17:58')
+    expect(scheduledRunContext(cron('d', { timezone: 'America/New_York' }), FIRED_AT)).toContain('2026-08-29 13:58')
+  })
+
+  it('names the zone it read in, so the agent can tell which clock it was given', () => {
+    expect(scheduledRunContext(cron('d', { timezone: 'Asia/Tokyo' }), FIRED_AT)).toContain('Asia/Tokyo')
+  })
+
+  it('falls back to the host clock for a cron that names no zone — croner reads it locally too', () => {
+    const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    expect(scheduledRunContext(cron('d'), FIRED_AT)).toContain(hostZone)
+  })
+
+  // A hand-authored cron is not validated against IANA, and Intl throws on a name it does not know.
+  it('falls back rather than throw on a zone no formatter accepts', () => {
+    const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    expect(scheduledRunContext(cron('d', { timezone: 'Not/AZone' }), FIRED_AT)).toContain(hostZone)
+  })
+
+  it('canonicalizes the zone it names, rather than echoing how the cron spelled it', () => {
+    expect(scheduledRunContext(cron('d', { timezone: 'utc' }), FIRED_AT)).toContain(' UTC ')
+    expect(scheduledRunContext(cron('d', { timezone: 'asia/shanghai' }), FIRED_AT)).toContain(' Asia/Shanghai ')
+  })
+
+  // On the fallback branches the zone IS the host's, so promising the host may differ would be false.
+  it('claims a second clock only when it actually read the schedule’s own', () => {
+    expect(scheduledRunContext(cron('d', { timezone: 'Asia/Tokyo' }), FIRED_AT)).toContain(
+      "the schedule's own clock; this host's may differ"
+    )
+    for (const timezone of [undefined, 'Not/AZone']) {
+      expect(scheduledRunContext(cron('d', { timezone }), FIRED_AT)).toContain("this host's own clock")
+    }
+  })
+
+  it('renders midnight as hour 00, never 24', () => {
+    const midnight = new Date('2026-08-29T16:00:00.000Z')
+    expect(scheduledRunContext(cron('d', { timezone: 'Asia/Shanghai' }), midnight)).toContain('2026-08-30 00:00')
+  })
+})
+
+const depsOf = () => ({ onFire: vi.fn(), newTraceId: () => 't', warn: vi.fn() })
+
+describe('a one-shot schedule', () => {
+  const ONCE = cron('once', { schedule: '2026-11-12T09:00:00', timezone: 'Asia/Shanghai' })
+  it('arms like a pattern and reports its moment on the schedule clock', () => {
+    expect(cronNextRunText(ONCE, new Date('2026-11-11T00:00:00Z'))).toBe('2026-11-12 09:00 Asia/Shanghai')
+    expect(cronNextRunText(ONCE, new Date('2026-11-12T01:30:00Z'))).toBeUndefined()
+  })
+  it('is armed by the scheduler, not skipped as malformed', () => {
+    const d = depsOf()
+    const s = new Scheduler(d)
+    s.sync('bot-a', [ONCE])
+    expect(s.count('bot-a')).toBe(1)
+    s.stop()
+    expect(d.warn).not.toHaveBeenCalled()
+  })
+})
+
+describe('Scheduler (per-agent converge — §5.2 crons change → upsert/remove)', () => {
+  const deps = depsOf
+
+  it("sync registers an agent's cron set and is replace-all idempotent", () => {
+    const s = new Scheduler(deps())
+    s.sync('bot-a', [cron('one'), cron('two')])
+    expect(s.count('bot-a')).toBe(2)
+    s.sync('bot-a', [cron('one')]) // re-sync replaces, never accumulates
+    expect(s.count('bot-a')).toBe(1)
+    s.sync('bot-a', [])
+    expect(s.count('bot-a')).toBe(0)
+    s.stop()
+  })
+
+  it("unregister drops only that agent's jobs", () => {
+    const s = new Scheduler(deps())
+    s.sync('bot-a', [cron('one')])
+    s.sync('bot-b', [cron('two')])
+    s.unregister('bot-a')
+    expect(s.count('bot-a')).toBe(0)
+    expect(s.count('bot-b')).toBe(1)
+    s.stop()
+  })
+
+  it('a malformed schedule skips that cron (warned) but registers the rest', () => {
+    const d = deps()
+    const s = new Scheduler(d)
+    s.sync('bot-a', [cron('bad', { schedule: 'not-a-cron' }), cron('good')])
+    expect(s.count('bot-a')).toBe(1)
+    expect(d.warn).toHaveBeenCalledOnce()
+    s.stop()
+  })
+
+  it('disabled crons stay unscheduled', () => {
+    const s = new Scheduler(deps())
+    s.sync('bot-a', [cron('off', { enabled: false }), cron('on')])
+    expect(s.count('bot-a')).toBe(1)
+    s.stop()
+  })
+
+  it('uses an explicit IANA timezone while local crons without one keep daemon-local scheduling', () => {
+    const d = deps()
+    const s = new Scheduler(d)
+    s.sync('bot-a', [
+      cron('zoned', { timezone: 'Asia/Singapore' }),
+      cron('local'),
+      cron('bad-zone', { timezone: 'Mars/Olympus_Mons' })
+    ])
+    expect(s.count('bot-a')).toBe(2)
+    expect(d.warn).toHaveBeenCalledOnce()
+    s.stop()
+  })
+
+  // Sync on purpose: timers are worker-wide (isolate: false); an await lets any live one re-arm on the fake clock.
+  it('fires at timezone-correct UTC instants across a DST offset change', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-03-07T13:59:59.000Z'))
+    const firedAt: string[] = []
+    const s = new Scheduler({
+      onFire: () => firedAt.push(new Date().toISOString()),
+      newTraceId: () => 't',
+      warn: vi.fn()
+    })
+
+    try {
+      s.sync('bot-a', [cron('new-york-morning', { timezone: 'America/New_York' })])
+      vi.advanceTimersByTime(1_000)
+      expect(firedAt).toEqual(['2026-03-07T14:00:00.000Z'])
+
+      vi.advanceTimersByTime(23 * 60 * 60 * 1_000)
+      expect(firedAt).toEqual(['2026-03-07T14:00:00.000Z', '2026-03-08T13:00:00.000Z'])
+    } finally {
+      s.stop()
+      vi.useRealTimers()
+    }
+  })
+})
+
+// #1031 — the arm-time question a duty handover creates: was a fire due while nobody held this
+// schedule? A fresh `Cron` cannot answer it, so the answer comes from the pattern, the stamp, and
+// the definition the stamp was written under.
+describe('missedOccurrence (handover catch-up)', () => {
+  const DAILY = { schedule: '0 3 * * *', timezone: 'Etc/UTC', enabled: true }
+  const at = (iso: string) => new Date(iso).getTime()
+  const ranAt = (iso: string, definition: ScheduleDefinition = DAILY) => ({
+    lastRunAt: at(iso),
+    definition: scheduleFingerprint(definition)
+  })
+
+  it('returns the previous occurrence when it is newer than the stamp', () => {
+    expect(missedOccurrence(DAILY, ranAt('2026-03-06T03:00:00.000Z'), at('2026-03-07T03:00:40.000Z'))).toBe(
+      at('2026-03-07T03:00:00.000Z')
+    )
+  })
+
+  it('returns nothing when the stamp already covers the previous occurrence', () => {
+    expect(missedOccurrence(DAILY, ranAt('2026-03-07T03:00:00.500Z'), at('2026-03-07T03:00:40.000Z'))).toBeUndefined()
+  })
+
+  it('returns nothing without a stamp — nothing durable says this schedule has ever been due', () => {
+    expect(missedOccurrence(DAILY, undefined, at('2026-03-07T03:00:40.000Z'))).toBeUndefined()
+  })
+
+  it('returns nothing when the stamp was written under a DIFFERENT definition', () => {
+    const now = at('2026-03-07T12:40:00.000Z')
+    const hourly = { schedule: '0 * * * *', timezone: 'Etc/UTC', enabled: true }
+    // Daily last stamped at 03:00, switched to hourly at 12:30: 12:00 is a moment the hourly
+    // definition never covered, and the stamp is no evidence about it either way.
+    expect(missedOccurrence(hourly, ranAt('2026-03-07T03:00:00.000Z'), now)).toBeUndefined()
+    // A moved timezone and a moved enabled flag are the same kind of change.
+    expect(
+      missedOccurrence(DAILY, ranAt('2026-03-06T03:00:00.000Z', { ...DAILY, timezone: 'Asia/Singapore' }), now)
+    ).toBeUndefined()
+    expect(
+      missedOccurrence(DAILY, ranAt('2026-03-06T03:00:00.000Z', { ...DAILY, enabled: false }), now)
+    ).toBeUndefined()
+    // A legacy row that predates the fingerprint is ineligible rather than assumed to match.
+    expect(
+      missedOccurrence(DAILY, { lastRunAt: at('2026-03-06T03:00:00.000Z'), definition: null }, now)
+    ).toBeUndefined()
+  })
+
+  it('returns nothing for a disabled definition — it is not armed, so nothing is owed', () => {
+    const off = { ...DAILY, enabled: false }
+    expect(
+      missedOccurrence(off, ranAt('2026-03-06T03:00:00.000Z', off), at('2026-03-07T03:00:40.000Z'))
+    ).toBeUndefined()
+  })
+
+  it('refuses a stale moment: past the grace window a missed fire is history, not a late fire', () => {
+    // Every minute ⇒ a one-minute grace, so the moment inside it is owed and an older one is not.
+    const minutely = { schedule: '* * * * *', timezone: 'Etc/UTC', enabled: true }
+    expect(
+      missedOccurrence(minutely, ranAt('2026-03-07T03:00:00.000Z', minutely), at('2026-03-07T03:02:30.000Z'))
+    ).toBe(at('2026-03-07T03:02:00.000Z'))
+    expect(missedOccurrence(DAILY, ranAt('2026-03-01T03:00:00.000Z'), at('2026-03-07T09:00:00.000Z'))).toBeUndefined()
+  })
+
+  it('never returns a backlog — a stamp days behind still yields only the newest missed moment', () => {
+    expect(missedOccurrence(DAILY, ranAt('2026-03-01T03:00:00.000Z'), at('2026-03-07T03:00:40.000Z'))).toBe(
+      at('2026-03-07T03:00:00.000Z')
+    )
+  })
+
+  it('returns nothing for a malformed pattern or an unknown zone instead of throwing', () => {
+    const now = at('2026-03-07T03:00:40.000Z')
+    const bad = { schedule: 'not-a-cron', enabled: true }
+    const zone = { ...DAILY, timezone: 'Mars/Olympus_Mons' }
+    expect(missedOccurrence(bad, ranAt('2026-03-01T00:00:00.000Z', bad), now)).toBeUndefined()
+    expect(missedOccurrence(zone, ranAt('2026-03-01T00:00:00.000Z', zone), now)).toBeUndefined()
+  })
+})

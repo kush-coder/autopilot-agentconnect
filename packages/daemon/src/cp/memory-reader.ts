@@ -1,0 +1,390 @@
+/**
+ * `MemoryReader` — the provider-aware router answering the CP's memory admin
+ * REQs. Managed/native keep the file surface; external providers expose
+ * canonical records; `none` exposes neither. Bodies live only on the daemon and
+ * transit the CP as correlated replies (§1/§12).
+ *
+ * Path containment stays inside each file provider (`memoryTopicName` for
+ * managed, nested containment for native): an escape throws `MemoryPathError` →
+ * `BAD_PAYLOAD`. An unknown agent is also `BAD_PAYLOAD`; a not-yet-created
+ * file/dir is data (`exists:false`), not an error. Frame-size safety mirrors the
+ * workspace reader: the read slice is bounded by the *encoded* reply size and
+ * ends on a UTF-8 boundary. Never log memory contents.
+ */
+import { randomUUID } from 'node:crypto'
+import type {
+  MemoryChannelClearReq,
+  MemoryChannelClearOk,
+  MemoryChannelsReq,
+  MemoryChannelsPage,
+  MemoryListReq,
+  MemoryListPage,
+  MemoryReadReq,
+  MemoryReadContent,
+  MemoryWriteReq,
+  MemoryWriteOk,
+  MemoryHistoryReq,
+  MemoryHistoryPage,
+  MemorySurfaceReq,
+  MemorySurfaceInfo,
+  MemoryRecordSearchReq,
+  MemoryRecordSearchPage,
+  MemoryRecordListReq,
+  MemoryRecordListPage,
+  MemoryRecordGetReq,
+  MemoryRecordGetResult,
+  MemoryRecordCreateReq,
+  MemoryRecordCreateResult,
+  MemoryRecordUpdateReq,
+  MemoryRecordUpdateResult,
+  MemoryRecordDeleteReq,
+  MemoryRecordDeleteResult,
+  MemoryRecordHistoryReq,
+  MemoryRecordHistoryPage,
+  MemoryPluginOperation
+} from '@agentconnect.md/protocol'
+import { fitToBudget, utf8Boundary } from '../wire-slice.js'
+import {
+  listMemory,
+  listMemoryHistory,
+  readMemoryFile,
+  writeMemoryFile,
+  listChannelMemoryKeys,
+  readChannelMemoryMeta,
+  channelMemoryHeld,
+  clearChannelMemory,
+  memoryPersonKey,
+  MemoryPathError,
+  MemoryTooLargeError,
+  MemoryConflictError,
+  MemoryHistoryNotLocalError,
+  MemoryHomeUnavailableError,
+  MemorySandboxUnavailableError,
+  type MemoryFs
+} from '../memory/store.js'
+import type { MemoryHomePorts } from '../memory/home.js'
+import { organizationFileRefusal } from '../memory/organization-files.js'
+import { MEMBERS_DIRECTORY_FILE } from '../memory/members-directory.js'
+import { memoryRefToTopic } from '../memory/frontmatter.js'
+import { MEMBERS_CONSOLE_EDIT_REFUSED } from './memory-entries.js'
+import type { MemoryAdminSurface, MemoryScope } from '../memory/provider.js'
+
+/** Unknown-agent violation → `BAD_PAYLOAD` on the wire (path escapes surface as
+ *  MemoryPathError from memory/store.ts, mapped the same way by the dispatcher). */
+export class MemoryViolationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'MemoryViolationError'
+  }
+}
+
+export {
+  MemoryPathError,
+  MemoryTooLargeError,
+  MemoryConflictError,
+  MemoryHistoryNotLocalError,
+  MemoryHomeUnavailableError,
+  MemorySandboxUnavailableError
+}
+
+export interface MemoryReader {
+  channels(req: MemoryChannelsReq): Promise<MemoryChannelsPage>
+  clearChannel(req: MemoryChannelClearReq): Promise<MemoryChannelClearOk>
+  list(req: MemoryListReq): Promise<MemoryListPage>
+  read(req: MemoryReadReq): Promise<MemoryReadContent>
+  write(req: MemoryWriteReq): Promise<MemoryWriteOk>
+  history(req: MemoryHistoryReq): Promise<MemoryHistoryPage>
+  surface(req: MemorySurfaceReq): Promise<MemorySurfaceInfo>
+  search(req: MemoryRecordSearchReq): Promise<MemoryRecordSearchPage>
+  recordList(req: MemoryRecordListReq): Promise<MemoryRecordListPage>
+  recordGet(req: MemoryRecordGetReq): Promise<MemoryRecordGetResult>
+  recordCreate(req: MemoryRecordCreateReq): Promise<MemoryRecordCreateResult>
+  recordUpdate(req: MemoryRecordUpdateReq): Promise<MemoryRecordUpdateResult>
+  recordDelete(req: MemoryRecordDeleteReq): Promise<MemoryRecordDeleteResult>
+  recordHistory(req: MemoryRecordHistoryReq): Promise<MemoryRecordHistoryPage>
+}
+
+export interface AgentMemoryAdminResolver {
+  adminSurfaceForAgent(agentId: string): MemoryAdminSurface
+}
+
+function isErrno(err: unknown, code: string): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === code
+}
+
+// `memoryHomePortsFor` resolves an agent id → the ports over its managed memory home (undefined for an unknown agent);
+// it throws `MemoryHomeUnavailableError` while the home is out of reach — a sleeping sandbox, or a `control-plane` tree
+// whose connection, feature, or migration copy is missing — and that refusal carries its reason to the CP.
+export function createMemoryReader(
+  memoryHomePortsFor: (agentId: string) => MemoryHomePorts | undefined,
+  provider?: AgentMemoryAdminResolver
+): MemoryReader {
+  function portsFor(agentId: string): MemoryHomePorts {
+    const ports = memoryHomePortsFor(agentId)
+    if (!ports) throw new MemoryViolationError(`unknown agent "${agentId}"`)
+    return ports
+  }
+
+  function dirFor(agentId: string): MemoryFs {
+    return portsFor(agentId).live
+  }
+
+  /** Identity only: a known agent whose home is out of reach is still a known agent. */
+  function assertKnown(agentId: string): void {
+    try {
+      portsFor(agentId)
+    } catch (err) {
+      if (!(err instanceof MemoryHomeUnavailableError)) throw err
+    }
+  }
+
+  function adminSurface(agentId: string): MemoryAdminSurface {
+    // Validate agent identity independently of provider selection. A resolver's
+    // default provider fallback must not turn an unknown id into an admin surface.
+    assertKnown(agentId)
+    return (
+      provider?.adminSurfaceForAgent(agentId) ?? {
+        shape: 'files',
+        list: async (scope) => listMemory(dirFor(scope.agentId)),
+        read: async (scope, path) => ({ path, content: await readMemoryFile(dirFor(scope.agentId), path) }),
+        write: async (scope, path, content, ifMatch, source) => {
+          const ports = portsFor(scope.agentId)
+          const result = await writeMemoryFile(
+            ports.live,
+            path,
+            content,
+            ifMatch,
+            source ?? 'console',
+            ports.historyFor(ports.live)
+          )
+          return { ok: true, path, ...result }
+        },
+        // Pages the store's sink; a home whose sink has no `list` (the CP's) answers the console itself, and a page asked here refuses.
+        history: async (scope, req) => {
+          const ports = portsFor(scope.agentId)
+          return listMemoryHistory(ports.historyFor(ports.live), req.path, req.cursor, req.limit)
+        }
+      }
+    )
+  }
+
+  function requireFileSurface(agentId: string) {
+    const surface = adminSurface(agentId)
+    if (!surface || surface.shape !== 'files') {
+      throw new MemoryViolationError('this memory provider does not expose files')
+    }
+    return surface
+  }
+
+  function requireRecordSurface(agentId: string, operation: MemoryPluginOperation) {
+    const surface = adminSurface(agentId)
+    if (!surface || surface.shape !== 'records') {
+      throw new MemoryViolationError('this memory provider does not expose records')
+    }
+    if (!surface.capabilities.has(operation)) {
+      throw new MemoryViolationError(`this memory provider does not support ${operation}`)
+    }
+    return surface
+  }
+
+  const scopeFor = (agentId: string, channelKey?: string, personUserId?: string): MemoryScope => {
+    // A console user's own layer, alone: the CP names only the signed-in caller, and never beside a place layer.
+    if (personUserId) {
+      if (channelKey) throw new MemoryViolationError('a memory read names one layer')
+      return { agentId, personKey: memoryPersonKey(`user:${personUserId}`), alone: true, withoutRecord: true }
+    }
+    // The organization record is on the Knowledge page, so the console's view leaves its names out.
+    return { agentId, ...(channelKey ? { channelKey } : {}), withoutRecord: true }
+  }
+
+  return {
+    async channels(req) {
+      const dir = dirFor(req.agentId)
+      const keys = (await listChannelMemoryKeys(dir)).filter((key) => !req.channelKey || key === req.channelKey)
+      const channels = []
+      for (const channelKey of keys) {
+        // Listed once it holds memory: a session's read leaves an internal marker in a folder that holds none.
+        if (!(await channelMemoryHeld(dir, channelKey))) continue
+        const meta = await readChannelMemoryMeta(dir, channelKey)
+        channels.push({
+          channelKey,
+          ...(meta?.channel ? { channel: meta.channel } : {}),
+          ...(meta?.transportScope ? { transportScope: meta.transportScope } : {}),
+          ...(meta?.platform ? { platform: meta.platform } : {}),
+          ...(meta?.name ? { name: meta.name } : {})
+        })
+      }
+      return { agentId: req.agentId, channels }
+    },
+
+    async clearChannel(req) {
+      const cleared = await clearChannelMemory(dirFor(req.agentId), req.channelKey)
+      return { agentId: req.agentId, channelKey: req.channelKey, cleared }
+    },
+
+    async list(req) {
+      const surface = requireFileSurface(req.agentId)
+      const files = await surface.list(scopeFor(req.agentId, req.channelKey, req.personUserId))
+      // Providers return [] for a missing/empty store; the console shows that as
+      // `exists:false`, preserving the legacy file-frame contract.
+      return { agentId: req.agentId, exists: files.length > 0, entries: files }
+    },
+
+    async read(req) {
+      const surface = requireFileSurface(req.agentId)
+      const scope = scopeFor(req.agentId, req.channelKey, req.personUserId)
+      const notFound = { agentId: req.agentId, path: req.path, exists: false }
+
+      const files = await surface.list(scope)
+      const entry = files.find((candidate) => candidate.name === req.path)
+      if (!entry) {
+        // `list` alone cannot distinguish a valid absent name from a containment
+        // violation. Ask the provider to validate the path before returning
+        // not-found; directories retain the legacy not-found behavior.
+        try {
+          await surface.read(scope, req.path)
+        } catch (error) {
+          if (isErrno(error, 'EISDIR')) return notFound
+          throw error
+        }
+        return notFound
+      }
+
+      const full = Buffer.from((await surface.read(scope, req.path)).content, 'utf8')
+      const size = full.length
+      const want = Math.min(req.limit, Math.max(0, size - req.offset))
+      const slice = full.subarray(req.offset, req.offset + want)
+      // Cut on a UTF-8 boundary, then shrink so the JSON-escaped reply fits the
+      // frame budget. `nextOffset` is authoritative — not a recount of `content`.
+      const { end, content } = fitToBudget(slice, utf8Boundary(slice, slice.length))
+      const nextOffset = req.offset + end
+      return {
+        agentId: req.agentId,
+        path: req.path,
+        exists: true,
+        size,
+        mtime: entry.mtime,
+        content,
+        offset: req.offset,
+        nextOffset,
+        truncated: nextOffset < size
+      }
+    },
+
+    async write(req) {
+      const surface = requireFileSurface(req.agentId)
+      // The console only clears people's directory entries; the shared layer's organization files keep their shapes (assistant-mode.md §5.15).
+      if (!req.channelKey && memoryRefToTopic(req.path) === MEMBERS_DIRECTORY_FILE)
+        throw new MemoryViolationError(MEMBERS_CONSOLE_EDIT_REFUSED)
+      const refusal = req.channelKey ? undefined : organizationFileRefusal(req.path, req.content)
+      if (refusal !== undefined) throw new MemoryViolationError(refusal)
+      const { size, mtime } = await surface.write(
+        scopeFor(req.agentId, req.channelKey),
+        req.path,
+        req.content,
+        req.ifMatchMtime,
+        'console'
+      )
+      return { agentId: req.agentId, path: req.path, size, mtime }
+    },
+
+    async history(req) {
+      const surface = requireFileSurface(req.agentId)
+      if (!surface.history) {
+        throw new MemoryViolationError('this memory provider does not expose file history')
+      }
+      const page = await surface.history(scopeFor(req.agentId, req.channelKey), {
+        path: req.path,
+        ...(req.cursor ? { cursor: req.cursor } : {}),
+        limit: req.limit
+      })
+      return {
+        agentId: req.agentId,
+        path: req.path,
+        events: page.events,
+        ...(page.nextCursor ? { nextCursor: page.nextCursor } : {})
+      }
+    },
+
+    async surface(req) {
+      const surface = adminSurface(req.agentId)
+      return {
+        agentId: req.agentId,
+        shape: surface?.shape ?? 'none',
+        capabilities: surface?.shape === 'records' ? [...surface.capabilities] : []
+      }
+    },
+
+    async search(req) {
+      const surface = requireRecordSurface(req.agentId, 'recall')
+      const records = await surface.search(scopeFor(req.agentId), {
+        turnId: randomUUID(),
+        query: req.query,
+        topK: req.topK,
+        maxBytes: req.maxBytes,
+        timeoutMs: 3_000
+      })
+      return { agentId: req.agentId, records }
+    },
+
+    async recordList(req) {
+      const surface = requireRecordSurface(req.agentId, 'list')
+      const page = await surface.list(scopeFor(req.agentId), {
+        ...(req.cursor ? { cursor: req.cursor } : {}),
+        limit: req.limit
+      })
+      return {
+        agentId: req.agentId,
+        records: page.records,
+        ...(page.nextCursor ? { nextCursor: page.nextCursor } : {})
+      }
+    },
+
+    async recordGet(req) {
+      const surface = requireRecordSurface(req.agentId, 'get')
+      return { agentId: req.agentId, record: await surface.get(scopeFor(req.agentId), req.id) }
+    },
+
+    async recordCreate(req) {
+      const surface = requireRecordSurface(req.agentId, 'create')
+      const record = await surface.create(scopeFor(req.agentId), {
+        operationId: req.operationId,
+        text: req.text,
+        ...(req.metadata ? { metadata: req.metadata } : {})
+      })
+      return { agentId: req.agentId, record }
+    },
+
+    async recordUpdate(req) {
+      const surface = requireRecordSurface(req.agentId, 'update')
+      const record = await surface.update(scopeFor(req.agentId), {
+        operationId: req.operationId,
+        id: req.id,
+        text: req.text,
+        ...(req.metadata ? { metadata: req.metadata } : {}),
+        ...(req.version ? { version: req.version } : {})
+      })
+      return { agentId: req.agentId, record }
+    },
+
+    async recordDelete(req) {
+      const surface = requireRecordSurface(req.agentId, 'delete')
+      const deleted = await surface.delete(scopeFor(req.agentId), {
+        operationId: req.operationId,
+        id: req.id,
+        ...(req.version ? { version: req.version } : {})
+      })
+      return { agentId: req.agentId, id: req.id, deleted }
+    },
+
+    async recordHistory(req) {
+      const surface = requireRecordSurface(req.agentId, 'history')
+      const page = await surface.history(scopeFor(req.agentId), {
+        id: req.id,
+        ...(req.cursor ? { cursor: req.cursor } : {}),
+        limit: req.limit
+      })
+      return { agentId: req.agentId, events: page.events, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) }
+    }
+  }
+}

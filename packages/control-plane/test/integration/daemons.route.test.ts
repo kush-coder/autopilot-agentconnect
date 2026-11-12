@@ -1,0 +1,1752 @@
+/**
+ * Daemon read model — `GET /daemons` live-status overlay + `PATCH /daemons/:id`.
+ *
+ * The durable `Daemon.status` is a lifecycle marker that is NOT downgraded when a
+ * daemon disconnects, so the read model overlays the LIVE connection index: a row
+ * with no live connection reads as `offline` even though the DB still says `ready`
+ * (the "exited but still shows connected" bug). The route also surfaces the
+ * console-assigned `name` and the registered `capabilities`.
+ *
+ * Driven through `app.inject` (DB-backed, no socket). A daemon row is seeded via
+ * the repo's `upsertOnAuth` + `applyRegister` (the same writes the WS handshake
+ * performs); liveness is injected as a stub so connect/disconnect is deterministic.
+ */
+import { describe, it, expect, afterEach, vi } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { prisma } from '../setup.db.js'
+import { seedAgent } from '../fixtures/seed.js'
+import { buildHttpApp, type HttpApp } from '../fakes/build-http.js'
+import { DEFAULT_ORG_ID } from '../../prisma/seed.js'
+import { PgDaemonRepo } from '../../src/persistence/repositories/daemon.repo.js'
+import { PgUserRepo } from '../../src/persistence/repositories/user.repo.js'
+import { PgDaemonLifecycleOpRepo } from '../../src/persistence/repositories/daemon-lifecycle-op.repo.js'
+import { PgRuntimeProfileRepo } from '../../src/persistence/repositories/runtime-profile.repo.js'
+import { DaemonRegistryService } from '../../src/registry/registryService.js'
+import { systemClock } from '../../src/domain/clock.js'
+import { DaemonId, OrgId } from '../../src/domain/ids.js'
+import type { DaemonLiveness } from '../../src/ports.js'
+import type { ControlSender } from '../../src/orchestrator/outbound.js'
+import { retryArm } from '../../src/http/routes/daemons.js'
+import type { DaemonReleaseResolver } from '../../src/registry/daemonRelease.js'
+import {
+  DAEMON_AUTO_UPGRADE_FEATURE,
+  DAEMON_BOOTSTRAP_UPGRADE_FEATURE,
+  RUNTIME_PROBE_FEATURE,
+  SESSION_EXECUTORS_V1_FEATURE,
+  type DaemonControlAck
+} from '@agentconnect.md/protocol'
+
+// Console routes are org-scoped: /orgs/:orgId/… (devAuth = seeded owner of the default org).
+const ORG = `/api/v1/orgs/${DEFAULT_ORG_ID}`
+
+const DAEMON = '15606a7a-f103-4b30-9ec7-5823a6bf5c1c'
+
+let running: HttpApp | undefined
+afterEach(async () => {
+  await running?.close()
+  running = undefined
+  vi.restoreAllMocks()
+})
+
+/** A liveness index backed by a plain map — what the in-memory ConnectionRegistry is, sans
+ *  socket. `sessionEpoch` defaults to 1 (seedDaemon's first auth epoch). */
+function liveness(
+  entries: Record<string, { state: string; reachable: boolean; sessionEpoch?: number }>,
+  reconnectForBootstrap?: DaemonLiveness['reconnectForBootstrap']
+): DaemonLiveness {
+  return {
+    get: (id) => {
+      const e = entries[id]
+      return e ? { state: e.state, reachable: e.reachable, sessionEpoch: e.sessionEpoch ?? 1 } : undefined
+    },
+    ...(reconnectForBootstrap ? { reconnectForBootstrap } : {})
+  }
+}
+
+/** Seed a registered daemon row (status `ready`, host + capabilities + version). */
+async function seedDaemon(features = ['worktree-iso']) {
+  const repo = new PgDaemonRepo(prisma)
+  await repo.upsertOnAuth({ daemonId: DaemonId(DAEMON), orgId: OrgId(DEFAULT_ORG_ID), agentVersion: '0.4.2' })
+  await repo.applyRegister(
+    DaemonId(DAEMON),
+    {
+      host: 'macbook-pro',
+      capabilities: { platforms: ['slack'], runtimes: ['claude', 'codex'], acp: true, features },
+      maxAgents: 3
+    },
+    new Date()
+  )
+}
+
+/** The reserved example name a sharing daemon registers its listener on — never served back. */
+const EXECUTOR_ENDPOINT_HOST = 'executor.example.test'
+
+/** Seed a daemon whose owner turned `sandbox.share` on: an effective strategy table, a ceiling, and
+ *  the listener address the read model must drop. */
+async function seedSharingDaemon() {
+  const repo = new PgDaemonRepo(prisma)
+  await repo.upsertOnAuth({ daemonId: DaemonId(DAEMON), orgId: OrgId(DEFAULT_ORG_ID), agentVersion: '0.4.2' })
+  await repo.applyRegister(
+    DaemonId(DAEMON),
+    {
+      host: 'macbook-pro',
+      capabilities: {
+        platforms: [],
+        runtimes: ['claude'],
+        acp: true,
+        features: [SESSION_EXECUTORS_V1_FEATURE],
+        executor: {
+          enabled: true,
+          strategies: {
+            host: { available: true },
+            microsandbox: { available: false, reason: 'no backend on this host' }
+          },
+          endpoint: { host: EXECUTOR_ENDPOINT_HOST, port: 7443 },
+          capacity: 8
+        }
+      },
+      maxAgents: 3
+    },
+    new Date()
+  )
+}
+
+type DaemonDto = {
+  daemonId: string
+  host: string | null
+  name: string | null
+  agentVersion: string | null
+  status: string
+  createdAt: string
+  createdBy: string | null
+  lastModifiedAt: string
+  lastModifiedBy: string | null
+  hostedSessions: number | null
+  capabilities: {
+    platforms: string[]
+    runtimes: string[]
+    acp: boolean
+    features: string[]
+    executor?: {
+      enabled: boolean
+      strategies?: Record<string, { available: true } | { available: false; reason: string }>
+      capacity?: number
+    }
+    strategies?: Record<string, { available: true } | { available: false; reason: string }>
+  }
+  runtimeProfiles: {
+    runtime: string
+    version: string
+    models: string[]
+    contextWindow: number | null
+    acpSupport: string
+    toolCalling: boolean
+    mcpCapabilities: { http: boolean; sse: boolean } | null
+    modelCatalog: {
+      models: { id: string; efforts?: { value: string; name?: string }[]; defaultEffort?: string; fastMode?: boolean }[]
+      defaultModel?: string
+      permissionModes?: { value: string; name?: string; description?: string }[]
+      source: string
+      observedAt: string
+    } | null
+    modelsSource: string | null
+    authRequired: boolean
+    unavailableReason?: 'image-binary-missing' | null
+    strategies?: Record<string, { available: boolean; unavailableReason?: string; models?: string[] }> | null
+    observedAt: string | null
+  }[]
+  mcpServers: {
+    name: string
+    transport: string
+  }[]
+  canEdit: boolean
+  canManageSharing: boolean
+  canManageLifecycle: boolean
+}
+
+/** `GET /daemons/capabilities` row — the capability half. Catalogs keep their
+ *  runtime-level answers; only their per-model matrix is emptied. */
+type CapabilityDto = Pick<DaemonDto, 'daemonId' | 'capabilities' | 'runtimeProfiles' | 'mcpServers'>
+
+const listCapabilities = async (): Promise<CapabilityDto[]> =>
+  (await running!.app.inject({ method: 'GET', url: `${ORG}/daemons/capabilities` })).json() as CapabilityDto[]
+
+describe('GET /daemons — live-status overlay', () => {
+  it('reads `offline` for a registered daemon with no live connection (the exited-but-connected bug)', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma) // default: empty liveness ⇒ nothing connected
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+
+    const d = rows.find((r) => r.daemonId === DAEMON)
+    expect(d).toBeDefined()
+    expect(d!.status).toBe('offline') // durable status is still `ready`, but it is not connected
+  })
+
+  it('lists an install-wide pool member without granting org-owned mutation access', async () => {
+    const poolMember = await new PgDaemonRepo(prisma).resolvePoolClusterIdentity(
+      'system:serviceaccount:agentconnect:ac-cloud-daemon',
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    )
+    running = buildHttpApp(prisma)
+
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((row) => row.daemonId === poolMember.id)).toMatchObject({
+      canEdit: false,
+      canManageSharing: false,
+      canManageLifecycle: false
+    })
+
+    const issueKey = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${poolMember.id}/keys` })
+    expect(issueKey.statusCode).toBe(404)
+    expect(await prisma.apiKey.count({ where: { daemonId: poolMember.id } })).toBe(0)
+
+    expect(
+      (await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${poolMember.id}/restart` })).statusCode
+    ).toBe(404)
+    expect(
+      (await running.app.inject({ method: 'PATCH', url: `${ORG}/daemons/${poolMember.id}`, payload: { name: 'mine' } }))
+        .statusCode
+    ).toBe(404)
+  })
+
+  it('reads `ready` when the daemon is live + reachable, `unreachable` when frozen', async () => {
+    await seedDaemon()
+
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: true } }))
+    const online = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(online.find((r) => r.daemonId === DAEMON)!.status).toBe('ready')
+    await running.close()
+
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: false } }))
+    const frozen = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(frozen.find((r) => r.daemonId === DAEMON)!.status).toBe('unreachable')
+  })
+
+  it('reads `connecting` for a disconnected daemon still within the reconnect grace', async () => {
+    // A CP restart empties the in-memory liveness index, so every daemon looks
+    // disconnected until it re-handshakes. With a grace window configured, a daemon
+    // that heartbeated recently reads `connecting` (amber) rather than `offline`.
+    await seedDaemon()
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { lastSeenAt: new Date() } })
+
+    running = buildHttpApp(prisma, { DAEMON_OFFLINE_GRACE_MS: 45_000 }) // empty liveness
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)!.status).toBe('connecting')
+  })
+
+  it('reads `offline` for a disconnected daemon whose last heartbeat is older than the grace', async () => {
+    await seedDaemon()
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { lastSeenAt: new Date(Date.now() - 10 * 60_000) } })
+
+    running = buildHttpApp(prisma, { DAEMON_OFFLINE_GRACE_MS: 45_000 })
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)!.status).toBe('offline')
+  })
+
+  it('never applies the grace to a never-authed provisioned daemon (stays `pending`)', async () => {
+    // No auth handshake yet ⇒ status `provisioned`; even a fresh lastSeenAt must not
+    // promote it to `connecting` — it has never connected, so `pending` is correct.
+    const repo = new PgDaemonRepo(prisma)
+    await repo.provision(DaemonId(DAEMON), OrgId(DEFAULT_ORG_ID))
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { lastSeenAt: new Date() } })
+
+    running = buildHttpApp(prisma, { DAEMON_OFFLINE_GRACE_MS: 45_000 })
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)!.status).toBe('pending')
+  })
+
+  it('surfaces host, version and the registered capabilities', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+
+    const d = rows.find((r) => r.daemonId === DAEMON)!
+    expect(d.host).toBe('macbook-pro')
+    expect(d.agentVersion).toBe('0.4.2')
+    expect(d.name).toBe('macbook-pro') // seeded from the hostname on first register
+    expect(d.createdBy).toBeNull()
+    expect(Date.parse(d.createdAt)).not.toBeNaN()
+    expect(d.lastModifiedBy).toBeNull()
+    expect(Date.parse(d.lastModifiedAt)).not.toBeNaN()
+
+    // Capability is its own read now; the liveness row carries none of it.
+    expect(d).not.toHaveProperty('capabilities')
+    const caps = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(caps.capabilities.runtimes).toEqual(['claude', 'codex'])
+    expect(caps.capabilities.platforms).toEqual(['slack'])
+    expect(caps.capabilities.acp).toBe(true)
+  })
+
+  it('defaults runtimeProfiles + mcpServers to [] for a daemon that has reported none', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const d = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(d.runtimeProfiles).toEqual([])
+    expect(d.mcpServers).toEqual([])
+  })
+
+  it('surfaces the observed runtime profiles (the available models per runtime)', async () => {
+    await seedDaemon()
+    const profiles = new PgRuntimeProfileRepo(prisma)
+    await profiles.record(
+      DaemonId(DAEMON),
+      {
+        runtime: 'claude',
+        version: '1.4.0',
+        models: ['claude-opus-4', 'claude-sonnet-4-5'],
+        contextWindow: 200000,
+        acpSupport: 'full',
+        toolCalling: true
+      },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+    const d = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(d.runtimeProfiles).toHaveLength(1)
+    expect(d.runtimeProfiles[0]!.runtime).toBe('claude')
+    expect(d.runtimeProfiles[0]!.models).toEqual(['claude-opus-4', 'claude-sonnet-4-5'])
+    expect(d.runtimeProfiles[0]!.acpSupport).toBe('full')
+    expect(d.runtimeProfiles[0]!.contextWindow).toBe(200000)
+    // Never probed for MCP transports ⇒ explicit null (assume stdio-only), not undefined.
+    expect(d.runtimeProfiles[0]!.mcpCapabilities).toBeNull()
+    // No catalog reported ⇒ explicit nulls (the console falls back to its static tables).
+    expect(d.runtimeProfiles[0]!.modelCatalog).toBeNull()
+    expect(d.runtimeProfiles[0]!.modelsSource).toBeNull()
+    // No login warning reported ⇒ explicit false (older daemons never send it).
+    expect(d.runtimeProfiles[0]!.authRequired).toBe(false)
+    expect(d.runtimeProfiles[0]!.unavailableReason).toBeNull()
+  })
+
+  it('retains auth and missing-image warnings in capability and detail reads', async () => {
+    await seedDaemon()
+    await new PgRuntimeProfileRepo(prisma).record(
+      DaemonId(DAEMON),
+      {
+        runtime: 'claude',
+        version: '1.4.0',
+        hostVersion: '2.0.0',
+        hostAvailable: true,
+        credentialsConfigured: false,
+        models: [],
+        acpSupport: 'full',
+        toolCalling: true,
+        authRequired: true,
+        unavailableReason: 'image-binary-missing'
+      },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+    expect((await listCapabilities()).find((r) => r.daemonId === DAEMON)!.runtimeProfiles[0]).toMatchObject({
+      runtime: 'claude',
+      hostVersion: '2.0.0',
+      hostAvailable: true,
+      credentialsConfigured: false,
+      authRequired: true,
+      unavailableReason: 'image-binary-missing'
+    })
+    const response = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })
+    expect(response.statusCode).toBe(200)
+    expect((response.json() as DaemonDto).runtimeProfiles[0]).toMatchObject({
+      runtime: 'claude',
+      hostVersion: '2.0.0',
+      hostAvailable: true,
+      credentialsConfigured: false,
+      authRequired: true,
+      unavailableReason: 'image-binary-missing'
+    })
+  })
+
+  it('serves each runtime’s per-strategy entries in capability and detail reads', async () => {
+    await seedDaemon()
+    const strategies = {
+      host: { available: true, models: ['m-host'], modelsSource: 'probed' as const },
+      srt: { available: true, models: ['m-host'], modelsSource: 'probed' as const },
+      microsandbox: { available: false, unavailableReason: 'the image does not provide this runtime' }
+    }
+    await new PgRuntimeProfileRepo(prisma).record(
+      DaemonId(DAEMON),
+      { runtime: 'claude', version: '1.4.0', models: ['m-host'], acpSupport: 'full', toolCalling: true, strategies },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+    expect((await listCapabilities()).find((r) => r.daemonId === DAEMON)!.runtimeProfiles[0]!.strategies).toEqual(
+      strategies
+    )
+    const response = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })
+    expect((response.json() as DaemonDto).runtimeProfiles[0]!.strategies).toEqual(strategies)
+  })
+
+  it('serves the reported modelCatalog, modelsSource and observedAt per runtime profile', async () => {
+    await seedDaemon()
+    const catalog = {
+      models: [
+        { id: 'claude-opus-4', efforts: [{ value: 'high', name: 'High' }], defaultEffort: 'high', fastMode: true },
+        { id: 'claude-sonnet-4-5', efforts: [] }
+      ],
+      defaultModel: 'claude-opus-4',
+      permissionModes: [{ value: 'acceptEdits', name: 'Accept edits', description: 'Ask before running commands.' }],
+      source: 'acp' as const,
+      observedAt: '2026-07-18T00:00:00.000Z'
+    }
+    const at = new Date('2026-07-18T01:02:03.000Z')
+    await new PgRuntimeProfileRepo(prisma).record(
+      DaemonId(DAEMON),
+      {
+        runtime: 'claude',
+        version: '1.4.0',
+        models: ['claude-opus-4', 'claude-sonnet-4-5'],
+        acpSupport: 'full',
+        toolCalling: true,
+        modelCatalog: catalog,
+        modelsSource: 'cached'
+      },
+      at
+    )
+
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(200)
+    const d = res.json() as DaemonDto
+
+    // One shape wire → JSONB → DTO: the catalog comes back verbatim, and only from here.
+    expect(d.runtimeProfiles[0]!.modelCatalog).toEqual(catalog)
+    expect(d.runtimeProfiles[0]!.modelsSource).toBe('cached')
+    expect(d.runtimeProfiles[0]!.observedAt).toBe(at.toISOString())
+  })
+
+  it('surfaces the per-runtime mcpCapabilities and the daemon-level mcpServers list', async () => {
+    await seedDaemon()
+    const profiles = new PgRuntimeProfileRepo(prisma)
+    await profiles.record(
+      DaemonId(DAEMON),
+      {
+        runtime: 'claude',
+        version: '1.4.0',
+        models: ['claude-opus-4'],
+        acpSupport: 'full',
+        toolCalling: true,
+        mcpCapabilities: { http: true, sse: false }
+      },
+      new Date()
+    )
+    await new PgDaemonRepo(prisma).setMcpServers(DaemonId(DAEMON), [
+      { name: 'github', transport: 'stdio' },
+      { name: 'flaky', transport: 'http' }
+    ])
+
+    running = buildHttpApp(prisma)
+    const d = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+
+    expect(d.runtimeProfiles[0]!.mcpCapabilities).toEqual({ http: true, sse: false })
+    expect(d.mcpServers).toEqual([
+      { name: 'github', transport: 'stdio' },
+      { name: 'flaky', transport: 'http' }
+    ])
+  })
+
+  it('serializes an omitted contextWindow as null through the route (not undefined)', async () => {
+    // Protocol `contextWindow` is optional (undefined); the DTO is `.nullable()`.
+    // Prisma's `Int?` column reads an omitted value back as null — assert that
+    // null (never undefined) reaches the route serializer, which would 500 on undefined.
+    await seedDaemon()
+    const profiles = new PgRuntimeProfileRepo(prisma)
+    await profiles.record(
+      DaemonId(DAEMON),
+      { runtime: 'claude', version: '1.4.0', models: ['claude-opus-4'], acpSupport: 'full', toolCalling: true },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+    expect((await listCapabilities()).find((r) => r.daemonId === DAEMON)!.runtimeProfiles[0]!.contextWindow).toBeNull()
+  })
+
+  it('groups runtime profiles per daemon (multiple runtimes on one daemon; no cross-daemon bleed)', async () => {
+    const DAEMON_B = '2b2b2b2b-2b2b-4b2b-8b2b-2b2b2b2b2b2b'
+    await seedDaemon() // daemon A
+    const repo = new PgDaemonRepo(prisma)
+    await repo.upsertOnAuth({ daemonId: DaemonId(DAEMON_B), orgId: OrgId(DEFAULT_ORG_ID), agentVersion: '0.4.2' })
+
+    const profiles = new PgRuntimeProfileRepo(prisma)
+    // Two runtimes on A (exercises the byDaemon append branch), one on B.
+    await profiles.record(
+      DaemonId(DAEMON),
+      { runtime: 'claude', version: '1.4.0', models: ['claude-opus-4'], acpSupport: 'full', toolCalling: true },
+      new Date()
+    )
+    await profiles.record(
+      DaemonId(DAEMON),
+      { runtime: 'codex', version: '0.9.0', models: ['gpt-5'], acpSupport: 'partial', toolCalling: true },
+      new Date()
+    )
+    await profiles.record(
+      DaemonId(DAEMON_B),
+      { runtime: 'claude', version: '1.4.0', models: ['claude-haiku-4-5'], acpSupport: 'full', toolCalling: true },
+      new Date()
+    )
+
+    running = buildHttpApp(prisma)
+    const rows = await listCapabilities()
+
+    const a = rows.find((r) => r.daemonId === DAEMON)!
+    expect(a.runtimeProfiles.map((p) => p.runtime)).toEqual(['claude', 'codex']) // ordered by runtime
+    expect(a.runtimeProfiles.find((p) => p.runtime === 'codex')!.models).toEqual(['gpt-5'])
+
+    const b = rows.find((r) => r.daemonId === DAEMON_B)!
+    expect(b.runtimeProfiles).toHaveLength(1) // only its own — no bleed from A
+    expect(b.runtimeProfiles[0]!.models).toEqual(['claude-haiku-4-5'])
+  })
+
+  // The split's whole point: the poll pays for liveness only, and the per-model matrix —
+  // which every reader wants one daemon at a time — is on neither fleet-wide read.
+  it('keeps capability off the liveness row and the model catalog off both fleet reads', async () => {
+    await seedDaemon()
+    await new PgRuntimeProfileRepo(prisma).record(
+      DaemonId(DAEMON),
+      {
+        runtime: 'claude',
+        version: '1.4.0',
+        models: ['claude-opus-4'],
+        acpSupport: 'full',
+        toolCalling: true,
+        modelCatalog: {
+          models: [{ id: 'claude-opus-4' }],
+          defaultModel: 'claude-opus-4',
+          source: 'acp' as const,
+          observedAt: '2026-07-18T00:00:00.000Z'
+        }
+      },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+
+    const fleet = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    const row = fleet.find((r) => r.daemonId === DAEMON)!
+    expect(row.status).toBe('offline') // it IS the liveness row
+    for (const half of ['capabilities', 'runtimeProfiles', 'mcpServers']) expect(row).not.toHaveProperty(half)
+
+    // The catalog's runtime-level answers survive the fleet read — the read-only model and
+    // permission labels resolve every agent against them — but the matrix does not.
+    const caps = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(caps.runtimeProfiles[0]!.models).toEqual(['claude-opus-4'])
+    expect(caps.runtimeProfiles[0]!.modelCatalog!.defaultModel).toBe('claude-opus-4')
+    expect(caps.runtimeProfiles[0]!.modelCatalog!.models).toEqual([])
+
+    const one = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })).json() as DaemonDto
+    expect(one.runtimeProfiles[0]!.modelCatalog!.models).toEqual([{ id: 'claude-opus-4' }])
+  })
+
+  // `registry.get` is the org-owned fleet, so resolving this read with it would 404 every
+  // daemon the fleet reads DO list from the shared pool.
+  it('serves the single-daemon read for an install-wide pool member', async () => {
+    const poolMember = await new PgDaemonRepo(prisma).resolvePoolClusterIdentity(
+      'system:serviceaccount:agentconnect:ac-cloud-daemon',
+      'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    )
+    running = buildHttpApp(prisma)
+
+    const listed = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(listed.some((r) => r.daemonId === poolMember.id)).toBe(true)
+
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${poolMember.id}` })
+    expect(res.statusCode).toBe(200)
+    const one = res.json() as DaemonDto & { cloud: boolean; canEdit: boolean }
+    expect(one.cloud).toBe(true)
+    expect(one.canEdit).toBe(false) // visible, but not this org's to mutate
+  })
+
+  it('404s the single-daemon read for an unknown id', async () => {
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${randomUUID()}` })
+    expect(res.statusCode).toBe(404)
+  })
+
+  // session-executors.md §10: what a sharing machine lends its group is a console fact; where its
+  // listener is, is not — that address is topology, configured nowhere and shown nowhere.
+  it('carries what a sharing daemon offers, its hosted count, and never its listener address', async () => {
+    await seedSharingDaemon()
+    await new PgDaemonRepo(prisma).setHostedSessions(DaemonId(DAEMON), 2)
+    running = buildHttpApp(prisma)
+
+    // The count moves with every launch, so it rides the liveness half the console polls.
+    const fleet = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(fleet.find((r) => r.daemonId === DAEMON)!.hostedSessions).toBe(2)
+
+    // The table and the ceiling move when the machine is reconfigured, so they ride capability.
+    const caps = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(caps.capabilities.executor).toEqual({
+      enabled: true,
+      strategies: { host: { available: true }, microsandbox: { available: false, reason: 'no backend on this host' } },
+      capacity: 8
+    })
+    expect(JSON.stringify(caps)).not.toContain(EXECUTOR_ENDPOINT_HOST)
+    const one = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })).json() as DaemonDto
+    expect(JSON.stringify(one)).not.toContain(EXECUTOR_ENDPOINT_HOST)
+  })
+
+  it('reports no executor and an unknown hosted count for a daemon that shares nothing', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+
+    const fleet = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    // Null, not 0: "it has reported no count" and "it hosts nothing" are different answers, and the
+    // console reads a capacity from the executor facts rather than inventing one here.
+    expect(fleet.find((r) => r.daemonId === DAEMON)!.hostedSessions).toBeNull()
+    expect((await listCapabilities()).find((r) => r.daemonId === DAEMON)!.capabilities.executor).toBeUndefined()
+  })
+
+  // session-executors.md §5: the agent's strategy picker offers what this machine's own sessions can run in.
+  it('carries the daemon’s own strategy table, and not the backend only the migration reads', async () => {
+    const repo = new PgDaemonRepo(prisma)
+    await repo.upsertOnAuth({ daemonId: DaemonId(DAEMON), orgId: OrgId(DEFAULT_ORG_ID), agentVersion: '0.4.2' })
+    const strategies = {
+      host: { available: true as const },
+      srt: { available: false as const, reason: 'no bwrap on this host' }
+    }
+    await repo.applyRegister(
+      DaemonId(DAEMON),
+      {
+        host: 'edge-1',
+        capabilities: {
+          platforms: [],
+          runtimes: ['claude'],
+          acp: true,
+          features: [],
+          strategies
+        },
+        maxAgents: 3
+      },
+      new Date()
+    )
+    running = buildHttpApp(prisma)
+
+    const caps = (await listCapabilities()).find((r) => r.daemonId === DAEMON)!
+    expect(caps.capabilities.strategies).toEqual(strategies)
+    const one = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })).json() as DaemonDto
+    expect(one.capabilities.strategies).toEqual(strategies)
+  })
+})
+
+describe('PATCH /daemons/:id — rename', () => {
+  it('assigns a display name and persists it, stamping the last-modified audit', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+
+    // Seeded (system) daemon: no human has touched it yet.
+    const before = await prisma.daemon.findUnique({ where: { id: DAEMON } })
+    expect(before?.lastModifiedByUserId).toBeNull()
+
+    // Bracket the rename with a same-process (Node) timestamp: the repo stamps
+    // lastModifiedAt with `new Date()` in THIS process, so `>= t0` proves a fresh
+    // re-stamp without comparing across the Node vs Postgres clocks (the seeded
+    // `before` value lives on the DB/container clock).
+    const t0 = Date.now()
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { name: 'draco-mbp' }
+    })
+    expect(res.statusCode).toBe(200)
+    const renamed = res.json() as DaemonDto
+    expect(renamed.name).toBe('draco-mbp')
+    expect(renamed.lastModifiedBy).toBeTruthy()
+    expect(Date.parse(renamed.lastModifiedAt)).not.toBeNaN()
+
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)!.name).toBe('draco-mbp')
+
+    // The rename is a human edit → last-modified now points at the devAuth owner
+    // and is re-stamped at edit time.
+    const after = await prisma.daemon.findUnique({ where: { id: DAEMON } })
+    expect(after?.lastModifiedByUserId).toBeTruthy()
+    expect(after!.lastModifiedAt.getTime()).toBeGreaterThanOrEqual(t0) // re-stamped at edit time
+  })
+
+  it('404s for an unknown daemon id', async () => {
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/00000000-0000-4000-8000-000000000000`,
+      payload: { name: 'ghost' }
+    })
+    expect(res.statusCode).toBe(404)
+  })
+
+  it('400s on an empty name', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({ method: 'PATCH', url: `${ORG}/daemons/${DAEMON}`, payload: { name: '   ' } })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('400s on an empty body (nothing to update)', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({ method: 'PATCH', url: `${ORG}/daemons/${DAEMON}`, payload: {} })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('persists sessionRetention and hot-pushes it to the connected daemon (config/push)', async () => {
+    await seedDaemon()
+    const pushes: { id: string; keys: Record<string, unknown> }[] = []
+    const control = {
+      configPush: (id: string, keys: Record<string, unknown>) => {
+        pushes.push({ id, keys })
+      }
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: true } }), control)
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { sessionRetention: '90d' }
+    })
+    expect(res.statusCode).toBe(200)
+    const updated = res.json() as DaemonDto & { sessionRetention: string }
+    expect(updated.sessionRetention).toBe('90d')
+    // A retention change is a human edit — the last-modified audit advances.
+    expect(updated.lastModifiedBy).toBeTruthy()
+
+    // Durable (the register/ok baseline reads this column) + hot-pushed.
+    const row = await prisma.daemon.findUnique({ where: { id: DAEMON } })
+    expect(row?.sessionRetention).toBe('90d')
+    expect(pushes).toEqual([{ id: DAEMON, keys: { 'sessions.retention': '90d' } }])
+  })
+
+  it('persists workspaceRetention and hot-pushes it to the connected daemon (config/push)', async () => {
+    await seedDaemon()
+    const pushes: { id: string; keys: Record<string, unknown> }[] = []
+    const control = {
+      configPush: (id: string, keys: Record<string, unknown>) => {
+        pushes.push({ id, keys })
+      }
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: true } }), control)
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { workspaceRetention: '3d' }
+    })
+    expect(res.statusCode).toBe(200)
+    // The row window keeps its new default.
+    expect(res.json()).toMatchObject({ sessionRetention: '90d', workspaceRetention: '3d' })
+    const row = await prisma.daemon.findUnique({ where: { id: DAEMON } })
+    expect(row?.workspaceRetention).toBe('3d')
+    expect(row?.sessionRetention).toBe('90d')
+    expect(pushes).toEqual([{ id: DAEMON, keys: { 'sessions.workspaceRetention': '3d' } }])
+
+    const bad = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { workspaceRetention: '0d' }
+    })
+    expect(bad.statusCode).toBe(400)
+  })
+
+  it('still 200s a retention change when the daemon is offline (push is best-effort)', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma) // empty liveness ⇒ configPush throws NoConnection internally
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { sessionRetention: 'never' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((res.json() as { sessionRetention: string }).sessionRetention).toBe('never')
+  })
+
+  it("accepts any '<n>d' day count as a retention window", async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { sessionRetention: '3d' }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((res.json() as { sessionRetention: string }).sessionRetention).toBe('3d')
+  })
+
+  it('400s a malformed retention window', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    for (const bad of ['0d', '7', '2weeks', 'always']) {
+      const res = await running.app.inject({
+        method: 'PATCH',
+        url: `${ORG}/daemons/${DAEMON}`,
+        payload: { sessionRetention: bad }
+      })
+      expect(res.statusCode, bad).toBe(400)
+    }
+  })
+})
+
+describe('DELETE /daemons/:id — remove from fleet', () => {
+  it('removes an offline daemon (no live connection) → 204, gone from the read model', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma) // empty liveness ⇒ offline
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(204)
+
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)).toBeUndefined()
+  })
+
+  it('cascades the daemon’s API keys (no orphaned credentials)', async () => {
+    await seedDaemon()
+    await prisma.apiKey.create({
+      data: {
+        principalType: 'daemon',
+        orgId: DEFAULT_ORG_ID,
+        daemonId: DAEMON,
+        hash: `delete-test-${DAEMON}`,
+        displayTail: '…a2b1'
+      }
+    })
+    running = buildHttpApp(prisma)
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(204)
+    expect(await prisma.apiKey.count({ where: { daemonId: DAEMON } })).toBe(0)
+  })
+
+  it('re-converges the unplaced agents’ hook rules (pool eviction, not daemon_offline limbo)', async () => {
+    // An agent placed on the daemon with a github hook: deleting the daemon
+    // SetNulls the placement, so the hook must leave the relay pool NOW —
+    // compile() of an unplaced hook is null ⇒ broadcast() converges to remove.
+    await seedDaemon()
+    const agentId = randomUUID()
+    await seedAgent(prisma, agentId, { daemonId: DAEMON })
+    await prisma.hookDef.create({
+      data: {
+        id: randomUUID(),
+        orgId: DEFAULT_ORG_ID,
+        agentId,
+        kind: 'github',
+        name: 'gh-evict',
+        sessionMode: 'perThread',
+        repoId: 987654321,
+        repoFullName: 'acme/infra',
+        events: ['issues:*'],
+        labelFilter: [],
+        targetPlatform: 'slack'
+      }
+    })
+    running = buildHttpApp(prisma)
+    const removeSpy = vi.spyOn(running.deps.relayControl, 'hookRemove')
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(204)
+    // The re-converge is fire-and-forget — wait for the eviction broadcast.
+    await vi.waitFor(() => expect(removeSpy).toHaveBeenCalled())
+    expect((await prisma.agent.findUniqueOrThrow({ where: { id: agentId } })).daemonId).toBeNull()
+  })
+
+  it('marks the daemon’s agents inactive (the FK SetNull alone leaves a stale “active”)', async () => {
+    // `daemonId` and `status` must agree: unplaced ⇒ inactive. The FK's SetNull only
+    // clears the placement, so the route unplaces through the repo first — otherwise a
+    // deleted daemon leaves `daemonId: null, status: 'active'` and every reader (console
+    // badge, the `status === 'active'` routing gates) treats the agent as runnable.
+    await seedDaemon()
+    const agentId = randomUUID()
+    await seedAgent(prisma, agentId, { daemonId: DAEMON })
+    await prisma.agent.update({ where: { id: agentId }, data: { status: 'active' } })
+    running = buildHttpApp(prisma)
+
+    expect((await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })).statusCode).toBe(204)
+    const agent = await prisma.agent.findUniqueOrThrow({ where: { id: agentId } })
+    expect({ daemonId: agent.daemonId, status: agent.status }).toEqual({ daemonId: null, status: 'inactive' })
+  })
+
+  it('re-broadcasts the collaboration snapshot (its agents just left the peer directory)', async () => {
+    // `Agent.daemonId` is SetNull, so the daemon's agents become UNPLACED and
+    // `buildCollabSnapshot` drops them — but only for holders that receive a new snapshot.
+    // Without this push every relay + remaining daemon keeps flat `agents[]` entries naming
+    // the dead daemonId, and `admits()` keeps admitting wakes nothing can deliver.
+    await seedDaemon()
+    await seedAgent(prisma, randomUUID(), { daemonId: DAEMON })
+    running = buildHttpApp(prisma)
+    const collabSpy = vi.spyOn(running.deps.collabRoutes, 'broadcast')
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(204)
+    expect(collabSpy).toHaveBeenCalledWith(DEFAULT_ORG_ID)
+  })
+
+  it('pushes NO collaboration snapshot when the daemon hosted no agents', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma)
+    const collabSpy = vi.spyOn(running.deps.collabRoutes, 'broadcast')
+
+    expect((await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })).statusCode).toBe(204)
+    expect(collabSpy).not.toHaveBeenCalled() // nothing left the directory ⇒ no routingEpoch churn
+  })
+
+  it('refuses (409) while the daemon is live + reachable', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: true } }))
+
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(409)
+
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as DaemonDto[]
+    expect(rows.find((r) => r.daemonId === DAEMON)).toBeDefined() // not deleted
+  })
+
+  it('allows delete of a frozen (unreachable) daemon', async () => {
+    await seedDaemon()
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: false } }))
+    const res = await running.app.inject({ method: 'DELETE', url: `${ORG}/daemons/${DAEMON}` })
+    expect(res.statusCode).toBe(204)
+  })
+
+  it('404s for an unknown daemon id', async () => {
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({
+      method: 'DELETE',
+      url: `${ORG}/daemons/00000000-0000-4000-8000-000000000000`
+    })
+    expect(res.statusCode).toBe(404)
+  })
+})
+
+// ── CP-commanded restart/upgrade (cli-daemon-split.md §7) ────────────────────
+
+type LifecycleOp = { id: string; op: string; status: string; targetVersion: string | null; outcome: string | null }
+
+const future = () => new Date(Date.now() + 60_000)
+
+const LIVE = liveness({ [DAEMON]: { state: 'READY', reachable: true } })
+
+/** A ControlSender spy recording the lifecycle frames it would send and returning an `acked`
+ *  outcome + the epoch it "sent" on (seedDaemon authed at epoch 1). */
+function controlSpy(ack: DaemonControlAck, epoch = 1) {
+  const calls: { method: string; id: string; payload: unknown }[] = []
+  const spy = {
+    daemonUpgrade: async (id: string, payload: unknown) => {
+      calls.push({ method: 'upgrade', id, payload })
+      return { kind: 'acked' as const, epoch, ack }
+    },
+    daemonRestart: async (id: string, payload: unknown) => {
+      calls.push({ method: 'restart', id, payload })
+      return { kind: 'acked' as const, epoch, ack }
+    }
+  }
+  return { spy: spy as unknown as ControlSender, calls }
+}
+
+describe('POST /daemons/:id/upgrade', () => {
+  it('opens a pending upgrade op and sends daemon/upgrade → 202; the read model shows pendingOp', async () => {
+    await seedDaemon()
+    const { spy, calls } = controlSpy({ accepted: true, willDrainUntil: new Date().toISOString() })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(res.statusCode).toBe(202)
+    // The 202 returns the opened op (with its id) so the console can track it.
+    const opened = res.json() as { id: string; op: string; status: string; targetVersion: string | null }
+    expect(opened).toMatchObject({ op: 'upgrade', status: 'pending', targetVersion: '0.5.0' })
+    expect(opened.id).toBeTruthy()
+    expect(calls).toEqual([
+      { method: 'upgrade', id: DAEMON, payload: { operationId: opened.id, targetVersion: '0.5.0', drainFirst: true } }
+    ])
+
+    await new PgDaemonLifecycleOpRepo(prisma).recordProgress(
+      DaemonId(DAEMON),
+      1n,
+      { operationId: opened.id, phase: 'preparing' },
+      new Date()
+    )
+
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as (DaemonDto & {
+      lifecycleOp: LifecycleOp | null
+    })[]
+    const row = rows.find((r) => r.daemonId === DAEMON)!
+    expect(row.lifecycleOp).toMatchObject({
+      id: opened.id,
+      op: 'upgrade',
+      status: 'pending',
+      phase: 'preparing',
+      targetVersion: '0.5.0'
+    })
+    expect(row.status).toBe('ready')
+    const progress = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}/lifecycle/${opened.id}` })
+    expect(progress.json()).toMatchObject({ status: 'pending', phase: 'preparing' })
+  })
+
+  it('503s when the daemon is not reachable (no op opened)', async () => {
+    await seedDaemon()
+    const { spy, calls } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'READY', reachable: false } }), spy)
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(res.statusCode).toBe(503)
+    expect(calls).toHaveLength(0)
+    expect(await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+  })
+
+  it('queues an upgrade without sending control when the offline daemon supports bootstrap recovery', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_BOOTSTRAP_UPGRADE_FEATURE])
+    const { spy, calls } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, liveness({}), spy)
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(res.statusCode).toBe(202)
+    expect(calls).toHaveLength(0)
+    const op = await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))
+    expect(op).toMatchObject({ op: 'upgrade', targetVersion: '0.5.0', acceptedAt: null })
+  })
+
+  it('reconnects a registering daemon after enqueue so auth cannot miss the upgrade', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_BOOTSTRAP_UPGRADE_FEATURE])
+    const reconnect = vi.fn(() => true)
+    const { spy, calls } = controlSpy({ accepted: true })
+    running = buildHttpApp(
+      prisma,
+      undefined,
+      liveness({ [DAEMON]: { state: 'REGISTERING', reachable: true } }, reconnect),
+      spy
+    )
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(res.statusCode).toBe(202)
+    expect(calls).toHaveLength(0)
+    expect(reconnect).toHaveBeenCalledWith(DAEMON, 1)
+  })
+
+  it('409s a second command while one is already in flight', async () => {
+    await seedDaemon()
+    const { spy } = controlSpy({ accepted: true, willDrainUntil: new Date().toISOString() })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const first = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(first.statusCode).toBe(202)
+    const second = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/restart`
+    })
+    expect(second.statusCode).toBe(409)
+  })
+
+  it('closes the op failed and 409s when the daemon declines (accepted:false)', async () => {
+    await seedDaemon()
+    const { spy } = controlSpy({ accepted: false, reason: 'no supervisor configured' })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.5.0' }
+    })
+    expect(res.statusCode).toBe(409)
+    expect(res.json().message).toContain('no supervisor')
+    // The op was opened then failed — nothing is left pending (a retry is allowed).
+    expect(await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+  })
+
+  it('expires a stuck overdue op and lets a new command through (no permanent 409)', async () => {
+    // A prior op the daemon accepted but never re-registered for: still `pending` in the
+    // DB with a lapsed deadline. Without clock-driven expiry it would 409 every command
+    // forever (the partial unique index reserves the daemon).
+    await seedDaemon()
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const stuck = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'upgrade',
+      targetVersion: '0.5.0',
+      commandEpoch: 1n,
+      deadline: new Date(Date.now() - 1_000)
+    })
+    const { spy } = controlSpy({ accepted: true, willDrainUntil: new Date().toISOString() })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.6.0' }
+    })
+    expect(res.statusCode).toBe(202) // the stuck op was expired, so the new one opens
+    const latest = await ops.latestForDaemon(DaemonId(DAEMON))
+    expect(latest?.targetVersion).toBe('0.6.0') // the NEW op is now latest + pending
+    expect(latest?.status).toBe('pending')
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.id).not.toBe(stuck.id)
+  })
+})
+
+describe('POST /daemons/:id/restart', () => {
+  it('sends daemon/restart → 202 and opens a pending restart op', async () => {
+    await seedDaemon()
+    const { spy, calls } = controlSpy({ accepted: true, willDrainUntil: new Date().toISOString() })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(202)
+    expect(calls[0]!.method).toBe('restart')
+    const op = await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))
+    expect(op?.op).toBe('restart')
+    expect(op?.targetVersion).toBeNull()
+  })
+
+  it('settles immediately when the daemon reaches READY during the ACK (fast restart)', async () => {
+    await seedDaemon() // epoch 1
+    // Spy: the daemon drains, relaunches, and re-registers (epoch bump) BEFORE the restart
+    // ACK returns — the fast-restart race. The route arms the op then re-checks, so the
+    // already-completed restart is recognized and the 202 body is already `succeeded`.
+    const spy = {
+      daemonRestart: async () => {
+        await new PgDaemonRepo(prisma).upsertOnAuth({
+          daemonId: DaemonId(DAEMON),
+          orgId: OrgId(DEFAULT_ORG_ID),
+          agentVersion: '0.4.2'
+        }) // epoch 2 — re-registered during the ACK
+        return { kind: 'acked' as const, epoch: 1, ack: { accepted: true } } // the command rode epoch 1
+      }
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(202)
+    expect((res.json() as LifecycleOp).status).toBe('succeeded')
+    expect(await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+  })
+})
+
+describe('lifecycle command delivery edge cases', () => {
+  it('503s when the daemon is reachable but not yet READY (reconnecting) — no frame, no op', async () => {
+    await seedDaemon()
+    const { spy, calls } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, liveness({ [DAEMON]: { state: 'AUTHENTICATING', reachable: true } }), spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(503)
+    expect(calls).toHaveLength(0)
+    expect(await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+  })
+
+  it('fails the op + 503 on a pre-dispatch unsent outcome (definitely not delivered)', async () => {
+    await seedDaemon()
+    const spy = {
+      daemonRestart: async () => ({ kind: 'unsent' as const })
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(503)
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('failed')
+  })
+
+  it('fails the op + 409 on a definite negative reply (correlated protocol rejection)', async () => {
+    await seedDaemon()
+    const spy = {
+      daemonRestart: async () => ({ kind: 'rejected' as const, epoch: 1, code: 'PROTOCOL_STATE', message: 'not READY' })
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(409)
+    expect(res.json().message).toContain('PROTOCOL_STATE')
+    // A definite rejection is terminal-failed (NOT left resolvable) — it never ran.
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('failed')
+  })
+
+  it('leaves the op pending + armed (202) on an ambiguous post-dispatch loss, then settles on READY', async () => {
+    await seedDaemon() // epoch 1
+    // The ACK never arrives (timeout / socket closed after the frame was queued) — the
+    // daemon may already be draining, so the route must NOT terminal-fail the op.
+    const spy = {
+      daemonRestart: async () => ({ kind: 'ambiguous' as const, epoch: 1, message: 'request timed out' })
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(202)
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const pend = await ops.pendingForDaemon(DaemonId(DAEMON))
+    expect(pend?.status).toBe('pending')
+    expect(pend?.acceptedAt).not.toBeNull() // armed with the attempted epoch (1)
+
+    // The command HAD landed: the daemon drains, relaunches, re-auths (epoch 2), registers.
+    await new PgDaemonRepo(prisma).upsertOnAuth({
+      daemonId: DaemonId(DAEMON),
+      orgId: OrgId(DEFAULT_ORG_ID),
+      agentVersion: '0.4.2'
+    })
+    await new DaemonRegistryService(
+      new PgDaemonRepo(prisma),
+      new PgRuntimeProfileRepo(prisma),
+      ops,
+      systemClock
+    ).settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('502s when the daemon accepted but the arm write can’t be persisted (no false-timeout 202)', async () => {
+    await seedDaemon()
+    const { spy } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    vi.spyOn(running.deps.repos.daemonLifecycleOp, 'markAccepted').mockRejectedValue(new Error('db down'))
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(502)
+  })
+
+  it('recovers from a one-shot arm-write failure via retry → armed + 202', async () => {
+    await seedDaemon()
+    const { spy } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    const repo = running.deps.repos.daemonLifecycleOp
+    const real = repo.markAccepted.bind(repo)
+    vi.spyOn(repo, 'markAccepted').mockRejectedValueOnce(new Error('transient')).mockImplementation(real)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })
+    expect(res.statusCode).toBe(202)
+    const op = await new PgDaemonLifecycleOpRepo(prisma).pendingForDaemon(DaemonId(DAEMON))
+    expect(op?.acceptedAt).not.toBeNull() // armed on the retry
+  })
+
+  it('background retryArm recovers an exhausted arm write, then settles the already-observed READY', async () => {
+    // Models the 502 path: the daemon accepted, in-request arming exhausted, and the daemon
+    // has ALREADY relaunched (epoch 2 — a READY the still-unarmed op ignored). Background
+    // recovery must arm and then settle it succeeded, so it never falsely times out.
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await new PgDaemonRepo(prisma).upsertOnAuth({
+      daemonId: DaemonId(DAEMON),
+      orgId: OrgId(DEFAULT_ORG_ID),
+      agentVersion: '0.4.2'
+    }) // epoch 2
+    const registry = new DaemonRegistryService(
+      new PgDaemonRepo(prisma),
+      new PgRuntimeProfileRepo(prisma),
+      ops,
+      systemClock
+    )
+    const real = ops.markAccepted.bind(ops)
+    vi.spyOn(ops, 'markAccepted').mockRejectedValueOnce(new Error('db blip')).mockImplementation(real)
+    const ok = await retryArm(ops, registry, op.id, DAEMON, 1n, [0, 0]) // zero delays for the test
+    expect(ok).toBe(true)
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('retryArm retries when the READY closure itself throws (not just the arm write)', async () => {
+    // The op is armed but the settle read/write throws transiently. Since the fast-restart
+    // READY may be the only trigger, retryArm must NOT report success until the settle
+    // completes — it retries the whole (idempotent) arm+settle step.
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await new PgDaemonRepo(prisma).upsertOnAuth({
+      daemonId: DaemonId(DAEMON),
+      orgId: OrgId(DEFAULT_ORG_ID),
+      agentVersion: '0.4.2'
+    }) // epoch 2 — a READY already observed
+    const registry = new DaemonRegistryService(
+      new PgDaemonRepo(prisma),
+      new PgRuntimeProfileRepo(prisma),
+      ops,
+      systemClock
+    )
+    const realSettle = registry.settleLifecycleOpOnReady.bind(registry)
+    vi.spyOn(registry, 'settleLifecycleOpOnReady')
+      .mockRejectedValueOnce(new Error('read blip'))
+      .mockImplementation(realSettle)
+    const ok = await retryArm(ops, registry, op.id, DAEMON, 1n, [0, 0])
+    expect(ok).toBe(true) // reported only after the settle completed on the retry
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+})
+
+describe('GET /daemons/:id/lifecycle/:opId', () => {
+  it('returns the op by id even after a newer op becomes the daemon’s latest', async () => {
+    await seedDaemon()
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const a = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await ops.settle(a.id, 'succeeded', null, new Date())
+    const b = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'upgrade',
+      targetVersion: '0.5.0',
+      commandEpoch: 1n,
+      deadline: future()
+    })
+    running = buildHttpApp(prisma)
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.id).toBe(b.id) // b is the fleet's latest slot
+    // The console still resolves op A by id — its polling doesn't break when B appears.
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}/lifecycle/${a.id}` })
+    expect(res.statusCode).toBe(200)
+    expect(res.json() as LifecycleOp).toMatchObject({ id: a.id, status: 'succeeded' })
+  })
+
+  it('projects an overdue pending op as failed (timed out), and 404s an unknown id', async () => {
+    await seedDaemon()
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const a = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'restart',
+      commandEpoch: 1n,
+      deadline: new Date(Date.now() - 1_000)
+    })
+    running = buildHttpApp(prisma)
+    const res = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}/lifecycle/${a.id}` })
+    expect((res.json() as LifecycleOp).status).toBe('failed')
+    expect((res.json() as LifecycleOp).outcome).toContain('timed out')
+    const miss = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}/lifecycle/does-not-exist` })
+    expect(miss.statusCode).toBe(404)
+  })
+})
+
+describe('lifecycle op closure on register→READY', () => {
+  const REG = {
+    host: 'macbook-pro',
+    capabilities: { platforms: [] as never[], runtimes: [] as string[], acp: true, features: [] as string[] },
+    maxAgents: 3,
+    localState: { assignments: [], crons: [], leases: [], agents: [], integrations: [], stagedAgents: [] }
+  }
+  const makeRegistry = (ops: PgDaemonLifecycleOpRepo) =>
+    new DaemonRegistryService(new PgDaemonRepo(prisma), new PgRuntimeProfileRepo(prisma), ops, systemClock)
+  // Re-auth the daemon (drain+relaunch → fresh connection → epoch bump), returning the new epoch.
+  const reauth = async (agentVersion: string) =>
+    (
+      await new PgDaemonRepo(prisma).upsertOnAuth({
+        daemonId: DaemonId(DAEMON),
+        orgId: OrgId(DEFAULT_ORG_ID),
+        agentVersion
+      })
+    ).sessionEpoch
+
+  const BOOT_A = 'b0b0b0b0-0000-4000-8000-00000000000a'
+  const BOOT_B = 'b0b0b0b0-0000-4000-8000-00000000000b'
+
+  it('completes a restart only when a different boot registers, not on a same-boot reconnect', async () => {
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const registry = makeRegistry(ops)
+    await registry.upsertOnRegister(DaemonId(DAEMON), { ...REG, bootId: BOOT_A })
+    const { spy } = controlSpy({ accepted: true })
+    running = buildHttpApp(prisma, undefined, LIVE, spy)
+    expect((await running.app.inject({ method: 'POST', url: `${ORG}/daemons/${DAEMON}/restart` })).statusCode).toBe(202)
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.commandBootId).toBe(BOOT_A)
+
+    // The same process reconnects, as it does across a CP restart: a newer epoch, the same boot.
+    await reauth('0.4.2')
+    await registry.upsertOnRegister(DaemonId(DAEMON), { ...REG, bootId: BOOT_A })
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.op).toBe('restart')
+
+    // The relaunched process registers under a new boot.
+    await reauth('0.4.2')
+    await registry.upsertOnRegister(DaemonId(DAEMON), { ...REG, bootId: BOOT_B })
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('completes a restart relaunched onto a daemon version that reports no boot', async () => {
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const registry = makeRegistry(ops)
+    const op = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'restart',
+      commandEpoch: 1n,
+      commandBootId: BOOT_A,
+      deadline: future()
+    })
+    await ops.markAccepted(op.id, new Date(), 1n)
+    await reauth('0.4.1')
+    await registry.upsertOnRegister(DaemonId(DAEMON), REG)
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('does NOT settle on upsertOnRegister alone — only the post-reconcile READY step settles', async () => {
+    // The register handler persists the register (upsertOnRegister) BEFORE reconcile, and
+    // only calls settleLifecycleOpOnReady after reconcile succeeds. So a reconcile that
+    // throws (never reaching the READY step) must leave the op pending.
+    await seedDaemon()
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await ops.markAccepted(op.id, new Date(), 1n)
+    await makeRegistry(ops).upsertOnRegister(DaemonId(DAEMON), REG)
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.op).toBe('restart') // still pending
+  })
+
+  it('does NOT settle before the op is armed — a READY between open() and the ACK is ignored', async () => {
+    // The row is opened before the daemon ACKs acceptance. A reconnect reaching READY in
+    // that window (higher epoch) must NOT settle it (the ACK may still decline).
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await reauth('0.4.2') // epoch 2 — a reconnect before the ACK
+    const registry = makeRegistry(ops)
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.id).toBe(op.id) // NOT armed ⇒ still pending
+
+    // Now arm (the ACK returned) + re-check → the already-observed higher-epoch READY settles it.
+    await ops.markAccepted(op.id, new Date(), 1n)
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('does NOT settle on a same-epoch READY (a duplicate register is not a relaunch)', async () => {
+    await seedDaemon() // epoch 1
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    await ops.markAccepted(op.id, new Date(), 1n) // armed, but the daemon has NOT re-authed
+    await makeRegistry(ops).settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.id).toBe(op.id) // epoch unchanged ⇒ still pending
+  })
+
+  it('closes a pending upgrade succeeded once the daemon reaches READY on the target version', async () => {
+    await seedDaemon() // epoch 1, agentVersion 0.4.2
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'upgrade',
+      targetVersion: '0.5.0',
+      commandEpoch: 1n,
+      deadline: future()
+    })
+    await ops.markAccepted(op.id, new Date(), 1n)
+    const registry = makeRegistry(ops)
+    // Re-auth on the OLD version (a failed install / prior-bundle relaunch) keeps it pending.
+    await reauth('0.4.2') // epoch 2
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect((await ops.pendingForDaemon(DaemonId(DAEMON)))?.op).toBe('upgrade')
+
+    // Re-auth onto the target → closed succeeded (no longer pending).
+    await reauth('0.5.0') // epoch 3
+    await registry.settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    expect((await ops.latestForDaemon(DaemonId(DAEMON)))?.status).toBe('succeeded')
+  })
+
+  it('fails a pending op whose deadline has already lapsed when the daemon reaches READY', async () => {
+    await seedDaemon()
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const op = await ops.open({
+      daemonId: DaemonId(DAEMON),
+      op: 'restart',
+      commandEpoch: 1n,
+      deadline: new Date(Date.now() - 1_000)
+    })
+    await ops.markAccepted(op.id, new Date(), 1n)
+    await makeRegistry(ops).settleLifecycleOpOnReady(DaemonId(DAEMON))
+    expect(await ops.pendingForDaemon(DaemonId(DAEMON))).toBeNull()
+    const latest = await ops.latestForDaemon(DaemonId(DAEMON))
+    expect(latest?.status).toBe('failed')
+    expect(latest?.outcome).toContain('timed out')
+  })
+})
+
+describe('POST /daemons/pool/runtime-probe', () => {
+  /** An install-wide pool member registered with `features`, as its Pod would on connect. */
+  async function seedPoolMember(podUid: string, features: string[]) {
+    const repo = new PgDaemonRepo(prisma)
+    const member = await repo.resolvePoolClusterIdentity('system:serviceaccount:agentconnect:ac-cloud-daemon', podUid)
+    await repo.applyRegister(
+      DaemonId(member.id),
+      { host: 'pool-member', capabilities: { platforms: [], runtimes: ['claude'], acp: true, features }, maxAgents: 0 },
+      new Date()
+    )
+    return member.id
+  }
+
+  function probeSpy(ok = true) {
+    const sent: string[] = []
+    const spy = {
+      runtimeProbe: async (id: string) => {
+        sent.push(id)
+        return ok ? { ok: true } : { ok: false, reason: 'this daemon does not take runtime probe requests' }
+      }
+    } as unknown as ControlSender
+    return { spy, sent }
+  }
+
+  it('asks every live member that takes requests, and no other', async () => {
+    const a = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [RUNTIME_PROBE_FEATURE])
+    const b = await seedPoolMember('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', [RUNTIME_PROBE_FEATURE])
+    const offline = await seedPoolMember('cccccccc-cccc-4ccc-8ccc-cccccccccccc', [RUNTIME_PROBE_FEATURE])
+    const older = await seedPoolMember('dddddddd-dddd-4ddd-8ddd-dddddddddddd', [])
+    await seedDaemon([RUNTIME_PROBE_FEATURE]) // org-owned: not part of the pool
+    const { spy, sent } = probeSpy()
+    const live = liveness({
+      [a]: { state: 'READY', reachable: true },
+      [b]: { state: 'READY', reachable: true },
+      [older]: { state: 'READY', reachable: true },
+      [DAEMON]: { state: 'READY', reachable: true }
+    })
+    running = buildHttpApp(prisma, undefined, live, spy)
+
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    expect(res.statusCode).toBe(202)
+    expect(res.json()).toEqual({ state: 'probing', members: 2 })
+    expect(sent.sort()).toEqual([a, b].sort())
+    expect(sent).not.toContain(offline)
+  })
+
+  it('answers unsupported without sending when no member takes requests (a managed pool)', async () => {
+    const member = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [])
+    const { spy, sent } = probeSpy()
+    running = buildHttpApp(prisma, undefined, liveness({ [member]: { state: 'READY', reachable: true } }), spy)
+    const res = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ state: 'unsupported', members: 0 })
+    expect(sent).toEqual([])
+  })
+
+  it('503s when no member that takes requests accepts one', async () => {
+    const member = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [RUNTIME_PROBE_FEATURE])
+    running = buildHttpApp(prisma, undefined, liveness({}), probeSpy().spy)
+    expect((await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })).statusCode).toBe(
+      503
+    )
+    await running.close()
+    const refused = probeSpy(false)
+    running = buildHttpApp(prisma, undefined, liveness({ [member]: { state: 'READY', reachable: true } }), refused.spy)
+    expect((await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })).statusCode).toBe(
+      503
+    )
+    expect(refused.sent).toEqual([member])
+  })
+
+  it('joins a request made within the debounce window instead of sending it again', async () => {
+    const member = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [RUNTIME_PROBE_FEATURE])
+    const { spy, sent } = probeSpy()
+    running = buildHttpApp(prisma, undefined, liveness({ [member]: { state: 'READY', reachable: true } }), spy)
+    const first = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    const second = await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    expect(first.statusCode).toBe(202)
+    expect(second.json()).toEqual({ state: 'probing', members: 1 })
+    expect(sent).toEqual([member])
+  })
+
+  it('joins a request that arrives while the first one is still waiting on its acks', async () => {
+    const member = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [RUNTIME_PROBE_FEATURE])
+    const sent: string[] = []
+    let release!: () => void
+    const acked = new Promise<void>((resolve) => (release = resolve))
+    const spy = {
+      runtimeProbe: async (id: string) => {
+        sent.push(id)
+        await acked
+        return { ok: true }
+      }
+    } as unknown as ControlSender
+    running = buildHttpApp(prisma, undefined, liveness({ [member]: { state: 'READY', reachable: true } }), spy)
+    const first = running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    await vi.waitFor(() => expect(sent).toHaveLength(1))
+    const second = running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })
+    release()
+    expect((await first).json()).toEqual({ state: 'probing', members: 1 })
+    expect((await second).json()).toEqual({ state: 'probing', members: 1 })
+    expect(sent).toEqual([member])
+  })
+
+  it('is refused to a member who does not own the organization', async () => {
+    const member = await seedPoolMember('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', [RUNTIME_PROBE_FEATURE])
+    const users = new PgUserRepo(prisma)
+    const email = `pool-probe-${randomUUID()}@example.test`
+    const { userId } = await users.provisionOidcUser({ oidcSubject: randomUUID(), email, emailVerified: true })
+    await users.addMemberByEmail(DEFAULT_ORG_ID, email, 'collaborator')
+    const { spy, sent } = probeSpy()
+    running = buildHttpApp(
+      prisma,
+      { DEFAULT_OWNER_ID: userId },
+      liveness({ [member]: { state: 'READY', reachable: true } }),
+      spy
+    )
+    expect((await running.app.inject({ method: 'POST', url: `${ORG}/daemons/pool/runtime-probe` })).statusCode).toBe(
+      403
+    )
+    expect(sent).toEqual([])
+  })
+})
+
+// ── auto-upgrade (daemon-auto-upgrade.md §3, §6) ─────────────────────────────
+
+type AutoUpgradeDto = DaemonDto & {
+  autoUpgrade: boolean
+  autoUpgradeSupported: boolean
+  lifecycleOp: (LifecycleOp & { trigger: string }) | null
+  lastAutoUpgrade: {
+    id: string
+    status: string
+    targetVersion: string | null
+    outcome: string | null
+    settledAt: string | null
+  } | null
+}
+
+/** A ControlSender spy for both the switch's config pushes and the lifecycle commands. */
+function autoUpgradeControl() {
+  const pushes: { id: string; keys: Record<string, unknown> }[] = []
+  const commands: { method: string; payload: unknown }[] = []
+  const ack: DaemonControlAck = { accepted: true, willDrainUntil: new Date().toISOString() }
+  const control = {
+    configPush: (id: string, keys: Record<string, unknown>) => void pushes.push({ id, keys }),
+    daemonUpgrade: async (_id: string, payload: unknown) => {
+      commands.push({ method: 'upgrade', payload })
+      return { kind: 'acked' as const, epoch: 1, ack }
+    },
+    daemonRestart: async (_id: string, payload: unknown) => {
+      commands.push({ method: 'restart', payload })
+      return { kind: 'acked' as const, epoch: 1, ack }
+    }
+  } as unknown as ControlSender
+  return { control, pushes, commands }
+}
+
+const releaseAt = (latestVersion: string) =>
+  ({
+    get: () => ({ channel: 'latest', latestVersion, availableVersions: [latestVersion] })
+  }) as unknown as DaemonReleaseResolver
+
+describe('PATCH /daemons/:id — auto-upgrade switch', () => {
+  it('turns it on for a daemon that advertises the feature, persists it and hot-pushes it', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_AUTO_UPGRADE_FEATURE])
+    const { control, pushes } = autoUpgradeControl()
+    running = buildHttpApp(prisma, undefined, LIVE, control)
+
+    const before = (
+      await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })
+    ).json() as AutoUpgradeDto
+    expect(before).toMatchObject({ autoUpgrade: false, autoUpgradeSupported: true, lastAutoUpgrade: null })
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { autoUpgrade: true }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((res.json() as AutoUpgradeDto).autoUpgrade).toBe(true)
+    expect((await prisma.daemon.findUnique({ where: { id: DAEMON } }))?.autoUpgrade).toBe(true)
+    expect(pushes).toEqual([{ id: DAEMON, keys: { 'upgrade.auto': true } }])
+  })
+
+  it('409s turning it on for a daemon without the feature, and writes nothing from the body', async () => {
+    await seedDaemon()
+    const { control, pushes } = autoUpgradeControl()
+    running = buildHttpApp(prisma, undefined, LIVE, control)
+
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { autoUpgrade: true, name: 'renamed' }
+    })
+    expect(res.statusCode).toBe(409)
+    const row = await prisma.daemon.findUnique({ where: { id: DAEMON } })
+    expect(row?.autoUpgrade).toBe(false)
+    expect(row?.name).not.toBe('renamed')
+    expect(pushes).toEqual([])
+    const read = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })).json() as AutoUpgradeDto
+    expect(read.autoUpgradeSupported).toBe(false)
+  })
+
+  it('always allows turning it off, even once the feature is gone', async () => {
+    await seedDaemon()
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { autoUpgrade: true } })
+    running = buildHttpApp(prisma) // offline: the push is best-effort
+    const res = await running.app.inject({
+      method: 'PATCH',
+      url: `${ORG}/daemons/${DAEMON}`,
+      payload: { autoUpgrade: false }
+    })
+    expect(res.statusCode).toBe(200)
+    expect((res.json() as AutoUpgradeDto).autoUpgrade).toBe(false)
+  })
+})
+
+describe('auto-upgrade lifecycle read model', () => {
+  it('keeps deferred rows out of lifecycleOp and reports the last automatic outcome', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_AUTO_UPGRADE_FEATURE])
+    const ops = new PgDaemonLifecycleOpRepo(prisma)
+    const auto = (targetVersion: string) =>
+      ops.open({
+        daemonId: DaemonId(DAEMON),
+        op: 'upgrade',
+        trigger: 'auto',
+        targetVersion,
+        commandEpoch: 1n,
+        acceptedAt: new Date(),
+        deadline: future()
+      })
+    const succeeded = await auto('0.5.0')
+    await ops.settle(succeeded.id, 'succeeded', null, new Date())
+    const deferred = await auto('0.6.0')
+    await ops.recordProgress(
+      DaemonId(DAEMON),
+      1n,
+      { operationId: deferred.id, phase: 'failed', reason: 'busy' },
+      new Date()
+    )
+    expect((await ops.getById(deferred.id))?.status).toBe('deferred')
+
+    running = buildHttpApp(prisma)
+    const rows = (await running.app.inject({ method: 'GET', url: `${ORG}/daemons` })).json() as AutoUpgradeDto[]
+    const row = rows.find((r) => r.daemonId === DAEMON)!
+    expect(row.lifecycleOp).toMatchObject({ id: succeeded.id, trigger: 'auto', status: 'succeeded' })
+    expect(row.lastAutoUpgrade).toMatchObject({ id: succeeded.id, status: 'succeeded', targetVersion: '0.5.0' })
+    expect(row.lastAutoUpgrade?.settledAt).toBeTruthy()
+
+    // A later manual op takes the badge, but not the last automatic outcome.
+    const manual = await ops.open({ daemonId: DaemonId(DAEMON), op: 'restart', commandEpoch: 1n, deadline: future() })
+    const detail = (
+      await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}` })
+    ).json() as AutoUpgradeDto
+    expect(detail.lifecycleOp).toMatchObject({ id: manual.id, trigger: 'manual', status: 'pending' })
+    expect(detail.lastAutoUpgrade?.id).toBe(succeeded.id)
+
+    // A deferred op stays readable by id.
+    const byId = await running.app.inject({ method: 'GET', url: `${ORG}/daemons/${DAEMON}/lifecycle/${deferred.id}` })
+    expect(byId.json()).toMatchObject({ id: deferred.id, trigger: 'auto', status: 'deferred', outcome: 'busy' })
+  })
+})
+
+describe('manual upgrade below the announced release', () => {
+  it('turns auto-upgrade off and tells the daemon before sending the upgrade', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_AUTO_UPGRADE_FEATURE])
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { autoUpgrade: true } })
+    const { control, pushes, commands } = autoUpgradeControl()
+    running = buildHttpApp(prisma, undefined, LIVE, control, { daemonRelease: releaseAt('1.0.0') })
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '0.9.0' }
+    })
+    expect(res.statusCode).toBe(202)
+    expect(res.json()).toMatchObject({ trigger: 'manual', targetVersion: '0.9.0' })
+    expect((await prisma.daemon.findUnique({ where: { id: DAEMON } }))?.autoUpgrade).toBe(false)
+    expect(pushes).toEqual([{ id: DAEMON, keys: { 'upgrade.auto': false } }])
+    expect(commands.map((c) => c.method)).toEqual(['upgrade'])
+  })
+
+  it('leaves auto-upgrade on for an upgrade to the announced release or newer', async () => {
+    await seedDaemon(['worktree-iso', DAEMON_AUTO_UPGRADE_FEATURE])
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { autoUpgrade: true } })
+    const { control, pushes } = autoUpgradeControl()
+    running = buildHttpApp(prisma, undefined, LIVE, control, { daemonRelease: releaseAt('1.0.0') })
+
+    const res = await running.app.inject({
+      method: 'POST',
+      url: `${ORG}/daemons/${DAEMON}/upgrade`,
+      payload: { version: '1.0.0' }
+    })
+    expect(res.statusCode).toBe(202)
+    expect((await prisma.daemon.findUnique({ where: { id: DAEMON } }))?.autoUpgrade).toBe(true)
+    expect(pushes).toEqual([])
+  })
+})

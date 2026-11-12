@@ -1,0 +1,1622 @@
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
+import type { Agent } from '../src/agents/agent-schema.js'
+import { hostKeyDirName, sessionHostKey } from '../src/acp/host-key.js'
+import { createWorkspaceScope } from '../src/cp/workspace-scope.js'
+import { privateRuntimeHomeFor } from '../src/launch/prepare.js'
+import {
+  daemonGitCredentialTarget,
+  gitFor,
+  initGitInjection,
+  workspaceGitLocalEnv
+} from '../src/workspace/git-injection.js'
+import {
+  GitTransportError,
+  LocalGitRunner,
+  type GitCloneOutput,
+  type GitRunner,
+  type GitLogEntry,
+  type GitPullSummary
+} from '../src/workspace/git-runner.js'
+import { ALLOWED_GIT_SUBCOMMANDS, createExecHandler } from '../src/shim/exec-handler.js'
+import { ShimGitRunner, type GitExecPayload } from '../src/shim/git-exec.js'
+import type { ShimRequester } from '../src/shim/channels.js'
+import { buildWorkspaceRootsAppend } from '../src/session/turn/standing-context.js'
+import { sessionHomeIn } from '../src/workspace/session-layout.js'
+import { WorkspaceManager, type PrepareSessionWorkspaceRequest } from '../src/workspace/workspace-manager.js'
+import { MicrosandboxWorkspaceFs } from '../src/microsandbox/workspace-fs.js'
+import { LocalWorkspaceFs } from '../src/workspace/workspace-fs.js'
+import { wireTestPlane } from './workspace-plane-support.js'
+
+// Real git against real repositories (git-workspace-model.md §11): the claims are about the disk — where a confined session's clones land, that nothing of theirs reaches the primary, that a review is fetched and verified inside the clone, and what retirement removes or keeps.
+
+const workspaces = new WorkspaceManager()
+
+const SHIM = join(mkdtempSync(join(tmpdir(), 'ac-session-clone-shim-')), 'git-credential-helper.sh')
+/** The repository each credential pre-warm named, in order; `workspace` when it named none. */
+const preWarms: string[] = []
+/** Refuse a repo-less pre-warm the way the CP does for a scratch agent, which has no workspace credential to mint. */
+let refuseWorkspacePreWarm = false
+initGitInjection({
+  targetFor: () => daemonGitCredentialTarget({ shimPath: SHIM, runDir: join(SHIM, '..') }),
+  preWarm: async (_agentId, _reason, repository) => {
+    preWarms.push(repository?.repoFullName ?? 'workspace')
+    if (repository === undefined && refuseWorkspacePreWarm) throw new Error('agent has no default github repository')
+  },
+  capabilityFor: (agentId) => `cap-${agentId}`
+})
+
+const KEY = 'slack:C1:1700000000.000100'
+const PRIMARY_URL = 'https://github.com/acme/primary-service.git'
+const roots: string[] = []
+/** Every daemon-run Git invocation, with the env it ran under — what proves which ones may fetch lazily. */
+const gitRuns: { args: string[]; env: Record<string, string> }[] = []
+/** Authorized clone URL (minus any `.git`) → the `file://` bare repository standing in for it. */
+const remotes = new Map<string, string>()
+const templateRoot = realpathSync(mkdtempSync(join(tmpdir(), 'ac-session-clone-templates-')))
+const templates = new Map<string, string>()
+
+afterAll(() => {
+  rmSync(join(SHIM, '..'), { recursive: true, force: true })
+  rmSync(templateRoot, { recursive: true, force: true })
+})
+afterEach(() => {
+  vi.restoreAllMocks()
+  gitRuns.length = 0
+  preWarms.length = 0
+  refuseWorkspacePreWarm = false
+  workspaces.setPlaneResolver(undefined)
+  remotes.clear()
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+/** Canonical, because the sandbox handler decides containment on canonical paths and macOS hands out a `/var` alias for `/private/var`. */
+function tempRoot(prefix: string): string {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)))
+  roots.push(root)
+  return root
+}
+
+/** Setup-only env: the daemon's own local policy widened to `file:`, plus a fixture identity. */
+function fixtureEnv(): Record<string, string> {
+  return {
+    ...workspaceGitLocalEnv(),
+    GIT_ALLOW_PROTOCOL: 'file:https:ssh',
+    GIT_AUTHOR_NAME: 'Fixture',
+    GIT_AUTHOR_EMAIL: 'fixture@example.invalid',
+    GIT_COMMITTER_NAME: 'Fixture',
+    GIT_COMMITTER_EMAIL: 'fixture@example.invalid'
+  }
+}
+
+function git(cwd: string, args: string[]): string {
+  const quiesced = ['-c', 'maintenance.auto=false', '-c', 'gc.auto=0', ...args]
+  return execFileSync('git', quiesced, { cwd, env: fixtureEnv(), encoding: 'utf8' }).trim()
+}
+
+// Seed each branch once; every test copies both the bare repository and its seed checkout.
+function buildTemplate(branch: string): string {
+  const root = mkdtempSync(join(templateRoot, 'repo-'))
+  const bare = join(root, 'origin.git')
+  const seed = join(root, 'seed')
+  git(root, ['init', '-q', '--bare', `--initial-branch=${branch}`, bare])
+  git(bare, ['config', 'receive.autogc', 'false'])
+  git(bare, ['config', 'uploadpack.allowFilter', 'true'])
+  mkdirSync(seed)
+  git(seed, ['init', '-q', `--initial-branch=${branch}`, '.'])
+  writeFileSync(join(seed, 'README.md'), 'seed\n')
+  git(seed, ['add', '-A'])
+  git(seed, ['commit', '-q', '-m', 'initial'])
+  git(seed, ['remote', 'add', 'origin', bare])
+  git(seed, ['push', '-q', 'origin', branch])
+  return root
+}
+
+/** A fresh bare repository and seed checkout, served over `file://` so `--filter` is honoured. */
+function bareRepo(branch = 'main'): { bare: string; seed: string; url: string } {
+  let template = templates.get(branch)
+  if (template === undefined) {
+    template = buildTemplate(branch)
+    templates.set(branch, template)
+  }
+  const root = tempRoot('ac-session-clone-remote-')
+  cpSync(template, root, { recursive: true })
+  const bare = join(root, 'origin.git')
+  const seed = join(root, 'seed')
+  // A test's pushes must target its own copy, never the template.
+  git(seed, ['remote', 'set-url', 'origin', bare])
+  return { bare, seed, url: `file://${bare}` }
+}
+
+function agentFixture(
+  opts: {
+    mode?: 'git-repo' | 'from-scratch'
+    githubApp?: boolean
+    additionalRepos?: Array<{ repoFullName: string; repoId: string; materialize?: 'always' | 'decision' | 'on-demand' }>
+    additionalInstallations?: Array<{ accountLogin: string; materialize: 'decision' | 'on-demand' }>
+  } = {}
+): Agent {
+  const home = tempRoot('ac-session-clone-agent-')
+  return {
+    id: 'bot-clone',
+    dir: home,
+    name: 'bot-clone',
+    status: 'active',
+    runtime: 'claude',
+    workspace: {
+      mode: opts.mode ?? 'git-repo',
+      isolation: 'session',
+      path: join(home, 'workspace'),
+      gitRepo: PRIMARY_URL,
+      gitBranch: 'main',
+      ...(opts.githubApp ? { gitCredential: 'github-app' } : {}),
+      additionalRepos: opts.additionalRepos ?? [],
+      additionalInstallations: (opts.additionalInstallations ?? []).map((grant) => ({
+        provider: 'github',
+        access: 'read',
+        ...grant
+      })),
+      pullOnNewSession: false,
+      skills: []
+    },
+    integrations: [],
+    output: { mode: 'medium' },
+    permissions: { policy: 'ask', autoApprove: [] },
+    crons: []
+  } as unknown as Agent
+}
+
+function serve(cloneUrl: string, url: string): void {
+  remotes.set(cloneUrl.replace(/\.git$/i, ''), url)
+}
+
+function substitute(value: string): string {
+  return remotes.get(value.replace(/\.git$/i, '')) ?? value
+}
+
+/** Real git through the workspace runner seam, with exactly one substitution: a fixture repository's authorized URL becomes its `file://` bare, and `file:` joins the protocol allowlist. */
+class SeamRunner implements GitRunner {
+  constructor(
+    readonly cwd: string | undefined,
+    private readonly abort: AbortSignal | undefined,
+    private readonly env: Record<string, string> = {}
+  ) {}
+
+  withEnv(env: Record<string, string>): GitRunner {
+    return new SeamRunner(this.cwd, this.abort, env)
+  }
+
+  private delegate(): GitRunner {
+    const env: Record<string, string> = { ...this.env, GIT_ALLOW_PROTOCOL: 'file:https:ssh' }
+    for (let index = 0; index < Number(env.GIT_CONFIG_COUNT ?? 0); index += 1) {
+      if (/^remote\..*\.url$/i.test(env[`GIT_CONFIG_KEY_${index}`] ?? '')) {
+        env[`GIT_CONFIG_VALUE_${index}`] = substitute(env[`GIT_CONFIG_VALUE_${index}`] ?? '')
+      }
+    }
+    const make = (value: Record<string, string>) => gitFor(this.cwd, this.abort, value)
+    return new LocalGitRunner(gitFor(this.cwd, this.abort), this.cwd, make).withEnv(env)
+  }
+
+  raw(args: string[]): Promise<string> {
+    gitRuns.push({ args, env: this.env })
+    return this.delegate().raw(args[0] === 'ls-remote' ? args.map(substitute) : args)
+  }
+
+  async clone(repo: string, target: string, options?: string[]): Promise<GitCloneOutput | undefined> {
+    gitRuns.push({ args: ['clone', repo, target, ...(options ?? [])], env: this.env })
+    return await this.delegate().clone(substitute(repo), target, options)
+  }
+
+  pull(remote: string, branch: string, options?: string[]): Promise<GitPullSummary> {
+    return this.delegate().pull(remote, branch, options)
+  }
+
+  status() {
+    return this.delegate().status()
+  }
+
+  log(options: { maxCount: number }): Promise<GitLogEntry[]> {
+    return this.delegate().log(options)
+  }
+
+  readBounded(args: string[], maxBytes: number) {
+    return this.delegate().readBounded(args, maxBytes)
+  }
+}
+
+/** The one substitution the wire makes: a fixture repository's authorized URL becomes its `file://` bare, and `file:` joins the protocol allowlist. */
+function wireEnv(env: Record<string, string>): Record<string, string> {
+  const next: Record<string, string> = { ...env, GIT_ALLOW_PROTOCOL: 'file:https:ssh' }
+  for (let index = 0; index < Number(next.GIT_CONFIG_COUNT ?? 0); index += 1) {
+    if (/^remote\..*\.url$/i.test(next[`GIT_CONFIG_KEY_${index}`] ?? '')) {
+      next[`GIT_CONFIG_VALUE_${index}`] = substitute(next[`GIT_CONFIG_VALUE_${index}`] ?? '')
+    }
+  }
+  return next
+}
+
+/** The pool's own runner against the pod's own handler, so the daemon's argv crosses the real exec channel and meets the real inventory — the enforcement a permissive stand-in hides, which is how `checkout` reached the field. */
+function shimRunner(workspaceRoot: string, cwd: string | undefined, abort: AbortSignal | undefined): GitRunner {
+  const handle = createExecHandler({ workspaceRoot, log: { info: () => {}, warn: () => {} } })
+  const requester: ShimRequester = {
+    request: async (capability, payload, options) => {
+      const sent = payload as GitExecPayload
+      gitRuns.push({ args: sent.args, env: sent.env ?? {} })
+      const wire: GitExecPayload = {
+        ...sent,
+        args: sent.args.map(substitute),
+        ...(sent.env ? { env: wireEnv(sent.env) } : {})
+      }
+      return await handle(capability, wire, options?.abort)
+    }
+  }
+  return new ShimGitRunner(requester, cwd, undefined, abort)
+}
+
+/** Serve the primary (when there is one) and every secondary root from fresh bare repositories. */
+function serveAll(agent: Agent, branches: Record<string, string> = {}): Record<string, ReturnType<typeof bareRepo>> {
+  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => new SeamRunner(cwd, abort) })
+  const served: Record<string, ReturnType<typeof bareRepo>> = {}
+  if (agent.workspace.mode === 'git-repo') {
+    served.primary = bareRepo('main')
+    serve(workspaces.primaryRoot(agent).cloneUrl, served.primary.url)
+  }
+  for (const root of workspaces.secondaryRoots(agent)) {
+    served[root.repoFullName] = bareRepo(branches[root.repoFullName] ?? 'main')
+    serve(root.cloneUrl, served[root.repoFullName]!.url)
+  }
+  return served
+}
+
+/** The same fixtures on the pool's shape: every daemon-run Git for this agent goes through the sandbox handler rooted at its directory. */
+function serveAllThroughShim(agent: Agent): Record<string, ReturnType<typeof bareRepo>> {
+  const served = serveAll(agent)
+  const root = workspaces.agentRootFor(agent)
+  wireTestPlane(workspaces, { gitRunnerFor: (_agentId, cwd, abort) => shimRunner(root, cwd, abort) })
+  return served
+}
+
+const confined = (extra: Partial<PrepareSessionWorkspaceRequest> = {}): PrepareSessionWorkspaceRequest => ({
+  sessionKey: KEY,
+  isolation: 'session',
+  initiatedBy: 'Ada Lovelace',
+  confined: true,
+  ...extra
+})
+
+const leafOf = (agent: Agent) => workspaces.sessionDir(agent, KEY)
+const idOf = () => workspaces.sessionWorktreeId(KEY)
+
+/** The same session, requested with no boundary around it — what a turn asks for once the agent's sandbox is off. */
+const unconfined = (extra: Partial<PrepareSessionWorkspaceRequest> = {}): PrepareSessionWorkspaceRequest => ({
+  sessionKey: KEY,
+  isolation: 'session',
+  initiatedBy: 'Ada Lovelace',
+  ...extra
+})
+
+/** The directory the LAUNCH resolves for this session's host — the same record preparation reads. */
+const launchHomeFor = (agent: Agent) =>
+  privateRuntimeHomeFor(workspaces.agentRootFor(agent), sessionHostKey(agent.id, KEY))
+
+/** One pull request on the served primary: a commit on top of `main`, published as `refs/pull/7/head`. */
+function publishPullRequest(seed: string, content: string): { base: string; head: string } {
+  writeFileSync(join(seed, 'feature.md'), content)
+  git(seed, ['add', '-A'])
+  git(seed, ['commit', '-q', '-m', `feature: ${content.trim()}`])
+  git(seed, ['push', '-q', 'origin', 'HEAD:refs/pull/7/head'])
+  return { base: git(seed, ['rev-parse', 'origin/main']), head: git(seed, ['rev-parse', 'HEAD']) }
+}
+
+describe('a confined session gets its own clone of every root (git-workspace-model §11)', () => {
+  it('lays the session out under sessions/<leaf>: a blobless clone as the cwd on its own branch, the primary untouched', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const home = workspaces.agentRootFor(agent)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const leaf = leafOf(agent)
+    expect(leaf).toBe(join(home, 'sessions', hostKeyDirName(sessionHostKey(agent.id, KEY))))
+    expect(cwd).toBe(realpathSync(join(leaf, 'workspace')))
+    expect(statSync(join(cwd, '.git')).isDirectory()).toBe(true)
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toMatch(/^a10t\/ada-lovelace\/[a-z]+-[a-z]+$/)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+    // A blobless partial clone straight from the remote: no alternates, no upstream on the session branch.
+    expect(git(cwd, ['config', '--get', 'remote.origin.partialclonefilter'])).toBe('blob:none')
+    expect(existsSync(join(cwd, '.git', 'objects', 'info', 'alternates'))).toBe(false)
+    expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+    // The primary is not the parent of anything: no worktrees parent, no session branch, one checkout.
+    const checkout = agent.workspace.path
+    expect(existsSync(join(checkout, '.git'))).toBe(true)
+    expect(existsSync(join(home, 'worktrees'))).toBe(false)
+    expect(git(checkout, ['branch', '--list', 'dev/*'])).toBe('')
+    expect(git(checkout, ['worktree', 'list']).split('\n')).toHaveLength(1)
+  })
+
+  it('clones a selected `decision` row into the session directory and lists the rest on demand (decisions 15 and 19)', async () => {
+    const agent = agentFixture({
+      additionalRepos: [
+        { repoFullName: 'acme/infra', repoId: '42', materialize: 'decision' },
+        { repoFullName: 'example-co/shared-library', repoId: '815', materialize: 'decision' }
+      ]
+    })
+    serveAll(agent, { 'acme/infra': 'trunk' })
+    const key = 'slack:C1:1700000000.000200'
+    workspaces.setSessionSelection(key, [{ provider: 'github', repoFullName: 'acme/infra', repoId: '42' }])
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ sessionKey: key }))
+
+    const scope = { sessionKey: key, isolation: 'session' as const }
+    const repos = join(workspaces.sessionDir(agent, key), 'repos')
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([
+      realpathSync(join(repos, 'acme', 'infra')),
+      realpathSync(repos)
+    ])
+    // Taken from the remote at its default, attested like every session clone (§11).
+    expect(
+      JSON.parse(readFileSync(join(repos, 'acme', 'infra', '.git', 'agentconnect-materialization.json'), 'utf8'))
+    ).toEqual({ provider: 'github', repoId: '42', repoFullName: 'acme/infra', branch: 'trunk' })
+    expect(existsSync(join(repos, 'example-co'))).toBe(false)
+    expect(
+      (await workspaces.sessionOnDemandClones(agent, scope))?.repositories.map((repo) => repo.repoFullName)
+    ).toEqual(['example-co/shared-library'])
+    // A confined session clones for itself: the agent's own `repos/` holds nothing of it.
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'repos'))).toBe(false)
+  })
+
+  it('keeps the clone, its branch and its files across turns', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const branch = git(cwd, ['symbolic-ref', '--short', 'HEAD'])
+    writeFileSync(join(cwd, 'notes.md'), 'kept\n')
+
+    const again = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(again).toBe(cwd)
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toBe(branch)
+    expect(existsSync(join(cwd, 'notes.md'))).toBe(true)
+    expect(workspaces.sessionWorktreePath(agent, KEY)).toBe(join(leafOf(agent), 'workspace'))
+  })
+
+  it('keeps the clone when its Git never ran, instead of reading that as no clone and cloning over it', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    writeFileSync(join(cwd, 'notes.md'), 'kept\n')
+    const clones = () => gitRuns.filter(({ args }) => args[0] === 'clone').length
+    const cloned = clones()
+    const refused = new GitTransportError('environment configuration changed while active')
+    const raw = SeamRunner.prototype.raw
+    vi.spyOn(SeamRunner.prototype, 'raw').mockImplementation(function (this: SeamRunner, args: string[]) {
+      return args[0] === 'rev-parse' ? Promise.reject(refused) : raw.call(this, args)
+    })
+
+    await expect(workspaces.prepareSessionWorkspace(agent, confined())).rejects.toBe(refused)
+
+    expect(readFileSync(join(cwd, 'notes.md'), 'utf8')).toBe('kept\n')
+    expect(clones()).toBe(cloned)
+  })
+
+  it.each(['shared', 'worktree', 'clone'] as const)(
+    'prepares skills once and refreshes shared roots only when needed by the %s tier',
+    async (tier) => {
+      const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+      agent.workspace.pullOnNewSession = true
+      const served = serveAll(agent)
+      await workspaces.prepareWorkspace(agent)
+      const roots = [workspaces.primaryRoot(agent), ...workspaces.secondaryRoots(agent)]
+      for (const root of roots) git(root.path, ['remote', 'set-url', 'origin', root.cloneUrl])
+      for (const remote of Object.values(served)) {
+        writeFileSync(join(remote.seed, 'README.md'), 'updated\n')
+        git(remote.seed, ['commit', '-qam', 'update'])
+        git(remote.seed, ['push', '-q', 'origin', 'HEAD'])
+      }
+      const installSkills = vi.fn(async () => [] as string[])
+      const raw = vi.spyOn(SeamRunner.prototype, 'raw')
+      const cwd = await workspaces.prepareSessionWorkspace(
+        agent,
+        { sessionKey: KEY, isolation: tier === 'shared' ? 'shared' : 'session', confined: tier === 'clone' },
+        { installSkills }
+      )
+
+      expect(installSkills.mock.calls).toEqual([[agent, cwd]])
+      expect(readFileSync(join(cwd, 'README.md'), 'utf8')).toBe('updated\n')
+      // One sync per shared root: its `checkout -B` onto the fetched tip.
+      const syncs = raw.mock.calls.filter(([args]) => args[0] === 'checkout' && args.includes('-B'))
+      expect(syncs).toHaveLength(tier === 'clone' ? 0 : 2)
+      for (const root of roots) {
+        expect(readFileSync(join(root.path, 'README.md'), 'utf8')).toBe(tier === 'clone' ? 'seed\n' : 'updated\n')
+      }
+      if (tier === 'clone') {
+        expect(readFileSync(join(leafOf(agent), 'repos', 'acme', 'infra', 'README.md'), 'utf8')).toBe('updated\n')
+      }
+    }
+  )
+
+  it('resolves agentDir against the new session clone when the shared checkout predates it', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    await workspaces.prepareWorkspace(agent)
+    mkdirSync(join(primary!.seed, 'app'))
+    writeFileSync(join(primary!.seed, 'app', 'README.md'), 'new directory\n')
+    git(primary!.seed, ['add', '-A'])
+    git(primary!.seed, ['commit', '-qm', 'add app'])
+    git(primary!.seed, ['push', '-q', 'origin', 'HEAD'])
+    agent.workspace.agentDir = 'app'
+    agent.workspace.pullOnNewSession = true
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'workspace', 'app')))
+    expect(readFileSync(join(cwd, 'README.md'), 'utf8')).toBe('new directory\n')
+    expect(existsSync(join(agent.workspace.path, 'app'))).toBe(false)
+  })
+
+  it.each(['primary', 'acme/parent'])(
+    'includes an authorized root after its submodule is removed from %s upstream',
+    async (parent) => {
+      const agent = agentFixture({
+        additionalRepos: [
+          ...(parent === 'primary' ? [] : [{ repoFullName: parent, repoId: '41' }]),
+          { repoFullName: 'example-co/library', repoId: '42' }
+        ]
+      })
+      agent.workspace.pullOnNewSession = true
+      const served = serveAll(agent)
+      const seed = served[parent]!.seed
+      writeFileSync(
+        join(seed, '.gitmodules'),
+        '[submodule "library"]\n\tpath = vendor/library\n\turl = https://github.com/example-co/library.git\n'
+      )
+      git(seed, ['add', '.gitmodules'])
+      git(seed, ['commit', '-qm', 'declare library submodule'])
+      git(seed, ['push', '-q', 'origin', 'HEAD'])
+      await workspaces.prepareWorkspace(agent)
+      for (const root of [workspaces.primaryRoot(agent), ...workspaces.secondaryRoots(agent)]) {
+        if (existsSync(join(root.path, '.git'))) git(root.path, ['remote', 'set-url', 'origin', root.cloneUrl])
+      }
+      expect((await workspaces.readySecondaryRoots(agent)).map((root) => root.repoFullName)).not.toContain(
+        'example-co/library'
+      )
+      git(seed, ['rm', '-q', '.gitmodules'])
+      git(seed, ['commit', '-qm', 'remove library submodule'])
+      git(seed, ['push', '-q', 'origin', 'HEAD'])
+
+      const pulls = vi.spyOn(SeamRunner.prototype, 'pull')
+      await workspaces.prepareSessionWorkspace(agent, confined())
+
+      expect(pulls).not.toHaveBeenCalled()
+      const ready = await workspaces.readySecondaryRoots(agent, confined())
+      expect(ready.map((root) => root.repoFullName)).toContain('example-co/library')
+      expect(readFileSync(join(leafOf(agent), 'repos', 'example-co', 'library', 'README.md'), 'utf8')).toBe('seed\n')
+    }
+  )
+
+  it.each(['new', 'review', 'resume'] as const)(
+    'discovers a submodule in the %s session tree even when the shared tree has none',
+    async (mode) => {
+      const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+      const { primary } = mode === 'review' ? serveAllThroughShim(agent) : serveAll(agent)
+      await workspaces.prepareWorkspace(agent)
+      const root = workspaces.secondaryRoots(agent)[0]!
+      git(root.path, ['remote', 'set-url', 'origin', root.cloneUrl])
+      const request = confined()
+      const path = mode === 'resume' ? await workspaces.prepareSessionWorkspace(agent, request) : primary!.seed
+      writeFileSync(join(path, '.gitmodules'), '[submodule "infra"]\n\turl = https://github.com/acme/infra.git\n')
+      if (mode === 'review') {
+        const revision = publishPullRequest(primary!.seed, 'with submodule\n')
+        request.review = { pullNumber: 7, baseSha: revision.base, headSha: revision.head }
+      } else if (mode === 'new') {
+        git(path, ['add', '-A'])
+        git(path, ['commit', '-qm', 'add submodule'])
+        git(path, ['push', '-q', 'origin', 'HEAD'])
+      }
+
+      const cwd = await workspaces.prepareSessionWorkspace(agent, request)
+
+      expect(readFileSync(join(cwd, '.gitmodules'), 'utf8')).toContain('acme/infra')
+      expect(existsSync(join(agent.workspace.path, '.gitmodules'))).toBe(false)
+      expect(await workspaces.readySecondaryRoots(agent, request)).toEqual([])
+      // A resumed session keeps its existing clone; a new one never creates the duplicate.
+      expect(existsSync(join(leafOf(agent), 'repos', 'acme', 'infra', '.git'))).toBe(mode === 'resume')
+    }
+  )
+
+  it.each(process.platform === 'win32' ? ['symlink'] : ['symlink', 'fifo'])(
+    'resumes past a %s the runtime left as its clone .gitmodules and withholds nothing',
+    async (kind) => {
+      const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+      serveAll(agent)
+      await workspaces.prepareWorkspace(agent)
+      const root = workspaces.secondaryRoots(agent)[0]!
+      git(root.path, ['remote', 'set-url', 'origin', root.cloneUrl])
+      const request = confined()
+      const path = await workspaces.prepareSessionWorkspace(agent, request)
+      git(join(leafOf(agent), 'repos', 'acme', 'infra'), ['remote', 'set-url', 'origin', root.cloneUrl])
+      const declaration = '[submodule "infra"]\n\turl = https://github.com/acme/infra.git\n'
+      let writer: ChildProcess | undefined
+      if (kind === 'symlink') {
+        // Past the 256 KiB byte cap yet under it in UTF-16 units, so a followed link would declare the root.
+        const target = join(tempRoot('ac-session-clone-gitmodules-'), 'large')
+        writeFileSync(target, `${declaration}# ${'é'.repeat(200_000)}\n`)
+        symlinkSync(target, join(path, '.gitmodules'))
+      } else {
+        execFileSync('mkfifo', [join(path, '.gitmodules')])
+        // A writer turns a blocking read into a wrong answer rather than a hung worker.
+        writer = spawn(process.execPath, [
+          '-e',
+          'require("fs").writeFileSync(...process.argv.slice(1))',
+          join(path, '.gitmodules'),
+          declaration
+        ])
+      }
+
+      try {
+        await workspaces.prepareSessionWorkspace(agent, request)
+      } finally {
+        writer?.kill()
+      }
+
+      expect((await workspaces.readySecondaryRoots(agent, request)).map((root) => root.repoFullName)).toEqual([
+        'acme/infra'
+      ])
+    }
+  )
+
+  it('does not exclude a submodule root when its parent checkout fails', async () => {
+    const agent = agentFixture({
+      additionalRepos: [
+        { repoFullName: 'acme/parent', repoId: '41' },
+        { repoFullName: 'example-co/library', repoId: '42' }
+      ]
+    })
+    const served = serveAll(agent)
+    const seed = served['acme/parent']!.seed
+    writeFileSync(join(seed, '.gitmodules'), '[submodule "lib"]\n\turl = https://github.com/example-co/library.git\n')
+    git(seed, ['add', '-A'])
+    git(seed, ['commit', '-qm', 'add submodule'])
+    git(seed, ['push', '-q', 'origin', 'HEAD'])
+    const run = SeamRunner.prototype.raw
+    vi.spyOn(SeamRunner.prototype, 'raw').mockImplementation(function (this: SeamRunner, args) {
+      if (args[0] === 'reset' && this.cwd && basename(this.cwd).startsWith('parent.clone-')) {
+        return Promise.reject(new Error('parent checkout failed'))
+      }
+      return run.call(this, args)
+    })
+
+    await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect((await workspaces.readySecondaryRoots(agent, confined())).map((root) => root.repoFullName)).toEqual([
+      'example-co/library'
+    ])
+    expect(readFileSync(join(leafOf(agent), 'repos', 'example-co', 'library', 'README.md'), 'utf8')).toBe('seed\n')
+  })
+
+  it('uses a reviewed secondary tree and resumes that cwd in a fresh manager over a scratch workspace', async () => {
+    const agent = agentFixture({
+      mode: 'from-scratch',
+      additionalRepos: [
+        { repoFullName: 'example-co/review', repoId: '41' },
+        { repoFullName: 'acme/library', repoId: '42' }
+      ]
+    })
+    const served = serveAll(agent)
+    const seed = served['example-co/review']!.seed
+    writeFileSync(join(seed, '.gitmodules'), '[submodule "lib"]\n\turl = https://github.com/acme/library.git\n')
+    const revision = publishPullRequest(seed, 'review with submodule\n')
+    const request = confined({
+      isolation: 'shared',
+      reviewRepoFullName: 'example-co/review',
+      review: { pullNumber: 7, baseSha: revision.base, headSha: revision.head }
+    })
+    const cwd = await workspaces.prepareSessionWorkspace(agent, request)
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'repos', 'example-co', 'review')))
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(revision.head)
+    expect(await workspaces.sessionAdditionalRoots(agent, request)).toEqual([])
+    expect(existsSync(join(leafOf(agent), 'repos', 'acme', 'library'))).toBe(false)
+    const root = workspaces.secondaryRoots(agent).find((root) => root.repoFullName === 'example-co/review')!
+    git(cwd, ['remote', 'set-url', 'origin', root.cloneUrl])
+    const fresh = new WorkspaceManager()
+    wireTestPlane(fresh, { gitRunnerFor: (_agentId, path, abort) => new SeamRunner(path, abort) })
+    const resumed = { sessionKey: KEY, isolation: 'shared' as const }
+
+    expect(await fresh.prepareSessionWorkspace(agent, resumed)).toBe(cwd)
+    expect(await fresh.sessionAdditionalRoots(agent, resumed)).toEqual([])
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(revision.head)
+  })
+
+  it('reviews a repository only an installation grant covers in its own clone, and resumes that cwd in a fresh manager', async () => {
+    const agent = agentFixture({ additionalInstallations: [{ accountLogin: 'example-co', materialize: 'on-demand' }] })
+    serveAll(agent)
+    const tools = bareRepo('main')
+    serve('https://github.com/example-co/tools', tools.url)
+    const revision = publishPullRequest(tools.seed, 'grant review\n')
+    const scope = { sessionKey: KEY, isolation: 'session' as const }
+
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({
+        reviewRepoFullName: 'example-co/tools',
+        reviewRepoId: '901',
+        review: { pullNumber: 7, baseSha: revision.base, headSha: revision.head }
+      })
+    )
+
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'repos', 'example-co', 'tools')))
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(revision.head)
+    // The primary rides along beside the session's clone directory; the reviewed clone is the cwd, nobody's reference.
+    const handed = [realpathSync(join(leafOf(agent), 'workspace')), realpathSync(join(leafOf(agent), 'repos'))]
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual(handed)
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'repos'))).toBe(false)
+    git(cwd, ['remote', 'set-url', 'origin', 'https://github.com/example-co/tools'])
+    const fresh = new WorkspaceManager()
+    wireTestPlane(fresh, { gitRunnerFor: (_agentId, path, abort) => new SeamRunner(path, abort) })
+
+    expect(await fresh.prepareSessionWorkspace(agent, scope)).toBe(cwd)
+    expect(await fresh.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual(handed)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(revision.head)
+  })
+
+  it('pins the placeholder helper in a github-app clone and converges its origin on resume', async () => {
+    const agent = agentFixture({ githubApp: true })
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const pinned = git(cwd, ['config', '--get-all', 'credential.https://github.com.helper'])
+    expect(pinned).toContain('AC_CODEHOST_CREDENTIAL')
+    expect(pinned).not.toContain(SHIM)
+    // The fixture's `file://` origin is what a real clone would have recorded as the authorized URL.
+    git(agent.workspace.path, ['remote', 'set-url', 'origin', PRIMARY_URL])
+    // A resumed clone is converged like a resumed primary: an origin off the managed host is refused...
+    await expect(workspaces.prepareSessionWorkspace(agent, confined())).rejects.toThrow(/trusted GitHub remote/)
+    // ...and one on it is repointed at the authorized repository.
+    git(cwd, ['remote', 'set-url', 'origin', 'https://github.com/acme/renamed.git'])
+    expect(await workspaces.prepareSessionWorkspace(agent, confined())).toBe(cwd)
+    expect(git(cwd, ['remote', 'get-url', 'origin'])).toBe(PRIMARY_URL)
+  })
+
+  it('clones every secondary root under repos/<owner>/<repo> of the same leaf and hands them out', async () => {
+    const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+    const served = serveAll(agent, { 'acme/infra': 'trunk' })
+    const home = workspaces.agentRootFor(agent)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const infra = join(leafOf(agent), 'repos', 'acme', 'infra')
+    expect(statSync(join(infra, '.git')).isDirectory()).toBe(true)
+    expect(git(infra, ['symbolic-ref', '--short', 'HEAD'])).toMatch(/^a10t\/ada-lovelace\//)
+    expect(git(infra, ['rev-parse', 'HEAD'])).toBe(git(served['acme/infra']!.seed, ['rev-parse', 'origin/trunk']))
+    expect(git(infra, ['config', '--get', 'remote.origin.partialclonefilter'])).toBe('blob:none')
+    expect(existsSync(join(infra, '.git', 'objects', 'info', 'alternates'))).toBe(false)
+    const scope = { sessionKey: KEY, isolation: 'session' as const }
+    expect(await workspaces.sessionAdditionalRoots(agent, scope)).toEqual([
+      { path: realpathSync(infra), repoFullName: 'acme/infra', branch: 'trunk' }
+    ])
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([realpathSync(infra)])
+    // The clone answers for itself — the remote's default, attested inside it — so nothing of the agent's own subtree was made for it.
+    expect(JSON.parse(readFileSync(join(infra, '.git', 'agentconnect-materialization.json'), 'utf8'))).toEqual({
+      provider: 'github',
+      repoId: '42',
+      repoFullName: 'acme/infra',
+      branch: 'trunk'
+    })
+    expect(existsSync(join(home, 'repos'))).toBe(false)
+  })
+
+  it('branches a clone whose base is `dev`, which Git refused every `dev/…` session branch beside (#2341)', async () => {
+    const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+    serveAll(agent, { 'acme/infra': 'dev' })
+
+    await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const infra = join(leafOf(agent), 'repos', 'acme', 'infra')
+    expect(git(infra, ['symbolic-ref', '--short', 'HEAD'])).toMatch(/^a10t\/ada-lovelace\/[a-z]+-[a-z]+$/)
+  })
+
+  it('keeps a scratch primary as the cwd while its secondaries get session clones', async () => {
+    const agent = agentFixture({
+      mode: 'from-scratch',
+      additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }]
+    })
+    serveAll(agent)
+    refuseWorkspacePreWarm = true
+
+    const installSkills = vi.fn(async () => [] as string[])
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined(), { installSkills })
+
+    expect(cwd).toBe(agent.workspace.path)
+    // A scratch agent has no workspace credential, so every warm names the repository its git reaches.
+    expect([...new Set(preWarms)]).toEqual(['acme/infra'])
+    expect(installSkills.mock.calls).toEqual([[agent, cwd]])
+    const infra = join(leafOf(agent), 'repos', 'acme', 'infra')
+    expect(statSync(join(infra, '.git')).isDirectory()).toBe(true)
+    expect(existsSync(join(leafOf(agent), 'workspace'))).toBe(false)
+    expect(
+      await workspaces.additionalWorkspaceDirectories(agent, cwd, { sessionKey: KEY, isolation: 'session' })
+    ).toEqual([realpathSync(infra)])
+  })
+
+  it.each([false, true])(
+    'prepares two roots concurrently and drains them before returning (primary fails: %s)',
+    async (failPrimary) => {
+      const agent = agentFixture({
+        additionalRepos: [
+          { repoFullName: 'acme/lib-a', repoId: '41' },
+          { repoFullName: 'acme/lib-b', repoId: '42' }
+        ]
+      })
+      serveAll(agent)
+      const gate = () => {
+        let resolve!: () => void
+        const promise = new Promise<void>((done) => {
+          resolve = done
+        })
+        return { promise, resolve }
+      }
+      const started = Array.from({ length: 3 }, gate)
+      const release = Array.from({ length: 3 }, gate)
+      const primaryFinished = gate()
+      const run = SeamRunner.prototype.raw
+      let active = 0
+      let peak = 0
+      const seen: number[] = []
+      const spy = vi.spyOn(SeamRunner.prototype, 'raw').mockImplementation(async function (this: SeamRunner, args) {
+        if (args[0] !== 'reset' || !this.cwd?.startsWith(leafOf(agent))) return await run.call(this, args)
+        const directory = basename(this.cwd)
+        const index = directory.startsWith('workspace.clone-') ? 0 : directory.startsWith('lib-a.clone-') ? 1 : 2
+        seen.push(index)
+        active += 1
+        peak = Math.max(peak, active)
+        started[index]!.resolve()
+        try {
+          await release[index]!.promise
+          if (index === 0 && failPrimary) throw new Error('primary checkout unavailable')
+          return await run.call(this, args)
+        } finally {
+          active -= 1
+          if (index === 0) primaryFinished.resolve()
+        }
+      })
+      let settled = false
+      const prepared = workspaces.prepareSessionWorkspace(agent, confined()).then(
+        (cwd) => ({ cwd, error: undefined }),
+        (error: unknown) => ({ cwd: undefined, error })
+      )
+      void prepared.then(() => {
+        settled = true
+      })
+      try {
+        await Promise.all([started[0]!.promise, started[1]!.promise])
+        expect(seen).toEqual([0, 1])
+        expect(active).toBe(2)
+        release[1]!.resolve()
+        await started[2]!.promise
+        expect(active).toBe(2)
+        release[0]!.resolve()
+        await primaryFinished.promise
+        await new Promise<void>((resolve) => setImmediate(resolve))
+        expect(settled).toBe(false)
+        release[2]!.resolve()
+        const result = await prepared
+        if (failPrimary) {
+          expect(result.error).toBeInstanceOf(Error)
+          expect((result.error as Error).message).toContain('primary checkout unavailable')
+        } else {
+          expect(result.error).toBeUndefined()
+          expect(readFileSync(join(result.cwd!, 'README.md'), 'utf8')).toBe('seed\n')
+        }
+        for (const repo of ['lib-a', 'lib-b']) {
+          expect(readFileSync(join(leafOf(agent), 'repos', 'acme', repo, 'README.md'), 'utf8')).toBe('seed\n')
+        }
+        expect(peak).toBe(2)
+        expect(active).toBe(0)
+      } finally {
+        for (const gate of release) gate.resolve()
+        await prepared
+        spy.mockRestore()
+      }
+    }
+  )
+
+  it('fetches a review into the clone, verifies HEAD exactly, and leaves no ref in the primary', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const first = publishPullRequest(primary!.seed, 'pr\n')
+
+    const installSkills = vi.fn(async () => [] as string[])
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({ review: { pullNumber: 7, baseSha: first.base, headSha: first.head } }),
+      { installSkills }
+    )
+
+    expect(installSkills.mock.calls).toEqual([[agent, cwd]])
+    const headRef = `refs/agentconnect/reviews/${idOf()}/head`
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(first.head)
+    expect(git(cwd, ['rev-parse', headRef])).toBe(first.head)
+    expect(git(cwd, ['rev-parse', `refs/agentconnect/reviews/${idOf()}/base`])).toBe(first.base)
+    expect(existsSync(join(cwd, 'feature.md'))).toBe(true)
+    expect(() => git(agent.workspace.path, ['rev-parse', '--verify', '--quiet', headRef])).toThrow()
+
+    // A later delivery re-fetches the exact revision and resets every tracked file, while what the
+    // session built in between — untracked or ignored — stays, so it need not install or build again.
+    const second = publishPullRequest(primary!.seed, 'pr v2\n')
+    writeFileSync(join(cwd, 'feature.md'), 'edited locally\n')
+    writeFileSync(join(cwd, 'scratch.txt'), 'kept\n')
+    mkdirSync(join(cwd, 'node_modules', '.pnpm'), { recursive: true })
+    writeFileSync(join(cwd, 'node_modules', '.pnpm', 'lock.yaml'), 'kept\n')
+    writeFileSync(join(cwd, '.git', 'info', 'exclude'), 'node_modules/\n')
+    const again = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({ review: { pullNumber: 7, baseSha: second.base, headSha: second.head } })
+    )
+    expect(again).toBe(cwd)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(second.head)
+    expect(readFileSync(join(cwd, 'feature.md'), 'utf8')).toBe('pr v2\n')
+    expect(existsSync(join(cwd, 'scratch.txt'))).toBe(true)
+    expect(existsSync(join(cwd, 'node_modules', '.pnpm', 'lock.yaml'))).toBe(true)
+    expect(git(cwd, ['status', '--porcelain'])).toBe('?? scratch.txt')
+  })
+
+  // A blobless clone has to resolve a fetched pack against objects it filtered out, which is a promisor
+  // fetch: under the daemon's usual `GIT_NO_LAZY_FETCH=1` the review fetch dies in `unpack-objects`
+  // ("could not fetch <oid> from promisor remote") and EVERY review in a confined session degrades.
+  it('lets the review fetch into a session clone fetch lazily, as its clone and checkout may', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const pr = publishPullRequest(primary!.seed, 'pr\n')
+
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({ review: { pullNumber: 7, baseSha: pr.base, headSha: pr.head } })
+    )
+
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(pr.head)
+    const inClone = gitRuns.filter(
+      (run) => run.args[0] === 'fetch' && run.args.some((arg) => arg.includes('refs/pull/7/head'))
+    )
+    expect(inClone.length).toBeGreaterThan(0)
+    for (const run of inClone) expect(run.env.GIT_NO_LAZY_FETCH).toBe('0')
+    // The fetch itself is filtered like the clone: unfiltered, the changed blobs arrive as deltas against
+    // bases the clone never had and are lazily fetched one round trip per changed file.
+    for (const run of inClone) expect(run.args).toContain('--filter=blob:none')
+    // A filtered fetch from a remote Git did not know as a promisor writes that mark into the checkout's
+    // config; declared at command scope, no daemon-named remote is left behind, review after review.
+    expect(readFileSync(join(cwd, '.git', 'config'), 'utf8')).not.toMatch(/\[remote "agentconnect-/)
+    // Retirement is the other side of the rule: it judges the clone with no network target at all.
+    gitRuns.length = 0
+    await workspaces.removeSessionWorktree(agent, KEY)
+    for (const run of gitRuns) expect(run.env.GIT_NO_LAZY_FETCH).not.toBe('0')
+  })
+
+  it('fails the session when the clone fails, leaving no worktree behind', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    await workspaces.prepareWorkspace(agent)
+    serve(PRIMARY_URL, `file://${join(tempRoot('ac-session-clone-missing-'), 'nowhere.git')}`)
+
+    await expect(workspaces.prepareSessionWorkspace(agent, confined())).rejects.toThrow(/session clone of .* failed/)
+
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'worktrees'))).toBe(false)
+    expect(existsSync(join(leafOf(agent), 'workspace'))).toBe(false)
+    expect(workspaces.confinedSessionDir(agent, KEY)).toBeUndefined()
+  })
+
+  it('publishes a new clone only after its single checkout succeeds, and retries a failed checkout', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const run = SeamRunner.prototype.raw
+    let fail = true
+    let resets = 0
+    vi.spyOn(SeamRunner.prototype, 'raw').mockImplementation(function (this: SeamRunner, args) {
+      if (args[0] === 'reset') {
+        resets++
+        const cloned = gitRuns.find(({ args }) => args[0] === 'clone' && args.includes('--no-checkout'))!
+        expect(cloned).toBeDefined()
+        const staged = cloned.args[2]!
+        expect(existsSync(join(staged, '.git'))).toBe(true)
+        expect(existsSync(join(staged, 'README.md'))).toBe(false)
+        expect(existsSync(join(leafOf(agent), 'workspace'))).toBe(false)
+        if (fail) return Promise.reject(new Error('checkout interrupted'))
+      }
+      return run.call(this, args)
+    })
+
+    await expect(workspaces.prepareSessionWorkspace(agent, confined())).rejects.toThrow('checkout interrupted')
+    expect(existsSync(leafOf(agent))).toBe(false)
+    fail = false
+    gitRuns.length = 0
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(resets).toBe(2)
+    expect(readFileSync(join(cwd, 'README.md'), 'utf8')).toBe('seed\n')
+    expect(git(cwd, ['status', '--porcelain'])).toBe('')
+    // No staging directory survives; the cwd record, naming the primary, is written once the clone is in place.
+    expect(readdirSync(leafOf(agent))).toEqual(['.session-cwd.json', 'workspace'])
+  })
+
+  it('resolves the console session root, and a repo-scoped one, to the clone', async () => {
+    const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+    serveAll(agent)
+    await workspaces.prepareSessionWorkspace(agent, confined())
+    const scope = createWorkspaceScope({
+      workspaces,
+      agentOf: () => agent,
+      sessionOf: async () => ({ key: KEY, workspaceIsolation: 'session' }),
+      runtimeRootOf: () => undefined
+    })
+
+    expect((await scope.location(agent.id, 'sid-1'))?.root).toBe(join(leafOf(agent), 'workspace'))
+    expect((await scope.location(agent.id, 'sid-1', 'acme/infra'))?.root).toBe(
+      join(leafOf(agent), 'repos', 'acme', 'infra')
+    )
+    expect((await scope.location(agent.id))?.root).toBe(agent.workspace.path)
+  })
+
+  it('gives a scratch session with every row on demand its own directory to clone into, and the prompt names it', async () => {
+    const onDemand = { repoFullName: 'example-co/library', repoId: '43', materialize: 'on-demand' as const }
+    const agent = agentFixture({ mode: 'from-scratch', additionalRepos: [onDemand] })
+    serveAll(agent)
+    const installSkills = vi.fn(async () => [] as string[])
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined(), { installSkills })
+
+    // Nothing was cloned, yet the session owns its directory, its cwd record and an empty `repos/`.
+    expect(cwd).toBe(agent.workspace.path)
+    expect(gitRuns.some((run) => run.args.some((arg) => arg.includes('example-co/library')))).toBe(false)
+    const repos = join(leafOf(agent), 'repos')
+    expect(readdirSync(repos)).toEqual([])
+    expect(JSON.parse(readFileSync(join(leafOf(agent), '.session-cwd.json'), 'utf8'))).toEqual({ subtreeName: null })
+    const scope = { sessionKey: KEY, isolation: 'session' as const }
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([realpathSync(repos)])
+    const block = buildWorkspaceRootsAppend(
+      await workspaces.sessionAdditionalRoots(agent, scope),
+      await workspaces.sessionOnDemandClones(agent, scope)
+    )
+    expect(block).toContain(`When you need one, clone it into ${realpathSync(repos)} as <owner>/<repo>`)
+    expect(block).toContain('Authorized but not checked out: example-co/library.')
+
+    // A scratch session with nothing on demand is left as it was: no directory of its own.
+    const plain = agentFixture({ mode: 'from-scratch' })
+    await workspaces.prepareSessionWorkspace(plain, confined(), { installSkills })
+    expect(existsSync(join(workspaces.agentRootFor(plain), 'sessions'))).toBe(false)
+  })
+
+  it('gives a confined session of a grant-only agent its own directory to clone into, and the prompt names the accounts', async () => {
+    const agent = agentFixture({
+      mode: 'from-scratch',
+      additionalInstallations: [
+        { accountLogin: 'example-co', materialize: 'on-demand' },
+        { accountLogin: 'acme', materialize: 'decision' }
+      ]
+    })
+    serveAll(agent)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const repos = join(leafOf(agent), 'repos')
+    expect(readdirSync(repos)).toEqual([])
+    const scope = { sessionKey: KEY, isolation: 'session' as const }
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([realpathSync(repos)])
+    const block = buildWorkspaceRootsAppend(
+      await workspaces.sessionAdditionalRoots(agent, scope),
+      await workspaces.sessionOnDemandClones(agent, scope)
+    )
+    expect(block).not.toContain('Authorized but not checked out')
+    expect(block).toContain('Any repository of these GitHub accounts is authorized: acme, example-co.')
+    expect(block).toContain(
+      `\`git clone https://github.com/acme/<repo> ${join(realpathSync(repos), 'acme', '<repo>')}\``
+    )
+  })
+
+  it('grants a confined session its own directory alone as a workspace write root', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const home = workspaces.agentRootFor(agent)
+    const unconfined = [join(home, 'worktrees'), join(home, 'repos'), join(home, 'clones')]
+    expect(workspaces.trustedWorkspaceWriteRoots(agent, KEY)).toEqual(unconfined)
+
+    await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(workspaces.trustedWorkspaceWriteRoots(agent, KEY)).toEqual([leafOf(agent)])
+    // The agent's shared host, and a session without a directory of its own, keep the worktree tier's parents.
+    expect(workspaces.trustedWorkspaceWriteRoots(agent)).toEqual(unconfined)
+    expect(workspaces.trustedWorkspaceWriteRoots(agent, 'slack:C1:other')).toEqual(unconfined)
+  })
+
+  it('clones only the `always` rows into a confined session, whose repos/ is where it clones the rest', async () => {
+    const agent = agentFixture({
+      additionalRepos: [
+        { repoFullName: 'acme/infra', repoId: '42' },
+        { repoFullName: 'example-co/library', repoId: '43', materialize: 'on-demand' }
+      ]
+    })
+    const served = serveAll(agent, { 'acme/infra': 'trunk' })
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    const repos = join(leafOf(agent), 'repos')
+    expect(readdirSync(repos)).toEqual(['acme'])
+    expect(gitRuns.some((run) => run.args.some((arg) => arg.includes('example-co/library')))).toBe(false)
+    const scope = { sessionKey: KEY, isolation: 'session' as const }
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([
+      realpathSync(join(repos, 'acme', 'infra')),
+      realpathSync(repos)
+    ])
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'clones'))).toBe(false)
+    // A clone the agent makes there is the session's, judged and removed with its directory like the daemon's own.
+    git(repos, ['clone', '-q', served['example-co/library']!.url, join('example-co', 'library')])
+    writeFileSync(join(repos, 'example-co', 'library', 'draft.md'), 'unsaved\n')
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'retained', reason: 'dirty' })
+    rmSync(join(repos, 'example-co', 'library', 'draft.md'))
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+    expect(existsSync(leafOf(agent))).toBe(false)
+  })
+
+  it('keeps the worktree tier for an unconfined request', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, { sessionKey: KEY, isolation: 'session' })
+
+    expect(cwd).toBe(realpathSync(join(workspaces.agentRootFor(agent), 'worktrees', idOf())))
+    expect(statSync(join(cwd, '.git')).isFile()).toBe(true)
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'sessions'))).toBe(false)
+  })
+})
+
+describe('retiring a confined session', () => {
+  it('checks Git safety before stopping a mounted session and removes its host source only after stop succeeds', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const sessionDir = leafOf(agent)
+    let stopFails = true
+    let stopAttempts = 0
+    let active = true
+    const guest = new LocalWorkspaceFs()
+    guest.rmTree = async () => {
+      throw new Error('EBUSY: cannot remove guest mountpoint')
+    }
+    const fs = new MicrosandboxWorkspaceFs(
+      () => (active ? guest : undefined),
+      async (path) => {
+        if (path !== sessionDir) return false
+        expect(gitRuns.some(({ args }) => args[0] === 'rev-list' && args.includes('--all'))).toBe(true)
+        stopAttempts++
+        if (stopFails) throw new Error('VM still has active executions')
+        expect(existsSync(sessionDir)).toBe(true)
+        active = false
+        return true
+      }
+    )
+    // The runner `serveAll` wired, now beside the VM-backed filesystem: one plane answers both.
+    wireTestPlane(workspaces, {
+      gitRunnerFor: (_agentId, path, abort) => new SeamRunner(path, abort),
+      workspaceFsFor: () => ({ fs })
+    })
+    gitRuns.length = 0
+    const dirty = join(cwd, 'wip.md')
+    writeFileSync(dirty, 'keep until safe')
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'retained', reason: 'dirty' })
+    expect(stopAttempts).toBe(0)
+    rmSync(dirty)
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({
+      outcome: 'failed',
+      error: 'VM still has active executions'
+    })
+    expect(existsSync(sessionDir)).toBe(true)
+    stopFails = false
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+    expect(stopAttempts).toBe(2)
+    expect(existsSync(sessionDir)).toBe(false)
+  })
+
+  it('removes the whole session directory, its HOME included, when every clone is clean and pushed', async () => {
+    const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+    serveAll(agent)
+    // The agent's own checkouts, which retiring the session must leave as they are.
+    await workspaces.prepareWorkspace(agent)
+    await workspaces.prepareSessionWorkspace(agent, confined())
+    expect(existsSync(leafOf(agent))).toBe(true)
+    // What a launch leaves beside the clones (§11): the session's private HOME with runtime state in it — never a clone, never a reason to retain.
+    const home = sessionHomeIn(leafOf(agent))
+    mkdirSync(join(home, '.codex', 'memories'), { recursive: true })
+    writeFileSync(join(home, '.codex', 'memories', 'memories.sqlite'), 'session-only\n')
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+
+    expect(existsSync(home)).toBe(false)
+    expect(existsSync(leafOf(agent))).toBe(false)
+    expect(workspaces.confinedSessionDir(agent, KEY)).toBeUndefined()
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'repos', 'acme', 'infra', 'checkout', '.git'))).toBe(true)
+  })
+
+  it('removes a session whose workspace holds only the empty mountpoints a sandbox left (#2246)', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    rmSync(cwd, { recursive: true, force: true })
+    for (const name of ['.git', '.agents', '.codex']) mkdirSync(join(cwd, name), { recursive: true })
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+    expect(existsSync(leafOf(agent))).toBe(false)
+  })
+
+  it('keeps a workspace with a file beside an unreadable `.git`, and says it could not judge it', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    rmSync(cwd, { recursive: true, force: true })
+    mkdirSync(join(cwd, '.git'), { recursive: true })
+    writeFileSync(join(cwd, 'notes.md'), 'work\n')
+
+    expect((await workspaces.removeSessionWorktree(agent, KEY)).outcome).toBe('failed')
+    expect(existsSync(join(cwd, 'notes.md'))).toBe(true)
+  })
+
+  it('retains a dirty clone', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    writeFileSync(join(cwd, 'wip.md'), 'unsaved\n')
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'retained', reason: 'dirty' })
+    expect(existsSync(join(cwd, 'wip.md'))).toBe(true)
+  })
+
+  it('retains a clone with commits no remote holds, on any of its branches', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    git(cwd, ['checkout', '-q', '-b', 'side'])
+    git(cwd, ['commit', '-q', '--allow-empty', '-m', 'only here'])
+    git(cwd, ['checkout', '-q', '-'])
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({
+      outcome: 'retained',
+      reason: 'unique-commits'
+    })
+    expect(existsSync(cwd)).toBe(true)
+  })
+
+  it('removes a dirty review snapshot — its refs mark it daemon-owned and reset on delivery', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const pr = publishPullRequest(primary!.seed, 'pr\n')
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({ review: { pullNumber: 7, baseSha: pr.base, headSha: pr.head } })
+    )
+    writeFileSync(join(cwd, 'wip.md'), 'disposable\n')
+    git(cwd, ['commit', '-q', '--allow-empty', '-m', 'disposable too'])
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+    expect(existsSync(leafOf(agent))).toBe(false)
+  })
+
+  it('sweeps a legacy worktree of the same session along with its directory', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const clone = await workspaces.prepareSessionWorkspace(agent, confined())
+    expect(clone).toBe(realpathSync(join(leafOf(agent), 'workspace')))
+    // A session cannot reach both tiers any more; this is what one migrated under the older rule left.
+    const root = workspaces.primaryRoot(agent)
+    const worktree = join(await workspaces.prepareSessionWorktreeRoot(agent), idOf())
+    await workspaces.addRootSessionWorktree(agent.id, root, worktree, `refs/remotes/origin/${root.branch}`)
+    expect(statSync(join(worktree, '.git')).isFile()).toBe(true)
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+
+    expect(existsSync(worktree)).toBe(false)
+    expect(existsSync(leafOf(agent))).toBe(false)
+    expect(git(agent.workspace.path, ['worktree', 'list']).split('\n')).toHaveLength(1)
+    expect(git(agent.workspace.path, ['branch', '--list', 'dev/*'])).toBe('')
+  })
+})
+
+/** A clean filter that leaves `marker` behind whenever Git runs it, bound to every path by `repo`'s own config and `info/attributes`, so nothing tracked changes. */
+function plantFilter(repo: string, marker: string): void {
+  git(repo, ['config', 'filter.probe.clean', `touch '${marker}' && cat`])
+  const attributes = resolve(repo, git(repo, ['rev-parse', '--git-path', 'info/attributes']))
+  mkdirSync(dirname(attributes), { recursive: true })
+  writeFileSync(attributes, '* filter=probe\n')
+}
+
+/** Prove the plant is live under the daemon's own local policy — `status` in `statusIn` rehashes `file` through it — then re-arm it for the call under test. */
+function expectFilterRuns(statusIn: string, file: string, marker: string): void {
+  const at = (year: number) => new Date(Date.UTC(year, 0, 1))
+  utimesSync(file, at(2001), at(2001))
+  git(statusIn, ['status', '--porcelain'])
+  expect(existsSync(marker)).toBe(true)
+  rmSync(marker)
+  utimesSync(file, at(2002), at(2002))
+}
+
+const markerIn = () => join(tempRoot('ac-session-clone-marker-'), 'ran')
+
+// Which root holds a confined session's cwd is the session's own fact: recorded in its directory, read there by every turn, and gone with it (k8s-daemon-pool.md §4).
+describe('a confined session records its cwd root in its own directory', () => {
+  const INFRA = { repoFullName: 'acme/infra', repoId: '42' }
+  const scope = { sessionKey: KEY, isolation: 'session' as const }
+  const recordOf = (agent: Agent) => join(leafOf(agent), '.session-cwd.json')
+  const legacyOf = (agent: Agent) =>
+    join(workspaces.agentRootFor(agent), 'repos', 'acme', 'infra', `.session-cwd-${idOf()}.json`)
+  const handedOut = async (agent: Agent) =>
+    (await workspaces.sessionAdditionalRoots(agent, scope)).map((root) => root.path)
+
+  it('keeps the record beside its clones, not beside the agent’s subtree, and drops it with the directory', async () => {
+    const agent = agentFixture({ additionalRepos: [INFRA] })
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ reviewRepoFullName: 'acme/infra' }))
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'repos', 'acme', 'infra')))
+    expect(JSON.parse(readFileSync(recordOf(agent), 'utf8'))).toEqual({ subtreeName: 'acme/infra' })
+    expect(existsSync(legacyOf(agent))).toBe(false)
+
+    // A later read that names no review resolves the same cwd from the record, with the primary alongside.
+    const primary = realpathSync(join(leafOf(agent), 'workspace'))
+    expect(await handedOut(agent)).toEqual([primary])
+    expect(await workspaces.additionalWorkspaceDirectories(agent, cwd, scope)).toEqual([primary])
+
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+    expect(existsSync(recordOf(agent))).toBe(false)
+  })
+
+  it('moves a record the agent’s subtree kept into the session directory, and drops both on revision-only', async () => {
+    const agent = agentFixture({ additionalRepos: [INFRA] })
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined({ reviewRepoFullName: 'acme/infra' }))
+    // What a session prepared before its directory kept the record has instead; a turn reads its directory alone until then.
+    rmSync(recordOf(agent))
+    mkdirSync(dirname(legacyOf(agent)), { recursive: true })
+    writeFileSync(legacyOf(agent), JSON.stringify({ repoFullName: 'acme/infra' }))
+    expect(await handedOut(agent)).toEqual([cwd])
+
+    // A resume converges the clone's origin, so the fixture stands at the authorized URL again.
+    git(cwd, ['remote', 'set-url', 'origin', workspaces.secondaryRoots(agent)[0]!.cloneUrl])
+    expect(await workspaces.prepareSessionWorkspace(agent, unconfined())).toBe(cwd)
+    expect(JSON.parse(readFileSync(recordOf(agent), 'utf8'))).toEqual({ subtreeName: 'acme/infra' })
+    expect(existsSync(legacyOf(agent))).toBe(false)
+    expect(await handedOut(agent)).toEqual([realpathSync(join(leafOf(agent), 'workspace'))])
+
+    // A review that degrades to revision-only drops the record wherever it is.
+    writeFileSync(legacyOf(agent), JSON.stringify({ repoFullName: 'acme/infra' }))
+    const revisionOnly = await workspaces.prepareSessionWorkspace(agent, confined({ githubReviewRevisionOnly: true }))
+    expect(revisionOnly).toBe(realpathSync(join(leafOf(agent), 'workspace')))
+    expect(existsSync(recordOf(agent))).toBe(false)
+    expect(existsSync(legacyOf(agent))).toBe(false)
+    await expect(workspaces.additionalWorkspaceDirectories(agent, revisionOnly, scope)).resolves.toEqual([cwd])
+  })
+
+  // A file symlink needs a privilege a Windows runner may not hold; the refusal itself is `lstat`, the same there.
+  it.skipIf(process.platform === 'win32')('refuses a record the runtime replaced with a link', async () => {
+    const agent = agentFixture({ additionalRepos: [INFRA] })
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const elsewhere = join(workspaces.agentRootFor(agent), 'elsewhere.json')
+    writeFileSync(elsewhere, JSON.stringify({ subtreeName: 'acme/infra' }))
+    // In place of the record preparation wrote, which names the primary.
+    rmSync(recordOf(agent))
+    symlinkSync(elsewhere, recordOf(agent))
+    const infra = realpathSync(join(leafOf(agent), 'repos', 'acme', 'infra'))
+    expect(await handedOut(agent)).toEqual([infra])
+
+    rmSync(recordOf(agent))
+    writeFileSync(recordOf(agent), JSON.stringify({ subtreeName: 'acme/infra' }))
+    expect(await handedOut(agent)).toEqual([cwd])
+  })
+})
+
+describe('a session directory no row names (#2283)', () => {
+  /** Run `work` with no Git on this host's PATH, so any Git it ran would fail it rather than decide its answer. */
+  const withoutHostGit = async <T>(work: () => Promise<T>): Promise<T> => {
+    vi.stubEnv('PATH', tempRoot('ac-session-clone-no-git-'))
+    try {
+      return await work()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  }
+
+  // A plane standing in for a VM that would have to boot: the orphan judgement must never ask it.
+  const refuseThePlane = () =>
+    wireTestPlane(workspaces, {
+      gitRunnerFor: () => {
+        throw new Error('the plane was asked for a runner')
+      },
+      workspaceFsFor: () => {
+        throw new Error('the plane was asked for a filesystem')
+      }
+    })
+
+  it('lists only session leaves, and removes a clean, pushed one judged on this host', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    await workspaces.prepareSessionWorkspace(agent, confined())
+    mkdirSync(join(workspaces.agentRootFor(agent), 'sessions', 'scratch'))
+    const leaf = basename(leafOf(agent))
+    expect(workspaces.sessionDirLeaves(agent)).toEqual([leaf])
+    refuseThePlane()
+
+    expect(await workspaces.removeOrphanSessionDir(agent, leaf)).toEqual({ outcome: 'removed' })
+    expect(existsSync(leafOf(agent))).toBe(false)
+    expect(workspaces.sessionDirLeaves(agent)).toEqual([])
+  })
+
+  it('keeps one with uncommitted work or a commit no remote has', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const leaf = basename(leafOf(agent))
+    refuseThePlane()
+    writeFileSync(join(cwd, 'wip.md'), 'unsaved\n')
+    expect(await workspaces.removeOrphanSessionDir(agent, leaf)).toEqual({ outcome: 'retained', reason: 'dirty' })
+    rmSync(join(cwd, 'wip.md'))
+    git(cwd, ['commit', '-q', '--allow-empty', '-m', 'only here'])
+    expect(await workspaces.removeOrphanSessionDir(agent, leaf)).toEqual({
+      outcome: 'retained',
+      reason: 'unique-commits'
+    })
+    expect(existsSync(cwd)).toBe(true)
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'keeps a clone a VM wrote without running this host’s Git in it',
+    async () => {
+      const agent = agentFixture()
+      serveAll(agent)
+      const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+      const leaf = basename(leafOf(agent))
+      const marker = markerIn()
+      plantFilter(cwd, marker)
+      expectFilterRuns(cwd, join(cwd, 'README.md'), marker)
+      refuseThePlane()
+
+      expect(await withoutHostGit(() => workspaces.removeOrphanSessionDir(agent, leaf, false))).toEqual({
+        outcome: 'retained',
+        reason: 'uninspected'
+      })
+      expect(existsSync(marker)).toBe(false)
+      expect(existsSync(cwd)).toBe(true)
+    }
+  )
+
+  it('still removes a VM’s directory whose clones hold no file', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const leaf = basename(leafOf(agent))
+    // What a sandbox leaves where it protected a clone that is not there: empty mountpoints only.
+    rmSync(cwd, { recursive: true })
+    mkdirSync(join(cwd, '.git'), { recursive: true })
+    refuseThePlane()
+
+    expect(await withoutHostGit(() => workspaces.removeOrphanSessionDir(agent, leaf, false))).toEqual({
+      outcome: 'removed'
+    })
+    expect(existsSync(leafOf(agent))).toBe(false)
+  })
+
+  it('refuses anything but a session leaf', async () => {
+    const agent = agentFixture()
+    expect((await workspaces.removeOrphanSessionDir(agent, '../workspace')).outcome).toBe('failed')
+  })
+})
+
+// git-workspace-model §11 "Changing the tier": the disk is the record, and every side reads it — so an
+// agent's `execution` or `workspaceIsolation` changing under a live session cannot leave preparation,
+// the launch and the reads serving three different directories.
+describe('changing the agent tier never strands a session', () => {
+  it('keeps a session in its clones once the agent stops being sandboxed, preparation and launch on one directory', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    writeFileSync(join(cwd, 'wip.md'), 'in progress\n')
+
+    // The next turn arrives with the boundary gone: nothing asks for confinement any more.
+    const open = { ...agent, execution: 'host', workspace: { ...agent.workspace, isolation: 'shared' } } as Agent
+    const again = await workspaces.prepareSessionWorkspace(open, unconfined())
+
+    expect(again).toBe(cwd)
+    expect(readFileSync(join(cwd, 'wip.md'), 'utf8')).toBe('in progress\n')
+    expect(workspaces.confinedSessionTier(open, KEY)).toBe(true)
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'worktrees'))).toBe(false)
+    // The launch derives the SAME directory from the same record — its HOME and its write root are the session's.
+    expect(launchHomeFor(open)).toBe(sessionHomeIn(realpathSync(leafOf(agent))))
+    expect(workspaces.trustedWorkspaceWriteRoots(open, KEY)).toEqual([leafOf(agent)])
+    // ...and the cwd containment check, which is what refused every turn on the live host, agrees with both.
+    await expect(workspaces.additionalWorkspaceDirectories(open, again, unconfined())).resolves.toEqual([])
+  })
+
+  // The transition that was failing in the field: a session born on the worktree tier whose agent
+  // later gained a boundary. It stays where it was born, so no half of the daemon moves without the
+  // others — the launch keeps the agent's HOME and the owner checkout's `.git`, as its cwd needs.
+  it('keeps a session born on the worktree tier there when the agent gains a boundary', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const worktree = await workspaces.prepareSessionWorkspace(agent, unconfined())
+    expect(statSync(join(worktree, '.git')).isFile()).toBe(true)
+    writeFileSync(join(worktree, 'earlier.md'), 'kept\n')
+
+    const again = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(again).toBe(worktree)
+    expect(readFileSync(join(worktree, 'earlier.md'), 'utf8')).toBe('kept\n')
+    expect(workspaces.sessionTierOnDisk(agent, KEY)).toBe('worktree')
+    expect(workspaces.confinedSessionTier(agent, KEY, true)).toBe(false)
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'sessions'))).toBe(false)
+    expect(launchHomeFor(agent)).toBe(join(workspaces.agentRootFor(agent), 'home'))
+    await expect(workspaces.additionalWorkspaceDirectories(agent, again, confined())).resolves.toEqual([])
+  })
+
+  // The same session with an EMPTY stub where its worktree should be: that is no record at all, so it
+  // takes the tier it would get now and can recover on its own instead of dying on every turn.
+  it('treats an empty stub as absent, so a session whose worktree is gone takes the tier it would get now', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    await workspaces.prepareWorkspace(agent)
+    const stub = join(workspaces.agentRootFor(agent), 'worktrees', idOf())
+    mkdirSync(stub, { recursive: true })
+    expect(workspaces.sessionTierOnDisk(agent, KEY)).toBeUndefined()
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'workspace')))
+    expect(existsSync(stub)).toBe(false)
+    expect(launchHomeFor(agent)).toBe(sessionHomeIn(realpathSync(leafOf(agent))))
+    await expect(workspaces.additionalWorkspaceDirectories(agent, cwd, confined())).resolves.toEqual([])
+  })
+
+  // The stub's own source: a review with no trusted checkout stages an empty stand-in, and it belongs on
+  // THIS session's tier — in the worktrees parent it was a cwd outside the checkout root every later turn.
+  it('stages a revision-only review inside the session directory, leaving no stub beside the primary', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    writeFileSync(join(cwd, 'stale.md'), 'from the previous turn\n')
+
+    const revisionOnly = await workspaces.prepareSessionWorkspace(agent, confined({ githubReviewRevisionOnly: true }))
+
+    expect(revisionOnly).toBe(cwd)
+    expect(readdirSync(revisionOnly)).toEqual([])
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'worktrees'))).toBe(false)
+    await expect(workspaces.additionalWorkspaceDirectories(agent, revisionOnly, confined())).resolves.toEqual([])
+  })
+
+  it('stages that same review beside the primary for a session with no directory of its own', async () => {
+    const agent = agentFixture()
+    serveAll(agent)
+    await workspaces.prepareWorkspace(agent)
+
+    const revisionOnly = await workspaces.prepareSessionWorkspace(agent, unconfined({ githubReviewRevisionOnly: true }))
+
+    expect(revisionOnly).toBe(realpathSync(join(workspaces.agentRootFor(agent), 'worktrees', idOf())))
+    expect(readdirSync(revisionOnly)).toEqual([])
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'sessions'))).toBe(false)
+    await expect(workspaces.additionalWorkspaceDirectories(agent, revisionOnly, unconfined())).resolves.toEqual([])
+  })
+})
+
+describe('a confined session across workspace changes', () => {
+  // A replaced workspace makes every session directory describe a repository the agent no longer has: they go with the worktrees, and the next turn re-clones from the new definition.
+  it('discards every session directory when the workspace is replaced, and re-clones on the next turn', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAll(agent)
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+    const oldTip = git(cwd, ['rev-parse', 'HEAD'])
+    git(primary!.seed, ['checkout', '-q', '-b', 'trunk'])
+    writeFileSync(join(primary!.seed, 'TRUNK.md'), 'trunk\n')
+    git(primary!.seed, ['add', '-A'])
+    git(primary!.seed, ['commit', '-q', '-m', 'trunk only'])
+    git(primary!.seed, ['push', '-q', 'origin', 'trunk'])
+    const trunkTip = git(primary!.seed, ['rev-parse', 'HEAD'])
+    const onTrunk = { ...agent, workspace: { ...agent.workspace, gitBranch: 'trunk' } } as Agent
+
+    const rollback = await workspaces.prepareWorkspaceForActivation(onTrunk, { reconcileMaterialization: true })
+
+    expect(existsSync(join(workspaces.agentRootFor(agent), 'sessions'))).toBe(false)
+    expect(workspaces.confinedSessionDir(onTrunk, KEY)).toBeUndefined()
+    expect(git(onTrunk.workspace.path, ['symbolic-ref', '--short', 'HEAD'])).toBe('trunk')
+    const again = await workspaces.prepareSessionWorkspace(onTrunk, confined())
+    expect(again).toBe(cwd)
+    expect(git(again, ['rev-parse', 'HEAD'])).toBe(trunkTip)
+    expect(git(again, ['rev-parse', 'HEAD'])).not.toBe(oldTip)
+    expect(existsSync(join(again, 'TRUNK.md'))).toBe(true)
+    expect(rollback).toBeTypeOf('function')
+  })
+
+  it('follows a canonical rename onto every session clone with the primary, reporting the ones that will not', async () => {
+    const agent = agentFixture({ githubApp: true })
+    serveAll(agent)
+    const other = 'slack:C1:1700000000.000200'
+    const first = await workspaces.prepareSessionWorkspace(agent, confined())
+    // The fixture's `file://` origin is what a real clone would have recorded as the authorized URL.
+    git(agent.workspace.path, ['remote', 'set-url', 'origin', PRIMARY_URL])
+    const second = await workspaces.prepareSessionWorkspace(agent, confined({ sessionKey: other }))
+    for (const checkout of [agent.workspace.path, first, second]) {
+      git(checkout, ['remote', 'set-url', 'origin', 'https://github.com/acme/old-name.git'])
+    }
+
+    expect(await workspaces.convergeGithubAppWorkspaceRename(agent)).toEqual({ unconvergedSessions: [] })
+
+    for (const checkout of [agent.workspace.path, first, second]) {
+      expect(git(checkout, ['remote', 'get-url', 'origin'])).toBe(PRIMARY_URL)
+    }
+    // A clone whose origin left the managed host is reported by its leaf and left alone; the rest still follow.
+    git(first, ['remote', 'set-url', 'origin', 'https://other-host.example/acme/elsewhere.git'])
+    git(second, ['remote', 'set-url', 'origin', 'https://github.com/acme/old-name.git'])
+    expect(await workspaces.convergeGithubAppWorkspaceRename(agent)).toEqual({
+      unconvergedSessions: [hostKeyDirName(sessionHostKey(agent.id, KEY))]
+    })
+    expect(git(first, ['remote', 'get-url', 'origin'])).toBe('https://other-host.example/acme/elsewhere.git')
+    expect(git(second, ['remote', 'get-url', 'origin'])).toBe(PRIMARY_URL)
+  })
+})
+
+// On a pool member every workspace Git call is routed through the shim into the session's pod, where a
+// closed inventory (shim/exec-handler.ts) decides what may run. Self-hosted runs git locally and never
+// meets it, so a subcommand the daemon issues and the sandbox refuses is a regression only the pool
+// sees — which is how `checkout -b` reached a live pool as "git checkout is not in the permitted
+// inventory" once this tier replaced the worktree one. These run the REAL handler, not a stand-in.
+describe('the confined tier issues only Git the sandbox admits (k8s-daemon-pool.md §4)', () => {
+  it('draws the session branch and materializes its tree across the exec channel', async () => {
+    const agent = agentFixture()
+    const { primary } = serveAllThroughShim(agent)
+
+    const cwd = await workspaces.prepareSessionWorkspace(agent, confined())
+
+    expect(cwd).toBe(realpathSync(join(leafOf(agent), 'workspace')))
+    expect(git(cwd, ['symbolic-ref', '--short', 'HEAD'])).toMatch(/^a10t\/ada-lovelace\/[a-z]+-[a-z]+$/)
+    expect(git(cwd, ['rev-parse', 'HEAD'])).toBe(git(primary!.seed, ['rev-parse', 'origin/main']))
+    // Materialized, not merely pointed at: the tree is the half `checkout` was doing.
+    expect(readFileSync(join(cwd, 'README.md'), 'utf8')).toBe('seed\n')
+    expect(git(cwd, ['status', '--porcelain'])).toBe('')
+    // `--no-track` survives the replacement, or the console's push button becomes a remote-branch creator.
+    expect(() => git(cwd, ['rev-parse', '--abbrev-ref', '@{upstream}'])).toThrow()
+    // So does the lazy fetch the materialization needs, which a blobless clone dies without.
+    const materialized = gitRuns.filter((run) => run.args[0] === 'reset' && run.args[1] === '--hard')
+    expect(materialized.length).toBeGreaterThan(0)
+    for (const run of materialized) expect(run.env.GIT_NO_LAZY_FETCH).toBe('0')
+  })
+
+  it('issues nothing outside the inventory across a whole confined life — prepare, review, retire', async () => {
+    const agent = agentFixture({ additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42' }] })
+    const { primary } = serveAllThroughShim(agent)
+    const pr = publishPullRequest(primary!.seed, 'pr\n')
+
+    await workspaces.prepareSessionWorkspace(agent, confined())
+    const cwd = await workspaces.prepareSessionWorkspace(
+      agent,
+      confined({ review: { pullNumber: 7, baseSha: pr.base, headSha: pr.head } })
+    )
+    writeFileSync(join(cwd, 'wip.md'), 'disposable\n')
+    // A dirty review snapshot, so retirement has to run the probe that used to ask `for-each-ref`.
+    expect(await workspaces.removeSessionWorktree(agent, KEY)).toEqual({ outcome: 'removed' })
+
+    const issued = [...new Set(gitRuns.map((run) => run.args[0]!))].sort()
+    // The assertion is only worth as much as the run behind it, so pin that the interesting ones ran.
+    expect(issued).toEqual(
+      expect.arrayContaining(['branch', 'clone', 'fetch', 'ls-remote', 'reset', 'show-ref', 'symbolic-ref'])
+    )
+    expect(issued.filter((subcommand) => !ALLOWED_GIT_SUBCOMMANDS.has(subcommand))).toEqual([])
+  })
+})

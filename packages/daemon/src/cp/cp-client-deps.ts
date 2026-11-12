@@ -1,0 +1,567 @@
+import type { DecisionEvaluationReader } from '../decisions/evaluations.js'
+import type { ComputerPool } from '../k8s/computer-pool.js'
+import type { DecisionModelEvaluationReader } from '../decisions/model-evaluations.js'
+import type { DecisionApiGateEvaluationReader } from '../decisions/api-gate-evaluations.js'
+import type { CoordinatorFilterEvaluationReader } from '../auto-session/coordinator-filter-evaluations.js'
+import type { DecisionEvaluator } from '../decisions/evaluator.js'
+import { createMemoryEntriesWriter, createMemoryEntriesReader } from './memory-entries.js'
+import type { MemoryProvider } from '../memory/provider.js'
+// The `CpClientDeps` literal the daemon hands `CpClient`, hoisted out of `Daemon.startCpClient`.
+// Construction order is load-bearing (the workspace resolvers feed the file, git and skills seams),
+// so `buildCpClientDeps` is the single wiring site and keeps it verbatim.
+import { randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
+import { join } from 'node:path'
+import type {
+  AssistantActivityPermission,
+  FactsMcpServer,
+  BootstrapLifecycle,
+  FactsRuntimeProfile,
+  GitCommitIdentity,
+  Heartbeat,
+  RegisterReq,
+  ChildSessionStatus,
+  ChildSessionStatusProbe,
+  SessionPullRequestFeedback,
+  SessionPullRequestFeedbackResult,
+  SharedImageResolveOk,
+  SharedImageResolveReq,
+  TaskList,
+  TaskListReq,
+  ExecutorStrategyTable,
+  TransferNetwork
+} from '@agentconnect.md/protocol'
+import { POD_TEMPLATE_HASH_ENV } from '@agentconnect.md/protocol'
+import { ClientTransport, systemClock } from '@agentconnect.md/connection'
+import { CP_SUBPROTOCOL, CP_WS_PATH, type BootstrapUpgradeOutcome, type CpClient, type CpClientDeps } from './client.js'
+import type { ConfigApply } from './config-apply.js'
+import type { AutoUpgradeCpHooks } from '../lifecycle/auto-upgrader.js'
+import { createSessionReader } from './session-reader.js'
+import { createWorkspaceReader, type WorkspaceFilesResolver } from './workspace-reader.js'
+import { createWorkspaceScope } from './workspace-scope.js'
+import { createWorkspaceGit, type CommitMessagePass } from './workspace-git.js'
+import { createAgentWaker, sessionPodOf } from './agent-wake.js'
+import { createMemoryReader, type AgentMemoryAdminResolver } from './memory-reader.js'
+import { createDreamReader } from './dream-reader.js'
+import { createLocalSkillsReader } from './local-skills-reader.js'
+import { createRuntimeCommandsReader } from './runtime-commands-reader.js'
+import { createAssistantActivity, type AssistantActivityDeps } from './assistant-activity.js'
+import type { AssistantControlDeps } from './control/assistant.js'
+import type { CapabilityControlDeps } from './control/capability.js'
+import type { RuntimeCommandsCache } from '../runtimes/runtime-commands.js'
+import type { CpAgentRegistry } from './cp-agent-registry.js'
+import type { CpIntegrationRegistry } from './cp-integration-registry.js'
+import type { CpCronRegistry } from './cp-cron.js'
+import type { CpCollabRoutes } from './cp-collab-routes.js'
+import type { CpMemoryConnectionRegistry } from './memory-connection-registry.js'
+import type { DutyCoordinator } from './duty-coordinator.js'
+import type { DutyRegistry } from './duty-registry.js'
+import { persistDaemonId } from '../config/load-config.js'
+import { DAEMON_VERSION } from '../version.js'
+import type { Logger } from '../log.js'
+import type { LoadedAgent } from '../agents/load-agents.js'
+import type { LocalStore, SessionRecord } from '../store/local-store.js'
+import type { InteractionActor } from '../platforms/contract.js'
+import type { ClusterSkillLedger } from '../store/cluster-skill-ledger.js'
+import type { SessionMetadataOutbox } from '../store/session-metadata-outbox.js'
+import type { CronReportOutbox } from '../store/cron-report-outbox.js'
+import type { WebchatMcpRevocations } from '../webchat/mcp-revocations.js'
+import type { WorkspaceManager } from '../workspace/workspace-manager.js'
+import type { K8sRuntimePlane } from '../k8s/runtime-plane.js'
+import type { AutoMergeWatcher } from '../github/auto-merge/watcher.js'
+import type { SandboxHolds } from '../k8s/sandbox-hold.js'
+import { agentSandboxSubject } from '../k8s/sandbox-identity.js'
+import { createSandboxKeepAlive } from './sandbox-keepalive.js'
+import type { SystemMetrics } from '../metrics/system-metrics.js'
+import type { ReadinessGate } from '../readiness.js'
+import type { MemoryHomePorts } from '../memory/home.js'
+import type { DreamRunner } from '../dream/runner.js'
+import type { ExecutorFacet } from '../execution/executor-facet.js'
+import type { CodeHostNoteProjector } from '../gitlab/note-projection.js'
+
+/** One per daemon process, so the CP can tell a restarted daemon from the same process reconnecting. */
+const PROCESS_BOOT_ID = randomUUID()
+
+/** The credentials, identity and logging this connection is built from, plus its single-point writes. */
+export interface CpClientConnectionHost {
+  /** The control-plane address, already checked by the caller's `configuredControlPlane` guard. */
+  cpUrl(): string
+  cpApiKey(): string | undefined
+  /** False ⇒ this daemon never emits `usage/report`; a deployment that meters upstream is the single writer. */
+  usageReporting(): boolean
+  clusterIdentityToken(): (() => string | undefined) | undefined
+  /** Echoed in the auth frame ONLY when the operator pinned one via `--daemon-id` — the token's `sub` is
+   *  otherwise authoritative, and a config-persisted id would either be rejected (4401) or be redundant. */
+  echoDaemonId(): string | undefined
+  heartbeatDefaultMs(): number
+  maxAgents(): number
+  /** The config root `startCpClient` was called with, and the explicit config path if any. */
+  configRoot(): string
+  configPath(): string | undefined
+  /** The daemon's own root dir (state that is not an agent's), e.g. `skill-installs/`. */
+  daemonRoot(): string
+  log(): Logger
+  /** Read lazily — the client is assigned only after these deps are built. */
+  cpClient(): CpClient | undefined
+  /** Stop serving and end the process with this exit code — the daemon's fatal-exit seam. */
+  exitFatal(code: number): void
+  setDaemonId(daemonId: string): void
+  setWebAppUrl(webAppUrl: string | undefined): void
+  setOrgSlug(orgSlug: string | undefined): void
+  /** Settles the promise `startCpClient` returns, on the first register/ok. */
+  resolveInitialRegistry(): void
+}
+
+/** What the register frame, the runtime/MCP facts and the heartbeat report about this daemon. */
+export interface CpClientRegistrationHost {
+  registrationPlatforms(): string[]
+  registrationFeatures(): string[]
+  /** The machine's effective strategy table (session-executors.md §5): each unavailable entry carries its probe's reason. */
+  ownStrategies(): ExecutorStrategyTable
+  /** The id of the shared PostgreSQL store this daemon writes to; unset on a private local store. */
+  contentStore(): string | undefined
+  /** The executor facet (session-executors.md §6); while it is dark it reports nothing, and then nothing new is sent. */
+  executorFacet(): ExecutorFacet | undefined
+  admittedRuntimeIds(): string[]
+  reportedRuntimeIds(): string[]
+  /** Registry id -> human-facing runtime name. */
+  runtimeNames(): Record<string, string>
+  runtimeProfileFor(id: string): FactsRuntimeProfile
+  mcpServerFactsFromDefs(): FactsMcpServer[]
+  cpLocalState(): RegisterReq['localState']
+  metrics(): SystemMetrics | undefined
+  hostCount(): number
+  activeSessions(): number
+  bootstrapUpgradeCapable(): boolean
+  runBootstrapFleetUpgrade(targetVersion: string, operationId?: string): Promise<BootstrapUpgradeOutcome>
+}
+
+/** The replay batch that runs once this daemon reaches READY on each (re)connect. */
+export interface CpClientReadyHost {
+  readiness(): ReadinessGate | undefined
+  probeRuntimesAndEmit(): Promise<void>
+  syncOrganizationSuggestions(): Promise<void>
+  memoryConnections(): CpMemoryConnectionRegistry | undefined
+  replayHookTerminalReports(): Promise<void>
+  replayChannelSnapshots(): Promise<void>
+  /** Re-send platform credential revocations the CP has not acknowledged yet. */
+  replayCredentialRevocations(): Promise<void>
+  /** Re-assert every live approval wait: the CP cleared them when this daemon dropped (slack-approval-dm.md §7). */
+  replayApprovalActivity(): void
+  sessionMetadataOutbox(): SessionMetadataOutbox
+  cronReportOutbox(): CronReportOutbox
+  webchatMcpRevocations(): WebchatMcpRevocations
+  drainSessionPurges(): Promise<void>
+  effectiveAgents(): LoadedAgent[]
+  /** The §16 run-projection writer: the CP dispatch target and the interrupted-write reconciler. */
+  noteProjector(): CodeHostNoteProjector
+  /** The §15 review outbox, for the control-plane frames a finished attempt still owes. */
+  codeHostReviews(): { reconcilePending(): Promise<void> }
+  /** Auto-upgrade trial settlement on READY and its register-rejection rollback. */
+  autoUpgrade(): AutoUpgradeCpHooks | undefined
+}
+
+/** Tenant lookups for agent-scoped frames, plus the duty seam the heartbeat carries. */
+export interface CpClientOrgHost {
+  cpAgents(): CpAgentRegistry | undefined
+  cpIntegrations(): CpIntegrationRegistry | undefined
+  cpCrons(): CpCronRegistry | undefined
+  cpCollab(): CpCollabRoutes
+  cpDegradedScopes(): string[]
+  dutyCoordinator(): DutyCoordinator
+  duties(): DutyRegistry
+}
+
+/** The read/write seams the CP serves the console from — sessions, workspaces, memory, tasks. */
+export interface CpClientSeamHost {
+  decisionEvaluator(): DecisionEvaluator
+  decisionEvaluations(): DecisionEvaluationReader
+  decisionModelEvaluations(): DecisionModelEvaluationReader
+  decisionApiGateEvaluations(): DecisionApiGateEvaluationReader
+  coordinatorFilterEvaluations(): CoordinatorFilterEvaluationReader
+  configApply(): ConfigApply
+  store(): LocalStore
+  agents(): ReadonlyMap<string, LoadedAgent>
+  workspaces(): WorkspaceManager
+  k8sPlane(): K8sRuntimePlane | undefined
+  /** A cluster member's requested re-probe, or undefined where the deployment takes no requests. */
+  runtimeProbeRequest(): (() => void) | undefined
+  /** This member's desktop claims for managed computers, or undefined where it serves none (computer-use.md §15.1). */
+  computerPool(): ComputerPool | undefined
+  workspaceFilesFor: WorkspaceFilesResolver
+  /** Pool members and their sandbox pods reach the transfer bucket in-cluster; everything else over its public origin. */
+  transferNetwork(): TransferNetwork
+  workspaceSkillLedger: NonNullable<Parameters<typeof createLocalSkillsReader>[4]>
+  verifyWorkspaceSkills: (id: string, roots: ClusterSkillLedger['roots'], cwd: string) => Promise<boolean[] | undefined>
+  memory(): AgentMemoryAdminResolver & MemoryProvider
+  dreamRunner(): DreamRunner
+  runtimeCommands(): RuntimeCommandsCache
+  memoryHomePortsFor(agentId: string): MemoryHomePorts | undefined
+  /** Drain the managed captures deferred while a memory home was out of reach — a READY connection is a reachable `control-plane` home. */
+  wakeMemoryOutbox(): void
+  /** Re-run every pending memory home migration from the start — its copy and completion report ride this connection. */
+  wakeMemoryHomeMigrations(): void
+  gitCommitIdentity(agentId: string): GitCommitIdentity | undefined
+  sessionThreadUrl(session: SessionRecord): string | undefined
+  childSessionStatusProbe(probe: ChildSessionStatusProbe): Promise<ChildSessionStatus>
+  dispatchPullRequestFeedback(req: SessionPullRequestFeedback): Promise<SessionPullRequestFeedbackResult>
+  resolveSharedImage(req: SharedImageResolveReq, orgId?: string): Promise<SharedImageResolveOk>
+  listBackgroundTasks(req: TaskListReq): Promise<TaskList>
+  /** An editor's approve or discard of an assistant-mode draft, run exactly as its card click would. */
+  decideAssistantDraft: AssistantActivityDeps['decideDraft']
+  /** The `!cancel` core shared by every stop surface: interrupt a session's turn, no mute; true when one was interrupted. */
+  cancelSessionByKey(key: string, actor?: InteractionActor): Promise<boolean>
+  /** Background sub-sessions' permission requests still waiting on a human (assistant-mode.md §5.6). */
+  pendingSubsessionApprovals(agentId: string): AssistantActivityPermission[]
+  /** End a follow-up from the console (assistant-mode.md §5.12). */
+  stopAssistantFollowUp: NonNullable<AssistantActivityDeps['stopFollowUp']>
+  /** Record a follow-up's event wake (assistant-mode.md §5.14). */
+  assistantFollowUpWake: NonNullable<AssistantControlDeps['followUpWake']>
+  /** A settled capability request's wake, a reopen's card rewrite, and a forward (capability-requests.md §4.5, §4.7). */
+  capabilitySettled: NonNullable<CapabilityControlDeps['capabilitySettled']>
+  capabilityReopened: NonNullable<CapabilityControlDeps['capabilityReopened']>
+  capabilityForward: NonNullable<CapabilityControlDeps['capabilityForward']>
+  capabilityMcpRebound: NonNullable<CapabilityControlDeps['mcpRebound']>
+  /** The edge's in-memory merge-when-ready registry, or undefined before agents are loaded. */
+  autoMerge(): AutoMergeWatcher | undefined
+  /** The console keep-alive leases over this daemon's sandboxes (`k8s/sandbox-hold.ts`). */
+  sandboxHolds(): SandboxHolds
+  withWorkspaceFileWrite<T>(agentId: string, write: () => Promise<T>): Promise<T>
+  /** The file-write coordination for a pull of the agent's own checkout, which stops only the hosts that can read it. */
+  withWorkspacePull<T>(agentId: string, pull: () => Promise<T>): Promise<T>
+  withWorkspaceIndexWrite<T>(agentId: string, write: () => Promise<T>): Promise<T>
+  runCommitMessagePass: CommitMessagePass
+}
+
+/** Everything the CP client's dependency literal touches on the `Daemon`. */
+export interface CpClientDepsHost
+  extends CpClientConnectionHost, CpClientRegistrationHost, CpClientReadyHost, CpClientOrgHost, CpClientSeamHost {}
+
+export function buildCpClientDeps(host: CpClientDepsHost): CpClientDeps {
+  const url = host.cpUrl()
+  const apiKey = host.cpApiKey()
+  const clusterIdentityToken = host.clusterIdentityToken()
+  const echoDaemonId = host.echoDaemonId()
+
+  // Which root a console request addresses and where it IS — the sandbox pod's volume under --k8s.
+  // ONE resolver for the file reader and the git seam: the directory the console browses and the one
+  // it commits are the same directory, and describing them two different ways broke both panels.
+  const workspaceScope = createWorkspaceScope({
+    workspaces: host.workspaces(),
+    agentOf: (id) => host.agents().get(id),
+    sessionOf: (id, sessionId) => host.store().getSessionByOutwardId(sessionId, id),
+    runtimeRootOf: (id) => host.k8sPlane()?.workspaceRootFor(id)
+  })
+
+  const workspaceGit = createWorkspaceGit(
+    host.workspaces(),
+    workspaceScope.location,
+    // Derived from the SCOPE's own target, not the primary workspace's credential mode: a manual
+    // GitHub workspace may authorize an App-covered repository, whose secondary root then needs the
+    // helper the primary does not. The helper itself is URL-routed, so it only answers for that root.
+    (id, repo) => (workspaceScope.usesGithubApp(id, repo) ? id : undefined),
+    workspaceScope.target,
+    // The agent's own App bot, else the one registered on `register/ok`; absent ⇒ refused as data (workspace-git.ts).
+    (id) => host.gitCommitIdentity(id),
+    // The model pass runs HERE, on the agent's own runtime: the CP is never on the inference path.
+    (id, systemPrompt, prompt, signal) => host.runCommitMessagePass(id, systemPrompt, prompt, signal)
+  )
+
+  // The last argument is what makes a sandboxed root reachable at all: the operations run where the root's agent or session runs.
+  const workspaceRead = createWorkspaceReader(
+    host.workspaces(),
+    workspaceScope.location,
+    (id, write) => host.withWorkspaceFileWrite(id, write),
+    (id, scope) => host.workspaceFilesFor(id, scope)
+  )
+
+  return {
+    url,
+    usageReporting: host.usageReporting(),
+    ...(apiKey ? { token: apiKey } : {}),
+    ...(clusterIdentityToken ? { clusterIdentityToken } : {}),
+    ...(echoDaemonId ? { daemonId: echoDaemonId } : {}),
+    onDaemonId: (id) => {
+      host.setDaemonId(id)
+      // An in-cluster daemon persists nothing: its identity is re-derived from the
+      // projected token on every connect, so a stored id could only go stale.
+      if (!clusterIdentityToken) persistDaemonId(host.configRoot(), id, host.configPath())
+      host.log().info(`cp: adopted daemonId ${id} from auth/ok`)
+    },
+    onWebAppUrl: (webAppUrl) => {
+      host.setWebAppUrl(webAppUrl)
+      if (webAppUrl) host.log().debug(`cp: web app url ${webAppUrl} (session deep links)`)
+    },
+    onOrgSlug: (slug) => {
+      host.setOrgSlug(slug)
+      if (slug) host.log().debug(`cp: org slug "${slug}" (session deep links)`)
+    },
+    // Only ever called on the identity path (client.ts states why); the diagnosis is logged there.
+    // Non-zero: a failure, not a planned lifecycle exit, so no supervisor treats it as a clean stop.
+    onAuthFatal: () => host.exitFatal(1),
+    onRegisterRejected: (err) => host.autoUpgrade()?.onRegisterRejected(err),
+    ...(host.bootstrapUpgradeCapable()
+      ? {
+          onBootstrapUpgrade: (lifecycle: BootstrapLifecycle) =>
+            host.runBootstrapFleetUpgrade(
+              lifecycle.targetVersion,
+              lifecycle.reportProgress ? lifecycle.operationId : undefined
+            )
+        }
+      : {}),
+    agentVersion: DAEMON_VERSION,
+    host: hostname(),
+    // The deployment side sets this from the pod-template-hash label; the ledger's rollout barrier
+    // lets only the newest live generation of the set claim vacated groups. Unset locally.
+    generation: process.env[POD_TEMPLATE_HASH_ENV]?.trim() || undefined,
+    bootId: PROCESS_BOOT_ID,
+    heartbeatDefaultMs: host.heartbeatDefaultMs(),
+    maxAgents: host.maxAgents(),
+    capabilities: () => {
+      const executor = host.executorFacet()?.facts()
+      const contentStore = host.contentStore()
+      return {
+        platforms: host.registrationPlatforms(),
+        // Report the human-facing tool name (e.g. "Claude Agent"), not the
+        // registry id ("claude-acp"); fall back to the id for user-defined or
+        // unnamed runtimes.
+        runtimes: host.admittedRuntimeIds().map((id) => host.runtimeNames()[id] ?? id),
+        acp: true,
+        features: host.registrationFeatures(),
+        ...(executor ? { executor } : {}),
+        strategies: host.ownStrategies(),
+        ...(contentStore ? { contentStore } : {})
+      }
+    },
+    // Observed runtime profiles, sent as one `facts/daemon-runtimes` snapshot on
+    // each register. Keyed by the registry id (the launch key), so the console can
+    // offer a runtime whose value round-trips back to `this.runtimes[agent.runtime]`
+    // at launch. `models` comes from the background probe sweep (empty until it
+    // completes on first connect); the picker falls back to "Runtime default" while
+    // empty. Includes auth-required curated candidates (reported, not admitted).
+    runtimeProfiles: (): FactsRuntimeProfile[] => host.reportedRuntimeIds().map((id) => host.runtimeProfileFor(id)),
+    // Daemon-configured MCP servers, derived from the effective def set (no
+    // probing), riding the same facts frame with replace-on-register semantics.
+    mcpServerFacts: (): FactsMcpServer[] => host.mcpServerFactsFromDefs(),
+    // On (re)connect, probe runtimes in the background and push refreshed profiles,
+    // and re-assert each integration's cached channel-membership snapshot (the CP
+    // may have missed emits while we were disconnected; latest-wins upsert).
+    onReady: async () => {
+      host.resolveInitialRegistry()
+      host.readiness()?.refresh()
+      void host.probeRuntimesAndEmit()
+      void host
+        .syncOrganizationSuggestions()
+        .catch((err) =>
+          host.log().warn(`cp: organization suggestion replay failed (${err instanceof Error ? err.name : 'unknown'})`)
+        )
+      host.cpClient()?.emitMemoryConnectionFacts(host.memoryConnections()?.facts() ?? [])
+      // A READY connection is a reachable `control-plane` memory home: distill the turns that waited for it.
+      host.wakeMemoryOutbox()
+      host.wakeMemoryHomeMigrations()
+      // Each replay fails on its own: one that throws must not skip the drains after it.
+      await host
+        .replayHookTerminalReports()
+        .catch((err) => host.log().warn(`cp: hook report replay failed (${(err as Error).message})`))
+      await host
+        .replayChannelSnapshots()
+        .catch((err) => host.log().warn(`cp: channel snapshot replay failed (${(err as Error).message})`))
+      // ...and every explicit credential revocation still unacknowledged: the platform never redelivers one.
+      void host.replayCredentialRevocations()
+      // Only snapshots written to the durable outbox by this build are
+      // replayed. Historical session rows are never scanned or backfilled.
+      // The approval replay follows the drain: a wait for a session whose `start` snapshot is still in
+      // the outbox would be dropped by the CP (no row to flag) and never re-asserted (§7).
+      const replayApprovals = () => host.replayApprovalActivity()
+      void host.sessionMetadataOutbox().drainSessionMetadataSnapshots().then(replayApprovals, replayApprovals)
+      // Replay remote MCP revocations that could not reach the CP (revokes
+      // queued while disconnected or left over from a previous process).
+      void host.webchatMcpRevocations().drainWebchatMcpRevocations()
+      // ...and every §16 projection write this daemon started but never settled. Each is reconciled
+      // by the hidden marker before the merge request is touched again, never by replaying the write.
+      void host.noteProjector().reconcilePending()
+      // ...and every §15 settle/result frame a review attempt still owes. Both are idempotent
+      // REQs, so replaying one the CP already took is a no-op; not replaying wedges its ledger.
+      void host.codeHostReviews().reconcilePending()
+      // ...and the retention-GC receipts (#485). A sweep that ran while the CP
+      // was unreachable (or before it advertised the feature) left the deleted
+      // sessions' metadata rows unmarked; this is the only side that still knows.
+      void host.drainSessionPurges()
+      // ...and every terminal cron outcome the CP has not ACKed, such as a completion that raced the drop.
+      void host.cronReportOutbox().drainReports()
+      // READY is an auto-upgrade trial's success signal, and where a rollback is reported.
+      void host
+        .autoUpgrade()
+        ?.onCpReady()
+        .catch((err) => host.log().warn(`cp: auto-upgrade ready hook failed (${(err as Error).message})`))
+      // ...and each CP cron's stored last-run stamp — fires while the CP was
+      // unreachable would otherwise never land (latest-wins upsert, so
+      // re-asserting an already-known stamp is a no-op).
+      for (const a of host.effectiveAgents())
+        for (const c of a.crons) {
+          if (c.origin !== 'cp') continue
+          const at = (await host.store().cronRun(`${a.id}:${c.id}`))?.lastRunAt
+          if (at !== undefined)
+            host.cpClient()?.emitCronReport({ cronId: c.id, agentId: a.id, firedAt: new Date(at).toISOString() })
+        }
+    },
+    localState: () => host.cpLocalState(),
+    loadSnapshot: (): Heartbeat['load'] => ({
+      // 0..1 utilization fractions sampled in the background by SystemMetrics
+      // (systeminformation): real busy-time CPU across cores + active memory,
+      // read synchronously here so the heartbeat send never blocks on a probe.
+      ...(host.metrics()?.snapshot() ?? { cpu: 0, mem: 0 }),
+      agents: host.hostCount()
+    }),
+    activeSessions: () => host.activeSessions(),
+    hostedSessions: () => host.executorFacet()?.hostedSessions(),
+    // The facet's only way in: its listener parses nothing, so a `prepare` reaches it over this connection or not at all.
+    executorPrepare: (req) =>
+      host.executorFacet()?.prepare(req) ?? Promise.resolve({ status: 'refused', reason: 'facet_off' }),
+    executorRelease: (req) => host.executorFacet()?.release(req) ?? Promise.resolve({ status: 'unknown' }),
+    orgForAgent: (agentId) => host.cpAgents()?.orgForAgent(agentId) ?? host.cpCollab().orgForAgent(agentId),
+    orgForIntegration: (integrationId) => {
+      const agentId = host.cpIntegrations()?.agentForIntegration(integrationId)
+      return agentId ? (host.cpAgents()?.orgForAgent(agentId) ?? host.cpCollab().orgForAgent(agentId)) : undefined
+    },
+    orgForCron: (cronId) => {
+      const agentId = host.cpCrons()?.agentForCron(cronId)
+      return agentId ? (host.cpAgents()?.orgForAgent(agentId) ?? host.cpCollab().orgForAgent(agentId)) : undefined
+    },
+    degradedScopes: () => host.cpDegradedScopes(),
+    duties: () => host.dutyCoordinator().dutyDigest(),
+    dutyPending: () => host.dutyCoordinator().pendingDutyAdmissions(),
+    onDutyFence: (groupIds) => host.dutyCoordinator().fenceDuties(groupIds),
+    configApply: host.configApply(),
+    sessionRead: createSessionReader(host.store(), (session) => host.sessionThreadUrl(session)),
+    // §5.4: serve a CP-forwarded status probe for a child session we own. Authorization is
+    // re-done here (the lineage rule lives where the session lives), not trusted from the CP.
+    childSessionStatusProbe: (probe) => host.childSessionStatusProbe(probe),
+    sharedImageResolve: (req, orgId) => host.resolveSharedImage(req, orgId),
+    pullRequestFeedback: async (req) => {
+      if (host.dutyCoordinator().dutyEnforced() && !host.duties().holdsAgent(req.agentId)) {
+        const claimed = await host.dutyCoordinator().claimDutyForTrigger(req.agentId)
+        if (!claimed.granted) return { deliveryKey: req.deliveryKey, accepted: false, reason: 'not_ready' }
+      }
+      return host.dispatchPullRequestFeedback(req)
+    },
+    workspaceRead,
+    transferNetwork: host.transferNetwork(),
+    workspaceGit: {
+      status: (id, sessionId, repo) => workspaceGit.status(id, sessionId, repo),
+      // diff/log are read-only, so they skip the runtime-quiescence coordinator the pull needs.
+      diff: (req) => workspaceGit.diff(req),
+      log: (req) => workspaceGit.log(req),
+      pull: (id, repo) => host.withWorkspacePull(id, () => workspaceGit.pull(id, repo)),
+      // The four console git writes serialize against agent turns without evicting the warm host
+      // — they touch `.git`, never the working tree (see withWorkspaceIndexWrite).
+      stage: (req) => host.withWorkspaceIndexWrite(req.agentId, () => workspaceGit.stage(req)),
+      unstage: (req) => host.withWorkspaceIndexWrite(req.agentId, () => workspaceGit.unstage(req)),
+      commit: (req) => host.withWorkspaceIndexWrite(req.agentId, () => workspaceGit.commit(req)),
+      push: (req) => host.withWorkspaceIndexWrite(req.agentId, () => workspaceGit.push(req)),
+      // The wand writes nothing, so it skips both coordinators like the other reads. It does start
+      // the agent's host, which the admission fence blocks while a mutation holds it — reported as
+      // data, not an error, because a workspace write is exactly when the answer would be stale.
+      message: (req) => workspaceGit.message(req)
+    },
+    ...(host.runtimeProbeRequest() ? { runtimeProbe: host.runtimeProbeRequest()! } : {}),
+    ...(host.computerPool() ? { computerPoolOp: (op) => host.computerPool()!.handle(op) } : {}),
+    // A pure projection of the in-memory lease — no I/O, no runtime, and nothing it can do to a
+    // reclaim decision, so it needs neither of the workspace coordinators.
+    taskReader: { list: async (req) => host.listBackgroundTasks(req) },
+    // The Activity view reads and edits this daemon's own ledger rows; the CP has already checked the caller.
+    assistantActivity: createAssistantActivity({
+      store: () => host.store(),
+      agent: (agentId) => host.agents().get(agentId),
+      now: () => systemClock.now(),
+      decideDraft: (input) => host.decideAssistantDraft(input),
+      stopSession: (key, actor) => host.cancelSessionByKey(key, actor),
+      pendingPermissions: (agentId) => host.pendingSubsessionApprovals(agentId),
+      stopFollowUp: (agentId, item, actor) => host.stopAssistantFollowUp(agentId, item, actor)
+    }),
+    followUpWake: (req) => host.assistantFollowUpWake(req),
+    capabilitySettled: (req) => host.capabilitySettled(req),
+    capabilityReopened: (req) => host.capabilityReopened(req),
+    capabilityForward: (req) => host.capabilityForward(req),
+    mcpRebound: (req) => host.capabilityMcpRebound(req),
+    // Merge-when-ready lives at the EDGE and nowhere else — the CP relays these two frames and
+    // stores nothing, so an unarmed answer is the truth about this process, not a lost row.
+    ...(host.autoMerge() ? { autoMerge: host.autoMerge()! } : {}),
+    // The keep-alive lease is the daemon's own decision, from facts the console cannot assert. Only
+    // a cluster daemon has a pod to hold; elsewhere the handler answers `placement:'daemon'` unasked.
+    ...(host.k8sPlane()
+      ? {
+          sandboxKeepAlive: createSandboxKeepAlive({
+            // A session's page holds the pod its own directory is on, as its wake resolves it, which its tree's status read routes to as well (§11).
+            podFor: async (id, sessionId) =>
+              (sessionId === undefined
+                ? undefined
+                : await sessionPodOf(workspaceScope, host.k8sPlane()!, id, sessionId)) ?? agentSandboxSubject(id),
+            agentPod: (id) => agentSandboxSubject(id),
+            holdIfBound: (subject) => host.k8sPlane()!.holdIfBound(subject),
+            knownAgent: (id) => host.agents().has(id),
+            boundPods: (id) => host.k8sPlane()!.boundSubjects(id),
+            armedIn: (subject) => host.k8sPlane()!.armedIn(subject),
+            gitStatus: (id, sessionId) => workspaceGit.status(id, sessionId),
+            holds: host.sandboxHolds(),
+            log: { debug: (m) => host.log().debug?.(m) }
+          })
+        }
+      : {}),
+    // §16 desired projection generations, converged by the only GitLab Notes writer for this surface.
+    codeHostNoteProjection: (desired, orgId) => host.noteProjector().apply(desired, orgId),
+    // The console's "start this sandbox": duty claim + channel bind, no host, reached without a turn; local daemons have no plane.
+    agentWake: createAgentWaker({
+      ...(host.k8sPlane()
+        ? {
+            sandbox: {
+              isRunning: (subject) => host.k8sPlane()!.sandboxBound(subject),
+              ensureChannel: (subject) => host.k8sPlane()!.ensureChannel(subject),
+              // The pod a session's page reads, off the session's own directory and the same routing its reads use (§11).
+              sessionPod: (id, sessionId) => sessionPodOf(workspaceScope, host.k8sPlane()!, id, sessionId),
+              claimUidFor: (subject) => host.k8sPlane()!.claimUidFor(subject),
+              resumeChannel: (subject, claimUid) => host.k8sPlane()!.resumeChannel(subject, claimUid)
+            }
+          }
+        : {}),
+      knowsAgent: (id) =>
+        host.agents().has(id) && (!host.dutyCoordinator().dutyEnforced() || host.duties().holdsAgent(id)),
+      claimDuty: async (id) =>
+        host.dutyCoordinator().dutyEnforced() && (await host.dutyCoordinator().claimDutyForTrigger(id)).granted,
+      log: host.log()
+    }),
+    memoryEntriesWrite: createMemoryEntriesWriter(
+      host.memory(),
+      host.store(),
+      (id) => host.agents().has(id) && (!host.dutyCoordinator().dutyEnforced() || host.duties().holdsAgent(id))
+    ),
+    memoryEntriesRead: createMemoryEntriesReader(
+      host.memory(),
+      host.store(),
+      (id) => host.agents().has(id) && (!host.dutyCoordinator().dutyEnforced() || host.duties().holdsAgent(id))
+    ),
+    memoryReader: createMemoryReader((id) => host.memoryHomePortsFor(id), host.memory()),
+    dreamReader: createDreamReader(host.dreamRunner()),
+    decisionEvaluator: host.decisionEvaluator(),
+    decisionEvaluations: host.decisionEvaluations(),
+    decisionModelEvaluations: host.decisionModelEvaluations(),
+    decisionApiGateEvaluations: host.decisionApiGateEvaluations(),
+    coordinatorFilterEvaluations: host.coordinatorFilterEvaluations(),
+    localSkillsReader: createLocalSkillsReader(
+      host.workspaces(),
+      // The workspace root in EXECUTION coordinates, like the file reader's: the skill roots the
+      // console lists are the ones the agent's harness loads, and those are in the pod.
+      async (id) => (await workspaceScope.location(id))?.root,
+      join(host.daemonRoot(), 'skill-installs'),
+      (id) => host.workspaceFilesFor(id),
+      (id, cwd) => host.workspaceSkillLedger(id, cwd),
+      async (id, roots, cwd) => (await host.verifyWorkspaceSkills(id, roots, cwd)) ?? roots.map(() => false)
+    ),
+    runtimeCommandsReader: createRuntimeCommandsReader(host.runtimeCommands(), (id) => host.agents().has(id)),
+    // webchat is no longer a CP control-WS integration (milestone A4) — it rides the
+    // relay's rd/* wire, wired through RelayManager.onRelayMsg.
+    clock: systemClock,
+    connect: (opts) => ClientTransport.dial(url, { subprotocol: CP_SUBPROTOCOL, path: CP_WS_PATH, ...opts }),
+    log: host.log()
+  }
+}

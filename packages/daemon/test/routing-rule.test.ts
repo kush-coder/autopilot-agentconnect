@@ -1,0 +1,570 @@
+import { describe, it, expect } from 'vitest'
+import {
+  rulesFromAgent,
+  resolveCpRule,
+  resolveAgentIntegration,
+  conversationAdmitted,
+  conversationKindOf,
+  conversationSessionMode,
+  conversationTrustLevel,
+  integrationRouting,
+  type CpRule
+} from '../src/router/routing-rule.js'
+import { configuredBotSelfId, integrationConfig, integrationCore } from '../src/platforms/integration-config.js'
+import { BindMatchSchema, type Agent, type Integration } from '../src/agents/agent-schema.js'
+
+function agent(over: Partial<Agent> = {}): Agent {
+  return {
+    id: 'agentA',
+    name: 'A',
+    status: 'active',
+    runtime: 'claude',
+    workspace: { mode: 'from-scratch', path: '/tmp/ws', gitBranch: 'main', pullOnNewSession: true, skills: [] },
+    integrations: [
+      {
+        id: 'int1',
+        platform: 'slack',
+        core: { bindRules: [{ match: { kind: 'mention' } }, { channel: 'C1', match: { kind: 'auto' } }] },
+        config: { botToken: 'x', appToken: 'y' } as any
+      }
+    ],
+    output: { mode: 'medium' },
+    permissions: { policy: 'ask', autoApprove: [] },
+    crons: [],
+    ...over
+  } as Agent
+}
+
+describe('integrationRouting (§6.4 core-envelope read)', () => {
+  const bindRules = [{ channel: 'C1', match: { kind: 'mention' as const } }]
+  // One row per platform, each with the SAME core envelope but its own opaque
+  // config payload and its own name for the bot's id. The expected values are
+  // today's, read from the four arms this replaced.
+  const cases: { int: Integration; selfId: string; parsedConfig: Record<string, unknown> }[] = [
+    {
+      int: {
+        id: 'i-slack',
+        platform: 'slack',
+        core: { mode: 'direct', bindRules, mutedChannels: ['C9'], gated: true },
+        config: { botToken: 'x', appToken: 'y', botUserId: 'U-SLACK' }
+      } as unknown as Integration,
+      selfId: 'U-SLACK',
+      parsedConfig: { botToken: 'x', appToken: 'y', botUserId: 'U-SLACK', shareable: false }
+    },
+    {
+      int: {
+        id: 'i-tg',
+        platform: 'telegram',
+        core: { mode: 'direct', bindRules, mutedChannels: ['C9'], gated: true },
+        config: { botToken: 'x', botUserId: 'U-TG' }
+      } as unknown as Integration,
+      selfId: 'U-TG',
+      parsedConfig: { botToken: 'x', botUserId: 'U-TG' }
+    },
+    {
+      int: {
+        id: 'i-dc',
+        platform: 'discord',
+        core: { mode: 'direct', bindRules, mutedChannels: ['C9'], gated: true },
+        config: { botToken: 'x', botUserId: 'U-DC' }
+      } as unknown as Integration,
+      selfId: 'U-DC',
+      parsedConfig: { botToken: 'x', botUserId: 'U-DC' }
+    },
+    {
+      int: {
+        id: 'i-fs',
+        platform: 'feishu',
+        core: { mode: 'direct', bindRules, mutedChannels: ['C9'], gated: true },
+        // Feishu's bot id is an open_id under a DIFFERENT field name — the one
+        // knob §6.4 deliberately leaves out of the core envelope.
+        config: { appId: 'cli_x', appSecret: 's', botOpenId: 'OU-FS' }
+      } as unknown as Integration,
+      selfId: 'OU-FS',
+      parsedConfig: { appId: 'cli_x', appSecret: 's', botOpenId: 'OU-FS', region: 'feishu' }
+    }
+  ]
+
+  it('reads identical core knobs from every platform, and the self id from the module config', () => {
+    for (const { int, selfId, parsedConfig } of cases) {
+      expect(integrationRouting(int)).toMatchObject({
+        staticBotUserId: selfId,
+        bindRules,
+        mutedChannels: ['C9'],
+        gated: true
+      })
+      // The envelope read and the self-id strategy are separable: core owns one,
+      // the platform owns the other.
+      expect(integrationCore(int)).toEqual({
+        mode: 'direct',
+        bindRules,
+        mutedChannels: ['C9'],
+        gated: true,
+        sessionModes: [],
+        externalChannels: [],
+        decisions: { bindings: [], definitions: [] },
+        chatAuthority: 'participants'
+      })
+      expect(configuredBotSelfId(int)).toBe(selfId)
+      // The opaque config is the MODULE-VALIDATED parse (schema defaults applied),
+      // resolved through the platform registry — not the raw stored value.
+      expect(integrationConfig(int)).toEqual(parsedConfig)
+    }
+  })
+
+  it('fails closed on an unregistered platform id and on a payload the module schema rejects', () => {
+    const foreign = {
+      id: 'i-x',
+      platform: 'mastodon',
+      core: {
+        mode: 'direct',
+        bindRules: [],
+        mutedChannels: [],
+        gated: false,
+        sessionModes: [],
+        decisions: { bindings: [], definitions: [] }
+      },
+      config: { botToken: 'x' }
+    } as unknown as Integration
+    expect(integrationConfig(foreign)).toBeUndefined()
+    expect(configuredBotSelfId(foreign)).toBeUndefined()
+    // A pre-S3 nested-shape entry parses with its block stripped => no config.
+    const legacy = {
+      id: 'i-legacy',
+      platform: 'slack',
+      core: {
+        mode: 'direct',
+        bindRules: [],
+        mutedChannels: [],
+        gated: false,
+        sessionModes: [],
+        decisions: { bindings: [], definitions: [] }
+      }
+    } as unknown as Integration
+    expect(integrationConfig(legacy)).toBeUndefined()
+    // Malformed payload (missing the required botToken) => no config, no self id.
+    const malformed = {
+      id: 'i-bad',
+      platform: 'slack',
+      core: {
+        mode: 'direct',
+        bindRules: [],
+        mutedChannels: [],
+        gated: false,
+        sessionModes: [],
+        decisions: { bindings: [], definitions: [] }
+      },
+      config: { botUserId: 'U-ONLY' }
+    } as unknown as Integration
+    expect(integrationConfig(malformed)).toBeUndefined()
+    expect(configuredBotSelfId(malformed)).toBeUndefined()
+    // Prototype names are legal values for an OPEN platform id and must read as
+    // unregistered — never resolve `Object.prototype` members into the schema
+    // lookup (which would throw mid-convergence instead of skipping the spec).
+    for (const platform of ['constructor', 'toString', '__proto__']) {
+      const proto = {
+        id: `i-${platform}`,
+        platform,
+        core: {
+          mode: 'direct',
+          bindRules: [],
+          mutedChannels: [],
+          gated: false,
+          sessionModes: [],
+          decisions: { bindings: [], definitions: [] }
+        },
+        config: { botToken: 'x' }
+      } as unknown as Integration
+      expect(integrationConfig(proto)).toBeUndefined()
+      expect(configuredBotSelfId(proto)).toBeUndefined()
+    }
+  })
+
+  it('normalizes an absent mutedChannels to empty and an unset bot id to undefined', () => {
+    // A hand-assembled integration (fixture / partial spec) never carried the
+    // post-hoc `mutedChannels` field; absent means "nothing muted". `mode` and
+    // `gated` normalize to their schema defaults for the same reason.
+    const int = {
+      id: 'i',
+      platform: 'slack',
+      core: { bindRules: [] },
+      config: { botToken: 'x' }
+    } as unknown as Integration
+    expect(integrationRouting(int)).toMatchObject({
+      staticBotUserId: undefined,
+      bindRules: [],
+      mutedChannels: [],
+      gated: false
+    })
+    expect(integrationCore(int).mode).toBe('direct')
+    expect(integrationCore(int).decisions).toEqual({ bindings: [], definitions: [] })
+  })
+
+  it('exposes the enabled By decision gate and every bound conversation', () => {
+    const definition = {
+      id: 'd1',
+      orgId: 'o',
+      name: 'Help',
+      providerId: 'typesafe',
+      model: 'jev-1.13.0',
+      question: { type: 'boolean', instructions: 'Help?', criteria: { true: 'Yes', false: 'No' } }
+    }
+    const gate = { type: 'gate', decisionId: 'd1', when: { type: 'boolean', values: [true] } }
+    const int = {
+      id: 'i',
+      platform: 'slack',
+      core: {
+        bindRules: [{ channel: 'C1', match: { kind: 'decision' } }],
+        decisions: {
+          bindings: [
+            { channel: 'C1', consumer: gate, enabled: true },
+            { channel: 'C2', consumer: gate, enabled: false, disabledReason: 'needs_review' }
+          ],
+          definitions: [definition]
+        }
+      },
+      config: { botToken: 'x' }
+    } as unknown as Integration
+    const routing = integrationRouting(int)
+    expect(routing.decisionBindingFor('C1')).toEqual({ channel: 'C1', binding: gate, definition })
+    expect(routing.decisionBindingFor('C2')).toBeUndefined()
+    expect([routing.decisionBound('C1'), routing.decisionBound('C2'), routing.decisionBound('C3')]).toEqual([
+      true,
+      true,
+      false
+    ])
+    expect(rulesFromAgent(agent({ integrations: [int] }), {}).map((r) => r.match)).toEqual([{ kind: 'decision' }])
+    expect(BindMatchSchema.parse({ kind: 'decision' })).toEqual({ kind: 'decision' })
+  })
+
+  it('exposes a routed channel as bound, never as a gate, with the router only where this daemon hosts it', () => {
+    const definition = {
+      id: 'd1',
+      orgId: 'o',
+      name: 'Help',
+      providerId: 'typesafe',
+      model: 'jev-1.13.0',
+      question: { type: 'boolean', instructions: 'Help?', criteria: { true: 'Yes', false: 'No' } }
+    }
+    const config = {
+      enabled: true,
+      decisionId: 'd1',
+      rules: [{ id: 'r1', when: { type: 'boolean', values: [true] }, action: { type: 'skip' } }],
+      otherwise: { type: 'default_agent' }
+    }
+    const router = { type: 'shared_bot_routing' }
+    const int = {
+      id: 'i',
+      platform: 'slack',
+      core: {
+        bindRules: [],
+        decisions: {
+          bindings: [
+            { channel: 'R1', consumer: router, enabled: true },
+            { channel: 'R2', consumer: router, enabled: true }
+          ],
+          definitions: [definition],
+          sharedBotRouting: { botId: 'b1', config, channels: [{ channel: 'R1' }] }
+        }
+      },
+      config: { botToken: 'x' }
+    } as unknown as Integration
+    const routing = integrationRouting(int)
+    expect(routing.decisionBound('R1')).toBe(true)
+    expect(routing.decisionBound('R2')).toBe(true)
+    expect(routing.decisionBindingFor('R1')).toBeUndefined()
+    expect(routing.routingFor('R1')?.routing).toMatchObject({ botId: 'b1', config })
+    expect(routing.routingFor('R2')).toEqual({ channel: 'R2', enabled: true })
+    expect(routing.routingFor('C9')).toBeUndefined()
+    expect(routing.sharedBotRouting()).toEqual({ botId: 'b1', config })
+  })
+})
+
+describe('rulesFromAgent', () => {
+  it('derives one resolved RoutingRule per bindRule with the resolved botUserId', () => {
+    const rules = rulesFromAgent(agent(), { int1: 'B1' })
+    expect(rules).toHaveLength(2)
+    expect(rules[0]).toMatchObject({
+      agentId: 'agentA',
+      integrationId: 'int1',
+      botUserId: 'B1',
+      match: { kind: 'mention' },
+      source: 'config',
+      scope: {}
+    })
+    expect(rules[1]).toMatchObject({ match: { kind: 'auto' }, scope: { channel: 'C1' } })
+  })
+
+  it("tags each rule with its platform and uses '' when botUserId unknown", () => {
+    const rules = rulesFromAgent(agent(), {})
+    expect(rules[0]!.botUserId).toBe('')
+    expect(rules[0]!.platform).toBe('slack')
+  })
+})
+
+// auto-session-mode.md §3.3: under `auto` the coordinator decides every message, so Mention and Any behave alike.
+describe('rulesFromAgent under auto', () => {
+  const withCore = (core: Record<string, unknown>) =>
+    agent({
+      integrations: [
+        { id: 'int1', platform: 'slack', core, config: { botToken: 'x', appToken: 'y' } } as unknown as Integration
+      ]
+    })
+  const scopedMatches = (core: Record<string, unknown>, autoSessionMode = true) =>
+    rulesFromAgent(withCore(core), {}, { autoSessionMode })
+      .filter((rule) => rule.scope.channel !== undefined)
+      .map((rule) => `${rule.scope.channel}:${rule.match.kind}`)
+  const sessionModes = [
+    { channel: 'C1', mode: 'auto' },
+    { channel: 'C2', mode: 'auto' },
+    { channel: 'C3', mode: 'append' }
+  ]
+
+  it('admits Any message in a direct integration’s auto conversations, muted ones still fenced', () => {
+    const core = { mode: 'direct', bindRules: [{ match: { kind: 'mention' } }], mutedChannels: ['C2'], sessionModes }
+    expect(scopedMatches(core)).toEqual(['C1:auto', 'C2:auto'])
+    expect(rulesFromAgent(withCore(core), {}, { autoSessionMode: true }).at(-1)!.mutedChannels).toEqual(['C2'])
+    expect(scopedMatches(core, false)).toEqual([])
+  })
+
+  it('adds nothing where a rule already admits Any, where By decision holds, or where a gated integration is Off', () => {
+    const bindRules = [
+      { channel: 'C1', match: { kind: 'auto' } },
+      { channel: 'C2', match: { kind: 'decision' } }
+    ]
+    expect(scopedMatches({ mode: 'direct', bindRules, sessionModes })).toEqual(['C1:auto', 'C2:decision'])
+    const gated = {
+      mode: 'direct',
+      gated: true,
+      bindRules: [{ channel: 'C1', match: { kind: 'mention' } }],
+      sessionModes
+    }
+    expect(scopedMatches(gated)).toEqual(['C1:mention', 'C1:auto'])
+    // A shared bot's relay picks what reaches this daemon.
+    expect(scopedMatches({ mode: 'shared', bindRules: [], sessionModes })).toEqual([])
+  })
+})
+
+describe('resolveCpRule', () => {
+  const cp: CpRule = { agentId: 'agentA', scope: { channel: 'C9' }, match: { kind: 'auto' }, epoch: 3 }
+  it('resolves integrationId + botUserId + platform when the agent is servable', () => {
+    const r = resolveCpRule(cp, () => ({ integrationId: 'int1', botUserId: 'B1', platform: 'slack' }))
+    expect(r).toMatchObject({
+      agentId: 'agentA',
+      integrationId: 'int1',
+      botUserId: 'B1',
+      platform: 'slack',
+      source: 'cp',
+      epoch: 3,
+      scope: { channel: 'C9' }
+    })
+  })
+  it('returns null when unservable (no local agent / no integration)', () => {
+    expect(resolveCpRule(cp, () => null)).toBeNull()
+  })
+})
+
+describe('resolveAgentIntegration', () => {
+  it('resolves the first integration + platform; botUserIds overrides the static id', () => {
+    const a = agent({
+      integrations: [
+        {
+          id: 'int1',
+          platform: 'slack',
+          core: {
+            mode: 'direct',
+            bindRules: [],
+            mutedChannels: [],
+            gated: false,
+            sessionModes: [],
+            decisions: { bindings: [], definitions: [] }
+          },
+          config: { botToken: 'x', botUserId: 'STATIC' } as any
+        }
+      ]
+    })
+    expect(resolveAgentIntegration(a, { int1: 'B1' })).toEqual({
+      integrationId: 'int1',
+      botUserId: 'B1',
+      platform: 'slack',
+      mutedChannels: []
+    })
+    // falls back to the static botUserId when the map has no entry
+    expect(resolveAgentIntegration(a, {})).toEqual({
+      integrationId: 'int1',
+      botUserId: 'STATIC',
+      platform: 'slack',
+      mutedChannels: []
+    })
+  })
+
+  it('prefers the integration matching the requested platform for a multi-platform agent', () => {
+    // Regression: a Slack+Telegram agent must resolve its Telegram integration when a reply
+    // is delivered into a Telegram session — else the reply posts through integrations[0]
+    // (Slack) and the Telegram chat id fails with channel_not_found.
+    const a = agent({
+      integrations: [
+        {
+          id: 'slack1',
+          platform: 'slack',
+          core: {
+            mode: 'direct',
+            bindRules: [],
+            mutedChannels: [],
+            gated: false,
+            sessionModes: [],
+            decisions: { bindings: [], definitions: [] }
+          },
+          config: { botToken: 'x', botUserId: 'BSLACK' } as any
+        },
+        {
+          id: 'tg1',
+          platform: 'telegram',
+          core: {
+            mode: 'direct',
+            bindRules: [],
+            mutedChannels: [],
+            gated: false,
+            sessionModes: [],
+            decisions: { bindings: [], definitions: [] }
+          },
+          config: { botToken: 'x', botUserId: 'BTG' } as any
+        }
+      ]
+    })
+    expect(resolveAgentIntegration(a, {}, 'telegram')).toMatchObject({ integrationId: 'tg1', platform: 'telegram' })
+    // Unspecified platform keeps the historical first-integration behavior…
+    expect(resolveAgentIntegration(a, {})).toMatchObject({ integrationId: 'slack1', platform: 'slack' })
+    // …and an unmatched platform falls back to the first integration rather than returning null.
+    expect(resolveAgentIntegration(a, {}, 'discord')).toMatchObject({ integrationId: 'slack1', platform: 'slack' })
+  })
+
+  it('returns null when there is no agent', () => {
+    expect(resolveAgentIntegration(undefined, {})).toBeNull()
+  })
+
+  it('returns null when the agent has no integrations', () => {
+    const a = agent({ integrations: [] })
+    expect(resolveAgentIntegration(a, {})).toBeNull()
+  })
+})
+
+describe('conversationAdmitted', () => {
+  const routing = (over: Partial<Parameters<typeof conversationAdmitted>[0]> = {}) => ({
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    ...over
+  })
+
+  it('admits any conversation of an ungated integration with nothing muted', () => {
+    expect(conversationAdmitted(routing(), 'C1')).toBe(true)
+  })
+
+  it('refuses a muted channel', () => {
+    const r = routing({ mutedChannels: ['C1'] })
+    expect(conversationAdmitted(r, 'C1')).toBe(false)
+    expect(conversationAdmitted(r, 'C2')).toBe(true)
+  })
+
+  // §14: a gated integration is fail-closed — an unknown conversation has no rule.
+  it('admits a gated conversation only when a scoped rule enables it', () => {
+    const r = routing({ gated: true, bindRules: [{ channel: 'C1', match: { kind: 'mention' } }] })
+    expect(conversationAdmitted(r, 'C1')).toBe(true)
+    expect(conversationAdmitted(r, 'C2')).toBe(false)
+  })
+
+  it('lets the mute override an enabling rule — the two fences are independent', () => {
+    const r = routing({
+      gated: true,
+      mutedChannels: ['C1'],
+      bindRules: [{ channel: 'C1', match: { kind: 'mention' } }]
+    })
+    expect(conversationAdmitted(r, 'C1')).toBe(false)
+  })
+})
+
+// assistant-mode.md §5.3: a place is internal unless the platform detects it as external.
+describe('conversationTrustLevel', () => {
+  const int = (externalChannels?: string[]) =>
+    ({
+      id: 'i-trust',
+      platform: 'slack',
+      core: {
+        mode: 'direct',
+        bindRules: [],
+        mutedChannels: [],
+        gated: true,
+        ...(externalChannels ? { externalChannels } : {})
+      }
+    }) as unknown as Integration
+
+  it('reads a detected external conversation as external and every other one as internal', () => {
+    expect(conversationTrustLevel(int(['C1']), 'C1')).toBe('external')
+    expect(conversationTrustLevel(int(['C1']), 'C2')).toBe('internal')
+    expect(conversationTrustLevel(int(), 'C1')).toBe('internal')
+  })
+})
+
+// assistant-mode.md §5.2: an assistant-mode place the control plane has not listed yet appends where its platform appends.
+describe('conversationSessionMode for an unlisted conversation', () => {
+  const int = (platform: string, sessionModes: { channel: string; mode: string }[] = []) =>
+    ({
+      id: 'i-mode',
+      platform,
+      core: { mode: 'direct', bindRules: [], mutedChannels: [], sessionModes }
+    }) as unknown as Integration
+  const on = (kind: 'channel' | 'im' | 'mpim') => ({ assistantMode: true, kind })
+
+  it('appends a room, a Slack DM and a Slack group DM, but not a DM that is one session already', () => {
+    expect(conversationSessionMode(int('slack'), 'C1', on('channel'))).toBe('append')
+    expect(conversationSessionMode(int('slack'), 'D1', on('im'))).toBe('append')
+    expect(conversationSessionMode(int('slack'), 'G1', on('mpim'))).toBe('append')
+    expect(conversationSessionMode(int('telegram'), '42', on('im'))).toBe('createNew')
+    expect(conversationSessionMode(int('linear'), 'team', on('channel'))).toBe('createNew')
+  })
+
+  it('keeps a listed mode, and gives nothing outside assistant mode or without a kind', () => {
+    expect(conversationSessionMode(int('slack', [{ channel: 'C1', mode: 'createNew' }]), 'C1', on('channel'))).toBe(
+      'createNew'
+    )
+    expect(conversationSessionMode(int('slack', [{ channel: 'C1', mode: 'auto' }]), 'C1', on('channel'))).toBe('auto')
+    expect(conversationSessionMode(int('slack'), 'C1', { assistantMode: false, kind: 'channel' })).toBe('createNew')
+    expect(conversationSessionMode(int('slack'), 'C1')).toBe('createNew')
+  })
+
+  // auto-session-mode.md §3.4: where the daemon runs `auto`, an assistant-mode place's one long session is its coordinator.
+  it('runs an unlisted assistant-mode place through the coordinator where auto runs', () => {
+    const auto = (kind: 'channel' | 'im' | 'mpim') => ({ assistantMode: true, kind, auto: true })
+    expect(conversationSessionMode(int('slack'), 'C1', auto('channel'))).toBe('auto')
+    expect(conversationSessionMode(int('slack'), 'D1', auto('im'))).toBe('auto')
+    expect(conversationSessionMode(int('slack'), 'G1', auto('mpim'))).toBe('auto')
+    expect(conversationSessionMode(int('slack', [{ channel: 'C1', mode: 'append' }]), 'C1', auto('channel'))).toBe(
+      'append'
+    )
+  })
+
+  it('keys a By decision or routed conversation listed `auto` Per thread, which never runs behind them', () => {
+    const bound = {
+      id: 'i-mode',
+      platform: 'slack',
+      core: {
+        mode: 'direct',
+        bindRules: [{ channel: 'C1', match: { kind: 'decision' } }],
+        sessionModes: [
+          { channel: 'C1', mode: 'auto' },
+          { channel: 'C2', mode: 'auto' }
+        ]
+      }
+    } as unknown as Integration
+    expect(conversationSessionMode(bound, 'C1')).toBe('createNew')
+    expect(conversationSessionMode(bound, 'C2')).toBe('auto')
+  })
+
+  it('reads the kind the way the control plane seeds the row', () => {
+    expect(conversationKindOf({ platform: 'slack', channel: 'D1', isDm: true })).toBe('im')
+    expect(conversationKindOf({ platform: 'slack', channel: 'D1', isDm: false })).toBe('im')
+    expect(conversationKindOf({ platform: 'slack', channel: 'G1', isDm: false, isGroupDm: true })).toBe('mpim')
+    expect(conversationKindOf({ platform: 'slack', channel: 'C1', isDm: false })).toBe('channel')
+  })
+})

@@ -1,0 +1,83 @@
+// Single-use OAuth state, optionally bound to an existing organization, with no credentials and a bounded TTL.
+import type { SlackPlatformInstall } from '../../generated/prisma/client.js'
+import type { PrismaLike } from '../prisma.js'
+import type { SlackPlatformInstallRecord, SlackPlatformInstallStore } from '../ports.js'
+import { OrgId, AgentId, BotId } from '../../domain/ids.js'
+
+function toRecord(r: SlackPlatformInstall): SlackPlatformInstallRecord {
+  return {
+    id: r.id,
+    orgId: r.orgId ? OrgId(r.orgId) : null,
+    agentId: r.agentId ? AgentId(r.agentId) : null,
+    status: r.status,
+    failureReason: r.failureReason,
+    missingScopes: r.missingScopes,
+    botId: r.botId,
+    createdByUserId: r.createdByUserId,
+    createdAt: r.createdAt,
+    settledAt: r.settledAt
+  }
+}
+
+export class PgSlackPlatformInstallStore implements SlackPlatformInstallStore {
+  constructor(private readonly prisma: PrismaLike) {}
+
+  async create(input: {
+    id: string
+    orgId?: OrgId
+    agentId?: AgentId
+    botId?: BotId
+    createdByUserId?: string
+  }): Promise<SlackPlatformInstallRecord> {
+    const row = await this.prisma.slackPlatformInstall.create({
+      data: {
+        id: input.id,
+        ...(input.orgId ? { orgId: input.orgId } : {}),
+        ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
+        ...(input.botId !== undefined ? { botId: input.botId } : {}),
+        ...(input.createdByUserId !== undefined ? { createdByUserId: input.createdByUserId } : {})
+      }
+    })
+    return toRecord(row)
+  }
+
+  async get(id: string): Promise<SlackPlatformInstallRecord | null> {
+    const row = await this.prisma.slackPlatformInstall.findUnique({ where: { id } })
+    return row ? toRecord(row) : null
+  }
+
+  async settle(
+    id: string,
+    outcome:
+      | { status: 'completed'; botId?: string }
+      | { status: 'failed'; failureReason: string; missingScopes?: readonly string[] }
+  ): Promise<void> {
+    // `status: 'pending'` in the WHERE: a double callback (Slack retry / a
+    // double-clicked tab) keeps the FIRST outcome rather than overwriting a
+    // completed install with a late failure. updateMany so a reaped row is a
+    // no-op, not a throw.
+    await this.prisma.slackPlatformInstall.updateMany({
+      where: { id, status: 'pending' },
+      data: {
+        status: outcome.status,
+        settledAt: new Date(),
+        ...(outcome.status === 'completed'
+          ? { ...(outcome.botId ? { botId: outcome.botId } : {}) }
+          : {
+              failureReason: outcome.failureReason,
+              ...(outcome.missingScopes ? { missingScopes: [...outcome.missingScopes] } : {})
+            })
+      }
+    })
+  }
+
+  async delete(id: string): Promise<void> {
+    // deleteMany so a double-callback / already-reaped row is a no-op, not a throw.
+    await this.prisma.slackPlatformInstall.deleteMany({ where: { id } })
+  }
+
+  async reapExpired(staleBefore: Date): Promise<number> {
+    const res = await this.prisma.slackPlatformInstall.deleteMany({ where: { createdAt: { lt: staleBefore } } })
+    return res.count
+  }
+}

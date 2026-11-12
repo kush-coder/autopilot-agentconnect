@@ -1,0 +1,1243 @@
+import { describe, it, expect, vi } from 'vitest'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import {
+  AcpHost,
+  ModelSelectionError,
+  claudeSessionMeta,
+  isOAuthRefreshContention,
+  shouldForwardUpdateDuringLoad,
+  turnFailureCode,
+  turnFailureReason
+} from '../src/acp/acp-host.js'
+import { RuntimeSessionFailure, sessionFailureFromMeta } from '../src/acp/session-failure.js'
+import { CODEX_MCP_STARTUP_GRACE_MS, codexGuardianOperatorPolicy } from '../src/runtimes/codex-config.js'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const fakeAgent = join(here, 'fixtures', 'fake-acp-agent.mjs')
+describe('AcpHost (against a fake ACP agent)', () => {
+  it.each([true, false])('gates and sends session profiles on new/load (supported=%s)', async (supported) => {
+    const profiles = {
+      'protected-workspace': { extends: ':workspace', filesystem: { '/repo/.git/worktrees/task': 'write' } }
+    }
+    const sessionProfiles = vi.fn(async () => profiles)
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        codexSessionPermissionProfiles: sessionProfiles,
+        env: {
+          AC_INIT_META: JSON.stringify({ codex: { sessionPermissionProfiles: supported } }),
+          AC_EXPECT_SESSION_META: JSON.stringify({ codex: { permissionProfiles: profiles } })
+        }
+      }
+    )
+    await host.start()
+    try {
+      if (!supported) {
+        await expect(host.newSession('/repo')).rejects.toThrow('update the runtime')
+        await expect(host.loadSession('persisted', '/repo')).rejects.toThrow('update the runtime')
+        return
+      }
+      const cold = await host.newSession('/repo', [], undefined, undefined, ['/secondary'])
+      await host.newSession('/warm', [], undefined, undefined, ['/warm-secondary'])
+      await host.loadSession(cold, '/repo', [], undefined, undefined, ['/secondary'])
+      expect(sessionProfiles.mock.calls).toEqual([
+        [['/repo', '/secondary']],
+        [['/warm', '/warm-secondary']],
+        [['/repo', '/secondary']]
+      ])
+    } finally {
+      await host.stop()
+    }
+  })
+
+  it.each([
+    { capabilities: ['customInstructions'], native: true },
+    { capabilities: ['sessionFailure'], native: false },
+    { capabilities: 'customInstructions', native: false }
+  ])('routes new/load instructions only when advertised: $capabilities', async ({ capabilities, native }) => {
+    const instructions = 'Follow the configured review policy.'
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        env: {
+          AC_INIT_META: JSON.stringify({ jetbrains: { air: { version: 1, capabilities } } }),
+          AC_EXPECT_SESSION_META: JSON.stringify(
+            native ? { jetbrains: { air: { version: 1, customInstructions: instructions } } } : null
+          )
+        }
+      }
+    )
+    await host.start()
+    try {
+      expect(host.usesMetaSystemPrompt()).toBe(native)
+      // Custom instructions apply when a thread starts, so a load cannot refresh them.
+      expect(host.appliesSystemPromptOnLoad()).toBe(false)
+      const sessionId = await host.newSession('/tmp', [], undefined, instructions)
+      await host.loadSession(sessionId, '/tmp', [], undefined, instructions)
+    } finally {
+      await host.stop()
+    }
+  })
+
+  it('sends the selected Claude model and native tool policy before new/load', async () => {
+    const model = 'claude-fable-5-1[1m]'
+    const toolSandbox = {
+      protectedCredentialRoots: ['/credentials'],
+      allowModelToolUnixSockets: true,
+      sharedWriteRoots: ['/cache'],
+      claudeProtectedSettings: {
+        env: { ANTHROPIC_CONFIG_DIR: '/policy/disabled', ANTHROPIC_PROFILE: 'agentconnect-disabled' }
+      }
+    }
+    const expected = claudeSessionMeta(
+      undefined,
+      true,
+      undefined,
+      undefined,
+      toolSandbox.protectedCredentialRoots,
+      toolSandbox.claudeProtectedSettings,
+      true,
+      [],
+      toolSandbox.sharedWriteRoots
+    )!
+    expected.claudeCode.options = { model, ...expected.claudeCode.options }
+    expect(expected?.claudeCode.options.settings?.permissions).toEqual({
+      deny: ['Read(//credentials)', 'Read(//credentials/**)', 'Edit(//credentials)', 'Edit(//credentials/**)']
+    })
+    expect(expected?.claudeCode.options.settings?.plansDirectory).toBe('./.claude/plans')
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent, 'claude-acp'], env: [] },
+      {
+        onUpdate: () => {},
+        configPrefs: { model },
+        toolSandbox,
+        env: { AC_EXPECT_SESSION_META: JSON.stringify(expected), AC_LOAD_UPDATES: '1', AC_MODELS: `default,${model}` }
+      }
+    )
+    await host.start()
+    try {
+      expect(host.appliesSystemPromptOnLoad()).toBe(true)
+      const sessionId = await host.newSession('/tmp')
+      expect(host.modelOptions(sessionId)?.current).toBe(model)
+      await host.loadSession('persisted-session', '/tmp')
+      expect(host.modelOptions('persisted-session')?.current).toBe(model)
+    } finally {
+      await host.stop()
+    }
+  })
+
+  it('initializes, creates a session, and streams an echoed reply', async () => {
+    const updates: Array<{ sessionId: string; text: string }> = []
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: (sessionId, update) => {
+          if (update.sessionUpdate === 'agent_message_chunk') {
+            const c = (update as any).content
+            if (c?.type === 'text') updates.push({ sessionId, text: c.text })
+          }
+        }
+      }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    expect(host.sessionCwd(sessionId)).toBe('/tmp')
+    const res = await host.prompt(sessionId, [{ type: 'text', text: 'hi' }])
+    expect(res.stopReason).toBe('end_turn')
+    expect(updates).toContainEqual({ sessionId, text: 'echo:hi' })
+    host.forgetSession(sessionId)
+    expect(host.sessionCwd(sessionId)).toBeUndefined()
+    await host.stop()
+  })
+
+  it.each([
+    { category: 'service', actions: ['retry'], code: 'turn_failed' },
+    { category: 'access', actions: ['login'], code: 'provider_auth_required' },
+    { category: 'limit', actions: [], code: 'provider_quota_exhausted' },
+    { category: 'limit', actions: ['new_session'], code: 'turn_failed' }
+  ])(
+    'rejects a typed $category failure returned as end_turn, then permits recovery',
+    async ({ category, actions, code }) => {
+      const onUpdate = vi.fn()
+      const failure = {
+        id: 'turn-1:error',
+        revision: 1,
+        severity: 'error',
+        category,
+        title: 'Provider unavailable',
+        actions
+      }
+      const host = new AcpHost(
+        { command: process.execPath, args: [fakeAgent], env: [] },
+        { onUpdate, env: { AC_FIRST_PROMPT_FAILURE: JSON.stringify(failure) } }
+      )
+      await host.start()
+      try {
+        const sid = await host.newSession('/tmp')
+        const error = await host.prompt(sid, [{ type: 'text', text: 'review' }]).catch((err: unknown) => err)
+        expect(error).toBeInstanceOf(RuntimeSessionFailure)
+        expect(error).toMatchObject({ message: failure.title, retryable: actions.includes('retry') })
+        expect(turnFailureCode(error)).toBe(code)
+        expect(onUpdate).not.toHaveBeenCalled()
+        await expect(host.prompt(sid, [{ type: 'text', text: 'review' }])).resolves.toMatchObject({
+          stopReason: 'end_turn'
+        })
+      } finally {
+        await host.stop()
+      }
+    }
+  )
+
+  it('does not turn an informational warning or unrelated metadata into a terminal failure', () => {
+    expect(sessionFailureFromMeta(undefined)).toBeUndefined()
+    expect(sessionFailureFromMeta({ quota: { token_count: null } })).toBeUndefined()
+    expect(
+      sessionFailureFromMeta({ jetbrains: { air: { version: 1, sessionFailure: { severity: 'error' } } } })
+    ).toBeUndefined()
+    expect(
+      sessionFailureFromMeta({
+        jetbrains: {
+          air: {
+            version: 1,
+            sessionFailure: { severity: 'warning', category: 'connection', title: 'Reconnecting', actions: [] }
+          }
+        }
+      })
+    ).toBeUndefined()
+  })
+
+  it('clamps session mcpServers to [] for a runtime that rejects them, and only then', async () => {
+    const bridge = { name: 'agentconnect', command: process.execPath, args: ['-e', ''], env: [] }
+    const rejectingEnv = [{ name: 'AC_REJECT_MCP_SERVERS', value: '1' }]
+
+    // Without the declaration the fixture's OpenClaw-style rejection surfaces.
+    const bare = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: rejectingEnv },
+      { onUpdate: () => {} }
+    )
+    await bare.start()
+    await expect(bare.newSession('/tmp', [bridge])).rejects.toThrow(/per-session MCP servers/)
+    await bare.stop()
+
+    // With it, the host drops the list and the session opens.
+    const clamped = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: rejectingEnv, sessionMcpServers: 'unsupported' },
+      { onUpdate: () => {} }
+    )
+    await clamped.start()
+    const sessionId = await clamped.newSession('/tmp', [bridge])
+    expect(sessionId).toBeTruthy()
+    await clamped.stop()
+  })
+
+  // A runtime can advertise from inside `newSession()`: the host makes the session ownable and
+  // then awaits its configuration round trips. Whatever the daemon needs in order to name that
+  // session must therefore be handed over at the RAW response, before it is reachable.
+  it('announces a new session id before the session becomes reachable', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    await host.start()
+    let reachableWhenAnnounced: boolean | undefined
+    let announced: string | undefined
+    const sessionId = await host.newSession('/tmp', [], undefined, undefined, [], (id) => {
+      announced = id
+      reachableWhenAnnounced = host.hasSession(id)
+    })
+    expect(announced).toBe(sessionId)
+    expect(reachableWhenAnnounced).toBe(false)
+    expect(host.hasSession(sessionId)).toBe(true)
+    await host.stop()
+  })
+
+  it('applies the configured permission mode at session/new and switches it live', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        env: { AC_PERMISSION_MODES: 'read-only,agent,agent-full-access' },
+        configPrefs: { permissionMode: 'agent' }
+      }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    const mode = () => host.sessionConfigOptions(sessionId)?.find((option) => option.category === 'mode')
+    expect(mode()?.currentValue).toBe('agent')
+
+    await host.setSessionPermissionMode(sessionId, 'agent-full-access')
+    expect(mode()?.currentValue).toBe('agent-full-access')
+    await host.stop()
+  })
+
+  // The dream gate re-asserts the read-only mode the configured settings just applied (#2774).
+  it('reports a mode the session already holds as in effect, and an unoffered one as not', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_PERMISSION_MODES: 'agent,read-only' } }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    await expect(host.setSessionPermissionMode(sessionId, 'read-only')).resolves.toBe(true)
+    await expect(host.setSessionPermissionMode(sessionId, 'read-only')).resolves.toBe(true)
+    expect(host.permissionModeOptions(sessionId)?.current).toBe('read-only')
+    await expect(host.setSessionPermissionMode(sessionId, 'plan')).resolves.toBe(false)
+    await host.stop()
+  })
+})
+
+describe('AcpHost.mcpCapabilities (MCP transports from initialize)', () => {
+  it('is null before start, and coerces an absent capability block to all-false', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    expect(host.mcpCapabilities()).toBeNull()
+    await host.start()
+    expect(host.mcpCapabilities()).toEqual({ http: false, sse: false })
+    await host.stop()
+  })
+
+  it('captures the transports the agent advertised', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_MCP_CAPS: 'http' } }
+    )
+    await host.start()
+    expect(host.mcpCapabilities()).toEqual({ http: true, sse: false })
+    await host.stop()
+  })
+})
+
+describe('AcpHost additional workspace directories', () => {
+  it('forwards them on new/load only when the agent advertises support', async () => {
+    const cwd = '/tmp/repo/agents/node-operator'
+    const repoRoot = '/tmp/repo'
+    const supported = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        env: {
+          AC_ADDITIONAL_DIRECTORIES: '1',
+          AC_EXPECT_ADDITIONAL_DIRECTORIES: JSON.stringify([repoRoot]),
+          AC_LOAD_UPDATES: '1'
+        }
+      }
+    )
+    await supported.start()
+    await supported.newSession(cwd, [], undefined, undefined, [repoRoot])
+    await supported.loadSession('persisted-session', cwd, [], undefined, undefined, [repoRoot])
+    expect(supported.sessionCwd('persisted-session')).toBe(cwd)
+    supported.discardSession('persisted-session')
+    expect(supported.sessionCwd('persisted-session')).toBeUndefined()
+    await supported.stop()
+
+    const unsupported = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        env: { AC_EXPECT_ADDITIONAL_DIRECTORIES: '[]' }
+      }
+    )
+    await unsupported.start()
+    await unsupported.newSession(cwd, [], undefined, undefined, [repoRoot])
+    await unsupported.stop()
+  })
+})
+
+describe('AcpHost session deletion', () => {
+  it('uses session/delete when advertised and releases local ownership', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_DELETE_SESSION: '1' } }
+    )
+    await host.start()
+    expect(host.deleteSupported()).toBe(true)
+    const sessionId = await host.newSession('/tmp')
+    expect(await host.deleteSession(sessionId)).toBe(true)
+    expect(host.hasSession(sessionId)).toBe(false)
+    expect(host.sessionCwd(sessionId)).toBeUndefined()
+    await host.stop()
+  })
+})
+
+describe('AcpHost session close', () => {
+  it('uses session/close when advertised, releases local ownership, and can load the session again', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_CLOSE_SESSION: '1', AC_LOAD_UPDATES: '1' } }
+    )
+    await host.start()
+    expect(host.closeSupported()).toBe(true)
+    const sessionId = await host.newSession('/tmp')
+    expect(await host.closeSession(sessionId)).toBe(true)
+    expect(host.hasSession(sessionId)).toBe(false)
+    expect(await host.closeSession(sessionId)).toBe(false)
+    await host.loadSession(sessionId, '/tmp')
+    expect(host.hasSession(sessionId)).toBe(true)
+    await host.stop()
+  })
+
+  it('keeps the session when the agent does not advertise session/close', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    await host.start()
+    expect(host.closeSupported()).toBe(false)
+    const sessionId = await host.newSession('/tmp')
+    expect(await host.closeSession(sessionId)).toBe(false)
+    expect(host.hasSession(sessionId)).toBe(true)
+    await host.stop()
+  })
+})
+
+describe('AcpHost session/load update filtering', () => {
+  it('forwards restored title metadata while suppressing replayed conversation output', async () => {
+    const updates: string[] = []
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: (_sessionId, update) => updates.push(update.sessionUpdate),
+        env: { AC_LOAD_UPDATES: '1' }
+      }
+    )
+    await host.start()
+    expect(host.loadSupported()).toBe(true)
+    await host.loadSession('persisted-session', '/tmp')
+    expect(updates).toEqual(['session_info_update'])
+    await host.stop()
+  })
+
+  it('reconciles a restored session whose persisted permission mode differs', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: () => {},
+        env: {
+          AC_LOAD_PERMISSION_MODE: 'agent',
+          AC_LOAD_UPDATES: '1',
+          AC_PERMISSION_MODES: 'read-only,agent,agent-full-access'
+        },
+        configPrefs: { permissionMode: 'agent-full-access' }
+      }
+    )
+    await host.start()
+    await host.loadSession('persisted-session-mode', '/tmp')
+    const options = host.sessionConfigOptions('persisted-session-mode')
+    expect(options?.find((option) => option.category === 'mode')?.currentValue).toBe('agent-full-access')
+    await host.stop()
+  })
+
+  it('allows only latest-wins metadata through during load', () => {
+    expect(shouldForwardUpdateDuringLoad({ sessionUpdate: 'session_info_update', title: 'Restored' })).toBe(true)
+    expect(shouldForwardUpdateDuringLoad({ sessionUpdate: 'usage_update', used: 1, size: 10 } as any)).toBe(true)
+    // The adapter advertises the command list AFTER a load's replay — the only one a resumed
+    // session makes, so dropping it would leave the console blind until the next new session.
+    expect(shouldForwardUpdateDuringLoad({ sessionUpdate: 'available_commands_update', availableCommands: [] })).toBe(
+      true
+    )
+    expect(
+      shouldForwardUpdateDuringLoad({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'history' }
+      })
+    ).toBe(false)
+  })
+})
+
+describe('AcpHost.usesMetaSystemPrompt (system-prompt routing per runtime)', () => {
+  const make = (command: string) => new AcpHost({ command, args: [], env: [] }, { onUpdate: () => {} })
+
+  it('retains the Claude channel before capability discovery', () => {
+    expect(make('claude-code-acp').usesMetaSystemPrompt()).toBe(true)
+    expect(make('codex-acp').usesMetaSystemPrompt()).toBe(false)
+  })
+})
+
+describe('claudeSessionMeta (system prompt + memory index over _meta)', () => {
+  it('suppresses only the built-in SendMessage on an ordinary session', () => {
+    expect(claudeSessionMeta(undefined, true)?.claudeCode.options.disallowedTools).toEqual(['SendMessage'])
+  })
+
+  it('also suppresses the approval-gated plan exits on a headless pass', () => {
+    // A headless pass (distillation, dream, commit-message) runs under `plan` when the
+    // runtime advertises no `read-only`, and plan mode can only END through
+    // ExitPlanMode / AskUserQuestion — which no headless caller can approve.
+    const meta = claudeSessionMeta(undefined, true, undefined, undefined, undefined, undefined, false, [
+      'ExitPlanMode',
+      'AskUserQuestion'
+    ])
+    expect(meta?.claudeCode.options.disallowedTools).toEqual(['SendMessage', 'ExitPlanMode', 'AskUserQuestion'])
+  })
+
+  it('returns undefined for a non-Claude runtime', () => {
+    expect(claudeSessionMeta(undefined, false, 'seed', 'mem')).toBeUndefined()
+  })
+
+  // Claude saves an oversized tool result under its own `.claude/projects/…/tool-results/` and tells the model to read
+  // it there: the runtime's state is read back, never changed, while its credentials stay neither read nor changed.
+  it('denies credentials to Read and Edit, and the runtime state it reads back to Edit alone', () => {
+    const meta = claudeSessionMeta(
+      undefined,
+      true,
+      undefined,
+      undefined,
+      ['/home/s/.claude.json'],
+      undefined,
+      false,
+      [],
+      [],
+      ['/home/s/.claude']
+    )!
+    const deny = meta.claudeCode.options.settings!.permissions!.deny
+    expect(deny).toEqual([
+      'Read(//home/s/.claude.json)',
+      'Read(//home/s/.claude.json/**)',
+      'Edit(//home/s/.claude.json)',
+      'Edit(//home/s/.claude.json/**)',
+      'Edit(//home/s/.claude)',
+      'Edit(//home/s/.claude/**)'
+    ])
+    const filesystem = meta.claudeCode.options.sandbox!.filesystem
+    expect(filesystem.denyRead).toEqual(['/home/s/.claude.json'])
+    expect(filesystem.denyWrite).toEqual(['/home/s/.claude.json', '/home/s/.claude'])
+  })
+
+  it('omits systemPrompt when neither seed nor memory is set', () => {
+    expect(claudeSessionMeta(undefined, true)?.systemPrompt).toBeUndefined()
+  })
+
+  it('carries the seed alone', () => {
+    expect(claudeSessionMeta(undefined, true, 'be terse')?.systemPrompt).toEqual({ append: 'be terse' })
+  })
+
+  it('carries the memory index alone', () => {
+    expect(claudeSessionMeta(undefined, true, undefined, '# Persistent memory\nidx')?.systemPrompt).toEqual({
+      append: '# Persistent memory\nidx'
+    })
+  })
+
+  it('joins seed then memory with a blank line', () => {
+    expect(claudeSessionMeta(undefined, true, 'be terse', '# Persistent memory\nidx')?.systemPrompt).toEqual({
+      append: 'be terse\n\n# Persistent memory\nidx'
+    })
+  })
+})
+
+describe('AcpHost.setSessionModel (mid-session model switch)', () => {
+  it.each(['new', 'load', 'switch'] as const)(
+    'surfaces a rejected model and its provider detail on %s',
+    async (operation) => {
+      const host = new AcpHost(
+        { command: process.execPath, args: [fakeAgent, 'claude-acp'], env: [] },
+        {
+          onUpdate: () => {},
+          configPrefs: operation === 'switch' ? undefined : { model: 'model-b' },
+          env: { AC_MODELS: 'model-a,model-b', AC_MODEL_ERROR: 'This model requires usage credits.' }
+        }
+      )
+      await host.start()
+      try {
+        let sessionId = 'persisted'
+        if (operation === 'switch') sessionId = await host.newSession('/tmp')
+        const request =
+          operation === 'new'
+            ? host.newSession('/tmp', [], undefined, undefined, [], (id) => {
+                sessionId = id
+              })
+            : operation === 'load'
+              ? host.loadSession(sessionId, '/tmp')
+              : host.setSessionModel(sessionId, 'model-b')
+        await expect(request).rejects.toMatchObject({
+          name: 'ModelSelectionError',
+          message: 'Could not select model "model-b": This model requires usage credits.'
+        })
+        expect(host.hasSession(sessionId)).toBe(operation === 'switch')
+        expect(host.modelOptions(sessionId)?.current).toBe(operation === 'switch' ? 'model-a' : undefined)
+      } finally {
+        await host.stop()
+      }
+    }
+  )
+
+  it('applies an offered model to a live session and refreshes modelOptions; rejects bad inputs', async () => {
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      { onUpdate: () => {}, env: { AC_MODELS: 'model-a,model-b' } }
+    )
+    await host.start()
+    const sid = await host.newSession('/tmp')
+    expect(host.modelOptions()).toEqual({ current: 'model-a', models: ['model-a', 'model-b'] })
+
+    // switch to an offered model → applied, options refreshed
+    expect(await host.setSessionModel(sid, 'model-b')).toBe(true)
+    expect(host.modelOptions()?.current).toBe('model-b')
+    expect(host.modelOptions(sid)?.current).toBe('model-b')
+
+    // Each session retains its own selector even when another session refreshes the global cache.
+    const sid2 = await host.newSession('/tmp')
+    expect(host.modelOptions()?.current).toBe('model-a')
+    expect(host.modelOptions(sid)?.current).toBe('model-b')
+    expect(host.modelOptions(sid2)?.current).toBe('model-a')
+    expect(host.modelOptions('s-unknown')).toBeNull()
+
+    // An unchanged model is already in effect; an unavailable one is an error; unknown sessions are no-ops.
+    expect(await host.setSessionModel(sid, 'model-b')).toBe(true)
+    expect(host.modelOptions(sid)?.current).toBe('model-b')
+    await expect(host.setSessionModel(sid, 'nope')).rejects.toBeInstanceOf(ModelSelectionError)
+    expect(await host.setSessionModel('s-unknown', 'model-a')).toBe(false)
+    await host.stop()
+  })
+
+  it('returns false when the runtime advertises no model selector', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    await host.start()
+    const sid = await host.newSession('/tmp')
+    expect(host.modelOptions()).toBeNull()
+    expect(await host.setSessionModel(sid, 'model-a')).toBe(false)
+    await host.stop()
+  })
+})
+
+const envEchoAgent = join(here, 'fixtures', 'env-echo-acp-agent.mjs')
+
+it('injects opts.env into the spawned child process', async () => {
+  const updates: string[] = []
+  const host = new AcpHost(
+    { command: process.execPath, args: [envEchoAgent], env: [] },
+    {
+      onUpdate: (_sid, update) => {
+        if (update.sessionUpdate === 'agent_message_chunk') {
+          const c = (update as any).content
+          if (c?.type === 'text') updates.push(c.text)
+        }
+      },
+      env: { AC_ECHO_VAR: 'injected-value' }
+    }
+  )
+  await host.start()
+  const sid = await host.newSession('/tmp')
+  await host.prompt(sid, [{ type: 'text', text: 'go' }])
+  expect(updates).toContain('env:injected-value')
+  await host.stop()
+})
+
+it('can use an exact env without re-inheriting daemon variables', async () => {
+  const updates: string[] = []
+  const saved = process.env.AC_ECHO_VAR
+  process.env.AC_ECHO_VAR = 'ambient-value'
+  try {
+    const host = new AcpHost(
+      { command: process.execPath, args: [envEchoAgent], env: [] },
+      {
+        onUpdate: (_sid, update) => {
+          if (update.sessionUpdate !== 'agent_message_chunk') return
+          const content = (update as { content?: { type?: string; text?: string } }).content
+          if (content?.type === 'text' && content.text) updates.push(content.text)
+        },
+        env: { AC_ECHO_NAME: 'AC_ECHO_VAR' },
+        inheritProcessEnv: false
+      }
+    )
+    await host.start()
+    const sid = await host.newSession('/tmp')
+    await host.prompt(sid, [{ type: 'text', text: 'go' }])
+    expect(updates).toContain('env:')
+    await host.stop()
+  } finally {
+    if (saved === undefined) delete process.env.AC_ECHO_VAR
+    else process.env.AC_ECHO_VAR = saved
+  }
+})
+
+async function runIsolatedFixture(
+  runtimeId: string,
+  name: string,
+  value: string,
+  log?: { info: (message: string) => void; warn: (message: string) => void },
+  isolateAccountApps?: boolean,
+  servicesElicitations?: boolean,
+  operatorInstructions?: string
+): Promise<string[]> {
+  const updates: string[] = []
+  const host = new AcpHost(
+    // Neutral "agent" marker arg; account-app isolation now keys off runtimeId, so
+    // any appended flag lands after it in argv.
+    { command: process.execPath, args: [envEchoAgent, 'agent'], env: [{ name, value }] },
+    {
+      onUpdate: (_sid, update) => {
+        if (update.sessionUpdate !== 'agent_message_chunk') return
+        const content = (update as { content?: { type?: string; text?: string } }).content
+        if (content?.type === 'text' && content.text) updates.push(content.text)
+      },
+      env: { AC_ECHO_NAME: name, [name]: value },
+      runtimeId,
+      isolateAccountApps,
+      ...(servicesElicitations ? { onElicit: async () => undefined } : {}),
+      ...(operatorInstructions ? { configPrefs: { operatorInstructions } } : {}),
+      ...(log
+        ? {
+            log: {
+              trace: () => {},
+              debug: () => {},
+              info: log.info,
+              warn: log.warn,
+              error: () => {}
+            }
+          }
+        : {})
+    }
+  )
+  await host.start()
+  const sid = await host.newSession('/tmp')
+  await host.prompt(sid, [{ type: 'text', text: 'go' }])
+  await host.stop()
+  return updates
+}
+
+describe('AcpHost — account-bound app isolation', () => {
+  it('forces Codex apps off in the spawned process after all caller env is merged', async () => {
+    const raw = JSON.stringify({ model: 'gpt-test', features: { fast_mode: true, apps: true } })
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', raw)
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      model: 'gpt-test',
+      features: { fast_mode: true, apps: false },
+      mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+  })
+
+  it('warns and replaces unsafe CODEX_CONFIG without blocking child startup', async () => {
+    const warns: string[] = []
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', 'not-json', {
+      info: () => {},
+      warn: (message) => warns.push(message)
+    })
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      features: { apps: false },
+      mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+    expect(warns.join('\n')).toContain('ignoring unsafe inherited CODEX_CONFIG')
+  })
+
+  it('gives OpenCode CLAUDE.md as an instruction file beside the launch config', async () => {
+    const raw = JSON.stringify({ model: 'deepseek/deepseek-chat' })
+    const out = await runIsolatedFixture('opencode', 'OPENCODE_CONFIG_CONTENT', raw)
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toMatchObject({ model: 'deepseek/deepseek-chat', instructions: ['CLAUDE.md'] })
+  })
+
+  it("enables Codex's request_user_input tool when the host services elicitations", async () => {
+    const raw = JSON.stringify({ model: 'gpt-test', features: { apps: true } })
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', raw, undefined, undefined, true)
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      model: 'gpt-test',
+      features: { apps: false, default_mode_request_user_input: true },
+      mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+  })
+
+  it('leaves it off for a headless Codex host that would decline the question', async () => {
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', JSON.stringify({ model: 'gpt-test' }))
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      model: 'gpt-test',
+      features: { apps: false },
+      mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+  })
+
+  it('keeps a Codex MCP startup grace the runtime config already chose', async () => {
+    const raw = JSON.stringify({ mcp_optional_startup_grace_ms: 0 })
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', raw)
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      features: { apps: false },
+      mcp_optional_startup_grace_ms: 0,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+  })
+
+  it("hands the agent's operator instructions to Codex's Guardian after a policy the config already set", async () => {
+    const raw = JSON.stringify({ auto_review: { policy: 'Deployment policy.' } })
+    const instructions = 'Escalate by posting to Slack #support.'
+    const out = await runIsolatedFixture(
+      'codex-acp',
+      'CODEX_CONFIG',
+      raw,
+      undefined,
+      undefined,
+      undefined,
+      instructions
+    )
+
+    const echoed = JSON.parse(out.find((line) => line.startsWith('env:'))?.slice('env:'.length) ?? '')
+    expect(echoed.auto_review).toEqual({
+      policy: `Deployment policy.\n\n${codexGuardianOperatorPolicy(instructions)}`
+    })
+  })
+
+  it('leaves the Guardian policy alone for an agent without operator instructions', async () => {
+    const out = await runIsolatedFixture('codex-acp', 'CODEX_CONFIG', JSON.stringify({ model: 'gpt-test' }))
+
+    const echoed = JSON.parse(out.find((line) => line.startsWith('env:'))?.slice('env:'.length) ?? '')
+    expect(echoed.auto_review).toBeUndefined()
+  })
+
+  it('forces Claude.ai MCP servers off in the spawned process', async () => {
+    const out = await runIsolatedFixture('claude-acp', 'ENABLE_CLAUDEAI_MCP_SERVERS', 'true')
+    expect(out).toContain('env:false')
+  })
+
+  it('appends Copilot --disable-builtin-mcps to the spawned argv', async () => {
+    const out = await runIsolatedFixture('github-copilot-cli', 'ARGV', 'x')
+    const argv = JSON.parse(out.find((line) => line.startsWith('argv:'))?.slice('argv:'.length) ?? '[]')
+    expect(argv).toContain('--disable-builtin-mcps')
+  })
+
+  it('preserves Codex account apps when the daemon explicitly opts out', async () => {
+    const warns: string[] = []
+    const raw = JSON.stringify({ model: 'gpt-test', features: { apps: true } })
+    const out = await runIsolatedFixture(
+      'codex-acp',
+      'CODEX_CONFIG',
+      raw,
+      { info: () => {}, warn: (message) => warns.push(message) },
+      false
+    )
+
+    const echoed = out.find((line) => line.startsWith('env:'))?.slice('env:'.length)
+    expect(JSON.parse(echoed ?? '')).toEqual({
+      model: 'gpt-test',
+      features: { apps: true },
+      mcp_optional_startup_grace_ms: CODEX_MCP_STARTUP_GRACE_MS,
+      project_doc_fallback_filenames: ['CLAUDE.md']
+    })
+    expect(warns.join('\n')).toContain('account-app isolation disabled by daemon config')
+  })
+
+  it('preserves Copilot built-in MCPs when the daemon explicitly opts out', async () => {
+    const out = await runIsolatedFixture('github-copilot-cli', 'ARGV', 'x', undefined, false)
+    const argv = JSON.parse(out.find((line) => line.startsWith('argv:'))?.slice('argv:'.length) ?? '[]')
+    expect(argv).not.toContain('--disable-builtin-mcps')
+  })
+
+  it('warns for a known account-app runtime with no safe isolation switch when opted out', async () => {
+    const warns: string[] = []
+    await runIsolatedFixture(
+      'auggie',
+      'AC_ECHO_VAR',
+      'ok',
+      { info: () => {}, warn: (message) => warns.push(message) },
+      false
+    )
+    expect(warns.join('\n')).toContain('account-app isolation disabled by daemon config for auggie')
+    expect(warns.join('\n')).toContain('no narrow switch')
+  })
+
+  it('does not warn for a runtime with no account-connector concept', async () => {
+    const warns: string[] = []
+    await runIsolatedFixture('qwen-code', 'AC_ECHO_VAR', 'ok', {
+      info: () => {},
+      warn: (message) => warns.push(message)
+    })
+    expect(warns).toEqual([])
+  })
+
+  it('warns when the runtime is unrecognized', async () => {
+    const warns: string[] = []
+    await runIsolatedFixture('some-new-agent', 'AC_ECHO_VAR', 'ok', {
+      info: () => {},
+      warn: (message) => warns.push(message)
+    })
+    expect(warns.join('\n')).toContain('not verified')
+  })
+})
+
+const claudeAgent = join(here, 'fixtures', 'claude-env-echo-acp-agent.mjs')
+
+// Run a claude-fixture host (its path contains "claude" ⇒ AcpHost treats it as a
+// Claude runtime) and capture what it echoes for CLAUDE_CODE_EXECUTABLE.
+async function runClaudeHost(env: Record<string, string>): Promise<string[]> {
+  const out: string[] = []
+  const host = new AcpHost(
+    { command: process.execPath, args: [claudeAgent], env: [] },
+    {
+      onUpdate: (_sid, update) => {
+        if (update.sessionUpdate === 'agent_message_chunk') {
+          const c = (update as { content?: { type?: string; text?: string } }).content
+          if (c?.type === 'text' && c.text) out.push(c.text)
+        }
+      },
+      env
+    }
+  )
+  await host.start()
+  const sid = await host.newSession('/tmp')
+  await host.prompt(sid, [{ type: 'text', text: 'go' }])
+  await host.stop()
+  return out
+}
+
+describe('AcpHost — auto-inject CLAUDE_CODE_EXECUTABLE for a Claude runtime', () => {
+  it('sets it from a `claude` on PATH when unset', async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'ac-claudebin-'))
+    const fakeClaude = join(bin, 'claude')
+    writeFileSync(fakeClaude, '#!/bin/sh\n')
+    chmodSync(fakeClaude, 0o755)
+    const saved = process.env.CLAUDE_CODE_EXECUTABLE
+    delete process.env.CLAUDE_CODE_EXECUTABLE
+    try {
+      // PATH (merged after process.env) points only at our fake claude.
+      const out = await runClaudeHost({ PATH: bin })
+      expect(out).toContain(`claude_exec:${fakeClaude}`)
+    } finally {
+      if (saved === undefined) delete process.env.CLAUDE_CODE_EXECUTABLE
+      else process.env.CLAUDE_CODE_EXECUTABLE = saved
+    }
+  })
+
+  it('does NOT override an already-set CLAUDE_CODE_EXECUTABLE', async () => {
+    const out = await runClaudeHost({ CLAUDE_CODE_EXECUTABLE: '/custom/claude', PATH: '/nonexistent' })
+    expect(out).toContain('claude_exec:/custom/claude')
+  })
+})
+
+describe('turnFailureReason (actionable message from a failed ACP request)', () => {
+  const LIMIT =
+    "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:01 PM."
+  const GATEWAY_STOP =
+    'Out of AgentConnect credits — this message was not processed. Add credits (https://console.example.test/example-org/billing) or run this agent on a self-hosted Daemon (https://docs.example.test/install). Then resend.'
+
+  it('strips Codex’s status prefix and request-url suffix from a gateway refusal, keeping the provider’s sentence', () => {
+    // Exactly what Codex surfaces when the AI gateway refuses a stopped org's credential: its own
+    // wrapper around the gateway's sentence, plus the internal URL it was dialling.
+    const err = Object.assign(new Error('Internal error'), {
+      code: -32603,
+      data: {
+        message: `unexpected status 401 Unauthorized: ${GATEWAY_STOP}, url: http://example-aigw-drain.example.svc.cluster.local:8082/v1/responses`
+      }
+    })
+    expect(turnFailureReason(err)).toBe(GATEWAY_STOP)
+    // The older shape, with no url, and a reason phrase with spaces.
+    expect(turnFailureReason(new Error(`unexpected status 402 Payment Required: ${GATEWAY_STOP}`))).toBe(GATEWAY_STOP)
+    // A wrapper around nothing keeps a status line rather than answering with an empty string.
+    expect(turnFailureReason(new Error('unexpected status 502 Bad Gateway: , url: http://x/y'))).toBe(
+      'unexpected status 502'
+    )
+    // Anything not in that exact shape passes through untouched.
+    expect(turnFailureReason(new Error('status 401: nope, url: http://x'))).toBe('status 401: nope, url: http://x')
+  })
+
+  it('strips Claude Code’s "API Error" wrapper as claude-agent-acp relays it, including the authenticate guess on a 401', () => {
+    // claude-agent-acp rejects the prompt with the CLI's own result text (RequestError.internalError with
+    // the text as data.message). For a gateway 401 that text is the CLI's non-interactive rendering.
+    const err = Object.assign(new Error('Internal error'), {
+      code: -32603,
+      data: { message: `Failed to authenticate. API Error: 401 ${GATEWAY_STOP}` }
+    })
+    expect(turnFailureReason(err)).toBe(GATEWAY_STOP)
+    // Interactive rendering, a plain status, and no status at all.
+    expect(turnFailureReason(new Error(`Please run /login · API Error: 403 ${GATEWAY_STOP}`))).toBe(GATEWAY_STOP)
+    expect(turnFailureReason(new Error('API Error: 402 Payment is required.'))).toBe('Payment is required.')
+    expect(turnFailureReason(new Error('API Error: Request was aborted.'))).toBe('Request was aborted.')
+    // A wrapper around nothing keeps a status line; a bare label is not a wrapper.
+    expect(turnFailureReason(new Error('API Error: 500 '))).toBe('API error 500')
+    expect(turnFailureReason(new Error('API Error: 405 status code (no body)'))).toBe('API error 405')
+    expect(turnFailureReason(new Error('API Error'))).toBe('API Error')
+  })
+
+  it('strips the DeepSeek Harness adapter’s "turn failed:" prefix, then whatever the harness wrapped', () => {
+    expect(turnFailureReason(new Error(`turn failed: ${GATEWAY_STOP}`))).toBe(GATEWAY_STOP)
+    expect(turnFailureReason(new Error(`turn failed: unexpected status 401 Unauthorized: ${GATEWAY_STOP}`))).toBe(
+      GATEWAY_STOP
+    )
+  })
+
+  it('prefers data.message over a generic JSON-RPC title (codex-acp quota exhaustion)', () => {
+    // Exactly what codex-acp rejects session/prompt with when Codex is out of usage.
+    const err = Object.assign(new Error('Internal error'), {
+      code: -32603,
+      data: { message: LIMIT, codexErrorInfo: 'usageLimitExceeded' }
+    })
+    expect(turnFailureReason(err)).toBe(LIMIT)
+  })
+
+  it('keeps a specific message that already contains the detail (authRequired with additionalMessage)', () => {
+    const err = Object.assign(new Error(`Authentication required: ${LIMIT}`), {
+      code: -32000,
+      data: { message: LIMIT }
+    })
+    expect(turnFailureReason(err)).toBe(`Authentication required: ${LIMIT}`)
+  })
+
+  it('appends a distinct detail to a non-generic message', () => {
+    const err = Object.assign(new Error('turn aborted'), { code: -32603, data: { message: 'backend unreachable' } })
+    expect(turnFailureReason(err)).toBe('turn aborted: backend unreachable')
+  })
+
+  it('falls back to the plain Error message when there is no data', () => {
+    expect(turnFailureReason(new Error('spawn claude ENOENT'))).toBe('spawn claude ENOENT')
+  })
+})
+
+describe('turnFailureCode (normalized non-actionable provider failures)', () => {
+  it.each([
+    {
+      name: 'codex-acp structured usage code',
+      error: Object.assign(new Error('Internal error'), {
+        code: -32603,
+        data: { codexErrorInfo: 'usageLimitExceeded' }
+      })
+    },
+    {
+      name: 'OpenAI-compatible nested quota code',
+      error: Object.assign(new Error('request failed'), {
+        data: { error: { type: 'insufficient_quota' } }
+      })
+    },
+    {
+      name: 'Codex usage text',
+      error: Object.assign(new Error('Internal error'), {
+        data: { message: "You've hit your usage limit. Purchase more credits or try again at 7:01 PM." }
+      })
+    },
+    {
+      name: 'Claude reset text',
+      error: new Error("You've hit your limit · resets 2pm (America/Los_Angeles)")
+    },
+    {
+      name: 'provider credit exhaustion text',
+      error: { error: { message: 'Credit balance is too low to access the Anthropic API' } }
+    },
+    {
+      // Observed live 2026-08-21: every review turn on the org died in under a second, and this
+      // wording reached neither the quota codes nor the usage-limit patterns, so the Check said
+      // only "Review could not be completed" while the real cause sat in the daemon log.
+      name: 'Claude org spend limit text',
+      error: Object.assign(
+        new Error(
+          "Internal error: You've hit your org's monthly spend limit · run /usage-credits to ask your admin for a higher limit"
+        ),
+        { code: -32603, data: { errorKind: 'rate_limit' } }
+      )
+    },
+    {
+      name: 'spend limit reached text',
+      error: { data: { message: 'Your monthly spend limit has been reached.' } }
+    }
+  ])('classifies $name as provider_quota_exhausted', ({ error }) => {
+    expect(turnFailureCode(error)).toBe('provider_quota_exhausted')
+  })
+
+  it('classifies an expired unrefreshable OAuth session as provider_auth_required', () => {
+    // Observed live from claude-agent-acp 0.59.0 with an expired-but-present
+    // OAuth credential (agent private HOME seeded long ago): initialize and
+    // session/new succeed, the prompt rejects -32603 with this exact message.
+    const error = Object.assign(
+      new Error('Internal error: Failed to authenticate: OAuth session expired and could not be refreshed'),
+      { code: -32603 }
+    )
+    expect(turnFailureCode(error)).toBe('provider_auth_required')
+  })
+
+  it('recognizes Claude Code refresh-lock contention as transient, not a dead login', () => {
+    const error = Object.assign(
+      new Error(
+        'Internal error: Failed to refresh OAuth token: another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again'
+      ),
+      { code: -32603, data: { errorKind: 'authentication_failed' } }
+    )
+    expect(isOAuthRefreshContention(error)).toBe(true)
+    expect(turnFailureCode(error)).toBe('turn_failed')
+    expect(
+      isOAuthRefreshContention(new Error('Failed to authenticate: OAuth session expired and could not be refreshed'))
+    ).toBe(false)
+  })
+
+  it('classifies a revoked refresh token as provider_auth_required', () => {
+    const error = Object.assign(new Error('Authentication required'), {
+      data: {
+        message:
+          'Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.'
+      }
+    })
+    expect(turnFailureCode(error)).toBe('provider_auth_required')
+  })
+
+  it.each([
+    new Error('spawn claude ENOENT'),
+    { code: 'rate_limit_error', message: 'Rate limit exceeded; retry in 20 seconds' },
+    // An adapter's `rate_limit` error kind is transient on its own: only the message promotes.
+    { message: 'Rate limit exceeded; retry in 20 seconds', data: { errorKind: 'rate_limit' } },
+    { data: { error: { type: 'overloaded_error', message: 'Service temporarily overloaded' } } },
+    Object.assign(new Error('Authentication required'), { data: { message: 'Please sign in again' } })
+  ])('keeps non-quota failures as turn_failed', (error) => {
+    expect(turnFailureCode(error)).toBe('turn_failed')
+  })
+})
+
+describe('AcpHost.stop', () => {
+  it('resolves promptly when the child already exited on its own (e.g. terminal Ctrl-C hit the process group)', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    await host.start()
+    // Kill the child out from under the host — the terminal delivering SIGINT to
+    // the whole foreground process group does exactly this — and wait until its
+    // 'exit' has actually been emitted, so stop() runs against a reaped child.
+    // The process handle now lives in the local spawn driver's launched target.
+    const child = (host as unknown as { spawned: { child: import('node:child_process').ChildProcess } }).spawned.child
+    await new Promise<void>((resolve) => {
+      child.once('exit', () => resolve())
+      child.kill('SIGKILL')
+    })
+    const t0 = Date.now()
+    await host.stop()
+    // The regression hung here forever (once('exit') never re-fires); well under
+    // the 5s SIGTERM deadline proves the pre-exited guard took the early return.
+    expect(Date.now() - t0).toBeLessThan(1000)
+  })
+
+  // Windows has no POSIX signals, so there is no SIGTERM to ignore and no SIGKILL to escalate to.
+  it.skipIf(process.platform === 'win32')(
+    'escalates to SIGKILL when the child ignores SIGTERM',
+    async () => {
+      const warns: string[] = []
+      const host = new AcpHost(
+        { command: process.execPath, args: [fakeAgent], env: [] },
+        {
+          onUpdate: () => {},
+          env: { AC_IGNORE_SIGTERM: '1' },
+          log: { trace: () => {}, debug: () => {}, info: () => {}, warn: (m: string) => warns.push(m), error: () => {} }
+        }
+      )
+      await host.start()
+      await host.stop(200)
+      expect(warns.join('\n')).toContain('ignored SIGTERM')
+    },
+    15_000
+  )
+})
+
+// URL-mode elicitation (issue #1794 gap 4). The daemon is an ACP *client*: it answers
+// `elicitation/create` and receives `elicitation/complete`, and never raises either.
+describe('AcpHost elicitation capabilities', () => {
+  it('advertises both form and url elicitation, so a runtime may pick the URL seam', async () => {
+    const chunks: string[] = []
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [{ name: 'AC_ECHO_CLIENT_CAPS', value: '1' }] },
+      {
+        onUpdate: (_sid, update) => {
+          const c = (update as any).content
+          if ((update as any).sessionUpdate === 'agent_message_chunk' && c?.type === 'text') chunks.push(c.text)
+        }
+      }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    await host.prompt(sessionId, [{ type: 'text', text: 'hi' }])
+    // Without `url` here a runtime cannot use the seam the spec reserves for credentials.
+    expect(JSON.parse(chunks[0]!).elicitation).toEqual({ form: {}, url: {} })
+    await host.stop()
+  })
+
+  it('routes a URL elicitation to the policy and reports its completion by id alone', async () => {
+    const completed: string[] = []
+    const chunks: string[] = []
+    let seen: any
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [{ name: 'AC_ELICIT_URL', value: '1' }] },
+      {
+        onUpdate: (_sid, update) => {
+          const c = (update as any).content
+          if ((update as any).sessionUpdate === 'agent_message_chunk' && c?.type === 'text') chunks.push(c.text)
+        },
+        onElicit: async (_sid, params) => {
+          seen = params
+          return { action: 'accept' }
+        },
+        onElicitComplete: (elicitationId) => completed.push(elicitationId)
+      }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    await host.prompt(sessionId, [{ type: 'text', text: 'hi' }])
+    expect(seen).toMatchObject({ mode: 'url', elicitationId: 'el-fixture', url: 'https://example.test/authorize' })
+    expect(chunks).toContain('elicited:accept')
+    // The notification carries no session — only the elicitation id it settles. It rides the
+    // same stream as the prompt result and is dispatched independently of it, so wait rather
+    // than assume the turn's resolution ordered it.
+    await vi.waitFor(() => expect(completed).toEqual(['el-fixture']))
+    await host.stop()
+  })
+
+  it('declines a URL elicitation when no policy is wired, rather than hanging the turn', async () => {
+    const chunks: string[] = []
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [{ name: 'AC_ELICIT_URL', value: '1' }] },
+      {
+        onUpdate: (_sid, update) => {
+          const c = (update as any).content
+          if ((update as any).sessionUpdate === 'agent_message_chunk' && c?.type === 'text') chunks.push(c.text)
+        }
+      }
+    )
+    await host.start()
+    const sessionId = await host.newSession('/tmp')
+    await host.prompt(sessionId, [{ type: 'text', text: 'hi' }])
+    await vi.waitFor(() => expect(chunks).toContain('elicited:decline'))
+    await host.stop()
+  })
+})
+
+describe('AcpHost steering (`_session/steering` against the fake agent)', () => {
+  it('reads the capability from initialize `_meta` and never calls a runtime that lacks it', async () => {
+    const host = new AcpHost({ command: process.execPath, args: [fakeAgent], env: [] }, { onUpdate: () => {} })
+    await host.start()
+    expect(host.steeringSupported()).toBe(false)
+    const sessionId = await host.newSession('/tmp')
+    // The fixture answers the method with "not found" when steering is off; the host must not send it.
+    await expect(host.steer(sessionId, [{ type: 'text', text: 'x' }])).resolves.toBe('failed')
+    await host.stop()
+  })
+
+  it('reports the runtime outcome: declined on an idle session under promptRequired, injected into a running turn', async () => {
+    const chunks: string[] = []
+    const host = new AcpHost(
+      { command: process.execPath, args: [fakeAgent], env: [] },
+      {
+        onUpdate: (_sid, update) => {
+          if (update.sessionUpdate === 'agent_message_chunk' && (update as any).content?.type === 'text')
+            chunks.push((update as any).content.text)
+        },
+        env: { AC_STEERING: '1', AC_STEER_HOLD_PROMPT: '1' }
+      }
+    )
+    await host.start()
+    expect(host.steeringSupported()).toBe(true)
+    const sessionId = await host.newSession('/tmp')
+    // Idle session: `promptRequired` makes the runtime decline instead of opening a turn.
+    await expect(
+      host.steer(sessionId, [{ type: 'text', text: 'early' }], { idleBehavior: 'promptRequired' })
+    ).resolves.toBe('failed')
+    // A session this host does not own is declined locally.
+    await expect(host.steer('not-mine', [{ type: 'text', text: 'x' }])).resolves.toBe('failed')
+
+    // Running turn: the fixture holds the prompt open until a steer lands in it.
+    const turn = host.prompt(sessionId, [{ type: 'text', text: 'start' }])
+    await expect(
+      host.steer(sessionId, [{ type: 'text', text: 'and also this' }], { idleBehavior: 'promptRequired' })
+    ).resolves.toBe('injected')
+    await expect(turn).resolves.toMatchObject({ stopReason: 'end_turn' })
+    expect(chunks).toContain('steer:and also this')
+    await host.stop()
+  })
+})

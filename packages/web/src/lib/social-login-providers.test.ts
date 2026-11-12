@@ -1,0 +1,64 @@
+import { describe, expect, it } from 'vitest'
+import {
+  SOCIAL_LOGIN_CATALOG,
+  parseEnabledTargets,
+  selectEnabledProviders,
+  selectOfferedProviders
+} from './social-login-providers'
+
+const targets = (raw: string | undefined) => selectEnabledProviders(raw).map((p) => p.target)
+
+describe('social login provider selection', () => {
+  it('reads an empty list as SSO-only once an SSO connector is configured', () => {
+    expect(selectOfferedProviders('', true)).toEqual([])
+    expect(selectOfferedProviders('github', true).map((provider) => provider.target)).toEqual(['github'])
+    expect(selectOfferedProviders('', false).map((provider) => provider.target)).toEqual(['google', 'slack', 'github'])
+  })
+
+  it('keeps the original providers by default and requires an explicit wildcard for the whole catalog', () => {
+    expect(parseEnabledTargets(undefined)).toEqual(new Set(['github', 'google', 'slack']))
+    expect(targets(undefined)).toEqual(['google', 'slack', 'github'])
+    expect(targets('*')).toEqual(SOCIAL_LOGIN_CATALOG.map((p) => p.target))
+    expect(targets('   ')).toEqual(['google', 'slack', 'github'])
+  })
+
+  it('keeps catalog order except for the configured Lark/Feishu preference', () => {
+    expect(targets('github,slack')).toEqual(['slack', 'github'])
+    expect(targets('discord,feishu,lark,google')).toEqual(['google', 'feishu', 'lark', 'discord'])
+    expect(targets(' google , slack ')).toEqual(['google', 'slack'])
+    expect(targets('lark,feishu')).toEqual(['lark', 'feishu'])
+    expect(targets('feishu,lark')).toEqual(['feishu', 'lark'])
+    expect(targets('github')).toEqual(['github'])
+    expect(targets('gitlab')).toEqual(['gitlab'])
+  })
+
+  it('offers Microsoft sign-in under its Logto target', () => {
+    expect(SOCIAL_LOGIN_CATALOG).toContainEqual({ target: 'azuread', name: 'Microsoft' })
+    expect(targets('azuread,google')).toEqual(['google', 'azuread'])
+    expect(targets('github,azuread,slack,google')).toEqual(['google', 'slack', 'azuread', 'github'])
+  })
+
+  it('ignores targets it cannot render rather than rendering a blank button', () => {
+    expect(targets('github,facebook')).toEqual(['github'])
+  })
+
+  it('falls back to the original providers when the setting names nothing usable', () => {
+    // Leaving the sign-in page with zero ways in is worse than ignoring a typo.
+    expect(targets('facebook')).toEqual(['google', 'slack', 'github'])
+    expect(targets(',,')).toEqual(['google', 'slack', 'github'])
+  })
+
+  // The invariant this variable exists for: whatever the console offers must be
+  // linkable. The CP deliberately does NOT re-derive this set -- it accepts any
+  // connector slug and lets the tenant's connector list be the gate -- so no
+  // second implementation of these rules can drift from these vectors.
+  it.each(['github,google,slack', 'lark,feishu', 'slack', 'facebook', '', '*', 'github,facebook', undefined])(
+    'only ever offers targets the catalog can render (%s)',
+    (raw) => {
+      const offered = selectEnabledProviders(raw).map((p) => p.target)
+      const renderable = SOCIAL_LOGIN_CATALOG.map((p) => p.target)
+      expect(offered.length).toBeGreaterThan(0)
+      expect(offered.every((target) => renderable.includes(target))).toBe(true)
+    }
+  )
+})

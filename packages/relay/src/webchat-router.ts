@@ -1,0 +1,191 @@
+// Fan conversation output to its verified browser connections; cache rosters separately for peer-daemon context.
+import { randomUUID } from 'node:crypto'
+import {
+  RD_WEBCHAT_IMAGES_V1,
+  type RdChat,
+  type RdMsg,
+  type RdWebchatImageUpdate,
+  type RdWebchatPromptSuggestion,
+  type RdWebchatPost
+} from '@agentconnect.md/protocol'
+
+/** The browser sink the router delivers a reply chunk to. */
+export interface ChatSink {
+  onChat(chat: RdChat): void
+  /** A participant's completed conversation post (multi-agent fan-out seam).
+   *  Optional so a minimal test sink stays valid. */
+  onPost?(post: RdWebchatPost): void
+  /** A published image's original changed state; optional like `onPost`. */
+  onImageUpdate?(update: RdWebchatImageUpdate): void
+  /** A participant's predicted next prompt; optional like `onPost`. */
+  onPromptSuggestion?(suggestion: RdWebchatPromptSuggestion): void
+  /** A daemon's relay link (re)became READY; optional like `onPost`. */
+  onDaemonReady?(daemonId: string): void
+}
+
+/** One cached roster entry (agentId + current placement, as verified by the CP). */
+export interface CachedParticipant {
+  agentId: string
+  daemonId?: string
+  /** The member holding this participant's content (#2218), which no re-route heals. */
+  recordedDaemonId?: string
+  /** A continued member session (#2500), which takes no context copies. */
+  targetSessionId?: string
+}
+
+// Bounded roster cache: entries are refreshed on every browser (re)connect and
+// evicted oldest-first. Sized for "conversations with recent browser activity" —
+// a completed reply's context fan-out must not depend on the browser still being
+// attached (webchat-multi-agents.md §5.2), only on it having been here recently.
+const ROSTER_CACHE_MAX = 4096
+
+/**
+ * Bind an `rd/webchat-post`'s authorship claim to the AUTHENTICATED daemon that sent
+ * it (webchat-multi-agents.md §5.2a; the webchat mirror of the `rd/agentmsg` rule that
+ * agent-call identity is bound by a trusted endpoint, never taken from the frame).
+ *
+ * The claim is bound when the outer and inner author fields agree
+ * (`post.agentId === post.post.author.agentId`), the claimed author is a CP-verified
+ * roster participant of this conversation, and that participant's verified placement
+ * is the daemon the frame arrived from. A stale or evicted roster cache fails closed.
+ *
+ * An UNBOUND claim is not dropped — a context copy was pre-§5.2a trust (transcript
+ * only), and transcripts already record whatever an authenticated daemon asserts. What
+ * an unbound claim may NOT carry onward is the activation-capable depth stamp: the
+ * returned post has `author.hopCount` stripped, so every receiving daemon treats it as
+ * transcript-only, and a forged author can never make peers execute under a
+ * `callFrom` the relay did not verify. The target daemon's own checks (call policy,
+ * hop budget, exactly-once) remain the terminal verification on the bound path.
+ */
+export function bindWebchatPostAuthor(
+  post: RdWebchatPost,
+  fromDaemonId: string,
+  roster: CachedParticipant[]
+): { post: RdWebchatPost; authorBound: boolean } {
+  const author = post.post.author
+  const placement = roster.find((p) => p.agentId === post.agentId)
+  const authorBound =
+    author.kind === 'agent' &&
+    author.agentId === post.agentId &&
+    placement !== undefined &&
+    placement.daemonId !== undefined &&
+    placement.daemonId === fromDaemonId
+  if (authorBound || author.kind !== 'agent' || author.hopCount === undefined) {
+    return { post, authorBound }
+  }
+  return {
+    authorBound,
+    post: { ...post, post: { ...post.post, author: { kind: 'agent', agentId: author.agentId } } }
+  }
+}
+
+export class WebchatRouter {
+  private byChatId = new Map<string, Set<ChatSink>>()
+  private rosterByChatId = new Map<string, { participants: CachedParticipant[]; asOfMs: number }>()
+
+  register(chatId: string, sink: ChatSink): void {
+    let sinks = this.byChatId.get(chatId)
+    if (!sinks) this.byChatId.set(chatId, (sinks = new Set()))
+    sinks.add(sink)
+  }
+
+  /** Cache a conversation's CP-verified roster as of `asOfMs`; a roster older than the cached one (a reused token's) never replaces it. */
+  rememberRoster(chatId: string, participants: CachedParticipant[], asOfMs: number = Date.now()): void {
+    const cached = this.rosterByChatId.get(chatId)
+    if (cached && cached.asOfMs > asOfMs) return
+    // Re-inserting moves the entry to the back of the eviction order.
+    this.rosterByChatId.delete(chatId)
+    this.rosterByChatId.set(chatId, { participants, asOfMs })
+    while (this.rosterByChatId.size > ROSTER_CACHE_MAX) {
+      const oldest = this.rosterByChatId.keys().next().value
+      if (oldest === undefined) break
+      this.rosterByChatId.delete(oldest)
+    }
+  }
+
+  /** The cached roster for a conversation ([] when never seen / evicted). */
+  rosterOf(chatId: string): CachedParticipant[] {
+    return this.rosterByChatId.get(chatId)?.participants ?? []
+  }
+
+  /** Remove only this connection; sibling tabs and reconnects remain subscribed. */
+  unregister(chatId: string, sink: ChatSink): void {
+    const sinks = this.byChatId.get(chatId)
+    if (!sinks) return
+    sinks.delete(sink)
+    if (sinks.size === 0) this.byChatId.delete(chatId)
+  }
+
+  /** Route output and completion to every browser subscribed to this conversation. */
+  deliver(chat: RdChat): void {
+    for (const sink of this.byChatId.get(chat.chatId) ?? []) sink.onChat(chat)
+  }
+
+  /** Render the canonical post to every subscriber; peer-daemon context uses the independent roster cache. */
+  deliverPost(post: RdWebchatPost): void {
+    for (const sink of this.byChatId.get(post.conversationId) ?? []) sink.onPost?.(post)
+  }
+
+  /** Deliver an original-state update to every browser on the conversation; peers never receive it. */
+  deliverImageUpdate(update: RdWebchatImageUpdate): void {
+    for (const sink of this.byChatId.get(update.conversationId) ?? []) sink.onImageUpdate?.(update)
+  }
+
+  /** Deliver a predicted next prompt to every browser on the conversation; peers never receive it. */
+  deliverPromptSuggestion(suggestion: RdWebchatPromptSuggestion): void {
+    for (const sink of this.byChatId.get(suggestion.conversationId) ?? []) sink.onPromptSuggestion?.(suggestion)
+  }
+
+  /** Tell every browser a daemon relinked, so one whose stream it served can resume what the gap dropped. */
+  deliverDaemonReady(daemonId: string): void {
+    for (const sinks of this.byChatId.values()) for (const sink of sinks) sink.onDaemonReady?.(daemonId)
+  }
+
+  size(): number {
+    return this.byChatId.size
+  }
+}
+
+/** Accept an image update or prompt suggestion only from the daemon the CP-verified roster places its agent on; an unknown roster fails closed. */
+export function imageUpdateBound(
+  update: Pick<RdWebchatImageUpdate, 'agentId'>,
+  fromDaemonId: string,
+  roster: CachedParticipant[]
+): boolean {
+  const placement = roster.find((p) => p.agentId === update.agentId)
+  return placement?.daemonId !== undefined && placement.daemonId === fromDaemonId
+}
+
+/** The slice of a daemon link the image fan-out needs. */
+export interface ImageUpdatePeer {
+  supports(capability: string): boolean
+  sendMsg(payload: RdMsg): Promise<unknown>
+}
+
+/** Send an original-state update to every other participant's daemon that holds a peer copy and can decode the op. */
+export function fanImageUpdate(
+  update: RdWebchatImageUpdate,
+  roster: CachedParticipant[],
+  daemonOf: (daemonId: string) => ImageUpdatePeer | undefined,
+  warn: (message: string) => void
+): void {
+  // Peers record state only; a signed GET is a browser's bearer link and never crosses to another daemon.
+  const { download: _download, ...peerUpdate } = update
+  for (const p of roster) {
+    // A continued member session takes no peer copy, so it has nothing to update.
+    if (p.agentId === update.agentId || !p.daemonId || p.targetSessionId) continue
+    const conn = daemonOf(p.daemonId)
+    if (!conn?.supports(RD_WEBCHAT_IMAGES_V1)) continue
+    void conn
+      .sendMsg({
+        source: 'webchat',
+        agentId: p.agentId,
+        sessionKey: update.conversationId,
+        msgId: randomUUID(),
+        chatId: update.conversationId,
+        ...(p.recordedDaemonId ? { recordedDaemonId: p.recordedDaemonId } : {}),
+        payload: { op: 'image_update', update: peerUpdate }
+      })
+      .catch((err) => warn(`relay: webchat image update fan-out failed: ${(err as Error).message}`))
+  }
+}

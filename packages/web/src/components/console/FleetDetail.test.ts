@@ -1,0 +1,149 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it, vi } from 'vitest'
+import { FleetRuntimesCard, intersectRuntimes, unionRuntimes } from './FleetDetail'
+import { selectableRuntimeIds, type DaemonRow, type Agent } from '@/lib/data'
+
+vi.mock('@/lib/acp-registry', () => ({ useAcpRegistry: () => ({}), acpRuntime: () => undefined }))
+vi.mock('@/components/console/ModalProvider', () => ({ useModal: () => ({ openModal: vi.fn() }) }))
+
+/** The set-level runtime views a detail page renders. Their model lists are ids — and for a
+ *  claude runtime those are ALIASES — so what a member's catalog says about each id has to
+ *  survive the aggregation, or the card can only ever show `opus[1m]`. */
+
+const member = (over: Partial<DaemonRow['runtimeModels'][number]> = {}): DaemonRow =>
+  ({
+    runtimeModels: [
+      {
+        runtime: 'claude',
+        version: '0.73.0',
+        models: ['opus[1m]', 'haiku'],
+        modelCatalog: {
+          models: [
+            { id: 'opus[1m]', name: 'Opus (1M context)', description: 'Opus 5 with 1M context' },
+            { id: 'haiku' }
+          ],
+          source: 'acp',
+          observedAt: '2026-09-03T00:00:00.000Z'
+        },
+        ...over
+      }
+    ]
+  }) as unknown as DaemonRow
+
+describe('runtime aggregation carries model display metadata', () => {
+  it('shows a reported alias once, counts its agents, and preserves a configured alias in the picker', () => {
+    const daemon = member({ runtime: 'native', models: [], modelCatalog: null })
+    daemon.runtimeModels.push({ ...daemon.runtimeModels[0]!, runtime: 'legacy', aliasOf: 'native' })
+    expect(selectableRuntimeIds(daemon)).toEqual(['native'])
+    expect(selectableRuntimeIds(daemon, 'legacy')).toEqual(['legacy'])
+    for (const aggregate of [unionRuntimes, intersectRuntimes]) {
+      const runtimes = aggregate([daemon])
+      expect(runtimes).toHaveLength(1)
+      expect(runtimes[0]).toMatchObject({ runtime: 'native', aliases: ['legacy'] })
+      const html = renderToStaticMarkup(
+        createElement(FleetRuntimesCard, {
+          title: 'Runtimes',
+          runtimes,
+          agents: [{ runtime: 'legacy' } as Agent],
+          empty: 'None'
+        })
+      )
+      expect(html).toContain('1 agent')
+    }
+    delete daemon.runtimeModels[1]!.aliasOf
+    expect(unionRuntimes([daemon])).toHaveLength(2)
+    expect(selectableRuntimeIds(daemon)).toEqual(['native', 'legacy'])
+  })
+
+  it('unions the catalog names and blurbs alongside the ids', () => {
+    const [rt] = unionRuntimes([member()])
+    expect(rt!.models).toEqual(['opus[1m]', 'haiku'])
+    expect(rt!.modelInfo).toEqual({ 'opus[1m]': { name: 'Opus (1M context)', description: 'Opus 5 with 1M context' } })
+  })
+
+  it('keeps a describing member’s answer when a peer reports no catalog', () => {
+    const [rt] = unionRuntimes([member(), member({ modelCatalog: null })])
+    expect(rt!.modelInfo?.['opus[1m]']?.name).toBe('Opus (1M context)')
+    const [flipped] = unionRuntimes([member({ modelCatalog: null }), member()])
+    expect(flipped!.modelInfo?.['opus[1m]']?.name).toBe('Opus (1M context)')
+  })
+
+  it('drops a name the members disagree on — one alias, two concrete models', () => {
+    const other = member({
+      modelCatalog: {
+        models: [
+          { id: 'opus[1m]', name: 'Opus 4.8 (1M context)', description: 'Opus 4.8 with 1M context' },
+          { id: 'haiku' }
+        ],
+        source: 'acp',
+        observedAt: '2026-09-03T00:00:00.000Z'
+      }
+    } as never)
+    expect(unionRuntimes([member(), other])[0]!.modelInfo).toEqual({})
+    expect(intersectRuntimes([member(), other])[0]!.modelInfo).toEqual({})
+  })
+
+  it('stays silent once disputed, however many members agree later', () => {
+    const opus48 = member({
+      modelCatalog: {
+        models: [{ id: 'opus[1m]', name: 'Opus 4.8 (1M context)', description: 'Opus 4.8 with 1M context' }],
+        source: 'acp',
+        observedAt: '2026-09-03T00:00:00.000Z'
+      }
+    } as never)
+    // Opus 5, Opus 4.8, Opus 5 — the set still disagrees, so the third must not resurrect it.
+    expect(unionRuntimes([member(), opus48, member()])[0]!.modelInfo).toEqual({})
+    expect(intersectRuntimes([member(), opus48, member()])[0]!.modelInfo).toEqual({})
+  })
+
+  it('preserves a member image restriction without dropping host model knowledge', () => {
+    const members = [member(), member({ unavailableReason: 'image-binary-missing', authRequired: true })]
+    for (const aggregate of [unionRuntimes, intersectRuntimes]) {
+      const runtimes = aggregate(members)
+      const render = () =>
+        renderToStaticMarkup(
+          createElement(FleetRuntimesCard, { title: 'Runtimes', runtimes, agents: [], empty: 'None' })
+        )
+      expect(runtimes[0]).toMatchObject({
+        runtime: 'claude',
+        models: ['opus[1m]', 'haiku'],
+        unavailableReason: 'image-binary-missing',
+        authRequired: true
+      })
+      expect(render()).toContain('Binary not installed in image')
+      expect(render()).not.toContain('Login required')
+      runtimes[0]!.unavailableReason = null
+      expect(render()).toContain('Login required')
+      expect(render()).toContain('Show command')
+    }
+  })
+
+  it('names the members that need a login, in member order, and none when none does', () => {
+    const named = (name: string, authRequired?: boolean) => ({ ...member({ authRequired } as never), name })
+    for (const aggregate of [unionRuntimes, intersectRuntimes]) {
+      expect(aggregate([named('agent-1'), named('agent-2')])[0]).toMatchObject({
+        authRequired: false,
+        authRequiredOn: []
+      })
+      expect(aggregate([named('agent-1', true), named('agent-2'), named('agent-3', true)])[0]).toMatchObject({
+        authRequired: true,
+        authRequiredOn: ['agent-1', 'agent-3']
+      })
+    }
+    // A set's card names them; a single daemon's card is already about one host.
+    const runtimes = intersectRuntimes([named('agent-1', true), named('agent-2', true), named('agent-3', true)])
+    const card = (daemonName?: string) =>
+      renderToStaticMarkup(
+        createElement(FleetRuntimesCard, { title: 'Runtimes', runtimes, agents: [], empty: 'None', daemonName })
+      )
+    expect(card()).toContain('Login required on agent-1, agent-2 +1')
+    expect(card('agent-1')).toContain('Login required<')
+    expect(card('agent-1')).not.toContain('Login required on')
+  })
+
+  it('carries them through the intersection too', () => {
+    const [rt] = intersectRuntimes([member(), member()])
+    expect(rt!.modelInfo?.['opus[1m]']?.description).toBe('Opus 5 with 1M context')
+  })
+})

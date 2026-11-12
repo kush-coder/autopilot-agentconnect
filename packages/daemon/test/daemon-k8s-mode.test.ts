@@ -1,0 +1,2663 @@
+import { describe, expect, it, vi } from 'vitest'
+import { CodeHostRefResolver } from '../src/codehost/ref-resolver.js'
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  AGENT_WAKE_FEATURE,
+  AUTO_MERGE_SESSION_FEATURE,
+  DAEMON_BOOTSTRAP_UPGRADE_FEATURE,
+  RUNTIME_PROBE_FEATURE
+} from '@agentconnect.md/protocol'
+import { Daemon } from '../src/daemon.js'
+import {
+  LONG_IDLE_SKIP_AFTER_TTLS,
+  LONG_IDLE_SKIP_REPORT_INTERVAL_MS,
+  UNTRACKED_SANDBOX_ADOPTION_INTERVAL_MS
+} from '../src/daemon/constants.js'
+import { agentHostKey, sessionHostKey, sessionKeyDirName } from '../src/acp/host-key.js'
+import { wireWorkspacePlane } from '../src/execution/plane.js'
+import { SANDBOX_HOLD_TTL_MS, SandboxHolds } from '../src/k8s/sandbox-hold.js'
+import { internalSessionKey } from '../src/key-server/session-hosts.js'
+import { ShimChannelLostError } from '../src/shim/channels.js'
+import { agentSandboxSubject, sandboxSubjectFor, sandboxSubjectForPath } from '../src/k8s/sandbox-identity.js'
+import { DEFAULT_SHIM_WORKSPACE_ROOT } from '../src/shim/protocol.js'
+import type { ResolvedRuntimeCatalog } from '../src/runtimes/registry.js'
+import { LocalStore } from '../src/store/local-store.js'
+import type { SourceCacheMetrics, SourceCacheSweeper, SourceCacheWorkspaceReader } from '../src/source-cache/index.js'
+import { DATA_PLANE_CONFIG_PATH } from '../src/store/postgres-config.js'
+import { mcpSocketPath, statePath } from '../src/paths.js'
+import { SANDBOX_TUNNEL_PATHS } from '../src/shim/sandbox-paths.js'
+
+/** The behavior matrix for `--k8s`: each assertion here is one row of the mode
+ *  contract, so k8s and self-hosted behavior cannot drift apart unnoticed. */
+
+function root(
+  opts: { declared?: unknown; hostOff?: boolean; cliEntry?: boolean; store?: unknown; cp?: boolean } = {}
+): string {
+  const path = mkdtempSync(join(tmpdir(), 'ac-k8s-mode-'))
+  writeFileSync(
+    join(path, 'config.json'),
+    JSON.stringify({
+      version: 1,
+      controlPlane: { enabled: opts.cp ?? false },
+      ...(opts.hostOff ? { sandbox: { host: false } } : {}),
+      ...(opts.store ? { store: opts.store } : {})
+    })
+  )
+  if (opts.declared !== undefined) {
+    writeFileSync(join(path, 'k8s-runtimes.json'), JSON.stringify(opts.declared))
+  }
+  // A stale pointer left on the root volume is exactly the case that must NOT re-enable
+  // the self-installing upgrade path in k8s mode. readCliEntry only accepts a pointer
+  // whose target exists, so the fixture writes a real file to point at.
+  if (opts.cliEntry) {
+    const entry = join(path, 'cli-dist-entry.js')
+    writeFileSync(entry, '// stand-in for an installed CLI entry\n')
+    writeFileSync(join(path, 'cli-entry'), entry)
+  }
+  return path
+}
+
+function catalog(): ResolvedRuntimeCatalog {
+  // Deliberately a command that does not exist on the test host: host discovery must
+  // find nothing, so anything advertised came from the declared table.
+  const absent = { command: 'ac-k8s-absent-runtime', args: [], env: [] }
+  const hermes = { command: 'hermes', args: ['acp'], env: [] }
+  // A runtime whose command names a provider surface, so a probe of it composes a credential.
+  const codex = { command: 'codex-acp', args: [], env: [] }
+  return {
+    entries: {
+      claude: { runtime: absent, source: 'registry', name: 'Claude Code', version: '1.0.0', skillsAgentId: 'claude' },
+      'codex-acp': { runtime: codex, source: 'registry', name: 'Codex', version: '1.0.0', skillsAgentId: 'codex' },
+      'hermes-agent': { runtime: hermes, source: 'curated', name: 'Hermes Agent', version: '', skillsAgentId: null }
+    },
+    runtimes: { claude: absent, 'codex-acp': codex, 'hermes-agent': hermes }
+  }
+}
+
+/** A data plane over an in-memory store, so the rows about which store a daemon opens need no PostgreSQL. */
+async function fakeDataPlane(store?: LocalStore): Promise<never> {
+  return {
+    store: store ?? (await LocalStore.open(':memory:')),
+    transcripts: {
+      appendTranscript: () => {},
+      insertToolCall: () => {},
+      updateToolCall: () => {},
+      transcriptTailForAgent: async () => ({ rows: [], hasMore: false, cursor: 0 }),
+      transcriptPageForAgentByEventTime: async () => ({ rows: [], hasMore: false }),
+      transcriptPageForAgent: async () => ({ rows: [], hasMore: false }),
+      currentTranscriptRevision: async () => 0,
+      getToolBodyForAgent: async () => undefined
+    },
+    close: async () => {}
+  } as never
+}
+
+function daemon(opts: {
+  root: string
+  k8s: boolean
+  probe?: ReturnType<typeof vi.fn>
+  /** The ACP client the sandbox model probe drives, so the sweep runs without a cluster. */
+  probeHostFactory?: (rt: unknown, id: string, cwd: string, policy: unknown) => unknown
+  supervisor?: string
+  /** Extra plane members for the rows that are ABOUT the plane the mode installs. */
+  plane?: Record<string, unknown>
+  dataPlane?: boolean
+  /** A store shared by several members, so a pool-wide probe can be asserted across them. */
+  store?: LocalStore
+  openDataPlane?: ReturnType<typeof vi.fn>
+  startControlPlane?: ReturnType<typeof vi.fn>
+  /** Receives the options the mode hands the plane — the rows about what it asks the pod to serve. */
+  onPlaneStart?: (options: any) => void
+  /** The Source Cache's STS seam, so a row can prove no network call was made. */
+  sourceCacheFetch?: ReturnType<typeof vi.fn>
+  /** A recording Source Cache metrics recorder, for the wiring row. */
+  sourceCacheMetrics?: SourceCacheMetrics
+}): Daemon {
+  return new Daemon({
+    root: opts.root,
+    k8s: opts.k8s,
+    // The plane needs a cluster and has its own suite; this file is about what the MODE changes.
+    // Stubbing it here keeps the refuse-to-boot-without-a-cluster behaviour real everywhere else.
+    ...(opts.k8s
+      ? {
+          ...(opts.dataPlane === false ? {} : { openDataPlane: () => fakeDataPlane(opts.store) }),
+          startK8sPlane: async (options: any) => {
+            opts.onPlaneStart?.(options)
+            return {
+              driver: { claimName: (id: string) => `agent-${id}` } as never,
+              memberId: 'member-under-test',
+              runtimeImage: async () => 'runtime-sandbox:test',
+              listener: { listeningPort: () => 0 } as never,
+              workspacesOffDisk: true,
+              gitRunnerFor: () => undefined,
+              launched: () => [],
+              adoptUntracked: async () => [],
+              armedIn: async () => false,
+              suspendIdle: async () => 'absent',
+              suspendStalled: async () => 'absent',
+              discardAgent: async () => {},
+              stop: async () => {},
+              ...opts.plane
+            } as never
+          }
+        }
+      : {}),
+    ...(opts.openDataPlane ? { openDataPlane: opts.openDataPlane as never } : {}),
+    ...(opts.sourceCacheMetrics ? { sourceCacheMetrics: opts.sourceCacheMetrics } : {}),
+    startControlPlane: (opts.startControlPlane ?? vi.fn(() => Promise.resolve())) as never,
+    ...(opts.supervisor ? { supervisor: opts.supervisor } : {}),
+    resolveCatalog: async () => catalog(),
+    ...(opts.probe ? { probeRuntimes: opts.probe as never } : {}),
+    ...(opts.probeHostFactory ? { probeHostFactory: opts.probeHostFactory as never } : {}),
+    ...(opts.sourceCacheFetch ? { sourceCacheFetch: opts.sourceCacheFetch as never } : {}),
+    hostFactory: () => ({}) as never
+  })
+}
+
+describe('daemon --k8s mode', () => {
+  it('gives an isolated session its own host and pod, and a shared one the agent host, whatever mechanism this host has (§11)', async () => {
+    const instance = daemon({ root: root(), k8s: true })
+    try {
+      await instance.start()
+      // The mode never turns the in-process mechanism on; force it so the isolation rule — not the
+      // mechanism rule that decides self-hosted — is what keys the host here.
+      ;(instance as any).sandboxMechanism = 'bwrap'
+      const agent = {
+        id: 'bot-a',
+        name: 'bot-a',
+        status: 'active',
+        runtime: 'claude',
+        workspace: {
+          mode: 'git-repo',
+          path: '/agents/bot-a/workspace',
+          gitRepo: 'https://github.com/acme/private.git',
+          gitBranch: 'main'
+        },
+        integrations: [],
+        output: { mode: 'medium' }
+      }
+      ;(instance as any).agents.set('bot-a', agent)
+      const shared = { sessionKey: 'slack:C1:T1:bot-a', isolation: 'shared' as const }
+      const isolated = { sessionKey: 'slack:C1:T2:bot-a', isolation: 'session' as const }
+      expect((instance as any).hostKeyForRequest('bot-a', shared)).toBe(agentHostKey('bot-a'))
+      expect((instance as any).hostKeyForRequest('bot-a', isolated)).toBe(sessionHostKey('bot-a', isolated.sessionKey))
+      // The learned isolation keeps answering for callers holding only the key, and the pod follows the host.
+      expect((instance as any).hostKeyFor('bot-a', isolated.sessionKey)).toBe(
+        sessionHostKey('bot-a', isolated.sessionKey)
+      )
+      expect((instance as any).hostKeyFor('bot-a', shared.sessionKey)).toBe(agentHostKey('bot-a'))
+      expect((instance as any).podSubjectFor(agent, sessionHostKey('bot-a', isolated.sessionKey))).toBe(
+        sandboxSubjectFor(sessionHostKey('bot-a', isolated.sessionKey))
+      )
+      // A session-shaped host key the pool does not know as isolated (a dream, a model-session host) stays in the agent pod.
+      expect((instance as any).podSubjectFor(agent, sessionHostKey('bot-a', 'dream:bot-a:d1'))).toBeUndefined()
+      expect((instance as any).podSubjectFor(agent, agentHostKey('bot-a'))).toBeUndefined()
+      // A session the pool never heard of is the agent's, not a guess.
+      expect((instance as any).hostKeyFor('bot-a', 'slack:C1:T9:bot-a')).toBe(agentHostKey('bot-a'))
+      // Capacity keeps counting AGENTS: session hosts (and their pods) do not spend `maxAgents` slots.
+      ;(instance as any).cfg.limits.maxAgents = 5
+      ;(instance as any).hosts.set(sessionHostKey('bot-a', isolated.sessionKey), {})
+      ;(instance as any).hosts.set(sessionHostKey('bot-a', 'slack:C1:T3:bot-a'), {})
+      expect((instance as any).dutyCoordinator.dutyHeadroom()).toBe(5)
+      ;(instance as any).hosts.clear()
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('claims no session pod for a tier nothing has reported, whatever the agent defaults to (§11)', async () => {
+    // The asymmetry the pool needs: guessing `session` claims a pod that lives as long as the session's
+    // row, while guessing `shared` costs at most one turn in the agent pod. Every host key whose session
+    // the pool has not been told about — a dream, a model-session host, a session key seen before its
+    // row — therefore lands in the agent's own pod.
+    const instance = daemon({ root: root(), k8s: true })
+    try {
+      await instance.start()
+      ;(instance as any).sandboxMechanism = 'bwrap'
+      const agent = poolAgent('session')
+      ;(instance as any).agents.set('bot-a', agent)
+      const unreported = 'slack:C1:T1:bot-a'
+      expect((instance as any).confinedSession(agent, unreported)).toBe(false)
+      expect((instance as any).hostKeyFor('bot-a', unreported)).toBe(agentHostKey('bot-a'))
+      expect((instance as any).podSubjectFor(agent, sessionHostKey('bot-a', unreported))).toBeUndefined()
+      expect((instance as any).podSubjectFor(agent, sessionHostKey('bot-a', 'dream:bot-a:d1'))).toBeUndefined()
+      // The feature is untouched: a session the pool HAS been told is isolated still gets its own pod.
+      const isolated = { sessionKey: 'slack:C1:T2:bot-a', isolation: 'session' as const }
+      expect((instance as any).hostKeyForRequest('bot-a', isolated)).toBe(sessionHostKey('bot-a', isolated.sessionKey))
+      expect((instance as any).podSubjectFor(agent, sessionHostKey('bot-a', isolated.sessionKey))).toBe(
+        sandboxSubjectFor(sessionHostKey('bot-a', isolated.sessionKey))
+      )
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it("claims the pod this session's own isolation names, before its row is written (§11)", async () => {
+    // The model-session host starts inside openSession, seconds before `sessions.handle` records the
+    // row — so the pod it claims has to read the session's own isolation there, or an explicit
+    // per-session opt-out is honoured only once a pod nobody asked for is already running.
+    const cases = [
+      { agentDefault: 'session' as const, recorded: 'shared' as const, ownPod: false },
+      { agentDefault: 'shared' as const, recorded: 'session' as const, ownPod: true },
+      { agentDefault: 'session' as const, worktree: false, ownPod: false },
+      { agentDefault: 'shared' as const, worktree: true, ownPod: true }
+    ]
+    for (const scenario of cases) {
+      const instance = daemon({ root: root(), k8s: true })
+      try {
+        await instance.start()
+        ;(instance as any).sandboxMechanism = 'bwrap'
+        const agent = poolAgent(scenario.agentDefault)
+        ;(instance as any).agents.set('bot-a', agent)
+        const key = 'slack:C1:T1:bot-a'
+        const claimed = await openSessionClaim(instance, agent, key, scenario)
+        expect(claimed).toBe(scenario.ownPod ? sandboxSubjectFor(sessionHostKey('bot-a', key)) : undefined)
+      } finally {
+        await instance.stop()
+      }
+    }
+  })
+
+  it('places every workspace on the cluster plane — off this disk before any pod is bound, emptied through the plane — until it stops', async () => {
+    const clearPath = vi.fn(async () => 'no bound sandbox channel')
+    const instance = daemon({ root: root(), k8s: true, plane: { clearPath } })
+    try {
+      await instance.start()
+      // The plane's placement, not a channel's: `gitRunnerFor` answers undefined here, and an operation guarded by that would clone onto this disk.
+      expect(instance.workspaces.resolveGitRunner('bot-a', '/agent/repo')).toBeUndefined()
+      expect(instance.workspaces.offDisk({ agentId: 'bot-a' })).toBe(true)
+      expect(await instance.workspaces.clearPath('bot-a', '/agent/repo')).toBe('no bound sandbox channel')
+      expect(clearPath).toHaveBeenCalledWith('bot-a', '/agent/repo')
+    } finally {
+      await instance.stop()
+    }
+    expect(instance.workspaces.offDisk({ agentId: 'bot-a' })).toBe(false)
+  })
+
+  it('keeps a microsandbox workspace on this disk, since a VM mounts directories of this host', () => {
+    const local = daemon({ root: root(), k8s: false })
+    // Wired as the microsandbox backend wires it: having a plane is not living off this disk.
+    wireWorkspacePlane(local.workspaces, (local as any).microsandboxPlane)
+    expect(local.workspaces.offDisk({ agentId: 'bot-a', path: '/agents/bot-a/workspace' })).toBe(false)
+  })
+
+  it('does not inspect or open the PostgreSQL data plane outside k8s mode', async () => {
+    const openDataPlane = vi.fn()
+    const local = daemon({ root: root(), k8s: false, openDataPlane })
+    try {
+      await local.start()
+      expect(openDataPlane).not.toHaveBeenCalled()
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('opens a postgres store named by its file outside k8s mode, and keeps no SQLite database (#2188)', async () => {
+    const rootDir = root({ store: { backend: 'postgres', configFile: 'data-plane.json' }, cp: true })
+    const openDataPlane = vi.fn(() => fakeDataPlane())
+    const local = daemon({ root: rootDir, k8s: false, openDataPlane })
+    try {
+      await local.start()
+      expect(openDataPlane).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.any(Function),
+        join(rootDir, 'data-plane.json')
+      )
+      expect(existsSync(statePath(rootDir))).toBe(false)
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('serves no file-authored agent on a postgres store, since none has an organization to attribute rows to', async () => {
+    const rootDir = root({ store: { backend: 'postgres', configFile: 'data-plane.json' }, cp: true })
+    const agentDir = join(rootDir, 'agents', 'bot-local')
+    mkdirSync(agentDir, { recursive: true })
+    writeFileSync(
+      join(agentDir, 'agent.json'),
+      JSON.stringify({
+        id: 'bot-local',
+        name: 'bot-local',
+        status: 'active',
+        runtime: 'claude',
+        workspace: { mode: 'from-scratch', path: join(agentDir, 'workspace') },
+        integrations: []
+      })
+    )
+    const local = daemon({ root: rootDir, k8s: false, openDataPlane: vi.fn(() => fakeDataPlane()) })
+    try {
+      await local.start()
+      expect((local as any).agents.has('bot-local')).toBe(false)
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('refuses a postgres store on a daemon without the control plane', async () => {
+    const openDataPlane = vi.fn(() => fakeDataPlane())
+    const local = daemon({
+      root: root({ store: { backend: 'postgres', configFile: 'data-plane.json' } }),
+      k8s: false,
+      openDataPlane
+    })
+    await expect(local.start()).rejects.toThrow(/postgres store needs the control plane/)
+    expect(openDataPlane).not.toHaveBeenCalled()
+  })
+
+  it('reads the mounted configuration under --k8s whatever the store setting names', async () => {
+    const openDataPlane = vi.fn(() => fakeDataPlane())
+    const instance = daemon({
+      root: root({ store: { backend: 'postgres', configFile: 'data-plane.json' } }),
+      k8s: true,
+      openDataPlane
+    })
+    try {
+      await instance.start()
+      expect(openDataPlane).toHaveBeenCalledWith(expect.any(Function), expect.any(Function), DATA_PLANE_CONFIG_PATH)
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('requires the mounted PostgreSQL configuration before starting the execution plane', async () => {
+    const k8sDaemon = daemon({ root: root(), k8s: true, dataPlane: false })
+    await expect(k8sDaemon.start()).rejects.toThrow(/data-plane configuration is not readable/)
+  })
+
+  it('uses the mounted PostgreSQL store without creating a pool member SQLite database', async () => {
+    const rootDir = root()
+    const instance = daemon({ root: rootDir, k8s: true })
+    try {
+      await instance.start()
+      expect(existsSync(statePath(rootDir))).toBe(false)
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('waits for the initial CP organization registry before completing pool member startup', async () => {
+    let release!: () => void
+    const registryReady = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const startControlPlane = vi.fn(() => registryReady)
+    const instance = daemon({ root: root(), k8s: true, startControlPlane })
+    const starting = instance.start()
+    let settled = false
+    void starting.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      }
+    )
+    await vi.waitFor(() => expect(startControlPlane).toHaveBeenCalledOnce())
+    expect(settled).toBe(false)
+    release()
+    try {
+      await starting
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('refuses pool member startup when no authoritative CP organization registry is available', async () => {
+    const instance = daemon({ root: root(), k8s: true, startControlPlane: vi.fn(() => undefined) })
+    await expect(instance.start()).rejects.toThrow(/requires an authoritative CP organization registry/)
+    await instance.stop()
+  })
+
+  it('advertises the runtimes the image declares, not what is installed on the host', async () => {
+    const probe = vi.fn(async () => [])
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude', models: ['sonnet'] }] } }),
+      k8s: true,
+      probe
+    })
+    try {
+      await k8sDaemon.start()
+      expect(Object.keys((k8sDaemon as any).runtimes)).toEqual(['claude'])
+      // Never launches a runtime locally to learn this — the table is the source.
+      expect(probe).not.toHaveBeenCalled()
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('claude')
+      expect(profile.models).toEqual(['sonnet'])
+      // Declared, not probed: model gates must stay permissive on this provenance.
+      expect(profile.modelsSource).toBe('cached')
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('advertises nothing in the same tree without --k8s, where host discovery decides', async () => {
+    const local = daemon({ root: root({ declared: { runtimes: [{ id: 'claude' }] } }), k8s: false })
+    try {
+      await local.start()
+      expect(Object.keys((local as any).runtimes)).toEqual([])
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('drops a declared curated runtime instead of advertising one that cannot launch', async () => {
+    const k8sDaemon = daemon({ root: root({ declared: { runtimes: [{ id: 'hermes-agent' }] } }), k8s: true })
+    try {
+      await k8sDaemon.start()
+      expect(Object.keys((k8sDaemon as any).runtimes)).toEqual([])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('advertises no runtime and keeps running when the declared table is missing', async () => {
+    const k8sDaemon = daemon({ root: root(), k8s: true })
+    try {
+      await k8sDaemon.start()
+      expect(Object.keys((k8sDaemon as any).runtimes)).toEqual([])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('offers no sandboxing strategy: the pod is the isolation unit, not the SRT mechanism', async () => {
+    const k8sDaemon = daemon({ root: root({ declared: { runtimes: [{ id: 'claude' }] } }), k8s: true })
+    try {
+      await k8sDaemon.start()
+      expect((k8sDaemon as any).sandboxMechanism).toBeUndefined()
+      const pod = { available: false, reason: 'a k8s runtime is isolated by its own pod' }
+      expect((k8sDaemon as any).strategyTable()).toEqual({ host: { available: true }, srt: pod, microsandbox: pod })
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('advertises the sandbox wake: in cluster mode there is a sandbox to wake', async () => {
+    const k8sDaemon = daemon({ root: root({ declared: { runtimes: [{ id: 'claude' }] } }), k8s: true })
+    try {
+      await k8sDaemon.start()
+      expect((k8sDaemon as any).registrationFeatures()).toContain(AGENT_WAKE_FEATURE)
+      // And a watcher placed by the arming session, which only a pod-per-session daemon has.
+      expect((k8sDaemon as any).registrationFeatures()).toContain(AUTO_MERGE_SESSION_FEATURE)
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('advertises runtime probe requests only where the deployment opts in', async () => {
+    const managed = daemon({ root: root({ declared: { runtimes: [{ id: 'claude' }] } }), k8s: true })
+    try {
+      await managed.start()
+      expect((managed as any).registrationFeatures()).not.toContain(RUNTIME_PROBE_FEATURE)
+    } finally {
+      await managed.stop()
+    }
+    vi.stubEnv('AC_RUNTIME_PROBE_ON_DEMAND', 'true')
+    const selfHosted = daemon({ root: root({ declared: { runtimes: [{ id: 'claude' }] } }), k8s: true })
+    try {
+      await selfHosted.start()
+      expect((selfHosted as any).registrationFeatures()).toContain(RUNTIME_PROBE_FEATURE)
+    } finally {
+      await selfHosted.stop()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('refuses the self-installing upgrade even with a supervisor marker and a cli-entry present', async () => {
+    // Both prerequisites of the normal capability check are satisfied here: without a
+    // mode-level refusal, the daemon would advertise bootstrap-upgrade and accept a
+    // command that runs the CLI installer and exits the pod for an unrequested version.
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] }, cliEntry: true }),
+      k8s: true,
+      supervisor: 'service'
+    })
+    try {
+      await k8sDaemon.start()
+      expect((k8sDaemon as any).bootstrapUpgradeCapable()).toBe(false)
+      expect((k8sDaemon as any).registrationFeatures()).not.toContain(DAEMON_BOOTSTRAP_UPGRADE_FEATURE)
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('still offers the self-installing upgrade outside k8s mode with the same prerequisites', async () => {
+    // The control case, so the refusal above is attributable to the mode and not to a
+    // missing prerequisite in the fixture.
+    const local = daemon({ root: root({ cliEntry: true }), k8s: false, supervisor: 'service' })
+    try {
+      await local.start()
+      expect((local as any).bootstrapUpgradeCapable()).toBe(true)
+      expect((local as any).registrationFeatures()).toContain(DAEMON_BOOTSTRAP_UPGRADE_FEATURE)
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('refuses to start when sandbox.host is off, rather than pretending', async () => {
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] }, hostOff: true }),
+      k8s: true
+    })
+    await expect(k8sDaemon.start()).rejects.toThrow(/sandbox\.host: false is not supported with --k8s/)
+  })
+
+  it('suspends the pod of an agent that has gone quiet, and leaves a busy one alone', async () => {
+    const suspended: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: 'quiet', agentId: 'quiet', since: 0 },
+          { subject: 'serving', agentId: 'serving', since: 0 }
+        ],
+        suspendIdle: async (agentId: string) => {
+          suspended.push(agentId)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      // A host that is still inside its own idle window owns the decision; suspending underneath
+      // it would pull the pod out from a runtime that is merely between turns.
+      ;(k8sDaemon as any).hosts.set('serving', { stop: async () => {} })
+      ;(k8sDaemon as any).hostStartedAt.set('serving', Date.now())
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() => expect(suspended).toEqual(['quiet']))
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('leaves a HELD sandbox alone — an open page is watching work a suspend would throw away', async () => {
+    const suspended: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: 'watched', agentId: 'watched', since: 0 },
+          { subject: 'abandoned', agentId: 'abandoned', since: 0 }
+        ],
+        suspendIdle: async (agentId: string) => {
+          suspended.push(agentId)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      // What the keep-alive route renews: a lease taken because that session's worktree is dirty.
+      ;(k8sDaemon as any).sandboxHolds.renew('watched', 'session-1', ['uncommitted-files'])
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() => expect(suspended).toEqual(['abandoned']))
+
+      // The page closes: nothing renews, the lease lapses, and the next sweep suspends normally. The
+      // fake plane re-answers for `abandoned` too, so the assertion is about the held one arriving.
+      ;(k8sDaemon as any).sandboxHolds.release('watched', 'session-1')
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() => expect(suspended).toContain('watched'))
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('judges the hold per POD, so one dirty session page cannot pin its agent or its siblings (§11)', async () => {
+    // The lease is keyed by sandbox subject, not by agent: an agent-keyed one let a page watching one
+    // dirty session worktree keep every running session pod of that agent out of the sweep.
+    const suspended: string[] = []
+    const dirty = 'watched/session-dirty'
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: dirty, agentId: 'watched', since: 0 },
+          { subject: 'watched/session-clean', agentId: 'watched', since: 0 },
+          { subject: 'watched', agentId: 'watched', since: 0 }
+        ],
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      ;(k8sDaemon as any).sandboxHolds.renew(dirty, 'session-dirty', ['uncommitted-files'])
+      ;(k8sDaemon as any).sweepIdle()
+      // The agent's own pod and the sibling session's are judged on their own keys, and suspend.
+      await vi.waitFor(() => expect([...suspended].sort()).toEqual(['watched', 'watched/session-clean']))
+      expect(suspended).not.toContain(dirty)
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('keeps the agent pod while a watcher is armed in it with no page and no host, and lets it go after', async () => {
+    const suspended: string[] = []
+    const asked: string[] = []
+    let armed: boolean | Error = true
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: 'watched', agentId: 'watched', since: 0 },
+          { subject: 'watched/session-quiet', agentId: 'watched', since: 0 }
+        ],
+        armedIn: async (subject: string) => {
+          asked.push(subject)
+          if (armed instanceof Error) throw armed
+          return subject === 'watched' && armed
+        },
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      let now = Date.now()
+      inner.sandboxHolds = new SandboxHolds({ now: () => now })
+      const sweep = async (): Promise<void> => {
+        await inner.sweepIdleSandboxes(now, inner.cfg.limits.agentIdleTimeoutMs)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      const askedAgentPod = () => asked.filter((subject) => subject === 'watched')
+
+      // Nothing is stored anywhere: each pod's own registry answers for itself, and an armed answer is held.
+      await sweep()
+      expect(asked).toEqual(['watched', 'watched/session-quiet'])
+      expect(suspended).toEqual(['watched/session-quiet'])
+      expect(inner.sandboxHolds.reasons('watched')).toEqual(['auto-merge-armed'])
+      // While the hold is live the sweep leaves the pod alone without asking again.
+      await sweep()
+      expect(askedAgentPod()).toHaveLength(1)
+      expect(suspended).toEqual(['watched/session-quiet', 'watched/session-quiet'])
+
+      // Merged: the watcher exits, the hold lapses within its TTL, and the pod reports nothing armed.
+      armed = false
+      now += SANDBOX_HOLD_TTL_MS
+      await sweep()
+      expect(askedAgentPod()).toHaveLength(2)
+      expect(suspended).toContain('watched')
+
+      // A pod that cannot answer is not kept for a watcher it may not have.
+      suspended.length = 0
+      armed = new Error('shim timed out')
+      await sweep()
+      expect(suspended).toContain('watched')
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('keeps a SESSION pod while a watcher an isolated session armed runs in it, and lets it go after', async () => {
+    // Merge-when-ready moved into the session pod that armed it (k8s-daemon-pool §4), so the sweep asks that pod too.
+    const session = 'watched/session-armed'
+    const suspended: string[] = []
+    let armed = true
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [{ subject: session, agentId: 'watched', since: 0 }],
+        armedIn: async (subject: string) => subject === session && armed,
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      let now = Date.now()
+      inner.sandboxHolds = new SandboxHolds({ now: () => now })
+      const sweep = async (): Promise<void> => {
+        await inner.sweepIdleSandboxes(now, inner.cfg.limits.agentIdleTimeoutMs)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+
+      await sweep()
+      expect(suspended).toEqual([])
+      expect(inner.sandboxHolds.reasons(session)).toEqual(['auto-merge-armed'])
+
+      armed = false
+      now += SANDBOX_HOLD_TTL_MS
+      await sweep()
+      expect(suspended).toEqual([session])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('defers a pod whose channel was lost while asked, until it answers', async () => {
+    // A renewal that fails the question on its retry too says nothing about the watcher: suspending on it would kill a live one.
+    const suspended: string[] = []
+    let answer: 'lost' | boolean = 'lost'
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [{ subject: 'watched', agentId: 'watched', since: 0 }],
+        armedIn: async () => {
+          if (answer === 'lost') throw new ShimChannelLostError('shim channel renewed')
+          return answer
+        },
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      const sweep = async (): Promise<void> => {
+        await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+
+      await sweep()
+      expect(suspended).toEqual([])
+      // Deferred, not held: the next sweep asks again rather than waiting out a TTL.
+      expect(inner.sandboxHolds.holds('watched')).toBe(false)
+
+      answer = false
+      await sweep()
+      expect(suspended).toEqual(['watched'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('never suspends a pod whose watcher was armed while the sweep was asking it', async () => {
+    // The pod's answer predates the arm; the arm renews the sweep's hold before its own round-trip hold goes, and the sweep re-reads its holds in the tick it suspends.
+    const suspended: string[] = []
+    const held: string[] = []
+    let answer: (armed: boolean) => void = () => {}
+    let answerAsked: () => void = () => {}
+    const asked = new Promise<void>((resolve) => (answerAsked = resolve))
+    const pod = {
+      arm: async () => ({ armed: true }),
+      disarm: async () => ({ armed: false }),
+      state: async () => ({ armed: true }),
+      watching: async () => ({ armed: false })
+    }
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [{ subject: 'bot-a', agentId: 'bot-a', since: 0 }],
+        autoMergeSubjects: () => ['bot-a'],
+        autoMergeAt: async () => pod,
+        holdIfBound: (subject: string) => {
+          held.push(subject)
+          return () => held.push(`released ${subject}`)
+        },
+        armedIn: () =>
+          new Promise<boolean>((resolve) => {
+            answer = resolve
+            answerAsked()
+          }),
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      inner.agents.set('bot-a', poolAgent('shared'))
+      // The pre-arm GitHub probe cannot reach GitHub here, which never blocks an arm.
+      inner.gitCreds = {
+        get: async () => {
+          throw new Error('no GitHub in this test')
+        }
+      }
+      await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+      await asked
+      // The operator ticks the box while the sweep's question is still out.
+      const state = await inner.autoMergeWatcher.set({ agentId: 'bot-a', repoFullName: 'acme/app', prNumber: 7 }, true)
+      expect(state).toMatchObject({ armed: true, placement: 'sandbox' })
+      expect(held).toEqual(['bot-a', 'released bot-a'])
+      answer(false)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(suspended).toEqual([])
+      expect(inner.sandboxHolds.reasons('bot-a')).toEqual(['auto-merge-armed'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  // POSIX-only: a session directory is composed with the host's path module, and pod routing reads POSIX paths (the pool runs on Linux).
+  it.skipIf(process.platform === 'win32')(
+    'places an arm by the arming session’s tier: an isolated session’s own pod, a shared one’s agent pod (§4)',
+    async () => {
+      const ISOLATED = 'slack:C1:T1:bot-a'
+      const SHARED = 'slack:C1:T2:bot-a'
+      const LEGACY = 'slack:C1:T3:bot-a'
+      const sessionPod = sandboxSubjectFor(sessionHostKey('bot-a', ISOLATED))
+      const claimAsked: string[] = []
+      const pod = () => {
+        const ops: string[] = []
+        return {
+          ops,
+          arm: async (call: { prNumber: number }) => {
+            ops.push(`arm #${call.prNumber}`)
+            return { armed: true }
+          },
+          disarm: async () => ({ armed: false }),
+          state: async () => ({ armed: false }),
+          watching: async () => ({ armed: false })
+        }
+      }
+      const pods: Record<string, ReturnType<typeof pod>> = { 'bot-a': pod(), [sessionPod]: pod() }
+      const k8sDaemon = daemon({
+        root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+        k8s: true,
+        plane: {
+          // The routing every read uses: a path under the session directory is that session's pod.
+          subjectForPath: (agentId: string, path?: string) =>
+            sandboxSubjectForPath(agentId, path, DEFAULT_SHIM_WORKSPACE_ROOT),
+          workspaceFsFor: () => undefined,
+          workspaceRootFor: () => undefined,
+          autoMergeSubjects: () => Object.keys(pods),
+          autoMergeAt: async (subject: string) => pods[subject],
+          holdIfBound: () => () => {},
+          // Only the isolated session has a claim: the other isolated one predates its own pod.
+          hasSandbox: async (subject: string) => {
+            claimAsked.push(subject)
+            return subject === sessionPod
+          }
+        }
+      })
+      try {
+        await k8sDaemon.start()
+        const inner = k8sDaemon as any
+        inner.agents.set('bot-a', poolAgent('session'))
+        // The pre-arm GitHub probe cannot reach GitHub here, which never blocks an arm.
+        inner.gitCreds = {
+          get: async () => {
+            throw new Error('no GitHub in this test')
+          }
+        }
+        const rows: Record<string, unknown> = {
+          'outward-isolated': { key: ISOLATED, sessionId: 'outward-isolated', workspaceIsolation: 'session' },
+          'outward-shared': { key: SHARED, sessionId: 'outward-shared', workspaceIsolation: 'shared' },
+          'outward-legacy': { key: LEGACY, sessionId: 'outward-legacy', workspaceIsolation: 'session' }
+        }
+        vi.spyOn(inner.store, 'getSessionByOutwardId').mockImplementation(async (id: unknown) => rows[id as string])
+        const arm = (prNumber: number, sessionId?: string) =>
+          inner.autoMergeWatcher.set({ agentId: 'bot-a', repoFullName: 'acme/app', prNumber }, true, sessionId)
+
+        expect(await arm(1, 'outward-isolated')).toMatchObject({ armed: true, placement: 'sandbox' })
+        await arm(2, 'outward-shared')
+        // No session (an older Control Plane), or one this member does not know: the agent pod, as before.
+        await arm(3)
+        await arm(4, 'outward-unknown')
+        // An isolated session with no pod of its own keeps its workspace, and its watcher, on the agent pod.
+        await arm(5, 'outward-legacy')
+
+        expect(pods[sessionPod]!.ops).toEqual(['arm #1'])
+        expect(pods['bot-a']!.ops).toEqual(['arm #2', 'arm #3', 'arm #4', 'arm #5'])
+        // Only an isolated session's pod is looked up, never the agent's own.
+        expect(claimAsked).toEqual([sessionPod, sandboxSubjectFor(sessionHostKey('bot-a', LEGACY))])
+        // The sweep's own hold is renewed on the pod that runs the watcher.
+        expect(inner.sandboxHolds.reasons(sessionPod)).toEqual(['auto-merge-armed'])
+      } finally {
+        await k8sDaemon.stop()
+      }
+    }
+  )
+
+  it('counts idleness from when the launch was taken over when no activity is recorded', async () => {
+    const suspended: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        // No session row exists for either agent, so activity alone would read as idle since epoch.
+        launched: () => [
+          { subject: 'fresh', agentId: 'fresh', since: Date.now() },
+          { subject: 'stale', agentId: 'stale', since: Date.now() - 24 * 3_600_000 }
+        ],
+        suspendIdle: async (agentId: string) => {
+          suspended.push(agentId)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() => expect(suspended).toEqual(['stale']))
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('suspends a pod that never came up inside its agent activity window, and leaves one still coming up alone', async () => {
+    // The agent's traffic keeps the window open for all of its host-less session pods, so a pod the scheduler cannot place would otherwise hold its CPU request for as long as the agent is in use.
+    const suspended: string[] = []
+    const asked: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: 'busy-agent/session-stuck', agentId: 'busy-agent', since: Date.now() },
+          { subject: 'busy-agent/session-starting', agentId: 'busy-agent', since: Date.now() }
+        ],
+        // The plane owns the stalled judgement, so the sweep hands it every pod inside the window rather than a verdict it read first.
+        suspendStalled: async (subject: string) => {
+          asked.push(subject)
+          if (subject !== 'busy-agent/session-stuck') return 'absent'
+          suspended.push(subject)
+          return 'suspended'
+        },
+        suspendIdle: async (subject: string) => {
+          suspended.push(`idle:${subject}`)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() =>
+        expect([...asked].sort()).toEqual(['busy-agent/session-starting', 'busy-agent/session-stuck'])
+      )
+      expect(suspended).toEqual(['busy-agent/session-stuck'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('never suspends the sandbox of an agent whose duty is held elsewhere', async () => {
+    const suspended: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: {
+        launched: () => [
+          { subject: 'held', agentId: 'held', since: 0 },
+          { subject: 'moved', agentId: 'moved', since: 0 }
+        ],
+        suspendIdle: async (agentId: string) => {
+          suspended.push(agentId)
+          return 'suspended'
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      // A member of the install-wide pool: the duty ledger decides which agents it serves.
+      ;(k8sDaemon as any).cpClient = {
+        organizationScope: () => 'frame',
+        memberSet: () => ({ setId: '9f11e5e7-0000-4000-8000-000000000001', name: 'Cloud' }),
+        stop: async () => {}
+      }
+      ;(k8sDaemon as any).duties.applyGrant([
+        {
+          groupId: '11111111-1111-4111-8111-111111111111',
+          orgId: 'org-1',
+          term: '1',
+          members: [{ kind: 'agent', refId: 'held' }]
+        }
+      ])
+      ;(k8sDaemon as any).sweepIdle()
+      await vi.waitFor(() => expect(suspended).toEqual(['held']))
+      ;(k8sDaemon as any).sweepIdle()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(suspended).toEqual(['held', 'held'])
+    } finally {
+      ;(k8sDaemon as any).cpClient = undefined
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('takes over a running pod no launch here tracks, only for agents whose duty it holds and once per interval', async () => {
+    const adoptUntracked = vi.fn(async (_serves: (agentId: string) => boolean) => ['held:session-x'])
+    const k8sDaemon = daemon({ root: root(), k8s: true, plane: { adoptUntracked } })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      const info = vi.spyOn(inner.log, 'info')
+      const ttl = inner.cfg.limits.agentIdleTimeoutMs
+      const now = Date.now()
+      // Outside a member set nothing tells this member's agents from a peer's.
+      await inner.sweepIdleSandboxes(now, ttl)
+      expect(adoptUntracked).not.toHaveBeenCalled()
+      inner.cpClient = {
+        organizationScope: () => 'frame',
+        memberSet: () => ({ setId: '9f11e5e7-0000-4000-8000-000000000001', name: 'Cloud' }),
+        stop: async () => {}
+      }
+      inner.duties.applyGrant([
+        {
+          groupId: '11111111-1111-4111-8111-111111111111',
+          orgId: 'org-1',
+          term: '1',
+          members: [{ kind: 'agent', refId: 'held' }]
+        }
+      ])
+      await inner.sweepIdleSandboxes(now, ttl)
+      await vi.waitFor(() =>
+        expect(info).toHaveBeenCalledWith(
+          'idle: took over the running sandbox "held:session-x", which no launch here tracked'
+        )
+      )
+      await vi.waitFor(() => expect(inner.untrackedSandboxAdoption).toBeUndefined())
+      const serves = adoptUntracked.mock.calls[0]![0]
+      expect([serves('held'), serves('moved')]).toEqual([true, false])
+      // A duty-gain takeover still running or retrying keeps its agent.
+      inner.k8sAdoptions.set('held', undefined)
+      expect(serves('held')).toBe(false)
+      inner.k8sAdoptions.delete('held')
+      await inner.sweepIdleSandboxes(now + UNTRACKED_SANDBOX_ADOPTION_INTERVAL_MS - 1, ttl)
+      expect(adoptUntracked).toHaveBeenCalledOnce()
+      await inner.sweepIdleSandboxes(now + UNTRACKED_SANDBOX_ADOPTION_INTERVAL_MS, ttl)
+      expect(adoptUntracked).toHaveBeenCalledTimes(2)
+    } finally {
+      ;(k8sDaemon as any).cpClient = undefined
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('names what keeps a long-quiet pod up at info once an hour, and at debug before and in between', async () => {
+    let launched = [{ subject: 'bot-a', agentId: 'bot-a', since: 0 }]
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      plane: { launched: () => launched, suspendIdle: async () => 'busy' }
+    })
+    try {
+      await k8sDaemon.start()
+      const inner = k8sDaemon as any
+      const info = vi.spyOn(inner.log, 'info')
+      const debug = vi.spyOn(inner.log, 'debug')
+      const ttl = inner.cfg.limits.agentIdleTimeoutMs
+      const stillUp = (): number =>
+        info.mock.calls.filter(([line]) => String(line).startsWith('idle: the sandbox "bot-a" is still up after'))
+          .length
+      const skipped = (): number =>
+        debug.mock.calls.filter(([line]) => String(line).startsWith('idle: skipping sandbox "bot-a" — busy')).length
+      const longQuiet = (LONG_IDLE_SKIP_AFTER_TTLS + 1) * ttl
+      await inner.sweepIdleSandboxes(LONG_IDLE_SKIP_AFTER_TTLS * ttl, ttl)
+      await vi.waitFor(() => expect(skipped()).toBe(1))
+      expect(stillUp()).toBe(0)
+      await inner.sweepIdleSandboxes(longQuiet, ttl)
+      await vi.waitFor(() => expect(stillUp()).toBe(1))
+      expect(info).toHaveBeenCalledWith(
+        `idle: the sandbox "bot-a" is still up after ${Math.round(longQuiet / 60_000)} min without recorded activity — ` +
+          `busy; idle ${Math.round(longQuiet / 1000)}s, timeout ${Math.round(ttl / 1000)}s`
+      )
+      await inner.sweepIdleSandboxes(longQuiet + LONG_IDLE_SKIP_REPORT_INTERVAL_MS - 1, ttl)
+      await vi.waitFor(() => expect(skipped()).toBe(2))
+      expect(stillUp()).toBe(1)
+      await inner.sweepIdleSandboxes(longQuiet + LONG_IDLE_SKIP_REPORT_INTERVAL_MS, ttl)
+      await vi.waitFor(() => expect(stillUp()).toBe(2))
+      // A pod this member stopped holding starts over: the next time it is held and skipped, it is named at once.
+      launched = []
+      await inner.sweepIdleSandboxes(longQuiet + LONG_IDLE_SKIP_REPORT_INTERVAL_MS + 1, ttl)
+      launched = [{ subject: 'bot-a', agentId: 'bot-a', since: 0 }]
+      await inner.sweepIdleSandboxes(longQuiet + LONG_IDLE_SKIP_REPORT_INTERVAL_MS + 2, ttl)
+      await vi.waitFor(() => expect(stillUp()).toBe(3))
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('takes over the sandbox when a duty arrives and releases it — after the host stop — when the duty leaves', async () => {
+    const AGENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1'
+    const GROUP = '11111111-1111-4111-8111-111111111111'
+    const events: string[] = []
+    let servesAgent!: (agentId: string) => boolean
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      onPlaneStart: (options) => (servesAgent = options.servesAgent),
+      plane: {
+        adoptAgent: async (agentId: string) => void events.push(`adopt:${agentId}`),
+        releaseAgent: (agentId: string) => void events.push(`release:${agentId}`)
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      ;(k8sDaemon as any).cpClient = {
+        organizationScope: () => 'frame',
+        memberSet: () => ({ setId: '9f11e5e7-0000-4000-8000-000000000001', name: 'Cloud' }),
+        stop: async () => {},
+        releaseDuties: vi.fn(async () => {}),
+        reportDutiesNow: vi.fn(() => {}),
+        fetchDutyAgent: vi.fn(async () => ({
+          bundle: {
+            agentId: AGENT,
+            spec: {
+              orgId: 'org-1',
+              name: 'scout',
+              runtime: 'claude',
+              workspace: { mode: 'scratch', isolation: 'shared' }
+            },
+            integrations: [],
+            crons: []
+          }
+        }))
+      }
+      const grant = { groupId: GROUP, orgId: 'org-1', term: '1', members: [{ kind: 'agent', refId: AGENT }] }
+      await (k8sDaemon as any).dutyCoordinator.admitDutyGrants([grant])
+      await vi.waitFor(() => expect(events).toEqual([`adopt:${AGENT}`]))
+      expect(servesAgent(AGENT)).toBe(true)
+      // A stopped host stands in for the ex-holder's runtime; the release must wait for it to be down.
+      let hostDown = false
+      ;(k8sDaemon as any).hosts.set(AGENT, {
+        stop: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20))
+          hostDown = true
+        }
+      })
+      ;(k8sDaemon as any).dutyCoordinator.applyDutyRevoke([{ groupId: GROUP, reason: 'superseded' }])
+      expect(events).toEqual([`adopt:${AGENT}`])
+      expect(servesAgent(AGENT)).toBe(false)
+      await vi.waitFor(() => expect(events).toEqual([`adopt:${AGENT}`, `release:${AGENT}`]))
+      expect(hostDown).toBe(true)
+    } finally {
+      ;(k8sDaemon as any).cpClient = undefined
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('retries a failed takeover on the idle sweep and stops after success', async () => {
+    const adoptAgent = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error('claim list unavailable')
+      })
+      .mockResolvedValue(undefined)
+    const instance = daemon({ root: root(), k8s: true, plane: { adoptAgent } })
+    try {
+      await instance.start()
+      const inner = instance as any
+      inner.adoptClusterSandbox('bot-a')
+      await vi.waitFor(() => {
+        expect(inner.k8sAdoptions.has('bot-a')).toBe(true)
+        expect(inner.k8sAdoptions.get('bot-a')).toBeUndefined()
+      })
+      await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+      await vi.waitFor(() => expect(inner.k8sAdoptions.has('bot-a')).toBe(false))
+      await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+      expect(adoptAgent).toHaveBeenCalledTimes(2)
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('cancels a queued takeover when the agent leaves before the call starts', async () => {
+    const adoptAgent = vi.fn(async () => {})
+    const instance = daemon({ root: root(), k8s: true, plane: { adoptAgent, releaseAgent: vi.fn() } })
+    try {
+      await instance.start()
+      const inner = instance as any
+      inner.adoptClusterSandbox('bot-a')
+      // Let prior teardown settle and register the attempt, then release before its queued call.
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(inner.k8sAdoptions.has('bot-a')).toBe(true)
+      expect(adoptAgent).not.toHaveBeenCalled()
+      inner.releaseClusterSandbox('bot-a')
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(adoptAgent).not.toHaveBeenCalled()
+      expect(inner.k8sAdoptions.has('bot-a')).toBe(false)
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('does not let a departed takeover overwrite a new takeover waiting on teardown', async () => {
+    let failOld!: (error: Error) => void
+    const adoptAgent = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<void>((_, reject) => (failOld = reject)))
+      .mockResolvedValue(undefined)
+    const releaseAgent = vi.fn()
+    const instance = daemon({ root: root(), k8s: true, plane: { adoptAgent, releaseAgent } })
+    try {
+      await instance.start()
+      const inner = instance as any
+      inner.adoptClusterSandbox('bot-a')
+      await vi.waitFor(() => expect(adoptAgent).toHaveBeenCalledOnce())
+      await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+      expect(adoptAgent).toHaveBeenCalledOnce()
+      let finishTeardown!: () => void
+      const teardown = new Promise<void>((resolve) => (finishTeardown = resolve))
+      vi.spyOn(inner.dutyCoordinator, 'dutyHostStop').mockReturnValue(teardown)
+      inner.adoptClusterSandbox('bot-a')
+      inner.releaseClusterSandbox('bot-a')
+      finishTeardown()
+      await vi.waitFor(() => expect(adoptAgent).toHaveBeenCalledTimes(2))
+      failOld(new Error('old takeover failed late'))
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(inner.k8sAdoptions.has('bot-a')).toBe(false)
+      await inner.sweepIdleSandboxes(Date.now(), inner.cfg.limits.agentIdleTimeoutMs)
+      expect(adoptAgent).toHaveBeenCalledTimes(2)
+    } finally {
+      await instance.stop()
+    }
+  })
+
+  it('clears a readiness marker left on a mounted path before it waits on the control plane (#1043)', async () => {
+    const rootDir = root()
+    const marker = join(rootDir, 'ready')
+    writeFileSync(marker, 'ready\n')
+    vi.stubEnv('AC_READINESS_FILE', marker)
+    let release!: () => void
+    const startControlPlane = vi.fn(() => new Promise<void>((resolve) => (release = resolve)))
+    const instance = daemon({ root: rootDir, k8s: true, startControlPlane })
+    const starting = instance.start()
+    try {
+      // The marker outlives the container that wrote it, and startup blocks here for as long as the
+      // CP is down — so it has to be gone before the wait, not after it.
+      await vi.waitFor(() => expect(startControlPlane).toHaveBeenCalledOnce())
+      expect(existsSync(marker)).toBe(false)
+      expect(instance.readinessState()).toEqual({ ready: false, reason: 'starting' })
+      release()
+      await starting
+      // Startup is done; what is left is the member's own registration.
+      expect(instance.readinessState()).toEqual({ ready: false, reason: 'control-plane-unregistered' })
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      await starting.catch(() => undefined)
+      await instance.stop()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('is not ready until the install-wide sandbox runtime probe returns (#1043)', async () => {
+    let settle!: (table: unknown) => void
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      plane: { probeRuntimes: () => new Promise((resolve) => (settle = resolve)) }
+    })
+    try {
+      await k8sDaemon.start()
+      // Registered, but the member still advertises nothing: the CP would assign it no agent, so
+      // process health is not servability and the probe is the half only this member can settle.
+      ;(k8sDaemon as any).cpClient = { state: 'READY' }
+      expect(k8sDaemon.readinessState()).toEqual({ ready: false, reason: 'runtime-probe-pending' })
+      settle({ runtimes: [{ id: 'claude', version: '1.2.3' }] })
+      await vi.waitFor(() => expect(k8sDaemon.readinessState()).toEqual({ ready: true, reason: 'ready' }))
+    } finally {
+      ;(k8sDaemon as any).cpClient = undefined
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('tells its schedule when a probe adopted nothing, so a cold probe pod is retried rather than waited out', async () => {
+    let fail = true
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      plane: {
+        probeRuntimes: async () => {
+          if (fail) throw new Error('sandbox agent-probe did not become ready in time')
+          return { runtimes: [{ id: 'claude', version: '1.2.3' }] }
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      await (k8sDaemon as any).k8sProbeSchedule.idle()
+      ;(k8sDaemon as any).cpClient = { state: 'READY' }
+      expect(await (k8sDaemon as any).probeK8sRuntimes(0)).toBe(false)
+      expect(k8sDaemon.readinessState()).toEqual({ ready: false, reason: 'runtime-probe-pending' })
+      fail = false
+      expect(await (k8sDaemon as any).probeK8sRuntimes(0)).toBe(true)
+      expect(k8sDaemon.readinessState()).toEqual({ ready: true, reason: 'ready' })
+    } finally {
+      ;(k8sDaemon as any).cpClient = undefined
+      await k8sDaemon.stop()
+    }
+  })
+
+  // The image's own table is generated with no provider credentials, so it carries no model list at
+  // all — which is how every cluster runtime reached the console with an empty model picker. The
+  // credentialed probe is the answer: run the runtime in the pod that ships it and ASK.
+  it('reads each runtime’s models by running it in the probe sandbox, with the deployment’s credentials', async () => {
+    vi.stubEnv('ANTHROPIC_MODEL_TOKEN', 'deployment-token')
+    vi.stubEnv('ANTHROPIC_MODEL_BASE_URL', 'https://gateway.example/anthropic')
+    const policies: Array<{ id: string; env?: Record<string, string>; inherit?: boolean; cwd: string }> = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      probeHostFactory: (_rt, id, cwd, policy: any) => {
+        policies.push({ id, env: policy.env, inherit: policy.inheritProcessEnv, cwd })
+        return {
+          start: async () => {},
+          newSession: async () => 'probe-session',
+          modelOptions: () => ({ models: ['sonnet', 'opus[1m]'], current: 'sonnet' }),
+          acpProtocolVersion: () => 1,
+          acpAgentInfo: () => ({ name: 'claude-agent-acp', version: '0.66.0' }),
+          stop: async () => {}
+        } as never
+      },
+      // One held sandbox answers both halves: the table, then the runtimes it named.
+      plane: {
+        probeRuntimes: async (sweep: any) => {
+          // The command is the IMAGE's, which is also what identifies the provider surface the
+          // credential is written onto.
+          const table = { runtimes: [{ id: 'claude', version: '1.2.3', command: 'claude-agent-acp' }] }
+          await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+          return table
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).runtimeFacts.profileFor('claude').models).toHaveLength(2))
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('claude')
+      expect(profile.models).toEqual(['sonnet', 'opus[1m]'])
+      // A live session said so, so the model gates are strict — unlike a declared snapshot.
+      expect(profile.modelsSource).toBe('probed')
+      // The runtime ran in the POD: routed by the probe identity, addressed in the pod's
+      // coordinates, and carrying the deployment's provider pair rather than this daemon's env.
+      expect(policies).toEqual([
+        {
+          id: 'claude',
+          cwd: '/agent',
+          inherit: false,
+          env: {
+            AC_AGENT_ID: 'ac-runtime-probe-abc',
+            ANTHROPIC_API_KEY: 'deployment-token',
+            ANTHROPIC_BASE_URL: 'https://gateway.example/anthropic'
+          }
+        }
+      ])
+    } finally {
+      await k8sDaemon.stop()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  // One pod per POOL, not per replica. The answer describes the runtime image, and every member on
+  // that image would spend a sandbox to be told the same thing.
+  it('adopts the pool’s published probe instead of claiming a sandbox of its own', async () => {
+    const store = await LocalStore.open(':memory:')
+    await store.publishRuntimeImageProbe({
+      imageRef: 'runtime-sandbox:test',
+      now: Date.now(),
+      payload: JSON.stringify({
+        table: { runtimes: [{ id: 'claude', version: '9.9.9', command: 'claude-agent-acp' }] },
+        results: [{ runtime: 'claude', ok: true, models: ['sonnet', 'opus[1m]'], acpProtocolVersion: 1 }]
+      })
+    })
+    const probeRuntimes = vi.fn()
+    const k8sDaemon = daemon({ root: root(), k8s: true, store, plane: { probeRuntimes } })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      // No sandbox was claimed, and the member still advertises the models and the image's version.
+      expect(probeRuntimes).not.toHaveBeenCalled()
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('claude')
+      expect(profile.models).toEqual(['sonnet', 'opus[1m]'])
+      expect(profile.modelsSource).toBe('probed')
+      expect(profile.version).toBe('9.9.9')
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('hands the claim back when its own probe leaves the pool no answer', async () => {
+    // Holding a claim through a failure is what would make every other member wait out the whole
+    // stale window for a payload that is never coming.
+    const store = await LocalStore.open(':memory:')
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      store,
+      plane: {
+        probeRuntimes: async () => {
+          throw new Error('probe sandbox bound no session')
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(async () =>
+        expect(
+          await store.claimRuntimeImageProbe({
+            imageRef: 'runtime-sandbox:test',
+            memberId: 'another-member',
+            now: Date.now(),
+            staleBefore: 0
+          })
+        ).toBe(true)
+      )
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('re-probes rather than inherit an answer that has gone stale', async () => {
+    // An image reference is not always an immutable identity — a template pinned to a moving tag
+    // keeps one key across rebuilds — and the answer also depends on the deployment's credentials.
+    const store = await LocalStore.open(':memory:')
+    await store.publishRuntimeImageProbe({
+      imageRef: 'runtime-sandbox:test',
+      now: Date.now() - 25 * 60 * 60_000,
+      payload: JSON.stringify({
+        table: { runtimes: [{ id: 'claude', version: 'from-a-previous-build' }] },
+        results: [{ runtime: 'claude', ok: true, models: ['gone'] }]
+      })
+    })
+    const probeRuntimes = vi.fn(async (sweep: any) => {
+      const table = { runtimes: [{ id: 'claude', version: '1.2.3' }] }
+      await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+      return table
+    })
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      store,
+      probeHostFactory: () =>
+        ({
+          start: async () => {},
+          newSession: async () => 's',
+          modelOptions: () => ({ models: ['sonnet'], current: 'sonnet' }),
+          acpProtocolVersion: () => 1,
+          stop: async () => {}
+        }) as never,
+      plane: { probeRuntimes }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      expect(probeRuntimes).toHaveBeenCalledOnce()
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('claude')
+      expect(profile.version).toBe('1.2.3')
+      expect(profile.models).toEqual(['sonnet'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  // A request asks for an answer newer than itself, so a fresh pool answer no longer satisfies it.
+  it('probes again on request even while the pool answer is fresh, and publishes the new one', async () => {
+    const store = await LocalStore.open(':memory:')
+    await store.publishRuntimeImageProbe({
+      imageRef: 'runtime-sandbox:test',
+      now: Date.now(),
+      payload: JSON.stringify({
+        table: { runtimes: [{ id: 'claude', version: '1.2.3', command: 'claude-agent-acp' }] },
+        results: [{ runtime: 'claude', ok: true, models: ['sonnet'], acpProtocolVersion: 1 }]
+      })
+    })
+    const probeRuntimes = vi.fn(async (sweep: any) => {
+      const table = { runtimes: [{ id: 'claude', version: '1.2.3' }] }
+      await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+      return table
+    })
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      store,
+      probeHostFactory: () =>
+        ({
+          start: async () => {},
+          newSession: async () => 's',
+          modelOptions: () => ({ models: ['sonnet', 'a-model-added-since'], current: 'sonnet' }),
+          acpProtocolVersion: () => 1,
+          stop: async () => {}
+        }) as never,
+      plane: { probeRuntimes }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      await (k8sDaemon as any).k8sProbeSchedule.idle()
+      expect(probeRuntimes).not.toHaveBeenCalled()
+      ;(k8sDaemon as any).k8sProbeSchedule.request()
+      await (k8sDaemon as any).k8sProbeSchedule.idle()
+      expect(probeRuntimes).toHaveBeenCalledOnce()
+      expect((k8sDaemon as any).runtimeFacts.profileFor('claude').models).toEqual(['sonnet', 'a-model-added-since'])
+      const published = await store.readRuntimeImageProbe('runtime-sandbox:test')
+      expect(JSON.parse(published!.payload).results[0].models).toEqual(['sonnet', 'a-model-added-since'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('probes for itself when the pool has published nothing for THIS image', async () => {
+    // A template bump is a different key, so a member on a new image never adopts the old one's
+    // answer — which is what makes one shared probe safe across a rollout.
+    const store = await LocalStore.open(':memory:')
+    await store.publishRuntimeImageProbe({
+      imageRef: 'runtime-sandbox:previous',
+      now: 1,
+      payload: JSON.stringify({ table: { runtimes: [{ id: 'claude', version: '0.0.1' }] }, results: [] })
+    })
+    const probeRuntimes = vi.fn(async (sweep: any) => {
+      const table = { runtimes: [{ id: 'claude', version: '1.2.3' }] }
+      await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+      return table
+    })
+    const k8sDaemon = daemon({
+      root: root(),
+      k8s: true,
+      store,
+      probeHostFactory: () =>
+        ({
+          start: async () => {},
+          newSession: async () => 's',
+          modelOptions: () => null,
+          acpProtocolVersion: () => 1,
+          stop: async () => {}
+        }) as never,
+      plane: { probeRuntimes }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      expect(probeRuntimes).toHaveBeenCalledOnce()
+      expect((k8sDaemon as any).runtimeFacts.profileFor('claude').version).toBe('1.2.3')
+      // And what it found is published for the members that start after it.
+      const published = await store.readRuntimeImageProbe('runtime-sandbox:test')
+      expect(JSON.parse(published!.payload).table.runtimes[0].version).toBe('1.2.3')
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('keeps the image’s declared facts when the sandbox probe cannot reach a runtime', async () => {
+    // An empty `probed` list is a STRICT gate, so one slow pod would refuse an agent whose model
+    // the declared table already vouches for. Unreachable says nothing about the runtime.
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude', models: ['sonnet'] }] } }),
+      k8s: true,
+      probeHostFactory: () =>
+        ({
+          start: async () => {
+            throw new Error('no shim channel bound in time')
+          },
+          newSession: async () => 'unused',
+          modelOptions: () => null,
+          acpProtocolVersion: () => undefined,
+          stop: async () => {}
+        }) as never,
+      plane: {
+        probeRuntimes: async (sweep: any) => {
+          const table = { runtimes: [{ id: 'claude', version: '1.2.3', models: ['sonnet'] }] }
+          await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+          return table
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('claude')
+      expect(profile.models).toEqual(['sonnet'])
+      expect(profile.modelsSource).toBe('cached')
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('keeps the declared facts when a runtime refuses a probe this deployment gave no credential', async () => {
+    // Codex and DeepSeek Harness refuse `session/new` with no credential at all, and publishing
+    // that as authRequired empties the model picker AND asks the user to log a POD in.
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'codex-acp', models: ['gpt-5.6-sol'] }] } }),
+      k8s: true,
+      probeHostFactory: () =>
+        ({
+          start: async () => {
+            throw Object.assign(new Error('Authentication required'), { code: -32000 })
+          },
+          newSession: async () => 'unused',
+          modelOptions: () => null,
+          acpProtocolVersion: () => undefined,
+          stop: async () => {}
+        }) as never,
+      plane: {
+        probeRuntimes: async (sweep: any) => {
+          const table = {
+            runtimes: [{ id: 'codex-acp', version: '1.2.3', command: 'codex-acp', models: ['gpt-5.6-sol'] }]
+          }
+          await sweep?.(table, { agentId: 'ac-runtime-probe-abc', cwd: '/agent' })
+          return table
+        }
+      }
+    })
+    try {
+      await k8sDaemon.start()
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      const profile = (k8sDaemon as any).runtimeFacts.profileFor('codex-acp')
+      expect(profile.models).toEqual(['gpt-5.6-sol'])
+      expect(profile.authRequired).toBeUndefined()
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  // A daemon-path bridge spec sent to a pod is not a degraded tool surface but an unspawnable one:
+  // the runtime retried `/app/.../dist/index.js` on a backoff until it gave up, and the agent had no
+  // AgentConnect tools at all. The spec has to name what the IMAGE reports shipping.
+  it('injects the image’s own MCP bridge, in pod coordinates, once the probe reports one', async () => {
+    const BRIDGE = { command: '/usr/local/bin/node', args: ['/opt/agentconnect/shim/mcp-bridge.js'] }
+    let settle!: (table: unknown) => void
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: { probeRuntimes: () => new Promise((resolve) => (settle = resolve)) }
+    })
+    try {
+      await k8sDaemon.start()
+      settle({ runtimes: [{ id: 'claude', version: '1.2.3' }], mcpBridge: BRIDGE })
+      await vi.waitFor(() => expect(mcpServersFor(k8sDaemon)).toHaveLength(1))
+      const [server] = mcpServersFor(k8sDaemon)
+      // The image's own interpreter and entry, verbatim: anything resolved on this host — the
+      // daemon's node, its CLI entry, even a bare `node` trusting the pod's PATH — names something
+      // the runtime may not have.
+      expect(server).toMatchObject({ command: BRIDGE.command, args: BRIDGE.args })
+      // And the endpoint is the tunnel's in-pod socket, which the shim serves back to this daemon.
+      expect(server!.env).toContainEqual({ name: 'AC_MCP_ENDPOINT', value: SANDBOX_TUNNEL_PATHS.mcp })
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('withholds the tool server from an image that reports no bridge, rather than a spec it cannot spawn', async () => {
+    let settle!: (table: unknown) => void
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: { probeRuntimes: () => new Promise((resolve) => (settle = resolve)) }
+    })
+    try {
+      await k8sDaemon.start()
+      // An image built before the bridge shipped: it says nothing, and silence is the answer.
+      settle({ runtimes: [{ id: 'claude', version: '1.2.3' }] })
+      await vi.waitFor(() => expect((k8sDaemon as any).k8sRuntimeProbed).toBe(true))
+      expect(mcpServersFor(k8sDaemon)).toEqual([])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('still injects this daemon’s own bridge outside k8s, where the runtime shares its filesystem', async () => {
+    const local = daemon({ root: root(), k8s: false })
+    try {
+      await local.start()
+      const servers = mcpServersFor(local)
+      expect(servers).toHaveLength(1)
+      expect(servers[0]!.args).toContain('mcp-bridge')
+    } finally {
+      await local.stop()
+    }
+  })
+
+  it('asks every pod to serve the mcp socket and the credential socket, whose live secrets every agent may load', async () => {
+    let planeOptions!: any
+    const rootDir = root({ declared: { runtimes: [{ id: 'claude' }] } })
+    const k8sDaemon = daemon({ root: rootDir, k8s: true, onPlaneStart: (options) => (planeOptions = options) })
+    try {
+      await k8sDaemon.start()
+      // Every pod agent: any session may carry tools, and `agentconnect-secrets` rides the credential socket for
+      // every agent (capability-requests.md §4.9.2); the server answers `get` only for a managed credential.
+      ;(k8sDaemon as any).agents.set('plain', { id: 'plain', workspace: {} })
+      expect(planeOptions.tunnelsFor('plain')).toEqual(['mcp', 'agent'])
+      expect(planeOptions.tunnelSocketPath('mcp')).toBe(mcpSocketPath(rootDir))
+      ;(k8sDaemon as any).agents.set('gh', { id: 'gh', workspace: { mode: 'git-repo', gitCredential: 'github-app' } })
+      // A managed code-host credential also asks for `codehost`: the credential proxy is the only path to it.
+      expect(planeOptions.tunnelsFor('gh')).toEqual(['mcp', 'agent', 'codehost'])
+      ;(k8sDaemon as any).agents.set('anon', {
+        id: 'anon',
+        workspace: { mode: 'git-repo', additionalRepos: [{ repoFullName: 'acme/own', repoId: '2' }] }
+      })
+      expect(planeOptions.tunnelsFor('anon')).toEqual(['mcp', 'agent'])
+      // And nothing for the member's own runtime probe, whose channel is granted `probe` alone —
+      // asking it to serve a socket would be refused, and the refusal logged, on every boot.
+      expect(planeOptions.tunnelsFor('ac-runtime-probe-0f0f0f0f')).toEqual([])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+
+  it('deletes a removed agent’s sandbox, which is what takes its workspace volume with it', async () => {
+    const discarded: string[] = []
+    const k8sDaemon = daemon({
+      root: root({ declared: { runtimes: [{ id: 'claude' }] } }),
+      k8s: true,
+      plane: { discardAgent: async (agentId: string) => void discarded.push(agentId) }
+    })
+    try {
+      await k8sDaemon.start()
+      const cp = (k8sDaemon as any).cpConfigApply()
+      await cp.applyAgentUpsert({ agentId: 'doomed', spec: { name: 'doomed' } })
+      // The local path deletes the checkout at exactly this point; in a pod the checkout is on a
+      // volume no rmSync here can reach, so the claim is what has to go.
+      await cp.applyAgentRemove('doomed')
+      expect(discarded).toEqual(['doomed'])
+    } finally {
+      await k8sDaemon.stop()
+    }
+  })
+})
+
+describe("a host start in a session's own pod leaves the agent's checkout alone (#1896)", () => {
+  const KEY = 'slack:C1:T1:bot-a'
+  const AGENT_POD = agentSandboxSubject('bot-a')
+  const SESSION_POD = sandboxSubjectFor(sessionHostKey('bot-a', KEY))
+  const SESSION_CWD = join('/agent', 'sessions', sessionKeyDirName(KEY), 'workspace')
+
+  /** A pool member whose plane records every pod bound, with preparation and the launch observed rather than run. */
+  async function poolMember(opts: { isolation?: 'shared' | 'session'; key?: string; failFirstStart?: boolean } = {}) {
+    const bound: string[] = []
+    const instance = daemon({
+      root: root(),
+      k8s: true,
+      plane: {
+        withSandbox: async (subject: string, work: () => Promise<unknown>) => {
+          bound.push(subject)
+          return await work()
+        },
+        ensureChannel: async () => {},
+        workspaceRootFor: () => '/agent'
+      }
+    })
+    await instance.start()
+    const inner = instance as any
+    const agent = { ...poolAgent('session'), dir: mkdtempSync(join(tmpdir(), 'ac-k8s-agent-')) }
+    inner.agents.set('bot-a', agent)
+    if (opts.isolation) inner.sessionIsolation.set(opts.key ?? KEY, opts.isolation)
+    inner.cfg.limits.agentStartAttempts = 2
+    inner.cfg.limits.agentStartBackoffMs = 0
+    const preparation = vi.spyOn(inner, 'runAgentWorkspacePreparation')
+    const checkout = vi.spyOn(inner.workspaces, 'prepareClusterWorkspace').mockResolvedValue('/agent/checkout')
+    const skills = vi.spyOn(inner, 'reconcileClusterSkills').mockResolvedValue(undefined)
+    vi.spyOn(inner, 'ensureRuntimeInstalled').mockResolvedValue(undefined)
+    const gitListing = vi.spyOn(inner.workspaces, 'offDiskSessionGitDirs').mockResolvedValue([])
+    const launches: { hostKey: string; cwd: string }[] = []
+    // The clones' `.git` each launch was handed, apart from `launches` so the cwd assertions stay exact.
+    const gitDirs: Array<string[] | undefined> = []
+    vi.spyOn(inner, 'buildAcpHost').mockImplementation((...args: unknown[]) => {
+      const launch = args[2] as { hostKey: string; cwd: string; sessionGitDirs?: string[] }
+      launches.push({ hostKey: launch.hostKey, cwd: launch.cwd })
+      gitDirs.push(launch.sessionGitDirs)
+      const first = launches.length === 1
+      const start = async () => {
+        if (opts.failFirstStart && first) throw new Error('initialize failed')
+      }
+      return { host: { start, stop: async () => {} } }
+    })
+    return { instance, inner, agent, bound, preparation, checkout, skills, launches, gitListing, gitDirs }
+  }
+
+  const modelEntry = (sessionKey: string) => ({
+    agentId: 'bot-a',
+    sessionKey,
+    target: { provider: 'anthropic', runtime: 'claude' },
+    grant: { keyId: 'key-1', key: 'model-key', requestedAtMs: 0 }
+  })
+
+  it("starts a key-server host by re-verifying the session pod's skills alone, in the session's directory", async () => {
+    const pool = await poolMember({ isolation: 'session' })
+    try {
+      await pool.inner.startModelSessionRuntime(pool.agent, modelEntry(KEY))
+      expect(pool.preparation).not.toHaveBeenCalled()
+      expect(pool.checkout).not.toHaveBeenCalled()
+      expect(pool.bound).toEqual([SESSION_POD])
+      expect(pool.skills.mock.calls.map((call) => call[1])).toEqual([SESSION_POD])
+      expect(pool.launches).toEqual([{ hostKey: sessionHostKey('bot-a', KEY), cwd: SESSION_CWD }])
+      expect(pool.inner.hostLaunch.get(sessionHostKey('bot-a', KEY)).cwd).toBe(SESSION_CWD)
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  // Codex's `:workspace` pins a clone's `.git` read-only, so a restarted key-server host — a refreshed credential, a reaped host — needs the grants an ordinary start gives.
+  it('hands a key-server host the clones its session pod already holds, as an ordinary start does', async () => {
+    const pool = await poolMember({ isolation: 'session', failFirstStart: true })
+    try {
+      const clones = [`${SESSION_CWD}/.git`, join('/agent', 'sessions', sessionKeyDirName(KEY), 'repos/acme/lib/.git')]
+      pool.gitListing.mockResolvedValue(clones)
+      await pool.inner.startModelSessionRuntime(pool.agent, modelEntry(KEY))
+      // Listed on every attempt, as the replacement of a failed child is a fresh launch.
+      expect(pool.gitListing.mock.calls).toEqual([
+        [pool.agent, KEY],
+        [pool.agent, KEY]
+      ])
+      expect(pool.gitDirs).toEqual([clones, clones])
+
+      // A listing that fails grants nothing and still starts the host.
+      const fresh = await poolMember({ isolation: 'session' })
+      try {
+        fresh.gitListing.mockRejectedValue(new Error('no bound channel'))
+        await fresh.inner.startModelSessionRuntime(fresh.agent, modelEntry(KEY))
+        expect(fresh.gitDirs).toEqual([[]])
+      } finally {
+        await fresh.instance.stop()
+      }
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('re-verifies the session pod before every fresh key-server attempt, never the agent pod', async () => {
+    const pool = await poolMember({ isolation: 'session', failFirstStart: true })
+    try {
+      await pool.inner.startModelSessionRuntime(pool.agent, modelEntry(KEY))
+      expect(pool.launches).toHaveLength(2)
+      expect(pool.skills.mock.calls.map((call) => call[1])).toEqual([SESSION_POD, SESSION_POD])
+      expect(pool.bound).toEqual([SESSION_POD, SESSION_POD])
+      expect(pool.checkout).not.toHaveBeenCalled()
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('still prepares the agent pod for a key-server host of a shared session or an internal pass', async () => {
+    for (const scenario of [{ isolation: 'shared' as const, key: KEY }, { key: internalSessionKey.memory('bot-a') }]) {
+      const pool = await poolMember(scenario)
+      try {
+        await pool.inner.startModelSessionRuntime(pool.agent, modelEntry(scenario.key))
+        expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([undefined])
+        expect(pool.checkout.mock.calls).toEqual([[pool.agent, '/agent', undefined]])
+        expect(pool.bound).toEqual([AGENT_POD])
+        expect(pool.skills.mock.calls.map((call) => call[1])).toEqual([AGENT_POD])
+        expect(pool.launches).toEqual([{ hostKey: sessionHostKey('bot-a', scenario.key), cwd: '/agent/checkout' }])
+        // Neither holds clones of its own, so nothing is listed for it.
+        expect(pool.gitListing).not.toHaveBeenCalled()
+        expect(pool.gitDirs).toEqual([undefined])
+      } finally {
+        await pool.instance.stop()
+      }
+    }
+  })
+
+  it("starts a review's host in the cwd it prepared, re-verifying only the session pod before each attempt", async () => {
+    const pool = await poolMember({ failFirstStart: true })
+    try {
+      // Through the real seam, which learns the session's isolation from its request as a turn does.
+      await pool.inner.sessions.deps.hostFor('bot-a', { sessionKey: KEY, isolation: 'session' }, SESSION_CWD)
+      expect(pool.preparation).not.toHaveBeenCalled()
+      expect(pool.checkout).not.toHaveBeenCalled()
+      expect(pool.bound).toEqual([SESSION_POD, SESSION_POD])
+      expect(pool.skills.mock.calls.map((call) => call[1])).toEqual([SESSION_POD, SESSION_POD])
+      const launch = { hostKey: sessionHostKey('bot-a', KEY), cwd: SESSION_CWD }
+      expect(pool.launches).toEqual([launch, launch])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  /** Run a turn's real openSession on a key-server pool whose cold host starts as the pool starts it, and return the options `sessions.handle` was given. */
+  async function openKeyServerTurn(
+    pool: Awaited<ReturnType<typeof poolMember>>,
+    opts: { started?: boolean; row?: Record<string, unknown>; reviewCwd?: string } = {}
+  ): Promise<{ preparedWorkspaceCwd?: string }> {
+    const inner = pool.inner
+    let handed: { preparedWorkspaceCwd?: string } = {}
+    inner.githubReviews = {
+      prepareGithubReviewWorkspace: async () =>
+        opts.reviewCwd === undefined
+          ? {}
+          : { workspaceIsolation: 'session', forceWorkspaceIsolation: true, preparedWorkspaceCwd: opts.reviewCwd }
+    }
+    inner.store.getSession = async () => opts.row
+    inner.store.getDisplayNames = async (ids: string[]) =>
+      new Map(ids.filter((id) => id === 'U0').map((id) => [id, 'Opener']))
+    // The real pool, with the key-server grant stood in: its host starts as the pool starts it.
+    vi.spyOn(inner.modelSessions, 'enabled', 'get').mockReturnValue(true)
+    vi.spyOn(inner.modelSessions, 'hasStartedHost').mockReturnValue(opts.started === true)
+    vi.spyOn(inner.modelSessions, 'ensure').mockImplementation(async (agent: unknown, key: unknown) => ({
+      host: opts.started ? {} : await inner.startModelSessionRuntime(agent, modelEntry(key as string)),
+      hostKey: sessionHostKey('bot-a', key as string),
+      stop: async () => {},
+      waitForCleanup: async () => {}
+    }))
+    inner.sessions = {
+      handle: async (...args: unknown[]) => {
+        handed = args[7] as { preparedWorkspaceCwd?: string }
+        return { sessionId: 'acp-1', blocks: [], created: true }
+      }
+    }
+    const run = {
+      entry: {
+        agentId: 'bot-a',
+        initAbort: new AbortController(),
+        msg: { platform: 'webchat', channel: 'C1', msgId: 'm1', sender: { id: 'U1', name: 'Alice' }, text: 'hi' }
+      },
+      key: KEY,
+      plan: { deliveryBinding: {} },
+      agent: inner.agents.get('bot-a'),
+      // A turn that fails to open surfaces its cause here rather than through the failure delivery.
+      evaluation: {
+        failEvaluation: (err: unknown) => {
+          throw err
+        }
+      }
+    }
+    await inner.openSession(run, () => {})
+    return handed
+  }
+
+  // Codex's `:workspace` profile is fixed at spawn, so a new session's first key-server host must launch after its clones exist.
+  it("prepares a new session's own pod before its first key-server launch, which then lists its clones", async () => {
+    const pool = await poolMember()
+    try {
+      const clones = [`${SESSION_CWD}/.git`]
+      pool.gitListing.mockImplementation(async () => (pool.checkout.mock.calls.length > 0 ? clones : []))
+      const handed = await openKeyServerTurn(pool)
+      const request = { sessionKey: KEY, isolation: 'session', initiatedBy: 'Alice' }
+      expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([request])
+      expect(pool.checkout.mock.calls).toEqual([
+        [pool.agent, '/agent', { ...request, confined: true }, expect.any(Function)]
+      ])
+      expect(pool.gitDirs).toEqual([clones])
+      // The session pod alone: the preparation, then the launch's own gate.
+      expect(pool.bound).toEqual([SESSION_POD, SESSION_POD])
+      // The turn opens in what was prepared rather than preparing again.
+      expect(handed.preparedWorkspaceCwd).toBe('/agent/checkout')
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it("names a cold host's preparation for the session's opener, as the session itself does", async () => {
+    const pool = await poolMember()
+    try {
+      await openKeyServerTurn(pool, { row: { key: KEY, workspaceIsolation: 'session', triggeredBy: 'U0' } })
+      expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([
+        { sessionKey: KEY, isolation: 'session', initiatedBy: 'Opener' }
+      ])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('prepares nothing ahead of a warm key-server host, a review that prepared its own cwd, or a shared session', async () => {
+    const warm = await poolMember()
+    try {
+      expect((await openKeyServerTurn(warm, { started: true })).preparedWorkspaceCwd).toBeUndefined()
+      expect(warm.preparation).not.toHaveBeenCalled()
+    } finally {
+      await warm.instance.stop()
+    }
+    const review = await poolMember()
+    try {
+      expect((await openKeyServerTurn(review, { reviewCwd: SESSION_CWD })).preparedWorkspaceCwd).toBe(SESSION_CWD)
+      expect(review.preparation).not.toHaveBeenCalled()
+      expect(review.launches).toEqual([{ hostKey: sessionHostKey('bot-a', KEY), cwd: SESSION_CWD }])
+    } finally {
+      await review.instance.stop()
+    }
+    const shared = await poolMember()
+    try {
+      shared.inner.agents.set('bot-a', { ...poolAgent('shared'), dir: shared.agent.dir })
+      expect((await openKeyServerTurn(shared)).preparedWorkspaceCwd).toBeUndefined()
+      // Only the launch's own agent-pod preparation, which carries no session request.
+      expect(shared.preparation.mock.calls.map((call) => call[1])).toEqual([undefined])
+    } finally {
+      await shared.instance.stop()
+    }
+  })
+
+  it('still prepares the session request itself for a host start given no cwd', async () => {
+    const pool = await poolMember()
+    try {
+      const request = { sessionKey: KEY, isolation: 'session' as const }
+      await pool.inner.sessions.deps.hostFor('bot-a', request)
+      expect(pool.preparation.mock.calls.map((call) => call[1])).toEqual([request])
+      expect(pool.checkout.mock.calls).toEqual([
+        [pool.agent, '/agent', { ...request, confined: true }, expect.any(Function)]
+      ])
+      expect(pool.bound).toEqual([SESSION_POD])
+      expect(pool.skills.mock.calls.map((call) => call[1])).toEqual([SESSION_POD])
+      expect(pool.launches).toEqual([{ hostKey: sessionHostKey('bot-a', KEY), cwd: '/agent/checkout' }])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+})
+
+// An isolated session's preparation holds its own pod alone, and its retention judges the agent pod's legacy half only while that pod is bound (k8s-daemon-pool.md §4, step 7).
+describe('an isolated session reaches the agent pod only for work due there (#1896)', () => {
+  const KEY = 'slack:C1:T1:bot-a'
+  const AGENT_POD = agentSandboxSubject('bot-a')
+  const SESSION_POD = sandboxSubjectFor(sessionHostKey('bot-a', KEY))
+  const REQUEST = { sessionKey: KEY, isolation: 'session' as const }
+
+  /** A pool member whose plane records every pod it claims and binds, which it holds at each moment, and whether the agent pod is already bound. */
+  async function poolMember(opts: { agentPodBound?: boolean; sessionPod?: boolean } = {}) {
+    const bound: string[] = []
+    const held = new Set<string>()
+    const released: string[] = []
+    const instance = daemon({
+      root: root(),
+      k8s: true,
+      plane: {
+        withSandbox: async (subject: string, work: () => Promise<unknown>) => {
+          bound.push(subject)
+          held.add(subject)
+          try {
+            return await work()
+          } finally {
+            held.delete(subject)
+          }
+        },
+        ensureChannel: async () => {},
+        workspaceRootFor: () => '/agent',
+        hasSandbox: async (subject: string) => subject === SESSION_POD && opts.sessionPod !== false,
+        // A hold that claims and wakes nothing: granted only for a pod this member already has bound.
+        holdIfBound: (subject: string) => {
+          if (subject !== AGENT_POD || !opts.agentPodBound) return undefined
+          held.add(subject)
+          return () => {
+            held.delete(subject)
+            released.push(subject)
+          }
+        }
+      }
+    })
+    await instance.start()
+    const inner = instance as any
+    const agent = { ...poolAgent('session'), dir: mkdtempSync(join(tmpdir(), 'ac-k8s-agent-')) }
+    inner.agents.set('bot-a', agent)
+    const checkout = vi.spyOn(inner.workspaces, 'prepareClusterWorkspace').mockResolvedValue('/agent/checkout')
+    vi.spyOn(inner, 'reconcileClusterSkills').mockResolvedValue(undefined)
+    return { instance, inner, agent, bound, held, released, checkout }
+  }
+
+  it('prepares on the session pod alone, reaching the agent pod only through the workspace’s own call', async () => {
+    const pool = await poolMember()
+    try {
+      await pool.inner.runAgentWorkspacePreparation(pool.agent, REQUEST)
+      expect(pool.bound).toEqual([SESSION_POD])
+      expect(pool.checkout.mock.calls).toEqual([
+        [pool.agent, '/agent', { ...REQUEST, confined: true }, expect.any(Function)]
+      ])
+
+      // A due conversion or a one-time migration asks for it: the agent pod is claimed and held for that work, inside the session pod's hold.
+      let during: string[] = []
+      pool.checkout.mockImplementationOnce(async (...args: unknown[]) => {
+        const reach = args[3] as (work: () => Promise<string>) => Promise<string>
+        return await reach(async () => {
+          during = [...pool.held]
+          return '/agent/checkout'
+        })
+      })
+      pool.bound.length = 0
+      await pool.inner.runAgentWorkspacePreparation(pool.agent, REQUEST)
+      expect(pool.bound).toEqual([SESSION_POD, AGENT_POD])
+      expect(during).toEqual([SESSION_POD, AGENT_POD])
+      expect([...pool.held]).toEqual([])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('keeps a shared session’s preparation in the agent pod, held throughout', async () => {
+    const pool = await poolMember()
+    try {
+      const shared = { sessionKey: KEY, isolation: 'shared' as const }
+      await pool.inner.runAgentWorkspacePreparation(pool.agent, shared)
+      await pool.inner.runAgentWorkspacePreparation(pool.agent, undefined)
+      expect(pool.bound).toEqual([AGENT_POD, AGENT_POD])
+      expect(pool.checkout.mock.calls).toEqual([
+        [pool.agent, '/agent', shared],
+        [pool.agent, '/agent', undefined]
+      ])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  // multi-repository-workspaces.md decision 20: the row, not the rows of the agent, says a shared session had an on-demand clone directory.
+  it('judges a shared session’s on-demand clones on the agent pod by its own record once no row is on demand', async () => {
+    const pool = await poolMember()
+    try {
+      Object.assign(pool.agent.workspace, {
+        additionalRepos: [{ repoFullName: 'acme/infra', repoId: '42', materialize: 'always' }]
+      })
+      vi.spyOn(pool.inner, 'sessionRetentionActive').mockResolvedValue(false)
+      vi.spyOn(pool.inner.workspaces, 'hasOnDemandCloneDir').mockResolvedValue(true)
+      const removal = vi
+        .spyOn(pool.inner.workspaces, 'removeOnDemandClones')
+        .mockResolvedValue({ outcome: 'retained', reason: 'dirty' })
+      const shared = { key: KEY, agentId: 'bot-a', acpSessionId: null, workspaceIsolation: 'shared' }
+
+      // A shared session that was never handed one wakes nothing.
+      expect(await pool.inner.cleanupSessionWorktree(shared)).toEqual({ outcome: 'not_applicable' })
+      expect(pool.bound).toEqual([])
+
+      expect(await pool.inner.cleanupSessionWorktree({ ...shared, onDemandClones: 1 })).toEqual({
+        outcome: 'retained',
+        reason: 'dirty'
+      })
+      expect(pool.bound).toEqual([AGENT_POD])
+      expect(removal).toHaveBeenCalledWith(pool.agent, KEY)
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  /** Retention of the session's row, with every exclusion clear, and each removal the workspace was asked for recorded by half. */
+  async function retire(pool: Awaited<ReturnType<typeof poolMember>>, legacy: 'removed' | 'retained' = 'removed') {
+    vi.spyOn(pool.inner, 'sessionRetentionActive').mockResolvedValue(false)
+    const roots = vi.spyOn(pool.inner.workspaces, 'hasSessionWorktreeRoots').mockResolvedValue(true)
+    const halves: string[] = []
+    let heldDuringLegacy: string[] = []
+    vi.spyOn(pool.inner.workspaces, 'removeSessionWorktree').mockImplementation(async (...args: unknown[]) => {
+      const scope = args[2] as string
+      halves.push(scope)
+      if (scope === 'worktrees') heldDuringLegacy = [...pool.held]
+      return scope === 'worktrees' && legacy === 'retained'
+        ? { outcome: 'retained', reason: 'dirty' }
+        : { outcome: 'removed' }
+    })
+    const result = await pool.inner.cleanupSessionWorktree({
+      key: KEY,
+      agentId: 'bot-a',
+      acpSessionId: null,
+      workspaceIsolation: 'session'
+    })
+    return { result, halves, roots, heldDuringLegacy }
+  }
+
+  it('retires a session with a pod of its own without waking an asleep agent pod', async () => {
+    const pool = await poolMember({ agentPodBound: false })
+    try {
+      const { result, halves, roots } = await retire(pool)
+      expect(result).toEqual({ outcome: 'removed' })
+      expect(halves).toEqual(['clones'])
+      expect(roots).not.toHaveBeenCalled()
+      expect(pool.bound).toEqual([SESSION_POD])
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('still judges the legacy half while the agent pod is bound, holding it without a claim', async () => {
+    const pool = await poolMember({ agentPodBound: true })
+    try {
+      const { result, halves, heldDuringLegacy } = await retire(pool, 'retained')
+      expect(halves).toEqual(['worktrees', 'clones'])
+      expect(heldDuringLegacy).toEqual([AGENT_POD])
+      expect(pool.released).toEqual([AGENT_POD])
+      expect(pool.bound).toEqual([SESSION_POD])
+      // A pre-§11 worktree holding work keeps the session, as it did.
+      expect(result).toMatchObject({ outcome: 'retained', reason: 'dirty' })
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('wakes the agent pod as before for a session with no pod of its own, whose workspace can only be there', async () => {
+    const pool = await poolMember({ agentPodBound: false, sessionPod: false })
+    try {
+      const { result, halves, heldDuringLegacy } = await retire(pool)
+      expect(halves).toEqual(['worktrees'])
+      expect(heldDuringLegacy).toEqual([AGENT_POD])
+      expect(pool.bound).toEqual([AGENT_POD])
+      expect(result).toEqual({ outcome: 'removed' })
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+})
+
+// The agent pod answers to the work that runs IN it and to its own sessions' clock, never to an isolated session's (k8s-daemon-pool.md §4, step 8).
+describe('the idle sweep keeps the agent pod only for its own work (#1896)', () => {
+  const ISOLATED = 'slack:C1:T1:bot-a'
+  const SHARED = 'slack:C1:T2:bot-a'
+  const AGENT_POD = agentSandboxSubject('bot-a')
+  const SESSION_POD = sandboxSubjectFor(sessionHostKey('bot-a', ISOLATED))
+
+  /** A member holding the agent pod, launched long ago, and one isolated session's pod, recording what the sweep suspends. */
+  async function poolMember(store?: LocalStore) {
+    const suspended: string[] = []
+    const instance = daemon({
+      root: root(),
+      k8s: true,
+      ...(store ? { store } : {}),
+      plane: {
+        launched: () => [
+          { subject: AGENT_POD, agentId: 'bot-a', since: 0 },
+          { subject: SESSION_POD, agentId: 'bot-a', since: Date.now() }
+        ],
+        suspendIdle: async (subject: string) => {
+          suspended.push(subject)
+          return 'suspended'
+        }
+      }
+    })
+    await instance.start()
+    const inner = instance as any
+    inner.agents.set('bot-a', poolAgent('session'))
+    inner.sessionIsolation.set(ISOLATED, 'session')
+    inner.sessionIsolation.set(SHARED, 'shared')
+    const ttl = inner.cfg.limits.agentIdleTimeoutMs
+    /** Whether one sweep, well past the window, suspends the agent pod. */
+    const suspendsAgentPod = async (): Promise<boolean> => {
+      suspended.length = 0
+      await inner.sweepIdleSandboxes(Date.now() + 2 * ttl, ttl)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return suspended.includes(AGENT_POD)
+    }
+    return { instance, inner, suspendsAgentPod, suspended }
+  }
+
+  it('lets the agent pod go under an isolated session’s host, dispatch or turn, and keeps it for its own', async () => {
+    const pool = await poolMember()
+    const { inner } = pool
+    try {
+      const host = { stop: async () => {} }
+      const scenarios: Array<{ name: string; set: () => () => void; keeps: boolean }> = []
+      for (const [key, keeps] of [
+        [ISOLATED, false],
+        [SHARED, true]
+      ] as const) {
+        const hostKey = inner.hostKeyFor('bot-a', key)
+        scenarios.push(
+          {
+            name: `a host of ${key}`,
+            set: () => (inner.hosts.set(hostKey, host), () => inner.hosts.delete(hostKey)),
+            keeps
+          },
+          {
+            name: `a model-session host of ${key}`,
+            set: () => {
+              inner.modelSessions.entries.set(key, { agentId: 'bot-a', sessionKey: key, host })
+              return () => inner.modelSessions.entries.delete(key)
+            },
+            keeps
+          },
+          { name: `a dispatch of ${key}`, set: () => inner.beginActiveDispatch('bot-a', key), keeps },
+          {
+            name: `a pending turn of ${key}`,
+            set: () => {
+              inner.pending.set(`turn-${key}`, { plan: { agentId: 'bot-a', sessionKey: key } })
+              return () => inner.pending.delete(`turn-${key}`)
+            },
+            keeps
+          }
+        )
+      }
+      // A turn whose session has not reported its tier yet may still be headed for the agent pod.
+      scenarios.push({
+        name: 'a dispatch of an unreported session',
+        set: () => inner.beginActiveDispatch('bot-a', 'slack:C1:T3:bot-a'),
+        keeps: true
+      })
+      expect(await pool.suspendsAgentPod()).toBe(true)
+      for (const scenario of scenarios) {
+        const clear = scenario.set()
+        expect({ [scenario.name]: await pool.suspendsAgentPod() }).toEqual({ [scenario.name]: !scenario.keeps })
+        clear()
+      }
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('judges the agent pod by its own sessions’ activity, which an isolated session’s traffic does not refresh', async () => {
+    const store = await LocalStore.open(':memory:')
+    const pool = await poolMember(store)
+    const row = (key: string, workspaceIsolation: 'shared' | 'session', updatedAt: number) =>
+      store.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: key,
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt,
+        workspaceIsolation
+      })
+    try {
+      const ttl = pool.inner.cfg.limits.agentIdleTimeoutMs
+      const late = Date.now() + 2 * ttl
+      // Busy isolated traffic up to the sweep, while the one shared session went quiet long ago.
+      await row(ISOLATED, 'session', late)
+      await row(SHARED, 'shared', 0)
+      expect(await pool.suspendsAgentPod()).toBe(true)
+      // The agent pod's own session speaking keeps it, as before.
+      await row(SHARED, 'shared', late)
+      expect(await pool.suspendsAgentPod()).toBe(false)
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+
+  it('judges a hostless session pod by its own activity while a sibling dispatch runs', async () => {
+    const store = await LocalStore.open(':memory:')
+    const pool = await poolMember(store)
+    const { inner } = pool
+    const ttl = inner.cfg.limits.agentIdleTimeoutMs
+    const now = Date.now() + 2 * ttl
+    const row = (key: string, workspaceIsolation: 'shared' | 'session', updatedAt: number) =>
+      store.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: key,
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt,
+        workspaceIsolation
+      })
+    const release = inner.beginActiveDispatch('bot-a', SHARED)
+    try {
+      await row(ISOLATED, 'session', now - 2 * ttl)
+      await row(SHARED, 'shared', now)
+      await inner.sweepIdleSandboxes(now, ttl)
+      await vi.waitFor(() => expect(pool.suspended).toEqual([SESSION_POD]))
+
+      pool.suspended.length = 0
+      await row(ISOLATED, 'session', now)
+      await inner.sweepIdleSandboxes(now, ttl)
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(pool.suspended).toEqual([])
+    } finally {
+      release()
+      await pool.instance.stop()
+    }
+  })
+
+  it('reclaims an idle session host while a sibling dispatch runs', async () => {
+    const pool = await poolMember()
+    const { inner } = pool
+    const key = sessionHostKey('bot-a', ISOLATED)
+    const host = { stop: vi.fn(async () => {}) }
+    const release = inner.beginActiveDispatch('bot-a', SHARED)
+    try {
+      // No row to TTL-close: this exercises host reclaim independently of session closure.
+      inner.hosts.set(key, host)
+      inner.hostStartedAt.set(key, Date.now() - 2 * inner.cfg.limits.agentIdleTimeoutMs)
+      await inner.sweepIdle()
+      await vi.waitFor(() => expect(host.stop).toHaveBeenCalledOnce())
+    } finally {
+      release()
+      await pool.instance.stop()
+    }
+  })
+
+  it('keeps a session host whose dispatch starts during the idle activity read', async () => {
+    const pool = await poolMember()
+    const { inner } = pool
+    const key = sessionHostKey('bot-a', ISOLATED)
+    const host = { stop: vi.fn(async () => {}) }
+    let release = () => {}
+    try {
+      inner.hosts.set(key, host)
+      inner.hostStartedAt.set(key, Date.now() - 2 * inner.cfg.limits.agentIdleTimeoutMs)
+      vi.spyOn(inner.store, 'sessionLastActivityTs').mockImplementationOnce(async () => {
+        release = inner.beginActiveDispatch('bot-a', ISOLATED)
+        return 0
+      })
+      await inner.sweepIdle()
+      expect(host.stop).not.toHaveBeenCalled()
+      expect(inner.hosts.get(key)).toBe(host)
+    } finally {
+      release()
+      await pool.instance.stop()
+    }
+  })
+
+  it('keeps a hostless session pod admitted while the watcher query is in flight', async () => {
+    const pool = await poolMember()
+    const { inner } = pool
+    let release = () => {}
+    try {
+      inner.k8sPlane.armedIn = async (subject: string) => {
+        if (subject === SESSION_POD) release = inner.beginActiveDispatch('bot-a', ISOLATED)
+        return false
+      }
+      await inner.sweepIdleSandboxes(
+        Date.now() + 2 * inner.cfg.limits.agentIdleTimeoutMs,
+        inner.cfg.limits.agentIdleTimeoutMs
+      )
+      await new Promise((resolve) => setImmediate(resolve))
+      expect(pool.suspended).toEqual([AGENT_POD])
+    } finally {
+      release()
+      await pool.instance.stop()
+    }
+  })
+
+  it('lets the agent’s shared host, and with it the agent pod, go under an isolated session’s traffic, and keeps both for a shared one’s', async () => {
+    const store = await LocalStore.open(':memory:')
+    const pool = await poolMember(store)
+    const { inner } = pool
+    const sharedHost = agentHostKey('bot-a')
+    const host = { stop: vi.fn(async () => {}) }
+    const row = (key: string, workspaceIsolation: 'shared' | 'session', updatedAt: number) =>
+      store.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: key,
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt,
+        workspaceIsolation
+      })
+    try {
+      const ttl = inner.cfg.limits.agentIdleTimeoutMs
+      /** One full idle sweep over a shared host started two windows ago: whether it stopped the host and suspended the agent pod. */
+      const sweep = async () => {
+        inner.hosts.set(sharedHost, host)
+        inner.hostStartedAt.set(sharedHost, Date.now() - 2 * ttl)
+        host.stop.mockClear()
+        pool.suspended.length = 0
+        await inner.sweepIdle()
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return { hostStopped: host.stop.mock.calls.length > 0, podSuspended: pool.suspended.includes(AGENT_POD) }
+      }
+      // An isolated session busy right up to the sweep, on its own host, while the shared one went quiet two windows ago.
+      expect(inner.hostKeyFor('bot-a', ISOLATED)).not.toBe(sharedHost)
+      await row(ISOLATED, 'session', Date.now())
+      await row(SHARED, 'shared', Date.now() - 2 * ttl)
+      expect(await sweep()).toEqual({ hostStopped: true, podSuspended: true })
+      // A shared session speaking keeps the host it runs on, and that host keeps the pod.
+      const speaking = 'slack:C1:T4:bot-a'
+      inner.sessionIsolation.set(speaking, 'shared')
+      expect(inner.hostKeyFor('bot-a', speaking)).toBe(sharedHost)
+      await row(speaking, 'shared', Date.now())
+      expect(await sweep()).toEqual({ hostStopped: false, podSuspended: false })
+    } finally {
+      await pool.instance.stop()
+    }
+  })
+})
+
+/** The session seam that decides an agent's MCP servers, asked about an ordinary agent. */
+function mcpServersFor(
+  instance: Daemon
+): { command: string; args: string[]; env: { name: string; value: string }[] }[] {
+  const agent = { id: 'a1', name: 'a1', runtime: 'claude', integrations: [], mcpServers: [] }
+  return (instance as any).sessions.deps
+    .toolContextFor({
+      agent,
+      platform: 'slack',
+      channel: 'C1',
+      thread: '1',
+      isDm: false
+    })
+    .mcpServers()
+}
+
+/** A pool agent whose workspace could serve an isolated session, so only the tier rule decides its pod. */
+function poolAgent(isolation: 'shared' | 'session') {
+  return {
+    id: 'bot-a',
+    name: 'bot-a',
+    status: 'active',
+    runtime: 'claude',
+    workspace: {
+      mode: 'git-repo',
+      path: '/agents/bot-a/workspace',
+      gitRepo: 'https://github.com/acme/private.git',
+      gitBranch: 'main',
+      isolation
+    },
+    integrations: [],
+    output: { mode: 'medium' }
+  }
+}
+
+/** Run the real openSession as far as the model-session host, and report the pod that host would claim. */
+async function openSessionClaim(
+  instance: Daemon,
+  agent: ReturnType<typeof poolAgent>,
+  key: string,
+  scenario: { recorded?: 'shared' | 'session'; worktree?: boolean }
+): Promise<string | undefined> {
+  let claimed: string | undefined
+  const inner = instance as any
+  inner.githubReviews = { prepareGithubReviewWorkspace: async () => ({}) }
+  inner.store.getSession = async () =>
+    scenario.recorded === undefined ? undefined : { key, workspaceIsolation: scenario.recorded }
+  // The cold host's own preparation is not what this reports; its pod has its own rows above.
+  inner.prepareAgentWorkspace = async () => '/agent/checkout'
+  inner.modelSessions = {
+    enabled: true,
+    keys: () => [],
+    release: async () => {},
+    hasStartedHost: () => false,
+    ensure: async () => {
+      claimed = inner.podSubjectFor(agent, sessionHostKey('bot-a', key))
+      return { host: {}, hostKey: sessionHostKey('bot-a', key), stop: async () => {}, waitForCleanup: async () => {} }
+    }
+  }
+  inner.sessions = { handle: async () => ({ sessionId: 'acp-1', blocks: [], created: true }) }
+  const run = {
+    entry: {
+      agentId: 'bot-a',
+      initAbort: new AbortController(),
+      msg: { platform: 'webchat', channel: 'C1', msgId: 'm1', sender: { id: 'U1' }, text: 'hi' },
+      ...(scenario.worktree === undefined ? {} : { webchat: { worktree: scenario.worktree } })
+    },
+    key,
+    plan: { deliveryBinding: {} },
+    agent,
+    evaluation: {}
+  }
+  await inner.openSession(run, () => {})
+  return claimed
+}
+
+describe('daemon --k8s mode: Source Cache signer (source-cache.md §12)', () => {
+  function sourceCacheEnv(dir: string): string {
+    return JSON.stringify({
+      version: 1,
+      region: 'us-east-1',
+      bucket: 'ac-cache',
+      credentials: { source: 'static', dir, accessKeyIdKey: 'id', secretAccessKeyKey: 'secret' }
+    })
+  }
+
+  const cacheReaderOf = (instance: { workspaces: unknown }): unknown =>
+    (instance.workspaces as { sourceCacheReader?: unknown }).sourceCacheReader
+  const sweeperOf = (instance: object): unknown => (instance as { sourceCacheSweeper?: unknown }).sourceCacheSweeper
+
+  function keyDir(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'ac-source-cache-keys-'))
+    writeFileSync(join(dir, 'id'), 'AKIDEXAMPLE\n')
+    writeFileSync(join(dir, 'secret'), 'secret\n')
+    return dir
+  }
+
+  it('builds no signer and touches no network when the bucket is not configured', () => {
+    const fetch = vi.fn()
+    vi.stubEnv('AC_SOURCE_CACHE', '')
+    try {
+      const instance = daemon({ root: root(), k8s: true, sourceCacheFetch: fetch })
+      expect(instance.sourceCacheSigner()).toBeUndefined()
+      // No reader either, so every workspace clone keeps today's argv and reads no store.
+      expect(cacheReaderOf(instance)).toBeUndefined()
+      expect(sweeperOf(instance)).toBeUndefined()
+      // Credentialed skill refs still resolve per agent, bucket or not.
+      expect((instance as unknown as { codeHostRefs: unknown }).codeHostRefs).toBeInstanceOf(CodeHostRefResolver)
+      expect(fetch).not.toHaveBeenCalled()
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('refuses to construct with an invalid configuration, naming the variable', () => {
+    vi.stubEnv('AC_SOURCE_CACHE', JSON.stringify({ version: 1, region: 'us-east-1', bucket: 'ac-cache' }))
+    try {
+      expect(() => daemon({ root: root(), k8s: true })).toThrow('AC_SOURCE_CACHE is invalid')
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+
+  // The document requires an absolute POSIX key directory, which a Windows temp dir is not.
+  it.skipIf(process.platform === 'win32')(
+    'builds a signer from a valid configuration without any network call',
+    async () => {
+      const fetch = vi.fn()
+      vi.stubEnv('AC_SOURCE_CACHE', sourceCacheEnv(keyDir()))
+      try {
+        const instance = daemon({ root: root(), k8s: true, sourceCacheFetch: fetch })
+        expect(instance.sourceCacheSigner()).toBeDefined()
+        expect(cacheReaderOf(instance)).toBeDefined()
+        // The sweeper is built but idle: its lifecycle check and first pass start with the timers, not here.
+        expect(sweeperOf(instance)).toBeDefined()
+        expect(fetch).not.toHaveBeenCalled()
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    }
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'wires the read planner and the sweeper into the injected metrics recorder',
+    async () => {
+      const fetch = vi.fn(() => Promise.reject(new Error('offline')))
+      const recorder = { read: vi.fn(), writeBack: vi.fn(), sweepPass: vi.fn(), lifecycle: vi.fn() }
+      vi.stubEnv('AC_SOURCE_CACHE', sourceCacheEnv(keyDir()))
+      try {
+        const instance = daemon({ root: root(), k8s: true, sourceCacheFetch: fetch, sourceCacheMetrics: recorder })
+        const hit = { kind: 'hit', bundleKey: 'k', shape: 'full', repoClass: 'anon', bytes: 10 } as const
+        ;(cacheReaderOf(instance) as SourceCacheWorkspaceReader).record(hit)
+        expect(recorder.read).toHaveBeenCalledWith(hit)
+        await (sweeperOf(instance) as SourceCacheSweeper).checkLifecycle()
+        expect(recorder.lifecycle).toHaveBeenCalledWith('unknown')
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    }
+  )
+
+  it('ignores the configuration outside --k8s', () => {
+    vi.stubEnv('AC_SOURCE_CACHE', sourceCacheEnv(keyDir()))
+    try {
+      const instance = daemon({ root: root(), k8s: false })
+      expect(instance.sourceCacheSigner()).toBeUndefined()
+      expect(sweeperOf(instance)).toBeUndefined()
+      expect((instance as unknown as { codeHostRefs: unknown }).codeHostRefs).toBeInstanceOf(CodeHostRefResolver)
+    } finally {
+      vi.unstubAllEnvs()
+    }
+  })
+})

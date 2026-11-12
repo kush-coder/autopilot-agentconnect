@@ -1,0 +1,3078 @@
+// @vitest-environment happy-dom
+//
+// `pgSend` reports whether a send was ACCEPTED, and SessionDetailView's composer
+// relies on that to decide whether to pin the transcript to the bottom. Enter on
+// an empty composer must report rejection — otherwise a reader who scrolled up
+// into history gets yanked to the bottom for a send that never happened. Enter
+// while a turn is already streaming is accepted: it QUEUES (Claude Code-style)
+// and dispatches once the turn finishes, and each queued message can be
+// cancelled before it goes out.
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Agent } from '@/lib/data'
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    agents: [],
+    daemons: [],
+    allSessions: [],
+    getAgent: () => undefined,
+    refreshSessions: vi.fn()
+  })
+}))
+vi.mock('@/lib/org-context', () => ({ useOrgs: () => ({ activeOrg: { id: 'org1', slug: 'acme' } }) }))
+vi.mock('@/lib/api', () => ({
+  ApiError: class ApiError extends Error {
+    constructor(
+      message: string,
+      public status: number
+    ) {
+      super(message)
+    }
+  },
+  fetchSessionMessages: vi.fn(async () => ({ messages: [] })),
+  mintWebchatConversation: vi.fn(async () => ({ conversationId: 'c1' })),
+  webchatSocketUrl: () => 'wss://relay.test/ws',
+  // Rejects by default so the acceptance tests keep their fail-fast send path
+  // (busy clears, the queue dispatcher runs); the post-frame tests resolve it.
+  webchatWsUrl: vi.fn(async () => {
+    throw new (await import('@/lib/api')).ApiError('no relay in this test', 503)
+  }),
+  webchatSessionWsUrl: vi.fn(async () => 'wss://relay.test/session')
+}))
+
+const { PlaygroundProvider, usePlayground } = await import('./PlaygroundProvider')
+
+// The accepted path opens a socket; a stub that never settles keeps the test on
+// the synchronous return value instead of the streaming machinery.
+class StubSocket {
+  static CONNECTING = 0
+  // The provider reuses a socket only while `readyState` reads as OPEN against the class constant.
+  static OPEN = 1
+  readyState = 0
+  send = vi.fn()
+  close = vi.fn()
+  addEventListener = vi.fn()
+  removeEventListener = vi.fn()
+}
+
+let pgCancel: ReturnType<typeof usePlayground>['pgCancel']
+let pgSend: ReturnType<typeof usePlayground>['pgSend']
+let pgNotice: ReturnType<typeof usePlayground>['pgNotice']
+let setPgInput: ReturnType<typeof usePlayground>['setPgInput']
+let getPgInput: ReturnType<typeof usePlayground>['getPgInput']
+let setPgImage: ReturnType<typeof usePlayground>['setPgImage']
+let getPgImage: ReturnType<typeof usePlayground>['getPgImage']
+let getPgFiles: ReturnType<typeof usePlayground>['getPgFiles']
+let openPlayground: ReturnType<typeof usePlayground>['openPlayground']
+let getPgQueue: ReturnType<typeof usePlayground>['getPgQueue']
+let pgCancelQueued: ReturnType<typeof usePlayground>['pgCancelQueued']
+let getLiveSteps: ReturnType<typeof usePlayground>['getLiveSteps']
+let reconcileLiveSteps: ReturnType<typeof usePlayground>['reconcileLiveSteps']
+let pgAttach: ReturnType<typeof usePlayground>['pgAttach']
+let pgAnswerElicitation: ReturnType<typeof usePlayground>['pgAnswerElicitation']
+let pgAppRpc: ReturnType<typeof usePlayground>['pgAppRpc']
+let getPgSession: ReturnType<typeof usePlayground>['getPgSession']
+let getPgSuggestion: ReturnType<typeof usePlayground>['getPgSuggestion']
+let pgStageRuntime: ReturnType<typeof usePlayground>['pgStageRuntime']
+let pgSetModel: ReturnType<typeof usePlayground>['pgSetModel']
+let pgSetEffort: ReturnType<typeof usePlayground>['pgSetEffort']
+let pgSetPermissionPreset: ReturnType<typeof usePlayground>['pgSetPermissionPreset']
+let pgSetFast: ReturnType<typeof usePlayground>['pgSetFast']
+let markSessionTarget: ReturnType<typeof usePlayground>['markSessionTarget']
+let getBusyLaneAgentIds: ReturnType<typeof usePlayground>['getBusyLaneAgentIds']
+let isPgBusy: ReturnType<typeof usePlayground>['isPgBusy']
+let isPgTurnUnstreamed: ReturnType<typeof usePlayground>['isPgTurnUnstreamed']
+let pgSendThread: ReturnType<typeof usePlayground>['pgSendThread']
+let getPgTurnThread: ReturnType<typeof usePlayground>['getPgTurnThread']
+let getPgRelayFeatures: ReturnType<typeof usePlayground>['getPgRelayFeatures']
+
+function Probe() {
+  const pg = usePlayground()
+  pgCancel = pg.pgCancel
+  pgSend = pg.pgSend
+  pgNotice = pg.pgNotice
+  setPgInput = pg.setPgInput
+  getPgInput = pg.getPgInput
+  setPgImage = pg.setPgImage
+  getPgImage = pg.getPgImage
+  getPgFiles = pg.getPgFiles
+  openPlayground = pg.openPlayground
+  getPgQueue = pg.getPgQueue
+  pgCancelQueued = pg.pgCancelQueued
+  getLiveSteps = pg.getLiveSteps
+  reconcileLiveSteps = pg.reconcileLiveSteps
+  pgAttach = pg.pgAttach
+  pgAnswerElicitation = pg.pgAnswerElicitation
+  pgAppRpc = pg.pgAppRpc
+  getPgSession = pg.getPgSession
+  getPgSuggestion = pg.getPgSuggestion
+  pgStageRuntime = pg.pgStageRuntime
+  pgSetModel = pg.pgSetModel
+  pgSetEffort = pg.pgSetEffort
+  pgSetPermissionPreset = pg.pgSetPermissionPreset
+  pgSetFast = pg.pgSetFast
+  markSessionTarget = pg.markSessionTarget
+  getBusyLaneAgentIds = pg.getBusyLaneAgentIds
+  isPgBusy = pg.isPgBusy
+  isPgTurnUnstreamed = pg.isPgTurnUnstreamed
+  pgSendThread = pg.pgSendThread
+  getPgTurnThread = pg.getPgTurnThread
+  getPgRelayFeatures = pg.getPgRelayFeatures
+  return null
+}
+
+let host: HTMLDivElement
+let root: Root
+
+beforeEach(() => {
+  Reflect.set(globalThis, 'IS_REACT_ACT_ENVIRONMENT', true)
+  Reflect.set(globalThis, 'WebSocket', StubSocket)
+  host = document.createElement('div')
+  document.body.append(host)
+  root = createRoot(host)
+  act(() =>
+    root.render(
+      <PlaygroundProvider>
+        <Probe />
+      </PlaygroundProvider>
+    )
+  )
+})
+
+afterEach(() => {
+  act(() => root.unmount())
+  host.remove()
+  vi.clearAllMocks()
+})
+
+describe('Decision runtime startup', () => {
+  afterEach(async () => {
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockRejectedValue(new api.ApiError('no relay in this test', 503))
+  })
+
+  const agent = {
+    id: 'agent-1',
+    name: 'Review bot',
+    runtime: 'claude',
+    model: 'model-standard',
+    modelSelection: { decisionId: 'decision-1', rules: [] }
+  } as unknown as Agent
+
+  class RuntimeSocket extends StubSocket {
+    static instances: RuntimeSocket[] = []
+    onopen?: () => void
+    onmessage?: (event: { data: string }) => void
+    constructor() {
+      super()
+      RuntimeSocket.instances.push(this)
+    }
+  }
+
+  it.each([
+    { runtime: 'codex', model: 'model-capable' },
+    { runtime: agent.runtime, model: agent.model }
+  ])('resolves pending from the reported $runtime pair', async (target) => {
+    RuntimeSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', RuntimeSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    let id = ''
+    await act(async () => {
+      id = openPlayground(agent)
+      pgSend(id, agent.id, 'Review this change')
+    })
+    expect(getPgSession(id)?.runtimePending).toBe(true)
+    const socket = RuntimeSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const { turnId } = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    act(() => {
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ack', ack: { accepted: true, turnId, agentId: agent.id } }) })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: agent.id, index: 0, status: { contextUsed: 10 } }
+        })
+      })
+    })
+    expect(getPgSession(id)?.runtimePending).toBe(true)
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: agent.id, index: 1, status: { runtime: target.runtime } }
+        })
+      })
+    })
+    expect(getPgSession(id)?.runtimePending).toBe(true)
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: agent.id, index: 2, status: { ...target, sessionId: 'session-1' } }
+        })
+      })
+    })
+    expect(getPgSession(id)).toMatchObject({ ...target, runtimePending: false, realSessionId: 'session-1' })
+  })
+
+  it('shows a manual first-turn selection and restores pending when returning to Decision', () => {
+    let id = ''
+    act(() => {
+      id = openPlayground(agent)
+      pgStageRuntime(id, { runtime: 'codex', model: 'model-capable' })
+    })
+    expect(getPgSession(id)).toMatchObject({ runtime: 'codex', model: 'model-capable', runtimePending: false })
+    act(() => pgStageRuntime(id, { runtime: undefined, model: undefined }))
+    expect(getPgSession(id)?.runtimePending).toBe(true)
+    act(() => pgStageRuntime(id, { fastMode: true }))
+    expect(getPgSession(id)?.runtimePending).toBe(true)
+  })
+})
+
+// A runtime change sent before the daemon has a session is refused, so a fresh playground carries it on its first turn.
+describe('Runtime changes before the first turn', () => {
+  const agent = { id: 'agent-1', name: 'Echo', runtime: 'claude', model: 'model-standard' } as unknown as Agent
+
+  class RuntimeSocket extends StubSocket {
+    static instances: RuntimeSocket[] = []
+    onopen?: () => void
+    onmessage?: (event: { data: string }) => void
+    constructor() {
+      super()
+      RuntimeSocket.instances.push(this)
+    }
+  }
+
+  const sent = (socket: RuntimeSocket) =>
+    socket.send.mock.calls.map(([frame]) => JSON.parse(String(frame)) as Record<string, unknown>)
+
+  afterEach(async () => {
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockRejectedValue(new api.ApiError('no relay in this test', 503))
+  })
+
+  it('sends no set_* frame until the daemon reports a session, then sends them', async () => {
+    RuntimeSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', RuntimeSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    let id = ''
+    await act(async () => {
+      id = openPlayground(agent)
+      pgSetModel(id, agent.id, 'model-capable')
+      pgSetEffort(id, agent.id, 'high')
+      pgSetPermissionPreset(id, agent.id, 'auto')
+      pgSetFast(id, agent.id, true)
+      pgSend(id, agent.id, 'echo')
+    })
+    const socket = RuntimeSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const [turn, ...rest] = sent(socket)
+    expect(rest).toEqual([])
+    expect(turn).toMatchObject({
+      text: 'echo',
+      runtime: { model: 'model-capable', effort: 'high', permissionMode: 'auto', fastMode: true }
+    })
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId: turn!.turnId, agentId: agent.id, index: 0, status: { sessionId: 'session-1' } }
+        })
+      })
+    })
+    await act(async () => pgSetModel(id, agent.id, 'model-standard'))
+    expect(sent(socket).at(-1)).toEqual({ type: 'set_model', model: 'model-standard' })
+  })
+})
+
+// An approval decision is news the conversation must speak, but the composer is
+// the OWNER's: clicking Approve while a follow-up is half-typed (or an image is
+// staged) must not send their draft, and must not send their image with the notice.
+describe('pgNotice leaves the composer alone', () => {
+  const image = { name: 'shot.png', mimeType: 'image/png' as const, data: 'AAAA' }
+
+  it('keeps an unsent draft and a staged attachment exactly where they were', () => {
+    act(() => setPgInput('s1', 'half-typed follow-up'))
+    act(() => setPgImage('s1', image))
+    expect(pgNotice('s1', 'a1', '[approval] createAgent (operation op-1) is now completed.')).toBe(true)
+    expect(getPgInput('s1')).toBe('half-typed follow-up')
+    expect(getPgImage('s1')).toEqual(image)
+  })
+
+  it('sends nothing for an empty notice, and never pulls the staged image in', () => {
+    act(() => setPgImage('s1', image))
+    expect(pgNotice('s1', 'a1', '   ')).toBe(false)
+    expect(getPgImage('s1')).toEqual(image)
+  })
+
+  it('still queues behind a streaming turn, like any other input', () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+    })
+    act(() => {
+      expect(pgNotice('s1', 'a1', '[approval] createAgent is now completed.')).toBe(true)
+    })
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['[approval] createAgent is now completed.'])
+    // Queued as text only: the owner's staged image is not conscripted into it.
+    expect(getPgQueue('s1').map((q) => q.image)).toEqual([undefined])
+  })
+})
+
+describe('pgSend acceptance', () => {
+  it('rejects an empty composer', () => {
+    expect(pgSend('s1', 'a1', '')).toBe(false)
+    expect(pgSend('s1', 'a1', '   ')).toBe(false) // whitespace only
+    expect(pgSend('s1', 'a1', undefined)).toBe(false) // no staged input either
+  })
+
+  it('accepts a message with text', () => {
+    expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+  })
+
+  // A second send while the first turn streams is ACCEPTED — it queues instead
+  // of going on the wire, and dispatches once the turn finishes.
+  it('queues a second send while the first turn is still streaming', () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s1', 'a1', 'again')).toBe(true) // busy → queued
+    })
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['again'])
+    expect(getPgQueue('s2')).toEqual([]) // per-session queue
+  })
+
+  it('cancels a queued message before it is sent', () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s1', 'a1', 'first queued')).toBe(true)
+      expect(pgSend('s1', 'a1', 'second queued')).toBe(true)
+    })
+    const queued = getPgQueue('s1')
+    expect(queued.map((q) => q.text)).toEqual(['first queued', 'second queued'])
+    act(() => pgCancelQueued('s1', queued[0]!.queueId))
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['second queued'])
+  })
+
+  it('keeps queueing per session — a different session sends directly', () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s2', 'a1', 'hello')).toBe(true) // a different session is free
+    })
+    expect(getPgQueue('s2')).toEqual([]) // sent, not queued
+  })
+
+  // The dispatcher drains the queue once the session is no longer busy. In this
+  // harness the turn "finishes" when the (mocked, failing) socket settles and
+  // clears the busy flag — flushing microtasks gets there without streaming.
+  it('auto-dispatches the queued message once the turn ends', async () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'hello')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s1', 'a1', 'queued')).toBe(true)
+    })
+    expect(getPgQueue('s1')).toHaveLength(1)
+    await act(async () => {}) // settle the send + run the dispatcher effect
+    expect(getPgQueue('s1')).toEqual([])
+  })
+
+  // The FIFO gap: when a turn ends, the synchronous busy ref clears at once but
+  // the queue head is dispatched by a passive effect. A send landing in that gap
+  // must go BEHIND the pending queue, not straight to the wire ahead of it.
+  it('keeps a send arriving at the idle transition behind the pending queue', async () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'first')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s1', 'a1', 'second')).toBe(true) // busy → queued
+    })
+    await act(async () => {
+      // Pump microtasks so the (mocked, failing) first send settles and clears
+      // the busy ref — the dispatcher effect cannot run until this act body
+      // returns, so the next send lands exactly in the race window.
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      expect(pgSend('s1', 'a1', 'third')).toBe(true)
+    })
+    // Drain the dispatcher: each dispatched turn fails and frees the next.
+    await act(async () => {})
+    await act(async () => {})
+    expect(getPgQueue('s1')).toEqual([])
+    // '@you' transcript steps record wire order — FIFO means 'third' stays last
+    // ('s1' is not a synthetic pg_ session, so its steps land in the live tail).
+    const wireOrder = getLiveSteps('s1')
+      .filter((s) => s.who === '@you')
+      .map((s) => s.text)
+    expect(wireOrder).toEqual(['first', 'second', 'third'])
+  })
+
+  // The cancel twin of the FIFO gap: the dispatcher must not send a head the
+  // user canceled after the turn ended but before the passive effect ran. The
+  // dispatcher derives its head from the synchronous queue mirror, so a cancel
+  // landing in that window always wins over the render-time snapshot.
+  it('never dispatches a head canceled at the idle transition', async () => {
+    act(() => {
+      expect(pgSend('s1', 'a1', 'first')).toBe(true)
+    })
+    act(() => {
+      expect(pgSend('s1', 'a1', 'doomed')).toBe(true) // busy → queued
+    })
+    const queueId = getPgQueue('s1')[0]!.queueId
+    await act(async () => {
+      // Pump microtasks so the (mocked, failing) first send settles and clears
+      // the busy ref, then cancel the queued head before the dispatcher effect
+      // has had a chance to run.
+      for (let i = 0; i < 20; i++) await Promise.resolve()
+      pgCancelQueued('s1', queueId)
+    })
+    await act(async () => {})
+    expect(getPgQueue('s1')).toEqual([])
+    const wireOrder = getLiveSteps('s1')
+      .filter((s) => s.who === '@you')
+      .map((s) => s.text)
+    expect(wireOrder).toEqual(['first']) // 'doomed' must never reach the wire
+  })
+
+  // openPlayground exists on the same context; touching it here documents that the
+  // probe wiring is real and not a partially-mocked stand-in.
+  it('exposes the real provider surface', () => {
+    expect(typeof openPlayground).toBe('function')
+  })
+})
+
+// #807 follow-up: an agent-initiated post renders once per postId — the daemon may
+// re-broadcast the same canonical post (inbox replay, relay fan-out echo).
+describe('agent-initiated post frames', () => {
+  class CapturingSocket extends StubSocket {
+    static instances: CapturingSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      CapturingSocket.instances.push(this)
+    }
+  }
+
+  it('dedups a re-broadcast post by postId', async () => {
+    CapturingSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', CapturingSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const sock = CapturingSocket.instances[0]!
+    await act(async () => {
+      sock.readyState = 1
+      sock.onopen?.()
+      sock.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const frame = JSON.stringify({
+      type: 'post',
+      initiator: 'agent',
+      post: { postId: 'post-9', author: { kind: 'agent', agentId: 'agent-2' }, text: 'hi from B' }
+    })
+    await act(async () => {
+      sock.onmessage?.({ data: frame })
+      sock.onmessage?.({ data: frame })
+    })
+    const posts = getLiveSteps('s1').filter((s) => s.postId === 'post-9')
+    expect(posts).toHaveLength(1)
+    expect(posts[0]).toMatchObject({ kind: 'done', agentId: 'agent-2', text: 'hi from B' })
+  })
+})
+
+describe('stream text delta batching', () => {
+  class CapturingDeltaSocket extends StubSocket {
+    static instances: CapturingDeltaSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      CapturingDeltaSocket.instances.push(this)
+    }
+  }
+
+  async function openStream() {
+    CapturingDeltaSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', CapturingDeltaSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const socket = CapturingDeltaSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    return { socket, turnId: turn.turnId }
+  }
+
+  function captureAnimationFrames() {
+    let nextId = 1
+    const frames = new Map<number, FrameRequestCallback>()
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((callback) => {
+      const id = nextId++
+      frames.set(id, callback)
+      return id
+    })
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id) => {
+      frames.delete(id)
+    })
+    return () => {
+      const callbacks = [...frames.values()]
+      frames.clear()
+      for (const callback of callbacks) callback(16)
+    }
+  }
+
+  it('commits several same-frame message deltas as one transcript update', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      for (const [index, text] of ['Hel', 'lo', '!'].entries()) {
+        socket.onmessage?.({
+          data: JSON.stringify({
+            type: 'output',
+            output: { turnId, agentId: 'agent-1', index, event: { kind: 'message', text } }
+          })
+        })
+      }
+    })
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toEqual([])
+
+    act(runFrame)
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'done', text: 'Hello!' }
+    ])
+  })
+
+  it('renders a daemon notice in its own lane while the wait it announces is all there is', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } }
+        })
+      })
+    })
+    act(runFrame)
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'notice', text: 'Allocating a sandbox pod…', boundary: true }
+    ])
+  })
+
+  it('replaces and clears only the current turn wait while keeping standing notices and other participants', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+    act(() => {
+      for (const output of [
+        { agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Starting sandbox…' } },
+        { agentId: 'agent-2', index: 0, event: { kind: 'notice', text: 'Starting sandbox…' } },
+        { agentId: 'agent-1', index: 1, event: { kind: 'notice', text: 'An approval is unavailable', standing: true } },
+        { agentId: 'agent-1', index: 2, event: { kind: 'notice', text: 'Preparing workspace…' } }
+      ])
+        socket.onmessage?.({ data: JSON.stringify({ type: 'output', output: { turnId, ...output } }) })
+    })
+    act(runFrame)
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'notice', text: 'An approval is unavailable', standing: true },
+      { kind: 'notice', text: 'Preparing workspace…' }
+    ])
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: {
+            turnId,
+            agentId: 'agent-1',
+            index: 3,
+            event: { kind: 'notice', text: '' }
+          }
+        })
+      })
+    })
+    act(runFrame)
+    expect(getLiveSteps('s1').filter((step) => step.kind === 'notice')).toMatchObject([
+      { agentId: 'agent-2', text: 'Starting sandbox…' },
+      { agentId: 'agent-1', text: 'An approval is unavailable', standing: true }
+    ])
+  })
+
+  it('retires the notice as soon as the turn streams, so it never stands above the answer', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 1, event: { kind: 'thinking', text: 'here goes' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 2, event: { kind: 'message', text: 'Hello!' } }
+        })
+      })
+    })
+    act(runFrame)
+
+    // The pod is up — the wait's line is gone, and the reply chunks still start their own blocks.
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'plan', text: 'here goes' },
+      { kind: 'done', text: 'Hello!' }
+    ])
+  })
+
+  it('keeps a STANDING notice when the turn streams on — it is not a wait that ended', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: {
+            turnId,
+            agentId: 'agent-1',
+            index: 0,
+            event: { kind: 'notice', text: 'The agent asked something this chat can’t collect…', standing: true }
+          }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 1, event: { kind: 'message', text: 'Moving on then.' } }
+        })
+      })
+    })
+    act(runFrame)
+
+    // Retiring this one would delete the ONLY thing the reader was told about a question the
+    // agent asked and this surface could not show (#1794) — the answer that follows is not
+    // the wait ending, it is the agent carrying on without them.
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'notice', text: 'The agent asked something this chat can’t collect…', standing: true, boundary: true },
+      { kind: 'done', text: 'Moving on then.' }
+    ])
+  })
+
+  // ACP resends the WHOLE list on every revision, so a live plan must be one block that is
+  // rewritten — appending would stack a fresh checklist per keystroke of progress.
+  it('stands a capability request card in the conversation and settles it in place', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+    const requestId = '7f3a1c56-8a2b-4c3d-9e4f-0a1b2c3d4e5f'
+    act(() => {
+      for (const output of [
+        {
+          agentId: 'agent-1',
+          index: 0,
+          event: {
+            kind: 'capability_request',
+            requestId,
+            generation: 1,
+            summary: 'add the MCP server "Linear"',
+            reason: 'filing the bug needs Linear',
+            link: `https://console.example.test/acme/requests/${requestId}`
+          }
+        },
+        { agentId: 'agent-1', index: 1, event: { kind: 'message', text: 'I asked for Linear.' } },
+        {
+          agentId: 'agent-1',
+          index: 2,
+          event: { kind: 'capability_request_resolved', requestId, status: 'declined', text: 'Declined by Ben' }
+        }
+      ]) {
+        socket.onmessage?.({ data: JSON.stringify({ type: 'output', output: { turnId, ...output } }) })
+      }
+    })
+    act(runFrame)
+
+    // The reply after it stays its own text, and the card keeps its place, now settled.
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      {
+        kind: 'capability',
+        capability: { requestId, generation: 1, resolved: { status: 'declined', text: 'Declined by Ben' } }
+      },
+      { text: 'I asked for Linear.' }
+    ])
+  })
+
+  it("replaces the lane's plan block on each revision instead of appending another", async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      for (const output of [
+        {
+          agentId: 'agent-1',
+          index: 0,
+          event: {
+            kind: 'plan',
+            entries: [
+              { content: 'read the file', status: 'in_progress' },
+              { content: 'fix the bug', status: 'pending' }
+            ]
+          }
+        },
+        {
+          agentId: 'agent-1',
+          index: 1,
+          event: { kind: 'tool_call', toolCallId: 't1', title: 'cat a.ts', status: 'pending' }
+        },
+        {
+          agentId: 'agent-1',
+          index: 2,
+          event: {
+            kind: 'plan',
+            entries: [
+              { content: 'read the file', status: 'completed' },
+              { content: 'fix the bug', status: 'in_progress' }
+            ]
+          }
+        }
+      ]) {
+        socket.onmessage?.({ data: JSON.stringify({ type: 'output', output: { turnId, ...output } }) })
+      }
+    })
+    act(runFrame)
+
+    // One block, holding the position it first took — ahead of the tool it planned — and
+    // carrying the latest statuses.
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      {
+        kind: 'planblock',
+        plan: [
+          { content: 'read the file', status: 'completed' },
+          { content: 'fix the bug', status: 'in_progress' }
+        ]
+      },
+      { kind: 'tool', text: 'cat a.ts' }
+    ])
+  })
+
+  // The daemon builds ONE TranscriptRecorder per turn, so a replacement generation rewrites
+  // the SAME plan row. Appending here instead would leave the live view showing the
+  // discarded plan next to the current one, where a reload shows only the latter.
+  it('rewrites the same plan block across a supersession instead of stacking a second', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      for (const output of [
+        {
+          agentId: 'agent-1',
+          index: 0,
+          event: { kind: 'plan', entries: [{ content: 'first attempt', status: 'in_progress' }] }
+        },
+        { agentId: 'agent-1', index: 1, event: { kind: 'superseded', generation: 1 } },
+        {
+          agentId: 'agent-1',
+          index: 2,
+          event: { kind: 'plan', entries: [{ content: 'second attempt', status: 'in_progress' }] }
+        }
+      ]) {
+        socket.onmessage?.({ data: JSON.stringify({ type: 'output', output: { turnId, ...output } }) })
+      }
+    })
+    act(runFrame)
+
+    const blocks = getLiveSteps('s1').filter((step) => step.kind === 'planblock')
+    expect(blocks).toMatchObject([{ plan: [{ content: 'second attempt', status: 'in_progress' }] }])
+  })
+
+  it("retires only the streaming lane's notice — a lane still waiting keeps its own", async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      for (const output of [
+        { agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } },
+        { agentId: 'agent-2', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } },
+        { agentId: 'agent-1', index: 1, event: { kind: 'thinking', text: 'mine is up' } }
+      ]) {
+        socket.onmessage?.({ data: JSON.stringify({ type: 'output', output: { turnId, ...output } }) })
+      }
+    })
+    act(runFrame)
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId)).toMatchObject([
+      { kind: 'notice', agentId: 'agent-2' },
+      { kind: 'plan', agentId: 'agent-1', text: 'mine is up' }
+    ])
+  })
+
+  it('retires the notice when a lane ends cleanly having streamed nothing', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    // A silent AC_NO_RESPONSE decline holds every chunk back: the lane closes with no events.
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+      })
+    })
+    act(runFrame)
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toEqual([])
+  })
+
+  it('keeps the notice when the turn fails, where it explains the failure', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'done',
+          done: { turnId, agentId: 'agent-1', lastIndex: 0, error: 'the sandbox never came up' }
+        })
+      })
+    })
+    act(runFrame)
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'notice', text: 'Allocating a sandbox pod…' },
+      { kind: 'done', text: '⚠️ the sandbox never came up' }
+    ])
+  })
+
+  it('retires the notice on a streamed session title', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'notice', text: 'Allocating a sandbox pod…' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 1, event: { kind: 'session_info', title: 'Skills on hand' } }
+        })
+      })
+    })
+    act(runFrame)
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toEqual([])
+  })
+
+  it('flushes the final text before applying done', async () => {
+    const runFrame = captureAnimationFrames()
+    const { socket, turnId } = await openStream()
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index: 0, event: { kind: 'thinking', text: 'complete' } }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+      })
+    })
+
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'plan', text: 'complete' }
+    ])
+    act(runFrame)
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toHaveLength(1)
+  })
+})
+
+// A socket that drops between `send` and the turn's ack leaves the turn in limbo — it may
+// never have reached a daemon. The reconnect must put that turn back on the wire (same
+// turnId) rather than only `resume` a stream that was never opened; once a participant
+// HAS acked, the reconnect resumes as before.
+describe('reconnect after an unacked turn', () => {
+  class ReconnectSocket extends StubSocket {
+    static OPEN = 1
+    static CLOSING = 2
+    static CLOSED = 3
+    static instances: ReconnectSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      ReconnectSocket.instances.push(this)
+    }
+  }
+  const frames = (socket: ReconnectSocket): Array<Record<string, unknown>> =>
+    socket.send.mock.calls.map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** Send one turn, open its socket, and return the socket plus the turn frame it carried. */
+  async function sendAndOpen() {
+    ReconnectSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ReconnectSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const first = ReconnectSocket.instances[0]!
+    await act(async () => {
+      first.readyState = 1
+      first.onopen?.()
+      first.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = frames(first)[0] as { turnId: string; text: string }
+    expect(turn).toMatchObject({ text: 'hello' })
+    return { first, turn }
+  }
+
+  /** Drop the socket and run the reconnect backoff until the replacement socket is open and `ready`. */
+  async function dropAndReconnect(first: ReconnectSocket) {
+    await act(async () => {
+      first.readyState = 3
+      first.onclose?.()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    const second = ReconnectSocket.instances[1]!
+    expect(second).toBeDefined()
+    await act(async () => {
+      second.readyState = 1
+      second.onopen?.()
+      second.onmessage?.({ data: JSON.stringify({ type: 'ready', conversationId: 'c1' }) })
+    })
+    return second
+  }
+
+  it('carries the reader’s browser time zone on the turn frame', async () => {
+    const { turn } = await sendAndOpen()
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    expect(zone).toBeTruthy()
+    expect(turn).toMatchObject({ text: 'hello', timeZone: zone })
+  })
+
+  it('re-sends the turn, not a resume, when no participant acked it before the drop', async () => {
+    const { first, turn } = await sendAndOpen()
+    const second = await dropAndReconnect(first)
+    expect(frames(second)).toEqual([expect.objectContaining({ text: 'hello', turnId: turn.turnId })])
+    expect(frames(second).some((frame) => frame.type === 'resume')).toBe(false)
+  })
+
+  it('resumes the stream once the turn was acked', async () => {
+    const { first, turn } = await sendAndOpen()
+    await act(async () => {
+      first.onmessage?.({
+        data: JSON.stringify({ type: 'ack', ack: { accepted: true, turnId: turn.turnId, agentId: 'agent-1' } })
+      })
+    })
+    const second = await dropAndReconnect(first)
+    expect(frames(second)).toEqual([
+      expect.objectContaining({ type: 'resume', turnId: turn.turnId, agentId: 'agent-1', afterIndex: -1 })
+    ])
+  })
+
+  // The copy met its own stream: the original was admitted and its ack lost with the socket.
+  it('attaches to the existing stream when the re-sent copy is refused as busy', async () => {
+    const { first, turn } = await sendAndOpen()
+    const second = await dropAndReconnect(first)
+    await act(async () => {
+      second.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: { accepted: false, reason: 'busy', turnId: turn.turnId, agentId: 'agent-1' }
+        })
+      })
+    })
+    expect(frames(second).at(-1)).toMatchObject({ type: 'resume', turnId: turn.turnId, agentId: 'agent-1' })
+    expect(getLiveSteps('s1').some((step) => /busy/.test(step.text ?? ''))).toBe(false)
+  })
+
+  // `busy` for the copy is ambiguous: the attach's verdict tells a duplicate (stream exists → bound,
+  // streaming) from the daemon's real refusal (no stream → the agent IS busy; say so, stop retrying).
+  it('reports a real busy refusal when the attach after the copy finds no stream', async () => {
+    const { first, turn } = await sendAndOpen()
+    const second = await dropAndReconnect(first)
+    await act(async () => {
+      second.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: { accepted: false, reason: 'busy', turnId: turn.turnId, agentId: 'agent-1' }
+        })
+      })
+      second.onmessage?.({
+        data: JSON.stringify({
+          type: 'resumed',
+          ack: { accepted: false, reason: 'stream_not_found', agentId: 'agent-1' }
+        })
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+    })
+    expect(getLiveSteps('s1').filter((step) => /is busy/.test(step.text ?? ''))).toHaveLength(1)
+    // No resume ladder and no "could not be resumed": the busy verdict ended the turn.
+    expect(frames(second).filter((frame) => frame.type === 'resume')).toHaveLength(1)
+    expect(getLiveSteps('s1').some((step) => /could not be resumed/.test(step.text ?? ''))).toBe(false)
+  })
+
+  // A daemon that faulted taking the turn in (a full disk) is not contended: name the fault it reported.
+  it('names the fault of a turn the daemon failed to admit instead of calling the agent busy', async () => {
+    const { first, turn } = await sendAndOpen()
+    await act(async () => {
+      first.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: {
+            accepted: false,
+            reason: 'admission_failed',
+            detail: 'database or disk is full',
+            turnId: turn.turnId,
+            agentId: 'agent-1'
+          }
+        })
+      })
+    })
+    const texts = getLiveSteps('s1').map((step) => step.text ?? '')
+    const fault = 'could not take the message — database or disk is full'
+    expect(texts.filter((text) => text.endsWith(fault))).toHaveLength(1)
+    expect(texts.some((text) => /busy|no live daemon/.test(text))).toBe(false)
+  })
+
+  // A live daemon that could not post the turn to the session's origin conversation is not an absent daemon.
+  it('says the message could not reach the origin conversation instead of calling the daemon offline', async () => {
+    const { first, turn } = await sendAndOpen()
+    await act(async () => {
+      first.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: { accepted: false, reason: 'integration_delivery_failed', turnId: turn.turnId, agentId: 'agent-1' }
+        })
+      })
+    })
+    const texts = getLiveSteps('s1').map((step) => step.text ?? '')
+    expect(
+      texts.filter((text) => /could not be posted to the conversation this session came from/.test(text))
+    ).toHaveLength(1)
+    expect(texts.some((text) => /no live daemon/.test(text))).toBe(false)
+  })
+
+  it('tells this reader why the agent refused their runtime change, and keeps it standing', async () => {
+    const { first } = await sendAndOpen()
+    const reason = 'Only an Agent editor or the owner of this conversation can change its runtime settings.'
+    await act(async () => {
+      first.onmessage?.({
+        data: JSON.stringify({ type: 'refused', refused: { op: 'set_model', agentId: 'agent-1', reason } })
+      })
+    })
+    expect(getLiveSteps('s1')).toEqual(
+      expect.arrayContaining([expect.objectContaining({ kind: 'notice', text: `🔒 ${reason}`, standing: true })])
+    )
+  })
+
+  // The relay mints the canonical post identity per received frame, so a re-sent multi-agent turn
+  // partially admitted the first time would duplicate the user message on the rest of the roster.
+  it.each(['composer', 'relay'])('never re-sends a multi-agent turn with its roster from %s', async (source) => {
+    ReconnectSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ReconnectSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    const roster = [
+      { agentId: 'agent-1', name: 'one', primary: true },
+      { agentId: 'agent-2', name: 'two' }
+    ]
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello both', 'c1', source === 'composer' ? roster : undefined)
+    })
+    const first = ReconnectSocket.instances[0]!
+    await act(async () => {
+      first.readyState = 1
+      first.onopen?.()
+      first.onmessage?.({ data: JSON.stringify({ type: 'ready', participants: roster }) })
+    })
+    const turn = frames(first)[0] as { turnId: string }
+    const second = await dropAndReconnect(first)
+    expect(frames(second).map((frame) => frame.type)).toEqual(['resume', 'resume'])
+    expect(frames(second).every((frame) => frame.turnId === turn.turnId)).toBe(true)
+  })
+
+  it('re-sends at most once per socket — a retry on the same socket falls back to resume', async () => {
+    const { first, turn } = await sendAndOpen()
+    const second = await dropAndReconnect(first)
+    // The daemon never saw the turn AND refuses the copy outright: the retry ladder resumes, not re-sends.
+    await act(async () => {
+      second.onmessage?.({
+        data: JSON.stringify({
+          type: 'resumed',
+          ack: { accepted: false, reason: 'stream_not_found', agentId: 'agent-1' }
+        })
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    const sent = frames(second)
+    expect(sent.filter((frame) => frame.text === 'hello')).toHaveLength(1)
+    expect(sent.at(-1)).toMatchObject({ type: 'resume', turnId: turn.turnId })
+  })
+})
+
+// The socket stays open while the daemon's relay link is down, so frames it streamed then are simply gone.
+describe('a stream whose frames a relay gap dropped', () => {
+  class GapSocket extends StubSocket {
+    static instances: GapSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      GapSocket.instances.push(this)
+    }
+  }
+  const frames = (socket: GapSocket): Array<Record<string, unknown>> =>
+    socket.send.mock.calls.map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+  const resumes = (socket: GapSocket) => frames(socket).filter((frame) => frame.type === 'resume')
+  const deliver = (socket: GapSocket, frame: unknown) =>
+    act(async () => {
+      socket.onmessage?.({ data: JSON.stringify(frame) })
+    })
+  const output = (turnId: string, index: number, text: string) => ({
+    type: 'output',
+    output: { turnId, agentId: 'agent-1', index, event: { kind: 'message', text } }
+  })
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  /** Send one turn, open its socket, ack it, and stream its first chunk. */
+  async function streaming() {
+    GapSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', GapSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const socket = GapSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const { turnId } = frames(socket)[0] as { turnId: string }
+    await deliver(socket, { type: 'ack', ack: { accepted: true, turnId, agentId: 'agent-1' } })
+    await deliver(socket, output(turnId, 0, 'a'))
+    return { socket, turnId }
+  }
+
+  it('resumes a lane holding a hole, and the replay finishes the turn', async () => {
+    const { socket, turnId } = await streaming()
+    await deliver(socket, output(turnId, 2, 'c'))
+    await deliver(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 2 } })
+    expect(isPgBusy('s1')).toBe(true)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500)
+    })
+    expect(resumes(socket)).toEqual([expect.objectContaining({ turnId, agentId: 'agent-1', afterIndex: 0 })])
+    await deliver(socket, output(turnId, 1, 'b'))
+    await deliver(socket, output(turnId, 2, 'c'))
+    await deliver(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 2 } })
+    expect(isPgBusy('s1')).toBe(false)
+  })
+
+  it('resumes a turn whose done never arrived once the stream has been quiet for a while', async () => {
+    const { socket, turnId } = await streaming()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(19_000)
+    })
+    expect(resumes(socket)).toEqual([])
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(resumes(socket)).toEqual([expect.objectContaining({ turnId, afterIndex: 0 })])
+    await deliver(socket, { type: 'resumed', ack: { accepted: true, turnId, agentId: 'agent-1' } })
+    await deliver(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+    expect(isPgBusy('s1')).toBe(false)
+  })
+
+  it('resumes the lanes a resync names when their daemon relinks', async () => {
+    const { socket, turnId } = await streaming()
+    await deliver(socket, { type: 'resync', agentIds: ['agent-2'] })
+    expect(resumes(socket)).toEqual([])
+    await deliver(socket, { type: 'resync', agentIds: ['agent-1'] })
+    expect(resumes(socket)).toEqual([expect.objectContaining({ turnId, agentId: 'agent-1', afterIndex: 0 })])
+  })
+
+  it.each([
+    { name: 'a single-participant relay', answer: { type: 'error', message: 'agent daemon offline' } },
+    {
+      name: 'a multi-agent relay',
+      answer: { type: 'resumed', ack: { accepted: false, agentId: 'agent-1', reason: 'no_agent' } }
+    },
+    {
+      name: 'a newer tab’s resume',
+      answer: { type: 'resumed', ack: { accepted: false, agentId: 'agent-1', reason: 'stream_stale' } }
+    }
+  ])(
+    'keeps the turn live when $name answers a watchdog resume, so the relink still recovers it',
+    async ({ answer }) => {
+      const { socket, turnId } = await streaming()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000)
+      })
+      await deliver(socket, answer)
+      expect(isPgBusy('s1')).toBe(true)
+      expect(getLiveSteps('s1').some((step) => step.text?.startsWith('⚠️'))).toBe(false)
+      await deliver(socket, { type: 'resync', agentIds: ['agent-1'] })
+      expect(resumes(socket)).toHaveLength(2)
+      await deliver(socket, { type: 'resumed', ack: { accepted: true, turnId, agentId: 'agent-1' } })
+      await deliver(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+      expect(isPgBusy('s1')).toBe(false)
+    }
+  )
+
+  it('still ends the turn when a watchdog resume finds its replay window gone', async () => {
+    const { socket } = await streaming()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000)
+    })
+    await deliver(socket, { type: 'resumed', ack: { accepted: false, agentId: 'agent-1', reason: 'stream_not_found' } })
+    expect(isPgBusy('s1')).toBe(false)
+  })
+})
+
+// A cold attach replays a live turn with NO local prompt step, so the turn-shaped arm
+// of `reconcilePersistedLiveSteps` cannot retire it. The reply post's canonical postId
+// is the anchor that keeps the transcript tail from rendering the answer twice.
+describe('cold-attach retirement anchor', () => {
+  class AttachSocket extends StubSocket {
+    // pgAttach re-probes only a socket whose readyState matches WebSocket.OPEN.
+    static OPEN = 1
+    static CLOSED = 3
+    static instances: AttachSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      AttachSocket.instances.push(this)
+    }
+  }
+
+  async function coldAttach(participants = [{ agentId: 'agent-1' }]) {
+    AttachSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', AttachSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgAttach('s-cold', 'agent-1', 'c-cold')
+    })
+    const socket = AttachSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'ready', conversationId: 'c-cold', participants })
+      })
+    })
+    return socket
+  }
+
+  it('dials a marked continuation target with no conversation yet, and nothing for an unmarked one', async () => {
+    AttachSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', AttachSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgAttach('s-unmarked', 'agent-1', '')
+    })
+    expect(AttachSocket.instances).toHaveLength(0)
+    await act(async () => {
+      markSessionTarget('s-task')
+      pgAttach('s-task', 'agent-1', '')
+    })
+    expect(AttachSocket.instances).toHaveLength(1)
+  })
+
+  it('probes on ready and stamps the reply postId on the replayed steps', async () => {
+    const socket = await coldAttach()
+    expect(socket.send.mock.calls.map((c) => JSON.parse(String(c[0])))).toContainEqual({
+      type: 'attach',
+      agentId: 'agent-1'
+    })
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'attached',
+          ack: { accepted: true, turnId: 'turn-cold', agentId: 'agent-1', generation: 4 }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: {
+            turnId: 'turn-cold',
+            agentId: 'agent-1',
+            index: 0,
+            event: { kind: 'tool_call', toolCallId: 't1', title: 'Read file', status: 'completed' }
+          }
+        })
+      })
+    })
+    expect(getLiveSteps('s-cold').filter((s) => s.turnId === 'turn-cold')).toHaveLength(1)
+    // Human-initiated: no `initiator`, so the frame only carries the anchor.
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'post',
+          post: { postId: 'post-cold', author: { kind: 'agent', agentId: 'agent-1' }, text: 'done' }
+        })
+      })
+      socket.onmessage?.({ data: JSON.stringify({ type: 'done', done: { turnId: 'turn-cold', agentId: 'agent-1' } }) })
+    })
+    const replayed = getLiveSteps('s-cold').filter((s) => s.turnId === 'turn-cold')
+    expect(replayed.length).toBeGreaterThan(0)
+    expect(replayed.every((s) => s.postId === 'post-cold')).toBe(true)
+  })
+
+  const attachProbes = (socket: AttachSocket) =>
+    socket.send.mock.calls.map((c) => JSON.parse(String(c[0]))).filter((frame) => frame.type === 'attach')
+
+  it('re-probes a live idle socket and reattaches a turn started elsewhere', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000)
+    try {
+      const socket = await coldAttach()
+      await act(async () => {
+        socket.onmessage?.({
+          data: JSON.stringify({
+            type: 'attached',
+            ack: { accepted: false, agentId: 'agent-1', reason: 'stream_not_found' }
+          })
+        })
+      })
+      expect(isPgBusy('s-cold')).toBe(false)
+      now.mockReturnValue(12_000)
+      await act(async () => {
+        pgAttach('s-cold', 'agent-1', 'c-cold')
+      })
+      expect(AttachSocket.instances).toHaveLength(1)
+      expect(attachProbes(socket)).toHaveLength(2)
+      await act(async () => {
+        socket.onmessage?.({
+          data: JSON.stringify({ type: 'attached', ack: { accepted: true, turnId: 'turn-away', agentId: 'agent-1' } })
+        })
+      })
+      expect(isPgBusy('s-cold')).toBe(true)
+      // Busy now: further activity does not probe again.
+      now.mockReturnValue(14_000)
+      await act(async () => {
+        pgAttach('s-cold', 'agent-1', 'c-cold')
+      })
+      expect(attachProbes(socket)).toHaveLength(2)
+    } finally {
+      now.mockRestore()
+    }
+  })
+
+  it('throttles re-probes into one trailing probe', async () => {
+    const socket = await coldAttach()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] })
+    try {
+      act(() => {
+        pgAttach('s-cold', 'agent-1', 'c-cold')
+        pgAttach('s-cold', 'agent-1', 'c-cold')
+        pgAttach('s-cold', 'agent-1', 'c-cold')
+      })
+      expect(attachProbes(socket)).toHaveLength(1)
+      act(() => {
+        vi.advanceTimersByTime(1_000)
+      })
+      expect(attachProbes(socket)).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('offers Stop for a turn the daemon cannot replay and keeps asking until it ends', async () => {
+    const socket = await coldAttach()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] })
+    try {
+      const gap = {
+        type: 'attached',
+        ack: { accepted: false, turnId: 'turn-long', agentId: 'agent-1', reason: 'stream_gap' }
+      }
+      act(() => socket.onmessage?.({ data: JSON.stringify(gap) }))
+      expect(isPgTurnUnstreamed('s-cold')).toBe(true)
+      expect(isPgBusy('s-cold')).toBe(false)
+      // No activity arrives, yet the turn is asked about again.
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      expect(attachProbes(socket)).toHaveLength(2)
+      act(() =>
+        socket.onmessage?.({
+          data: JSON.stringify({
+            type: 'attached',
+            ack: { accepted: false, agentId: 'agent-1', reason: 'stream_not_found' }
+          })
+        })
+      )
+      expect(isPgTurnUnstreamed('s-cold')).toBe(false)
+      act(() => {
+        vi.advanceTimersByTime(10_000)
+      })
+      expect(attachProbes(socket)).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps re-probing an unstreamed participant while another one streams', async () => {
+    const socket = await coldAttach([{ agentId: 'agent-1' }, { agentId: 'agent-2' }])
+    vi.useFakeTimers({ toFake: ['setTimeout', 'Date'] })
+    try {
+      const verdict = (ack: Record<string, unknown>) =>
+        act(() => socket.onmessage?.({ data: JSON.stringify({ type: 'attached', ack }) }))
+      verdict({ accepted: false, turnId: 'turn-long', agentId: 'agent-1', reason: 'stream_gap' })
+      verdict({ accepted: true, turnId: 'turn-live', agentId: 'agent-2' })
+      expect(isPgBusy('s-cold')).toBe(true)
+      const probesFor = (agentId: string) => attachProbes(socket).filter((frame) => frame.agentId === agentId)
+      const before = probesFor('agent-1').length
+      act(() => {
+        vi.advanceTimersByTime(5_000)
+      })
+      // agent-2's lane must not swallow agent-1's retry.
+      expect(probesFor('agent-1')).toHaveLength(before + 1)
+      expect(probesFor('agent-2')).toHaveLength(1)
+      verdict({ accepted: false, agentId: 'agent-1', reason: 'stream_not_found' })
+      expect(isPgTurnUnstreamed('s-cold')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops an unstreamed turn when the socket closes', async () => {
+    const socket = await coldAttach()
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'attached',
+          ack: { accepted: false, turnId: 'turn-long', agentId: 'agent-1', reason: 'stream_gap' }
+        })
+      })
+    })
+    expect(isPgTurnUnstreamed('s-cold')).toBe(true)
+    await act(async () => socket.onclose?.())
+    expect(isPgTurnUnstreamed('s-cold')).toBe(false)
+  })
+
+  it('anchors when the reply post arrives after done (the failure path order)', async () => {
+    const socket = await coldAttach()
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'attached', ack: { accepted: true, turnId: 'turn-late', agentId: 'agent-1' } })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: {
+            turnId: 'turn-late',
+            agentId: 'agent-1',
+            index: 0,
+            event: { kind: 'tool_call', toolCallId: 't1', title: 'Read file', status: 'completed' }
+          }
+        })
+      })
+      socket.onmessage?.({ data: JSON.stringify({ type: 'done', done: { turnId: 'turn-late', agentId: 'agent-1' } }) })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'post',
+          post: { postId: 'post-late', author: { kind: 'agent', agentId: 'agent-1' }, text: 'partial' }
+        })
+      })
+    })
+    const replayed = getLiveSteps('s-cold').filter((s) => s.turnId === 'turn-late')
+    expect(replayed.length).toBeGreaterThan(0)
+    expect(replayed.every((s) => s.postId === 'post-late')).toBe(true)
+  })
+})
+
+// #1794 gap 5: the agent's in-band elicitation card is a stream event, and its answer a
+// webchat op on the same socket — no CP resource, and the card lives in the transcript.
+describe('in-band elicitation cards', () => {
+  class ElicitSocket extends StubSocket {
+    // The answer rides the SAME socket the card arrived on, so this stub carries the
+    // readyState constants `connect`'s reuse check reads.
+    static OPEN = 1
+    static CLOSED = 3
+    static instances: ElicitSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      ElicitSocket.instances.push(this)
+    }
+  }
+
+  async function openStream() {
+    ElicitSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ElicitSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const socket = ElicitSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    return { socket, turnId: turn.turnId }
+  }
+
+  function feed(socket: ElicitSocket, turnId: string, index: number, event: unknown, agentId = 'agent-1') {
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'output', output: { turnId, agentId, index, event } })
+      })
+    })
+  }
+
+  function finish(socket: ElicitSocket, turnId: string, lastIndex: number, agentId = 'agent-1') {
+    act(() => {
+      socket.onmessage?.({ data: JSON.stringify({ type: 'done', done: { turnId, agentId, lastIndex } }) })
+    })
+  }
+
+  const card = (requestId: string) => ({
+    kind: 'elicitation',
+    requestId,
+    message: 'Which branch should I cut from?',
+    options: [
+      { value: 'main', label: 'main' },
+      { value: 'develop', label: 'develop' }
+    ]
+  })
+
+  it('lands the card as its own live transcript step', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    expect(getLiveSteps('s1').filter((s) => s.kind === 'elicit')).toMatchObject([
+      {
+        kind: 'elicit',
+        text: 'Which branch should I cut from?',
+        boundary: true,
+        elicit: { requestId: 'elicit-1', options: [{ value: 'main' }, { value: 'develop' }] }
+      }
+    ])
+  })
+
+  it('carries a multi-field form card onto the step, fields and all', async () => {
+    const { socket, turnId } = await openStream()
+    const fields = [
+      {
+        propName: 'branch',
+        label: 'Base branch',
+        kind: 'enum',
+        required: true,
+        options: [{ value: 'main', label: 'main' }]
+      },
+      { propName: 'note', label: 'Note', kind: 'text', options: [] }
+    ]
+    feed(socket, turnId, 0, { ...card('elicit-1'), options: [], fields })
+    expect(getLiveSteps('s1').filter((s) => s.kind === 'elicit')).toMatchObject([
+      { elicit: { requestId: 'elicit-1', options: [], fields } }
+    ])
+  })
+
+  it('answers a form card with the whole record over the same socket', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    act(() => pgAnswerElicitation('s1', 'agent-1', 'elicit-1', { branch: 'main', note: 'ok' }, 'c1'))
+    await act(async () => {})
+    const frames = socket.send.mock.calls.map((call) => JSON.parse(String(call[0])))
+    expect(frames.filter((f) => f.type === 'elicitation_choice')).toEqual([
+      {
+        type: 'elicitation_choice',
+        requestId: 'elicit-1',
+        value: { branch: 'main', note: 'ok' },
+        agentId: 'agent-1'
+      }
+    ])
+  })
+
+  it('settles a card another participant cannot claim: `elicit-<n>` is unique per daemon only', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    // A second participant on a DIFFERENT daemon reuses the id from its own counter.
+    // agent-2 streams on its OWN index sequence — cursors are per participant lane.
+    feed(
+      socket,
+      turnId,
+      0,
+      { kind: 'elicitation_resolved', requestId: 'elicit-1', outcome: 'accepted', label: 'x' },
+      'agent-2'
+    )
+    const held = getLiveSteps('s1').filter((s) => s.kind === 'elicit')
+    expect(held).toHaveLength(1)
+    expect(held[0]!.elicit).toMatchObject({ requestId: 'elicit-1' })
+    expect(held[0]!.elicit?.outcome).toBeUndefined() // still live — the other lane's id is not ours
+
+    feed(socket, turnId, 1, { kind: 'elicitation_resolved', requestId: 'elicit-1', outcome: 'accepted', label: 'main' })
+    expect(getLiveSteps('s1').filter((s) => s.kind === 'elicit')).toMatchObject([
+      { elicit: { requestId: 'elicit-1', outcome: 'accepted', answerLabel: 'main' } }
+    ])
+  })
+
+  it("cancels a card the lane's terminal frame overtook, so it cannot stay answerable forever", async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    // An interrupt sends `done` before releaseElicits' output reaches the browser, which
+    // retires the lane cursor — the settlement that follows is dropped.
+    finish(socket, turnId, 0)
+    expect(getLiveSteps('s1').filter((s) => s.kind === 'elicit')).toMatchObject([
+      { elicit: { requestId: 'elicit-1', outcome: 'cancelled' } }
+    ])
+  })
+
+  it('settles the card in place on the resolved event, keeping its position', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    feed(socket, turnId, 1, { kind: 'tool_call', toolCallId: 't1', title: 'Read', status: 'pending' })
+    feed(socket, turnId, 2, { kind: 'elicitation_resolved', requestId: 'elicit-1', outcome: 'accepted', label: 'main' })
+    const steps = getLiveSteps('s1').filter((s) => s.kind === 'elicit' || s.kind === 'tool')
+    expect(steps.map((s) => s.kind)).toEqual(['elicit', 'tool']) // settled where it stood
+    expect(steps[0]!.elicit).toMatchObject({ outcome: 'accepted', answerLabel: 'main' })
+
+    // A settlement for a card this stream never carried changes nothing.
+    feed(socket, turnId, 3, { kind: 'elicitation_resolved', requestId: 'elicit-9', outcome: 'cancelled' })
+    expect(getLiveSteps('s1').filter((s) => s.kind === 'elicit')).toHaveLength(1)
+  })
+
+  it('records a turn-end cancellation on the card rather than leaving it live', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-2'))
+    feed(socket, turnId, 1, { kind: 'elicitation_resolved', requestId: 'elicit-2', outcome: 'cancelled' })
+    expect(getLiveSteps('s1').find((s) => s.kind === 'elicit')?.elicit).toMatchObject({
+      outcome: 'cancelled'
+    })
+  })
+
+  it('answers over the same socket — a chosen value and an explicit Dismiss', async () => {
+    const { socket, turnId } = await openStream()
+    feed(socket, turnId, 0, card('elicit-1'))
+    act(() => pgAnswerElicitation('s1', 'agent-1', 'elicit-1', 'develop', 'c1'))
+    act(() => pgAnswerElicitation('s1', 'agent-1', 'elicit-1', null, 'c1'))
+    await act(async () => {})
+    const frames = socket.send.mock.calls.map((call) => JSON.parse(String(call[0])))
+    expect(frames.filter((f) => f.type === 'elicitation_choice')).toEqual([
+      { type: 'elicitation_choice', requestId: 'elicit-1', value: 'develop', agentId: 'agent-1' },
+      { type: 'elicitation_choice', requestId: 'elicit-1', value: null, agentId: 'agent-1' }
+    ])
+    // The daemon owns the outcome: nothing settles locally on the send alone.
+    expect(getLiveSteps('s1').find((s) => s.kind === 'elicit')?.elicit?.outcome).toBeUndefined()
+    expect(ElicitSocket.instances).toHaveLength(1) // one socket, card in and answer out
+  })
+})
+
+// webchat-generated-images.md: a shared image is its own card, one per canonical post, updated in place.
+describe('shared image cards', () => {
+  class ImageSocket extends StubSocket {
+    static OPEN = 1
+    static CLOSED = 3
+    static instances: ImageSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      ImageSocket.instances.push(this)
+    }
+  }
+
+  async function openStream() {
+    ImageSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ImageSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'draw it', 'c1')
+    })
+    const socket = ImageSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    return { socket, turnId: turn.turnId }
+  }
+
+  const frame = (socket: ImageSocket, data: unknown) =>
+    act(() => {
+      socket.onmessage?.({ data: JSON.stringify(data) })
+    })
+
+  const POST = '33333333-3333-4333-8333-333333333333'
+  const ATT = '44444444-4444-4444-8444-444444444444'
+  const attachment = { name: 'chart.png', mimeType: 'image/png' as const, data: 'AAAA' }
+  const cache = (status: string) => ({
+    kind: 'cache',
+    attachmentId: ATT,
+    mimeType: 'image/png',
+    bytes: 9_000_000,
+    sha256: 'ab'.repeat(32),
+    status
+  })
+  const image = {
+    kind: 'image',
+    postId: POST,
+    at: 1,
+    text: 'A chart',
+    attachment,
+    original: cache('pending'),
+    revision: 0
+  }
+
+  it.each([true, false])('waits for relay capabilities before sending an upload (supported: %s)', async (supported) => {
+    ImageSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ImageSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    const file = {
+      uploadId: ATT,
+      name: 'chart.png',
+      mimeType: 'image/png',
+      size: 3,
+      sha256: 'A'.repeat(43) + '=',
+      preview: attachment
+    }
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'Inspect this chart', 'c1', undefined, undefined, undefined, [file])
+    })
+    const socket = ImageSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    expect(isPgBusy('s1')).toBe(true)
+    expect(getPgInput('s1')).toBe('')
+    expect(getLiveSteps('s1').some((step) => step.kind === 'done')).toBe(false)
+
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'ready',
+          conversationId: 'c1',
+          features: supported ? ['webchat-upload-previews-v1'] : []
+        })
+      })
+    })
+    if (supported) {
+      expect(socket.send).toHaveBeenCalledTimes(1)
+      expect(JSON.parse(String(socket.send.mock.calls[0]?.[0]))).toMatchObject({
+        text: 'Inspect this chart',
+        files: [file]
+      })
+    } else {
+      expect(socket.send).not.toHaveBeenCalled()
+      expect(isPgBusy('s1')).toBe(false)
+      expect(getPgInput('s1')).toBe('Inspect this chart')
+      expect(getPgFiles('s1')).toMatchObject([{ status: 'ready', attachment: file }])
+    }
+  })
+
+  it('splits the text around the card and keeps one card when the post copy arrives too', async () => {
+    const { socket, turnId } = await openStream()
+    frame(socket, {
+      type: 'output',
+      output: {
+        turnId,
+        agentId: 'agent-1',
+        index: 0,
+        event: { kind: 'message', text: 'Before', segmentId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }
+      }
+    })
+    frame(socket, { type: 'output', output: { turnId, agentId: 'agent-1', index: 1, event: image } })
+    frame(socket, {
+      type: 'post',
+      post: {
+        postId: POST,
+        author: { kind: 'agent', agentId: 'agent-1' },
+        text: 'A chart',
+        at: 1,
+        image: { attachment, original: cache('pending'), revision: 0 }
+      }
+    })
+    frame(socket, {
+      type: 'output',
+      output: {
+        turnId,
+        agentId: 'agent-1',
+        index: 2,
+        event: { kind: 'message', text: 'After', segmentId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }
+      }
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 80))
+    })
+    const done = getLiveSteps('s1').filter((s) => s.kind === 'done')
+    expect(done.map((s) => (s.sharedImage ? 'image' : s.text))).toEqual(['Before', 'image', 'After'])
+    expect(done[1]).toMatchObject({ postId: POST, sharedImage: { original: { status: 'pending' } } })
+  })
+
+  it('renders a post that arrives before its live event once, and applies only newer updates', async () => {
+    const { socket, turnId } = await openStream()
+    frame(socket, {
+      type: 'post',
+      post: {
+        postId: POST,
+        author: { kind: 'agent', agentId: 'agent-1' },
+        text: 'A chart',
+        at: 1,
+        image: { attachment, original: cache('pending'), revision: 0 }
+      }
+    })
+    frame(socket, { type: 'output', output: { turnId, agentId: 'agent-1', index: 0, event: image } })
+    const update = (revision: number, status: string) =>
+      frame(socket, {
+        type: 'image_update',
+        update: { conversationId: POST, agentId: 'agent-1', postId: POST, revision, original: cache(status) }
+      })
+    update(2, 'ready')
+    update(1, 'upload_failed')
+    const cards = getLiveSteps('s1').filter((s) => s.sharedImage)
+    expect(cards).toHaveLength(1)
+    expect(cards[0]!.sharedImage).toMatchObject({ revision: 2, original: { status: 'ready' } })
+  })
+
+  it('holds the predicted next prompt until a clear or the next send', async () => {
+    const { socket } = await openStream()
+    const suggest = (text: string | null) =>
+      frame(socket, { type: 'prompt_suggestion', suggestion: { conversationId: POST, agentId: 'agent-1', text } })
+    suggest('Run the tests')
+    expect(getPgSuggestion('s1')).toBe('Run the tests')
+    suggest(null)
+    expect(getPgSuggestion('s1')).toBeUndefined()
+    suggest('Open a pull request')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'something else', 'c1')
+    })
+    expect(getPgSuggestion('s1')).toBeUndefined()
+  })
+})
+
+// #547: once the daemon's status frame says the running turn is steerable, a send while it
+// streams goes straight to the wire as a steer instead of into the composer's queue.
+describe('mid-turn steering', () => {
+  class SteerSocket extends StubSocket {
+    static instances: SteerSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      SteerSocket.instances.push(this)
+    }
+  }
+
+  async function openSteerableStream(
+    participants?: Array<{ agentId: string; name: string; primary?: boolean }>,
+    text = 'hello'
+  ) {
+    SteerSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', SteerSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', text, 'c1', participants)
+    })
+    const socket = SteerSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'ack', ack: { accepted: true, turnId: turn.turnId, agentId: 'agent-1' } })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'output',
+          output: { turnId: turn.turnId, agentId: 'agent-1', index: 0, status: { steerable: true } }
+        })
+      })
+    })
+    return { socket, turnId: turn.turnId }
+  }
+  const frames = (socket: SteerSocket) =>
+    socket.send.mock.calls.map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+  const feed = (socket: SteerSocket, message: unknown) => socket.onmessage?.({ data: JSON.stringify(message) })
+
+  it('retires a completed tool-only turn when its saved prompt arrives', async () => {
+    const { socket, turnId } = await openSteerableStream()
+    act(() => {
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-1',
+          index: 1,
+          event: { kind: 'tool_call', toolCallId: 'tc-1', title: 'Read file', status: 'completed' }
+        }
+      })
+    })
+    expect(getLiveSteps('s1').some((step) => step.kind === 'tool')).toBe(true)
+    act(() => {
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 1 } })
+      reconcileLiveSteps(
+        's1',
+        [{ seq: 1, ts: String(Date.now()), sender: 'user', kind: 'text', text: 'hello' }],
+        'agent-1'
+      )
+    })
+    expect(getLiveSteps('s1').filter((step) => step.turnId === turnId)).toEqual([])
+  })
+
+  it('keeps a silent turn live until its other participant finishes', async () => {
+    const { socket, turnId } = await openSteerableStream([
+      { agentId: 'agent-1', name: 'one', primary: true },
+      { agentId: 'agent-2', name: 'two' }
+    ])
+    act(() => {
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-2',
+          index: 0,
+          event: { kind: 'tool_call', toolCallId: 'tc-2', title: 'Read file', status: 'completed' }
+        }
+      })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+      reconcileLiveSteps(
+        's1',
+        [{ seq: 1, ts: String(Date.now()), sender: 'user', kind: 'text', text: 'hello' }],
+        'agent-1'
+      )
+    })
+    expect(
+      getLiveSteps('s1')
+        .filter((step) => step.turnId === turnId)
+        .map((step) => step.kind)
+    ).toEqual(['tool'])
+    act(() => {
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-2', lastIndex: 0 } })
+      reconcileLiveSteps('s1', [], 'agent-1')
+    })
+    expect(getLiveSteps('s1').filter((step) => step.turnId === turnId)).toEqual([])
+  })
+
+  it('waits for relay-verified participants whose ack arrives after the first done', async () => {
+    const { socket, turnId } = await openSteerableStream()
+    act(() => {
+      feed(socket, {
+        type: 'ready',
+        conversationId: 'c1',
+        participants: [{ agentId: 'agent-1', primary: true }, { agentId: 'agent-2' }]
+      })
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-1',
+          index: 1,
+          event: { kind: 'tool_call', toolCallId: 'tc-1', title: 'Read file', status: 'completed' }
+        }
+      })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 1 } })
+      reconcileLiveSteps(
+        's1',
+        [{ seq: 1, ts: String(Date.now()), sender: 'user', kind: 'text', text: 'hello' }],
+        'agent-1'
+      )
+    })
+    expect(
+      getLiveSteps('s1')
+        .filter((step) => step.turnId === turnId)
+        .map((step) => step.kind)
+    ).toEqual(['tool'])
+
+    act(() => {
+      feed(socket, { type: 'ack', ack: { accepted: true, turnId, agentId: 'agent-2' } })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-2', lastIndex: -1 } })
+      reconcileLiveSteps('s1', [], 'agent-1')
+    })
+    expect(getLiveSteps('s1').filter((step) => step.turnId === turnId)).toEqual([])
+
+    await act(async () => pgSend('s1', 'agent-1', 'next', 'c1'))
+    expect(frames(socket).find((frame) => frame.text === 'next')?.targets).toEqual(['agent-1', 'agent-2'])
+  })
+
+  it('does not wait for unmentioned participants after a targeted send', async () => {
+    const roster = [
+      { agentId: 'agent-1', name: 'one', primary: true },
+      { agentId: 'agent-2', name: 'two' }
+    ]
+    const { socket, turnId } = await openSteerableStream(roster, '@one hello')
+    expect(frames(socket).find((frame) => frame.text === '@one hello')?.targets).toEqual(['agent-1'])
+    act(() => {
+      feed(socket, {
+        type: 'ready',
+        conversationId: 'c1',
+        participants: [{ agentId: 'agent-1', primary: true }, { agentId: 'agent-2' }]
+      })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0 } })
+      reconcileLiveSteps(
+        's1',
+        [{ seq: 1, ts: String(Date.now()), sender: 'user', kind: 'text', text: '@one hello' }],
+        'agent-1'
+      )
+    })
+    expect(getLiveSteps('s1').filter((step) => step.turnId === turnId)).toEqual([])
+  })
+
+  it('keeps consecutive reply messages separate even without a tool event between them', async () => {
+    const { socket, turnId } = await openSteerableStream()
+    const first = '11111111-1111-4111-8111-111111111111'
+    const second = '22222222-2222-4222-8222-222222222222'
+    act(() => {
+      for (const [index, text, postId] of [
+        [1, 'First ', first],
+        [2, 'message', first],
+        [3, 'Second', second]
+      ] as const)
+        feed(socket, {
+          type: 'output',
+          output: { turnId, agentId: 'agent-1', index, event: { kind: 'message', text, segmentId: postId, postId } }
+        })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 3 } })
+    })
+    expect(getLiveSteps('s1').filter((step) => step.kind === 'done')).toMatchObject([
+      { text: 'First message', postId: first },
+      { text: 'Second', postId: second }
+    ])
+  })
+
+  it('restores two refused steers in their send order, ahead of a later queued message', async () => {
+    const { socket } = await openSteerableStream()
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'first steer', 'c1')).toBe(true)
+      expect(pgSend('s1', 'agent-1', 'second steer', 'c1')).toBe(true)
+    })
+    const [a, b] = frames(socket).filter((f) => f.steer === true)
+    expect([a!.text, b!.text]).toEqual(['first steer', 'second steer'])
+    act(() => {
+      feed(socket, { type: 'ack', ack: { accepted: false, turnId: a!.turnId, agentId: 'agent-1', reason: 'busy' } })
+    })
+    // A later send lands behind the first refusal while the second is still on the wire …
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'typed after', 'c1')).toBe(true)
+    })
+    act(() => {
+      feed(socket, { type: 'ack', ack: { accepted: false, turnId: b!.turnId, agentId: 'agent-1', reason: 'busy' } })
+    })
+    // … and the second refusal slots back into ITS place, so the instructions run in the order typed.
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['first steer', 'second steer', 'typed after'])
+  })
+
+  it('lets a tool call that started before a steer complete in the live view', async () => {
+    const { socket, turnId } = await openSteerableStream()
+    act(() => {
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-1',
+          index: 1,
+          event: { kind: 'tool_call', toolCallId: 'tc-1', title: 'Run tests', status: 'in_progress' }
+        }
+      })
+    })
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'also lint', 'c1')).toBe(true)
+    })
+    act(() => {
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-1',
+          index: 2,
+          event: { kind: 'tool_update', toolCallId: 'tc-1', status: 'completed' }
+        }
+      })
+    })
+    const tool = getLiveSteps('s1').find((s) => s.kind === 'tool' && s.toolCallId === 'tc-1')
+    expect(tool).toMatchObject({ toolStatus: 'completed' })
+    // The steer still sits between the call and whatever the agent says next.
+    const kinds = getLiveSteps('s1').map((s) => (s.steer ? 'steer' : s.kind))
+    expect(kinds.indexOf('tool')).toBeLessThan(kinds.indexOf('steer'))
+  })
+
+  it('keeps the reply in the block above a steer until the daemon confirms it, then fences it', async () => {
+    vi.useFakeTimers()
+    try {
+      const { socket, turnId } = await openSteerableStream()
+      // Text deltas coalesce in the delta buffer; its latency cap is what lands them here.
+      const say = async (index: number, text: string) => {
+        act(() =>
+          feed(socket, {
+            type: 'output',
+            output: { turnId, agentId: 'agent-1', index, event: { kind: 'message', text } }
+          })
+        )
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(100)
+        })
+      }
+      await say(1, 'first half')
+      await act(async () => {
+        expect(pgSend('s1', 'agent-1', 'retry', 'c1')).toBe(true)
+      })
+      const steer = frames(socket).find((f) => f.steer === true)!
+      // Unconfirmed: the text that keeps streaming extends the block the reader was already in.
+      await say(2, ' second half')
+      let steps = getLiveSteps('s1')
+      expect(steps.filter((s) => s.kind === 'done').map((s) => s.text)).toEqual(['first half second half'])
+      expect(steps.findIndex((s) => s.kind === 'done')).toBeLessThan(steps.findIndex((s) => s.steer))
+      expect(steps.find((s) => s.steer)).not.toHaveProperty('steered')
+
+      // Confirmed: the step carries the verdict and what follows starts a fresh block below it.
+      act(() =>
+        feed(socket, { type: 'ack', ack: { accepted: true, turnId: steer.turnId, agentId: 'agent-1', steered: true } })
+      )
+      await say(3, 'third')
+      steps = getLiveSteps('s1')
+      expect(steps.find((s) => s.steer)).toMatchObject({ steered: true })
+      expect(steps.filter((s) => s.kind === 'done').map((s) => s.text)).toEqual(['first half second half', 'third'])
+      expect(steps.findIndex((s) => s.steer)).toBeLessThan(steps.findIndex((s) => s.text === 'third'))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('takes the steer’s own steered done as the confirmation when it lands ahead of the ack', async () => {
+    const { socket } = await openSteerableStream()
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'retry', 'c1')).toBe(true)
+    })
+    const steer = frames(socket).find((f) => f.steer === true)!
+    act(() => {
+      feed(socket, {
+        type: 'done',
+        done: { turnId: steer.turnId, agentId: 'agent-1', stopReason: 'steered_into_turn' }
+      })
+    })
+    expect(getLiveSteps('s1').find((s) => s.steer)).toMatchObject({ steered: true })
+  })
+
+  it('re-sends a steer nobody acked when the socket drops and reconnects', async () => {
+    vi.useFakeTimers()
+    try {
+      const { socket } = await openSteerableStream()
+      await act(async () => {
+        expect(pgSend('s1', 'agent-1', 'lost on the wire', 'c1')).toBe(true)
+      })
+      const steer = frames(socket).find((f) => f.steer === true)!
+      // The socket dies before the daemon's verdict arrives; the turn is still busy, so the
+      // provider reconnects and must put the steer back on the wire under the SAME turnId.
+      act(() => socket.onclose?.())
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+      const reconnected = SteerSocket.instances[1]!
+      expect(reconnected).toBeDefined()
+      await act(async () => {
+        reconnected.readyState = 1
+        reconnected.onopen?.()
+      })
+      act(() => feed(reconnected, { type: 'ready', conversationId: 'c1' }))
+      const resent = frames(reconnected).find((f) => f.steer === true)
+      expect(resent).toEqual(steer)
+      expect(getLiveSteps('s1').find((s) => s.text === 'lost on the wire')).toMatchObject({ steer: true })
+      expect(getPgQueue('s1')).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps an unacked steer under its own turnId when the socket closes on an idle turn', async () => {
+    vi.useFakeTimers()
+    try {
+      const { socket, turnId } = await openSteerableStream()
+      await act(async () => {
+        expect(pgSend('s1', 'agent-1', 'still unanswered', 'c1')).toBe(true)
+      })
+      const steer = frames(socket).find((f) => f.steer === true)!
+      // The running turn ends (busy clears) and then the socket closes with the steer unacked. The
+      // runtime may already have it, so it must NOT become a fresh turn: the provider reconnects for
+      // the steer alone and re-sends the same frame, which the daemon reconciles.
+      act(() => feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', stopReason: 'end_turn' } }))
+      act(() => socket.onclose?.())
+      expect(getPgQueue('s1')).toEqual([])
+      expect(getLiveSteps('s1').filter((s) => s.text === 'still unanswered')).toMatchObject([{ steer: true }])
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+      const reconnected = SteerSocket.instances[1]!
+      expect(reconnected).toBeDefined()
+      await act(async () => {
+        reconnected.readyState = 1
+        reconnected.onopen?.()
+      })
+      act(() => feed(reconnected, { type: 'ready', conversationId: 'c1' }))
+      expect(frames(reconnected).find((f) => f.steer === true)).toEqual(steer)
+      // The daemon had run it as its own turn (the turn was over): the copy is reported accepted, the
+      // step becomes an ordinary user turn and the browser opens its lane and pulls the replay.
+      act(() => feed(reconnected, { type: 'ack', ack: { accepted: true, turnId: steer.turnId, agentId: 'agent-1' } }))
+      expect(getLiveSteps('s1').filter((s) => s.text === 'still unanswered')).toMatchObject([{ steer: undefined }])
+      expect(frames(reconnected).find((f) => f.type === 'resume')).toMatchObject({ turnId: steer.turnId })
+      expect(getPgQueue('s1')).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('opens and resumes a late steer whose accepted ack outran the older turn’s replayed done', async () => {
+    vi.useFakeTimers()
+    try {
+      const { socket, turnId } = await openSteerableStream()
+      await act(async () => {
+        expect(pgSend('s1', 'agent-1', 'late steer', 'c1')).toBe(true)
+      })
+      const steer = frames(socket).find((f) => f.steer === true)!
+      // The socket drops while the first turn still streams here; daemon-side that turn ends and
+      // the steer is admitted as its own turn before the browser reconnects.
+      act(() => socket.onclose?.())
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+      const reconnected = SteerSocket.instances[1]!
+      await act(async () => {
+        reconnected.readyState = 1
+        reconnected.onopen?.()
+      })
+      act(() => feed(reconnected, { type: 'ready', conversationId: 'c1' }))
+      expect(frames(reconnected).find((f) => f.steer === true)).toEqual(steer)
+      // The copy's plain accepted ack arrives BEFORE the older turn's replayed done.
+      act(() => feed(reconnected, { type: 'ack', ack: { accepted: true, turnId: steer.turnId, agentId: 'agent-1' } }))
+      expect(frames(reconnected).filter((f) => f.type === 'resume' && f.turnId === steer.turnId)).toEqual([])
+      act(() => feed(reconnected, { type: 'done', done: { turnId, agentId: 'agent-1', stopReason: 'end_turn' } }))
+      // Retiring the older lane hands over to the late turn: its lane opens and is resumed, and the
+      // message reads as an ordinary turn — the reply will stream into this connection.
+      expect(frames(reconnected).find((f) => f.type === 'resume' && f.turnId === steer.turnId)).toMatchObject({
+        turnId: steer.turnId,
+        agentId: 'agent-1'
+      })
+      expect(getLiveSteps('s1').filter((s) => s.text === 'late steer')).toMatchObject([{ steer: undefined }])
+      expect(getPgQueue('s1')).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not requeue an unacked steer when reconnecting gives up — the delivery is marked uncertain', async () => {
+    vi.useFakeTimers()
+    try {
+      const { socket } = await openSteerableStream()
+      await act(async () => {
+        expect(pgSend('s1', 'agent-1', 'maybe delivered', 'c1')).toBe(true)
+      })
+      act(() => socket.onclose?.())
+      // Every reconnect attempt dies at once until the budget is spent.
+      for (let attempt = 0; attempt < 8; attempt++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5_000)
+        })
+        const latest = SteerSocket.instances.at(-1)!
+        if (latest !== socket && latest.readyState === 0) act(() => latest.onclose?.())
+      }
+      expect(getPgQueue('s1')).toEqual([])
+      expect(getLiveSteps('s1').filter((s) => s.text === 'maybe delivered')).toMatchObject([{ steer: true }])
+      expect(getLiveSteps('s1').some((s) => s.kind === 'done' && s.text.includes('Could not confirm'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('steers a follow-up into the running turn instead of queueing it', async () => {
+    const { socket, turnId } = await openSteerableStream()
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'use staging instead', 'c1')).toBe(true)
+    })
+    expect(getPgQueue('s1')).toEqual([])
+    const steer = frames(socket).find((f) => f.steer === true)
+    expect(steer).toMatchObject({ text: 'use staging instead', steer: true })
+    expect(steer!.turnId).not.toBe(turnId)
+    const step = getLiveSteps('s1').find((s) => s.text === 'use staging instead')
+    expect(step).toMatchObject({ kind: 'msg', who: '@you', steer: true })
+
+    // The daemon steered it: its own stream ends at once and the first turn keeps streaming —
+    // a further send is still a steer, not a fresh turn.
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: { accepted: true, turnId: steer!.turnId, agentId: 'agent-1', steered: true }
+        })
+      })
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'done',
+          done: { turnId: steer!.turnId, agentId: 'agent-1', stopReason: 'steered_into_turn' }
+        })
+      })
+    })
+    expect(getLiveSteps('s1').find((s) => s.text === 'use staging instead')).toMatchObject({ steer: true })
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'and skip the migration', 'c1')).toBe(true)
+    })
+    expect(frames(socket).filter((f) => f.steer === true)).toHaveLength(2)
+    expect(getPgQueue('s1')).toEqual([])
+  })
+
+  it('puts a steer the daemon refused back at the head of the queue', async () => {
+    const { socket } = await openSteerableStream()
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'declined steer', 'c1')).toBe(true)
+    })
+    const steer = frames(socket).find((f) => f.steer === true)!
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({
+          type: 'ack',
+          ack: { accepted: false, turnId: steer.turnId, agentId: 'agent-1', reason: 'busy' }
+        })
+      })
+    })
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['declined steer'])
+    expect(getLiveSteps('s1').some((s) => s.text === 'declined steer')).toBe(false)
+    // With something already queued, the next send waits behind it — FIFO beats steering.
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'after it', 'c1')).toBe(true)
+    })
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['declined steer', 'after it'])
+    expect(frames(socket).filter((f) => f.steer === true)).toHaveLength(1)
+  })
+
+  it('keeps queueing while the daemon has not declared the turn steerable', async () => {
+    SteerSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', SteerSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    const socket = SteerSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    await act(async () => {
+      expect(pgSend('s1', 'agent-1', 'queued as before', 'c1')).toBe(true)
+    })
+    expect(getPgQueue('s1').map((q) => q.text)).toEqual(['queued as before'])
+    expect(frames(socket).some((f) => f.steer === true)).toBe(false)
+  })
+})
+
+// The first send of a fresh playground rides the socket `openPlayground` warmed seconds earlier —
+// connect() hands a still-CONNECTING one straight to the turn — so a dial that dies in the browser
+// (one that never reaches the relay at all) used to lose exactly the message that opens a
+// conversation, and the retry the reader typed by hand started a SECOND conversation blind to it.
+describe('a dial that dies before the turn reaches the socket', () => {
+  class DyingSocket extends StubSocket {
+    static instances: DyingSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: (() => void) | null
+    constructor() {
+      super()
+      DyingSocket.instances.push(this)
+    }
+  }
+  /** Let a rebuild settle: its socket is two promises deep (mint, then dial). */
+  const settle = () => act(async () => {})
+
+  afterEach(() => vi.useRealTimers())
+
+  beforeEach(async () => {
+    vi.useFakeTimers()
+    DyingSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', DyingSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+  })
+
+  it.each(['error', 'close'] as const)('retries after %s and puts the SAME turn on the fresh socket', async (event) => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    await act(async () => {
+      const socket = DyingSocket.instances[0]!
+      if (event === 'error') socket.onerror?.({})
+      else {
+        socket.readyState = 1
+        socket.onopen?.()
+        socket.readyState = 3
+        socket.onclose?.()
+      }
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500)
+    })
+    expect(DyingSocket.instances).toHaveLength(2)
+    expect(isPgBusy('s1')).toBe(true)
+    const live = DyingSocket.instances[1]!
+    await act(async () => {
+      live.readyState = 1
+      live.onopen?.()
+      live.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turnId = getLiveSteps('s1').find((s) => s.text === 'hello')?.turnId
+    expect(JSON.parse(String(live.send.mock.calls[0]?.[0]))).toMatchObject({ text: 'hello', turnId })
+    expect(getLiveSteps('s1').some((s) => String(s.text).includes('couldn’t connect to the chat server'))).toBe(false)
+  })
+
+  it('backs off through six retries before reporting an unsent turn', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    for (const [attempt, delay] of [500, 1000, 2000, 4000, 4000, 4000].entries()) {
+      await act(async () => {
+        DyingSocket.instances[attempt]!.onerror?.({})
+      })
+      expect(isPgBusy('s1')).toBe(true)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay - 1)
+      })
+      expect(DyingSocket.instances).toHaveLength(attempt + 1)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1)
+      })
+      expect(DyingSocket.instances).toHaveLength(attempt + 2)
+    }
+    await act(async () => {
+      DyingSocket.instances[6]!.onerror?.({})
+    })
+    expect(isPgBusy('s1')).toBe(false)
+    expect(
+      getLiveSteps('s1').filter((s) => String(s.text).includes('couldn’t connect to the chat server'))
+    ).toHaveLength(1)
+    expect(DyingSocket.instances.every((s) => s.send.mock.calls.length === 0)).toBe(true)
+  })
+
+  it('reports one warning when every dial of a continued conversation fails', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello', 'c1')
+    })
+    for (const [attempt, delay] of [500, 1000, 2000, 4000, 4000, 4000].entries()) {
+      await act(async () => {
+        const socket = DyingSocket.instances[attempt]!
+        socket.onerror?.({})
+        socket.onclose?.()
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay)
+      })
+    }
+    await act(async () => {
+      const socket = DyingSocket.instances[6]!
+      socket.onerror?.({})
+      socket.onclose?.()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(DyingSocket.instances).toHaveLength(7)
+    expect(isPgBusy('s1')).toBe(false)
+    const warnings = getLiveSteps('s1').filter((s) => s.kind === 'done')
+    expect(warnings).toHaveLength(1)
+    expect(String(warnings[0]?.text)).toContain('couldn’t connect to the chat server')
+  })
+
+  it('recovers after several failures without duplicating the prompt', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    for (const [attempt, delay] of [500, 1000, 2000].entries()) {
+      await act(async () => {
+        DyingSocket.instances[attempt]!.onerror?.({})
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(delay)
+      })
+    }
+    const socket = DyingSocket.instances[3]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const prompts = getLiveSteps('s1').filter((step) => step.kind === 'msg')
+    expect(prompts).toHaveLength(1)
+    expect(socket.send).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(String(socket.send.mock.calls[0]?.[0]))).toMatchObject({
+      turnId: prompts[0]!.turnId,
+      text: 'hello'
+    })
+    expect(DyingSocket.instances.slice(0, 3).every((s) => s.send.mock.calls.length === 0)).toBe(true)
+  })
+
+  it('does not send when stopped during an outstanding dial', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    const socket = DyingSocket.instances[0]!
+    act(() => pgCancel('s1', 'agent-1'))
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    expect(socket.send).not.toHaveBeenCalled()
+    expect(isPgBusy('s1')).toBe(false)
+  })
+
+  it('cancels a pending retry without sending the message later', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    await act(async () => {
+      DyingSocket.instances[0]!.onerror?.({})
+    })
+    act(() => pgCancel('s1', 'agent-1'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(DyingSocket.instances).toHaveLength(1)
+    expect(DyingSocket.instances[0]!.send).not.toHaveBeenCalled()
+    expect(isPgBusy('s1')).toBe(false)
+  })
+
+  it('clears a pending retry when the console unmounts', async () => {
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    await act(async () => {
+      DyingSocket.instances[0]!.onerror?.({})
+    })
+    act(() => root.render(null))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+    expect(DyingSocket.instances).toHaveLength(1)
+    expect(DyingSocket.instances[0]!.send).not.toHaveBeenCalled()
+  })
+
+  it('does not rebuild on a CP verdict — a refusal is an answer, not a blip', async () => {
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockRejectedValue(new api.ApiError('webchat relay pool not configured', 503))
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'hello')
+    })
+    await settle()
+    expect(vi.mocked(api.webchatWsUrl)).toHaveBeenCalledTimes(1)
+    expect(getLiveSteps('s1').some((s) => String(s.text).includes('Webchat relay not configured'))).toBe(true)
+  })
+})
+
+describe('MCP App card lifetime (webchat-mcp-apps.md §7.3)', () => {
+  class AppSocket extends StubSocket {
+    static instances: AppSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      AppSocket.instances.push(this)
+    }
+  }
+
+  async function openStream() {
+    AppSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', AppSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => {
+      pgSend('s1', 'agent-1', 'open the chooser', 'c1')
+    })
+    const socket = AppSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    const turn = JSON.parse(String(socket.send.mock.calls.at(-1)?.[0])) as { turnId: string }
+    return { socket, turnId: turn.turnId }
+  }
+
+  const CARD = {
+    kind: 'app',
+    appId: 'app-1',
+    title: 'Deploy target',
+    toolName: 'charts__pick_target',
+    html: '<p>frame</p>'
+  }
+
+  function send(socket: AppSocket, turnId: string, index: number, event: unknown): void {
+    socket.onmessage?.({
+      data: JSON.stringify({ type: 'output', output: { turnId, agentId: 'agent-1', index, event } })
+    })
+  }
+
+  it('stands the card in the transcript with a boundary, so the reply after it starts fresh', async () => {
+    const { socket, turnId } = await openStream()
+    act(() => send(socket, turnId, 0, CARD))
+    expect(getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')).toMatchObject([
+      { kind: 'app', boundary: true, app: { appId: 'app-1', title: 'Deploy target' } }
+    ])
+  })
+
+  it('reassembles a chunked template in order and only then has a usable card', async () => {
+    const { socket, turnId } = await openStream()
+    const template = '<!doctype html><html><head></head><body>hi</body></html>'
+    const half = template.slice(0, 20)
+    act(() => {
+      send(socket, turnId, 0, { ...CARD, html: undefined, htmlBytes: template.length })
+      send(socket, turnId, 1, { kind: 'app_template', appId: 'app-1', seq: 0, chunk: half })
+    })
+    let step = getLiveSteps('s1').find((s) => s.kind === 'app')
+    // Still short of the declared length — the renderer treats this as "arriving", not as a page.
+    expect(step?.app?.html).toBe(half)
+    expect((step?.app?.html?.length ?? 0) < (step?.app?.htmlBytes ?? 0)).toBe(true)
+
+    act(() => send(socket, turnId, 2, { kind: 'app_template', appId: 'app-1', seq: 1, chunk: template.slice(20) }))
+    step = getLiveSteps('s1').find((s) => s.kind === 'app')
+    expect(step?.app?.html).toBe(template)
+    expect(step?.app?.html?.length).toBe(step?.app?.htmlBytes)
+  })
+
+  it('settles a card AFTER its opening turn has finished — a frame outlives the turn cursor', async () => {
+    const { socket, turnId } = await openStream()
+    act(() => send(socket, turnId, 0, CARD))
+    // The turn ends. Its cursor is retired and its lane refuses to reopen, which is exactly the
+    // state in which the reader is still looking at the frame and its bridge is still served.
+    await act(async () => {
+      socket.onmessage?.({ data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-1' } }) })
+    })
+    // The daemon settles the card on the card's ORIGINAL turnId. Dropping this would leave a
+    // closed frame rendering as live forever.
+    act(() => send(socket, turnId, 1, { kind: 'app_resolved', appId: 'app-1', outcome: 'closed' }))
+    const steps = getLiveSteps('s1').filter((step) => step.kind === 'app')
+    expect(steps).toMatchObject([{ app: { appId: 'app-1', outcome: 'closed' } }])
+    // The reader dismissed this one, so its page is hidden and holding the document would be
+    // holding it for nothing.
+    expect(steps[0]?.app?.html).toBeUndefined()
+  })
+
+  it('keeps the template when the BRIDGE settles, so the card does not blank in place', async () => {
+    // `superseded` and `expired` end an arming, not the page (§8). The persisted row that also
+    // holds this template steps aside while the live copy stands, so dropping it here would leave
+    // the reader with a card and nothing in it.
+    const { socket, turnId } = await openStream()
+    act(() => send(socket, turnId, 0, CARD))
+    act(() => send(socket, turnId, 1, { kind: 'app_resolved', appId: 'app-1', outcome: 'expired' }))
+    const steps = getLiveSteps('s1').filter((step) => step.kind === 'app')
+    expect(steps).toMatchObject([{ app: { appId: 'app-1', outcome: 'expired', html: CARD.html } }])
+  })
+
+  it('completes a view RPC issued after the turn finished, instead of letting it time out', async () => {
+    const { socket, turnId } = await openStream()
+    act(() => send(socket, turnId, 0, CARD))
+    await act(async () => {
+      socket.onmessage?.({ data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-1' } }) })
+    })
+
+    let settled: unknown
+    await act(async () => {
+      void pgAppRpc('s1', 'agent-1', 'app-1', { method: 'tools/call', name: 'refresh' }, 'c1').then((outcome) => {
+        settled = outcome
+      })
+    })
+    // The browser-minted callId is what correlates the answer; read it off the wire.
+    const sent = socket.send.mock.calls
+      .map((call) => JSON.parse(String(call[0])) as { type?: string; callId?: string })
+      .find((frame) => frame.type === 'app_rpc')
+    expect(sent?.callId).toBeTypeOf('string')
+
+    await act(async () => {
+      send(socket, turnId, 1, {
+        kind: 'app_rpc_result',
+        appId: 'app-1',
+        callId: sent!.callId,
+        outcome: { ok: true, result: { structuredContent: { rows: [1] } } }
+      })
+    })
+    await act(async () => undefined)
+    expect(settled).toEqual({ ok: true, result: { structuredContent: { rows: [1] } } })
+  })
+
+  it('keeps the ordered cursor intact when an app event lands MID-turn, so the turn still ends', async () => {
+    const { socket, turnId } = await openStream()
+    // The bot's sequence: app(0) → app_rpc_result(1) → message(2) → done(lastIndex: 2). Applying
+    // index 1 out of band would consume it without telling the cursor, which then waits for it
+    // forever — the reply text and `done` stay buffered and the conversation is wedged busy.
+    act(() => {
+      send(socket, turnId, 0, CARD)
+      send(socket, turnId, 1, {
+        kind: 'app_rpc_result',
+        appId: 'app-1',
+        callId: 'mid-turn',
+        outcome: { ok: true, result: {} }
+      })
+      send(socket, turnId, 2, { kind: 'message', text: 'picked prod' })
+    })
+    await act(async () => {
+      socket.onmessage?.({
+        data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 2 } })
+      })
+    })
+    // The reply after the app event committed, and the turn is no longer busy.
+    const steps = getLiveSteps('s1').filter((step) => step.agentId === 'agent-1')
+    expect(steps.map((step) => step.kind)).toEqual(['app', 'done'])
+    expect(steps.at(-1)).toMatchObject({ text: 'picked prod' })
+  })
+
+  it('drops an RPC answer nobody is waiting for, so a replayed stream is harmless', async () => {
+    const { socket, turnId } = await openStream()
+    act(() => send(socket, turnId, 0, CARD))
+    act(() =>
+      send(socket, turnId, 1, {
+        kind: 'app_rpc_result',
+        appId: 'app-1',
+        callId: 'never-asked',
+        outcome: { ok: true, result: {} }
+      })
+    )
+    // No throw, and no transcript row: an answer to nothing is not an event the reader sees.
+    expect(getLiveSteps('s1').filter((step) => step.kind === 'app')).toHaveLength(1)
+  })
+})
+
+describe('a continuation lane retargeted to another member session', () => {
+  class TargetSocket extends StubSocket {
+    static instances: TargetSocket[] = []
+    onopen?: () => void
+    onmessage?: (event: { data: string }) => void
+    constructor() {
+      super()
+      TargetSocket.instances.push(this)
+    }
+  }
+
+  beforeEach(() => {
+    TargetSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', TargetSocket)
+  })
+
+  it('mints for the member it names while the lane stays keyed by the page session', async () => {
+    const api = await import('@/lib/api')
+    markSessionTarget('s-architect', 's-review')
+    await act(async () => {
+      pgSend('s-architect', 'agent-review', 'please re-review')
+    })
+
+    expect(vi.mocked(api.webchatSessionWsUrl)).toHaveBeenCalledWith('org1', 's-review')
+    expect(getLiveSteps('s-architect')[0]).toMatchObject({ kind: 'msg', text: 'please re-review' })
+  })
+
+  it('drops the socket bound to the previous target so the next send dials the new one', async () => {
+    const api = await import('@/lib/api')
+    markSessionTarget('s-architect')
+    await act(async () => {
+      pgSend('s-architect', 'agent-architect', 'first')
+    })
+    const [first] = TargetSocket.instances
+    expect(vi.mocked(api.webchatSessionWsUrl)).toHaveBeenLastCalledWith('org1', 's-architect')
+    expect(first?.close).not.toHaveBeenCalled()
+
+    act(() => markSessionTarget('s-architect', 's-review'))
+    expect(first?.close).toHaveBeenCalled()
+
+    // Re-marking the same target is a no-op: it must not tear down a socket already bound to it.
+    act(() => markSessionTarget('s-architect', 's-review'))
+    expect(first?.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('opens the next turn on the new target, not on the roster the previous socket verified', async () => {
+    markSessionTarget('s-architect')
+    await act(async () => {
+      pgSend('s-architect', 'agent-architect', 'first')
+    })
+    const [first] = TargetSocket.instances
+    await act(async () => {
+      first!.readyState = 1
+      first!.onopen?.()
+      first!.onmessage?.({
+        data: JSON.stringify({
+          type: 'ready',
+          conversationId: 'c-architect',
+          participants: [{ agentId: 'agent-architect', primary: true }]
+        })
+      })
+    })
+    const turnId = (JSON.parse(String(first!.send.mock.calls.at(-1)?.[0])) as { turnId: string }).turnId
+    act(() => {
+      first!.onmessage?.({
+        data: JSON.stringify({ type: 'done', done: { turnId, agentId: 'agent-architect', lastIndex: -1 } })
+      })
+    })
+    expect(getBusyLaneAgentIds('s-architect')).toEqual([])
+
+    act(() => markSessionTarget('s-architect', 's-review'))
+    await act(async () => {
+      pgSend('s-architect', 'agent-review', 'second')
+    })
+    await act(async () => {
+      const second = TargetSocket.instances[1]!
+      second.readyState = 1
+      second.onopen?.()
+      second.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+
+    // A lane still keyed to the previous socket's roster would wait on an agent this socket never reaches.
+    expect(getBusyLaneAgentIds('s-architect')).toEqual(['agent-review'])
+  })
+})
+
+// auto-session-mode.md §10: a live session opened on the member's coordinator conversation resumes it, never minting another.
+describe('A live session on an existing conversation', () => {
+  it('dials that conversation from its first, warming connect', async () => {
+    const agent = { id: 'agent-1', name: 'Echo', runtime: 'claude', model: 'model-standard' } as unknown as Agent
+    const api = await import('@/lib/api')
+    let id = ''
+    await act(async () => {
+      id = openPlayground(agent, undefined, { conversationId: 'conv-co' })
+    })
+    expect(vi.mocked(api.webchatWsUrl)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(api.webchatWsUrl)).toHaveBeenCalledWith('org1', 'agent-1', 'conv-co', undefined)
+    expect(getPgSession(id)).toMatchObject({ agentId: 'agent-1' })
+  })
+})
+
+describe('messages in a coordinator conversation’s threads (webchat-threads.md §6.3)', () => {
+  const ROOT = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b'
+  class ThreadSocket extends StubSocket {
+    static instances: ThreadSocket[] = []
+    onopen?: () => void
+    onmessage?: (e: { data: string }) => void
+    onerror?: (e: unknown) => void
+    onclose?: () => void
+    constructor() {
+      super()
+      ThreadSocket.instances.push(this)
+    }
+  }
+  const frames = (socket: ThreadSocket) =>
+    socket.send.mock.calls.map((call) => JSON.parse(String(call[0])) as Record<string, unknown>)
+  const feed = (socket: ThreadSocket, message: unknown) => socket.onmessage?.({ data: JSON.stringify(message) })
+  async function open(send: () => void) {
+    ThreadSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ThreadSocket)
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockResolvedValue('wss://relay.test/ws')
+    await act(async () => send())
+    const socket = ThreadSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    return socket
+  }
+  afterEach(async () => {
+    const api = await import('@/lib/api')
+    vi.mocked(api.webchatWsUrl).mockRejectedValue(new api.ApiError('no relay in this test', 503))
+  })
+
+  it('sends a message in a thread without touching the composer, and keeps what answers there in it', async () => {
+    act(() => setPgInput('s1', 'half a thought'))
+    const socket = await open(() => {
+      expect(pgSendThread('s1', 'agent-1', ' and the notes? ', ROOT, 'c1')).toBe(true)
+    })
+    act(() =>
+      feed(socket, { type: 'ready', conversationId: 'c1', features: ['webchat-images-v1', 'webchat-threads-v1'] })
+    )
+    expect(getPgRelayFeatures('s1')).toEqual(['webchat-images-v1', 'webchat-threads-v1'])
+    const turn = frames(socket).at(-1)!
+    expect(turn).toMatchObject({ text: 'and the notes?', thread: ROOT })
+    expect(getPgInput('s1')).toBe('half a thought')
+    expect(getPgTurnThread('s1')).toBe(ROOT)
+    expect(getLiveSteps('s1')).toMatchObject([{ kind: 'msg', text: 'and the notes?', thread: ROOT }])
+
+    const turnId = turn.turnId as string
+    act(() => {
+      feed(socket, { type: 'ack', ack: { accepted: true, turnId, agentId: 'agent-1' } })
+      feed(socket, {
+        type: 'output',
+        output: {
+          turnId,
+          agentId: 'agent-1',
+          index: 0,
+          thread: ROOT,
+          event: { kind: 'tool_call', toolCallId: 'tc-1', title: 'Read notes', status: 'completed' }
+        }
+      })
+      feed(socket, { type: 'done', done: { turnId, agentId: 'agent-1', lastIndex: 0, thread: ROOT } })
+      // A task's answer posted in the thread, and one the coordinator posts at the root.
+      feed(socket, {
+        type: 'post',
+        initiator: 'agent',
+        post: { postId: 'post-1', author: { kind: 'agent', agentId: 'agent-1' }, text: 'Notes drafted.', thread: ROOT }
+      })
+      feed(socket, {
+        type: 'post',
+        initiator: 'agent',
+        post: { postId: 'post-2', author: { kind: 'agent', agentId: 'agent-1' }, text: 'At the root.' }
+      })
+    })
+    expect(getLiveSteps('s1').map((step) => [step.kind, step.thread])).toEqual([
+      ['msg', ROOT],
+      ['tool', ROOT],
+      ['done', ROOT],
+      ['done', undefined]
+    ])
+    expect(isPgBusy('s1')).toBe(false)
+    expect(getPgTurnThread('s1')).toBeUndefined()
+
+    // The thread's record retires its turn; the root's post waits for the root's own rows.
+    act(() =>
+      reconcileLiveSteps(
+        's1',
+        [
+          { seq: 4, ts: String(Date.now()), sender: 'user', kind: 'text', text: 'and the notes?' },
+          { seq: 5, ts: String(Date.now()), sender: 'agent-1', kind: 'text', text: 'Notes drafted.', postId: 'post-1' }
+        ],
+        'agent-1',
+        undefined,
+        ROOT
+      )
+    )
+    expect(getLiveSteps('s1').map((step) => step.postId)).toEqual(['post-2'])
+  })
+
+  it('never steers a message in a thread into the running turn: it waits its turn', async () => {
+    const socket = await open(() => pgSend('s1', 'agent-1', 'plan the release', 'c1'))
+    const { turnId } = frames(socket).at(-1) as { turnId: string }
+    act(() => {
+      feed(socket, { type: 'ack', ack: { accepted: true, turnId, agentId: 'agent-1' } })
+      feed(socket, {
+        type: 'output',
+        output: { turnId, agentId: 'agent-1', index: 0, status: { steerable: true } }
+      })
+    })
+    act(() => {
+      pgSendThread('s1', 'agent-1', 'and the notes?', ROOT, 'c1')
+    })
+    expect(frames(socket).filter((frame) => frame.steer)).toEqual([])
+    expect(getPgQueue('s1')).toMatchObject([{ text: 'and the notes?', thread: ROOT }])
+  })
+
+  it('writes a continuation’s message in its task’s thread, on the task’s own timeline', async () => {
+    ThreadSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ThreadSocket)
+    await act(async () => {
+      markSessionTarget('ses_task')
+      pgSendThread('ses_task', 'agent-1', 'try a warm cache', ROOT)
+    })
+    const socket = ThreadSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    expect(frames(socket).at(-1)).toMatchObject({ text: 'try a warm cache', thread: ROOT })
+    expect(getLiveSteps('ses_task')[0]).not.toHaveProperty('thread')
+  })
+
+  it('draws a continued coordinator’s message in the platform thread it is written in (webchat-threads.md §7)', async () => {
+    const TS = '1754123456.000200'
+    ThreadSocket.instances = []
+    Reflect.set(globalThis, 'WebSocket', ThreadSocket)
+    await act(async () => {
+      markSessionTarget('ses_coordinator', 'ses_coordinator', true)
+      pgSendThread('ses_coordinator', 'agent-1', 'and the cache?', TS)
+    })
+    const socket = ThreadSocket.instances[0]!
+    await act(async () => {
+      socket.readyState = 1
+      socket.onopen?.()
+      socket.onmessage?.({ data: JSON.stringify({ type: 'ready' }) })
+    })
+    expect(frames(socket).at(-1)).toMatchObject({ text: 'and the cache?', thread: TS })
+    expect(getLiveSteps('ses_coordinator')[0]).toMatchObject({ kind: 'msg', thread: TS })
+  })
+})

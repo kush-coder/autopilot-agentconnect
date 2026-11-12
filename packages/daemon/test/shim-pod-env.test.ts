@@ -1,0 +1,274 @@
+import { describe, expect, it } from 'vitest'
+import { AcpRunner, wrapperPath, type ResolveCommand } from '../src/shim/acp-runner.js'
+import { SHIM_SEED_ENV } from '../src/shim/protocol.js'
+import { SANDBOX_BROWSER_EXECUTABLE_ENV, SANDBOX_PATHBIN_DIR } from '../src/shim/sandbox-paths.js'
+
+// The sandbox spawns with what the daemon sent PLUS the pod's own filesystem basics. The daemon
+// composes the agent's configuration but describes a different machine: it was sending its own
+// HOME, and codex then failed with "failed to initialize sqlite state runtime under
+// /var/lib/agentconnect/.codex" — a path that exists only on the daemon.
+
+/** The runner's own open path, which is private: these tests drive it directly rather than over a channel. */
+const openOf = (runner: AcpRunner): ((payload: unknown) => Promise<void>) =>
+  (runner as unknown as { open(payload: unknown): Promise<void> }).open.bind(runner)
+
+describe('sandbox spawn environment', () => {
+  it('takes HOME from the POD when the daemon does not name one', async () => {
+    const seen: Array<Record<string, string>> = []
+    const runner = new AcpRunner({
+      emit: () => {},
+      podEnv: { HOME: '/agent', PATH: '/usr/local/bin:/usr/bin', TMPDIR: '/tmp', SANDBOX_SECRET: 'must-not-leak' },
+      resolveCommand: ((command, env) => {
+        seen.push({ ...env })
+        return command
+      }) satisfies ResolveCommand,
+      log: { info: () => {}, warn: () => {} }
+    } as never)
+    await openOf(runner)({ op: 'open', command: 'true', args: [], env: { AC_AGENT_ID: 'a' } }).catch(() => {})
+    const env = seen.at(-1) ?? {}
+    expect(env.HOME).toBe('/agent')
+    expect(env.PATH).toBe('/usr/local/bin:/usr/bin')
+    // An allowlist, not all of process.env: the pod env can carry provider credentials from the
+    // SandboxTemplate, which are forwarded deliberately elsewhere rather than in bulk.
+    expect(env.SANDBOX_SECRET).toBeUndefined()
+    await runner.close(1_000).catch(() => {})
+  })
+
+  // The image bakes Chrome and names it in the pod env, but the child is spawned from an allowlist — so without
+  // this projection agent-browser sees no browser and downloads its own onto the workspace volume.
+  it("projects the pod's baked-browser path onto the child", async () => {
+    const seen: Array<Record<string, string>> = []
+    const runner = new AcpRunner({
+      emit: () => {},
+      podEnv: {
+        HOME: '/agent',
+        PATH: '/usr/bin',
+        [SANDBOX_BROWSER_EXECUTABLE_ENV]: '/opt/agentconnect/browser/chrome'
+      },
+      resolveCommand: ((command, env) => {
+        seen.push({ ...env })
+        return command
+      }) satisfies ResolveCommand,
+      log: { info: () => {}, warn: () => {} }
+    } as never)
+    await openOf(runner)({ op: 'open', command: 'true', args: [], env: {} }).catch(() => {})
+    expect(seen.at(-1)?.[SANDBOX_BROWSER_EXECUTABLE_ENV]).toBe('/opt/agentconnect/browser/chrome')
+    await runner.close(1_000).catch(() => {})
+  })
+
+  // An image that ships no baked browser must not gain an env naming one, and a daemon that named a browser
+  // deliberately stays authoritative — the same fill-in rule the provider pairs follow.
+  it('leaves the baked-browser path alone when the image ships none or the daemon sent one', async () => {
+    const seen: Array<Record<string, string>> = []
+    const runnerOf = (podEnv: Record<string, string>) =>
+      new AcpRunner({
+        emit: () => {},
+        podEnv,
+        resolveCommand: ((command, env) => {
+          seen.push({ ...env })
+          return command
+        }) satisfies ResolveCommand,
+        log: { info: () => {}, warn: () => {} }
+      } as never)
+    const bare = runnerOf({ HOME: '/agent', PATH: '/usr/bin' })
+    await openOf(bare)({ op: 'open', command: 'true', args: [], env: {} }).catch(() => {})
+    expect(seen.at(-1)?.[SANDBOX_BROWSER_EXECUTABLE_ENV]).toBeUndefined()
+    await bare.close(1_000).catch(() => {})
+    const both = runnerOf({ HOME: '/agent', PATH: '/usr/bin', [SANDBOX_BROWSER_EXECUTABLE_ENV]: '/opt/baked' })
+    await openOf(both)({
+      op: 'open',
+      command: 'true',
+      args: [],
+      env: { [SANDBOX_BROWSER_EXECUTABLE_ENV]: '/sent/by/daemon' }
+    }).catch(() => {})
+    expect(seen.at(-1)?.[SANDBOX_BROWSER_EXECUTABLE_ENV]).toBe('/sent/by/daemon')
+    await both.close(1_000).catch(() => {})
+  })
+
+  it('lets the daemon override a pod value it deliberately set', async () => {
+    const seen: Array<Record<string, string>> = []
+    const runner = new AcpRunner({
+      emit: () => {},
+      podEnv: { HOME: '/agent', PATH: '/usr/bin' },
+      resolveCommand: ((command, env) => {
+        seen.push({ ...env })
+        return command
+      }) satisfies ResolveCommand,
+      log: { info: () => {}, warn: () => {} }
+    } as never)
+    await openOf(runner)({ op: 'open', command: 'true', args: [], env: { HOME: '/agent/private' } }).catch(() => {})
+    expect(seen.at(-1)?.HOME).toBe('/agent/private')
+    await runner.close(1_000).catch(() => {})
+  })
+
+  // session-executors.md §5: inside SRT's network namespace its proxy bridge is the only route out, so its variables win in both env modes.
+  it("hands the runtime SRT's proxy environment over the launch's, and only a shim SRT wrapped", async () => {
+    const proxy = {
+      HTTP_PROXY: 'http://localhost:3128',
+      HTTPS_PROXY: 'http://localhost:3128',
+      https_proxy: 'http://localhost:3128',
+      ALL_PROXY: 'http://localhost:3128',
+      NO_PROXY: 'localhost,127.0.0.1',
+      NODE_USE_ENV_PROXY: '1'
+    }
+    const seen: Array<Record<string, string>> = []
+    const runnerOf = (podEnv: Record<string, string>, completeEnv = false) =>
+      new AcpRunner({
+        emit: () => {},
+        podEnv,
+        completeEnv,
+        resolveCommand: ((command, env) => {
+          seen.push({ ...env })
+          return command
+        }) satisfies ResolveCommand,
+        log: { info: () => {}, warn: () => {} }
+      } as never)
+    const sent = { HTTPS_PROXY: 'http://proxy.example.test:8080', PATH: '/usr/bin' }
+    for (const completeEnv of [false, true]) {
+      const wrapped = runnerOf({ HOME: '/agent', PATH: '/usr/bin', SANDBOX_RUNTIME: '1', ...proxy }, completeEnv)
+      await openOf(wrapped)({ op: 'open', command: 'true', args: [], env: sent }).catch(() => {})
+      expect(seen.at(-1)).toMatchObject(proxy)
+      // The marker itself stays where SRT set it.
+      expect(seen.at(-1)?.SANDBOX_RUNTIME).toBeUndefined()
+      await wrapped.close(1_000).catch(() => {})
+    }
+    // A pod or a VM with a proxy of its own is not SRT's: the launch's value stands and nothing is added.
+    const pod = runnerOf({ HOME: '/agent', PATH: '/usr/bin', ...proxy })
+    await openOf(pod)({ op: 'open', command: 'true', args: [], env: sent }).catch(() => {})
+    expect(seen.at(-1)?.HTTPS_PROXY).toBe('http://proxy.example.test:8080')
+    expect(seen.at(-1)?.HTTP_PROXY).toBeUndefined()
+    await pod.close(1_000).catch(() => {})
+  })
+
+  // A host executor's HOME seed leaves the Claude sign-in where only that machine can name it (session-executors.md §8).
+  it("fills in where this machine's HOME seed left the Claude sign-in, under whatever the daemon sent", async () => {
+    const seen: Array<Record<string, string>> = []
+    const runnerOf = () =>
+      new AcpRunner({
+        emit: () => {},
+        podEnv: { HOME: '/d/sessions/s/home', PATH: '/usr/bin', CLAUDE_SECURESTORAGE_CONFIG_DIR: '/home/op/.claude' },
+        resolveCommand: ((command, env) => {
+          seen.push({ ...env })
+          return command
+        }) satisfies ResolveCommand,
+        log: { info: () => {}, warn: () => {} }
+      } as never)
+    const seeded = runnerOf()
+    await openOf(seeded)({ op: 'open', command: 'true', args: [], env: {} }).catch(() => {})
+    expect(seen.at(-1)?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('/home/op/.claude')
+    await seeded.close(1_000).catch(() => {})
+    const sent = runnerOf()
+    await openOf(sent)({
+      op: 'open',
+      command: 'true',
+      args: [],
+      env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/sent/by/daemon' }
+    }).catch(() => {})
+    expect(seen.at(-1)?.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe('/sent/by/daemon')
+    await sent.close(1_000).catch(() => {})
+  })
+
+  // session-executors.md §8: a hosted VM's executor names its placeholders and proxy trust; the holder's env still wins.
+  it("fills a hosted VM's seed in beneath the holder's env, reading string entries only", async () => {
+    const seen: Array<Record<string, string>> = []
+    const runnerOf = (seed: string) =>
+      new AcpRunner({
+        emit: () => {},
+        podEnv: { HOME: '/agent', PATH: '/usr/bin', [SHIM_SEED_ENV]: seed },
+        resolveCommand: ((command, env) => {
+          seen.push({ ...env })
+          return command
+        }) satisfies ResolveCommand,
+        log: { info: () => {}, warn: () => {} }
+      } as never)
+    const seed = {
+      DEEPSEEK_API_KEY: 'msb-secret-DEEPSEEK_API_KEY',
+      NODE_EXTRA_CA_CERTS: '/.msb/tls/ca.pem',
+      SSL_CERT_FILE: '/etc/ssl/certs/ca-certificates.crt',
+      NOT_A_STRING: 1
+    }
+    const hosted = runnerOf(JSON.stringify(seed))
+    await openOf(hosted)({
+      op: 'open',
+      command: 'true',
+      args: [],
+      env: { SSL_CERT_FILE: '/sent/by/holder', AC_AGENT_ID: 'a' }
+    }).catch(() => {})
+    expect(seen.at(-1)).toEqual({
+      HOME: '/agent',
+      PATH: '/usr/bin',
+      DEEPSEEK_API_KEY: 'msb-secret-DEEPSEEK_API_KEY',
+      NODE_EXTRA_CA_CERTS: '/.msb/tls/ca.pem',
+      SSL_CERT_FILE: '/sent/by/holder',
+      AC_AGENT_ID: 'a'
+    })
+    await hosted.close(1_000).catch(() => {})
+    // An unreadable seed adds nothing rather than failing the launch.
+    const broken = runnerOf('{not json')
+    await openOf(broken)({ op: 'open', command: 'true', args: [], env: {} }).catch(() => {})
+    expect(seen.at(-1)).toEqual({ HOME: '/agent', PATH: '/usr/bin' })
+    await broken.close(1_000).catch(() => {})
+  })
+
+  // A local VM's shim is started by the daemon on the same machine: that launch environment is whole, and a pod's
+  // fill-ins would change it — an inherited OpenAI key would become codex's login in place of the one the user has.
+  it('adds nothing but resolved hints when the driving daemon sends the whole environment', async () => {
+    const seen: Array<Record<string, string>> = []
+    const runner = new AcpRunner({
+      emit: () => {},
+      completeEnv: true,
+      podEnv: {
+        HOME: '/agent',
+        PATH: '/pod/bin',
+        AC_CODEX_API_KEY: 'pod-key',
+        AC_CODEX_BASE_URL: 'https://gateway.example.test/v1',
+        [SANDBOX_BROWSER_EXECUTABLE_ENV]: '/opt/baked',
+        // A hosted seed is not this launch's either: a local VM's daemon composed the protected env itself.
+        [SHIM_SEED_ENV]: JSON.stringify({ NODE_EXTRA_CA_CERTS: '/seeded/ca.pem' })
+      },
+      // The profile is read off the requested name, so the runtime itself can be any executable that exists.
+      resolveCommand: ((command, env) => {
+        seen.push({ ...env })
+        return command === 'claude' ? '/usr/local/bin/claude' : '/usr/bin/true'
+      }) satisfies ResolveCommand,
+      log: { info: () => {}, warn: () => {} }
+    } as never)
+    await openOf(runner)({
+      op: 'open',
+      command: 'codex-acp',
+      args: [],
+      env: { PATH: '/guest/tools', OPENAI_API_KEY: 'host-key' },
+      hints: [{ envVar: 'CLAUDE_CODE_EXECUTABLE', command: 'claude' }]
+    }).catch(() => {})
+    expect(seen.at(-1)).toEqual({
+      PATH: '/guest/tools',
+      OPENAI_API_KEY: 'host-key',
+      CLAUDE_CODE_EXECUTABLE: '/usr/local/bin/claude'
+    })
+    await runner.close(1_000).catch(() => {})
+  })
+
+  // The wrapper dir is the IMAGE's, so the decision is made here rather than sent by a daemon that would be naming a path on a machine it is not on.
+  it('puts the image wrapper dir first on PATH when this image ships one', () => {
+    expect(wrapperPath('/usr/local/bin:/usr/bin', () => true)).toBe(`${SANDBOX_PATHBIN_DIR}:/usr/local/bin:/usr/bin`)
+    // A PATH the daemon already sent may name it; the wrapper must still be first, and only once.
+    expect(wrapperPath(`/usr/bin:${SANDBOX_PATHBIN_DIR}`, () => true)).toBe(`${SANDBOX_PATHBIN_DIR}:/usr/bin`)
+    expect(wrapperPath(undefined, () => true)).toBe(SANDBOX_PATHBIN_DIR)
+  })
+
+  it('leaves PATH exactly as it was on an image with no wrapper', () => {
+    expect(wrapperPath('/usr/local/bin:/usr/bin', () => false)).toBe('/usr/local/bin:/usr/bin')
+    expect(wrapperPath(undefined, () => false)).toBeUndefined()
+  })
+
+  // A host shim on an installation has no image directory: its launcher writes the wrappers into the runtime root.
+  it("puts the host launcher's wrappers first when the image ships none", () => {
+    const runtime = '/srv/daemon/hs/0a1b2c3d4e5f/pathbin'
+    const only = (dir: string) => (candidate: string) => candidate === dir
+    expect(wrapperPath('/usr/bin', only(runtime), runtime)).toBe(`${runtime}:/usr/bin`)
+    expect(wrapperPath(`/usr/bin:${runtime}`, only(runtime), runtime)).toBe(`${runtime}:/usr/bin`)
+    // The image's own wrapper stays the one a pod runs, whatever a launcher named.
+    expect(wrapperPath('/usr/bin', () => true, runtime)).toBe(`${SANDBOX_PATHBIN_DIR}:/usr/bin`)
+    expect(wrapperPath('/usr/bin', () => false, runtime)).toBe('/usr/bin')
+  })
+})

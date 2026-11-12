@@ -1,0 +1,64 @@
+// Stream-lane keying for multi-agent webchat conversations
+// (webchat-multi-agents.md §5.3): one ordering cursor per (session, participant)
+// lane, keyed `${id} ${agentId}`. Pure helpers over the provider's cursor map so
+// the resolution rules are unit-testable.
+
+/** The cursor-map key for one participant's stream lane. */
+export function laneKey(id: string, agentId?: string): string {
+  return `${id}\u0000${agentId ?? ''}`
+}
+
+/** The participant a lane key addresses (undefined for the anonymous lane). */
+export function laneAgentId(key: string): string | undefined {
+  const agentId = key.slice(key.indexOf('\u0000') + 1)
+  return agentId || undefined
+}
+
+/** Every lane key belonging to one session id. */
+export function lanesOf(lanes: ReadonlyMap<string, unknown>, id: string): string[] {
+  return [...lanes.keys()].filter((k) => k.startsWith(`${id}\u0000`))
+}
+
+/**
+ * Resolve the lane a frame belongs to.
+ *
+ * Agent-tagged frames match their EXACT lane only — a tagged ack/output for a
+ * participant the client has not laned yet must return undefined so the caller
+ * can admit the lane lazily (a resumed conversation where the relay applied the
+ * all-participants default). The sole-lane compatibility fallback is reserved
+ * for legacy frames that omit `agentId`: letting a tagged frame fall back would
+ * share the primary's cursor across participants, misattributing or dropping
+ * replies once one participant's `done` removes it.
+ */
+export function cursorKeyFor(lanes: ReadonlyMap<string, unknown>, id: string, agentId?: string): string | undefined {
+  const exact = laneKey(id, agentId)
+  if (lanes.has(exact)) return exact
+  if (agentId !== undefined) return undefined
+  const all = lanesOf(lanes, id)
+  return all.length === 1 ? all[0] : undefined
+}
+
+/**
+ * Whether a tagged frame for an un-laned participant may ADMIT its lane.
+ *
+ * Any frame of the in-flight send's turn is proof the relay accepted that
+ * participant — the ack is merely the usual first such frame, NOT the only
+ * one. On a warm session the daemon emits its first stream frame
+ * synchronously inside turn admission, so `output`/`done` can reach the
+ * browser BEFORE the participant's ack; dropping that first output would
+ * leave the lane's ordered cursor waiting on index 0 forever (no render, no
+ * done, busy never clears).
+ */
+export function admitsLane(
+  agentId: string | undefined,
+  turnId: string | undefined,
+  pendingTurnId: string | undefined,
+  finishedAgentIds?: ReadonlySet<string>
+): boolean {
+  if (agentId === undefined || turnId === undefined || turnId !== pendingTurnId) return false
+  // A COMPLETED lane must never be re-admitted: with done-before-ack ordering
+  // the terminal frame both creates and retires the lane, and the trailing ack
+  // would otherwise recreate an empty cursor that can never finish — wedging
+  // the turn's busy state and fencing the participant's next turn.
+  return !finishedAgentIds?.has(agentId)
+}

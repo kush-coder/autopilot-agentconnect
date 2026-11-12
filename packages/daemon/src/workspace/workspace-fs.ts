@@ -1,0 +1,190 @@
+import { randomUUID } from 'node:crypto'
+import { linkSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, rmdirSync, writeFileSync } from 'node:fs'
+import { readRegularFileSync, RegularFileError } from '../fs/regular-file.js'
+import { removeTreeSync } from './remove-tree.js'
+
+/**
+ * What one path IS, resolved WITHOUT following a symlink.
+ *
+ * `other` is the answer for a symlink and for every non-regular entry, and every caller treats it
+ * as a refusal — which is what the local code expressed by throwing on `lstatSync().isSymbolicLink()`.
+ * `missing` is data, never an error: absence is the ordinary answer to "is the checkout there".
+ */
+export type WorkspaceFsKind = 'file' | 'dir' | 'missing' | 'other'
+
+/** An `ifAbsent` write found the target already there. The name was NOT reserved by the caller's
+ *  earlier stat — that is the point of asking for exclusive creation — so a caller picks another. */
+export class WorkspaceFileExistsError extends Error {
+  constructor(path: string) {
+    super(`workspace file already exists: ${path}`)
+    this.name = 'WorkspaceFileExistsError'
+  }
+}
+
+export interface WorkspaceWriteOptions {
+  mode?: number
+  /** Exclusive create: publish only if nothing is at `path`, else throw {@link WorkspaceFileExistsError}.
+   *  Atomic on both arms (hard link of the staged file, not a replacing rename). */
+  ifAbsent?: boolean
+}
+
+/**
+ * The filesystem twin of `GitRunner`: the workspace file operations the daemon actually performs,
+ * as a frozen inventory rather than a general-purpose `node:fs`.
+ *
+ * It exists for the same reason the git seam does. A cluster-backed agent's workspace lives on its
+ * sandbox pod's volume, so every `existsSync`/`mkdirSync`/`rmSync` in the worktree paths inspects
+ * the wrong disk — silently, because the daemon's own directory answers plausibly. The orchestration
+ * stays here and only the execution moves.
+ *
+ * Paths are ABSOLUTE, in the coordinates of the filesystem that holds them: this daemon's disk for a
+ * local agent, the pod's mount for a sandboxed one. Deriving the members from what the code already
+ * calls (rather than from what a filesystem can do) is what keeps the move mechanical.
+ */
+export interface WorkspaceFs {
+  /** Never follows a symlink — see {@link WorkspaceFsKind}. */
+  stat(path: string): Promise<WorkspaceFsKind>
+  /** Entry names, not paths. Callers prove the directory is there first; one that cannot be read
+   *  must fail rather than read as empty, since "empty" is what licenses a removal. */
+  readdir(path: string): Promise<string[]>
+  /** Recursive, like `mkdir -p`. */
+  mkdir(path: string, mode?: number): Promise<void>
+  /** The only read: bounded, never through a link or a pipe; absent or unreadable is undefined, over `maxBytes` is `{tooLarge}`. */
+  readFileBytes(path: string, maxBytes: number): Promise<{ bytes: Buffer } | { tooLarge: number } | undefined>
+  /** Atomic: staged beside the target, then published by one rename. Text or raw BYTES: the
+   *  binary arm lands an inbound attachment in the workspace (inbound-file-attachments.md §2). */
+  writeFile(path: string, content: string | Uint8Array, options?: WorkspaceWriteOptions): Promise<void>
+  rename(from: string, to: string): Promise<void>
+  /**
+   * Remove a directory ONLY if it is empty, answering whether it went.
+   *
+   * Distinct from {@link rmTree} because "reclaim a provably empty leftover" is not a tree removal:
+   * proving emptiness and then deleting recursively are two operations, and on a volume the agent's
+   * runtime is writing to, anything that appears between them is deleted by a removal the proof
+   * licensed. Here the kernel decides both at once, so the race resolves as "kept", not as data loss.
+   */
+  rmdir(path: string): Promise<boolean>
+  /** Recursive and forgiving, like `rm -rf`. */
+  rmTree(path: string): Promise<void>
+}
+
+/**
+ * Where one agent's workspace files live: the filesystem that holds them, and the mount its paths
+ * are composed in.
+ *
+ * The two travel together because they are one answer. A daemon that knew which filesystem to ask
+ * but not which coordinates to ask in would compose `<agentDir>/worktrees` and send it to a pod that
+ * has no such path — the exact failure this seam exists to remove.
+ */
+export interface WorkspacePlacement {
+  fs: WorkspaceFs
+  /** The workspace mount; omit to keep paths in the daemon host's coordinates. */
+  mount?: string
+}
+
+/** Today's behaviour: the daemon's own disk, through `node:fs`. */
+export class LocalWorkspaceFs implements WorkspaceFs {
+  async stat(path: string): Promise<WorkspaceFsKind> {
+    try {
+      const stats = lstatSync(path)
+      return stats.isDirectory() ? 'dir' : stats.isFile() ? 'file' : 'other'
+    } catch {
+      // Unreadable reads as absent, exactly as the `existsSync` this replaces did.
+      return 'missing'
+    }
+  }
+
+  async readdir(path: string): Promise<string[]> {
+    return readdirSync(path)
+  }
+
+  async mkdir(path: string, mode?: number): Promise<void> {
+    mkdirSync(path, { recursive: true, ...(mode === undefined ? {} : { mode }) })
+  }
+
+  async readFileBytes(path: string, maxBytes: number): Promise<{ bytes: Buffer } | { tooLarge: number } | undefined> {
+    try {
+      return { bytes: readRegularFileSync(path, maxBytes) }
+    } catch (err) {
+      // A link, a pipe or any unreadable path is absent; only an oversized regular file reports its size.
+      return err instanceof RegularFileError && err.reason === 'too-large' ? { tooLarge: err.size! } : undefined
+    }
+  }
+
+  async writeFile(path: string, content: string | Uint8Array, options: WorkspaceWriteOptions = {}): Promise<void> {
+    // A per-write temp name rather than a fixed `.tmp`: two writers publishing the same marker must
+    // not stage into one another's file, and the rename is what makes either one whole.
+    const temp = `${path}.${randomUUID()}.tmp`
+    try {
+      writeFileSync(temp, content, options.mode === undefined ? {} : { mode: options.mode })
+      if (options.ifAbsent) {
+        // link(2) fails with EEXIST when ANYTHING is at `path` (a file, a dir, even a dangling
+        // symlink), and never follows it — so the check and the publish are one kernel step.
+        try {
+          linkSync(temp, path)
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'EEXIST') throw new WorkspaceFileExistsError(path)
+          throw err
+        }
+        rmSync(temp, { force: true })
+      } else renameSync(temp, path)
+    } catch (err) {
+      rmSync(temp, { force: true })
+      throw err
+    }
+  }
+
+  async rename(from: string, to: string): Promise<void> {
+    renameSync(from, to)
+  }
+
+  async rmdir(path: string): Promise<boolean> {
+    try {
+      rmdirSync(path)
+      return true
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code
+      // Already gone counts as removed; anything the kernel refuses to empty is kept, not forced.
+      if (code === 'ENOENT') return true
+      if (code === 'ENOTEMPTY' || code === 'EEXIST' || code === 'ENOTDIR') return false
+      throw err
+    }
+  }
+
+  async rmTree(path: string): Promise<void> {
+    removeTreeSync(path)
+  }
+}
+
+/** One instance is enough: it holds no state, and every local agent shares this disk. */
+export const localWorkspaceFs = new LocalWorkspaceFs()
+
+// Route every operation explicitly so additions to WorkspaceFs must also update this boundary.
+export class RoutedWorkspaceFs implements WorkspaceFs {
+  constructor(private readonly route: (path: string) => Promise<WorkspaceFs>) {}
+
+  async stat(path: string): ReturnType<WorkspaceFs['stat']> {
+    return (await this.route(path)).stat(path)
+  }
+  async readdir(path: string): Promise<string[]> {
+    return (await this.route(path)).readdir(path)
+  }
+  async mkdir(path: string, mode?: number): Promise<void> {
+    return (await this.route(path)).mkdir(path, mode)
+  }
+  async readFileBytes(path: string, maxBytes: number): ReturnType<WorkspaceFs['readFileBytes']> {
+    return (await this.route(path)).readFileBytes(path, maxBytes)
+  }
+  async writeFile(path: string, content: string | Uint8Array, options?: WorkspaceWriteOptions): Promise<void> {
+    return (await this.route(path)).writeFile(path, content, options)
+  }
+  async rename(from: string, to: string): Promise<void> {
+    return (await this.route(from)).rename(from, to)
+  }
+  async rmdir(path: string): Promise<boolean> {
+    return (await this.route(path)).rmdir(path)
+  }
+  async rmTree(path: string): Promise<void> {
+    return (await this.route(path)).rmTree(path)
+  }
+}

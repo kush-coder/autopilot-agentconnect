@@ -1,0 +1,413 @@
+{{- $sourceCache := include "agentconnect.sourceCache" . | fromJson }}
+{{- $sourceCacheCredentials := $sourceCache.credentials | default dict }}
+{{- $transferSecret := and $sourceCache.enabled (eq $sourceCacheCredentials.source "secret") }}
+{{- $transferIdentity := and $sourceCache.enabled (eq $sourceCacheCredentials.source "serviceAccount") (($sourceCacheCredentials.serviceAccount | default dict).roleArn) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentconnect.fullname" . }}-control-plane
+  labels:
+    {{- include "agentconnect.labels" . | nindent 4 }}
+    {{- include "agentconnect.componentLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+spec:
+  {{- if gt (int .Values.controlPlane.replicas) 1 }}
+  {{- fail "controlPlane.replicas above 1 is not supported: the Control Plane still keeps connection and control state per process (docs/designs/high-availability.md)" }}
+  {{- end }}
+  replicas: {{ .Values.controlPlane.replicas }}
+  # Kubernetes treats readiness as immediately available by default. Keep the
+  # new endpoint stable long enough for Gateway/Envoy discovery before it may
+  # terminate the old singleton CP pod.
+  minReadySeconds: {{ .Values.controlPlane.minReadySeconds }}
+  # Surge-first rollout: the new pod must pass readiness BEFORE the old one is
+  # torn down (maxUnavailable: 0), so daemons whose sockets close during the
+  # switchover reconnect to an already-serving pod. maxSurge: 1 is required for
+  # progress at replicas: 1 (0/0 would deadlock).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "agentconnect.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "agentconnect.labels" . | nindent 8 }}
+        {{- include "agentconnect.componentLabels" (dict "ctx" . "component" "control-plane") | nindent 8 }}
+    spec:
+      # Own SA per release — its token is the workload JWT for Vault kubernetes
+      # auth (SECRET_CIPHER=vault-transit). automount is the k8s default; kept
+      # explicit because the CP reads the token to log in to Vault.
+      serviceAccountName: {{ include "agentconnect.controlPlaneServiceAccountName" . }}
+      automountServiceAccountToken: true
+      # Give the CP time to drain daemon WS sockets on SIGTERM (it closes them
+      # 1012 so daemons reconnect to the new pod, then exits; a 10s in-process
+      # failsafe caps it) — comfortably inside this grace period.
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: control-plane
+          image: "{{ .Values.image.registry }}/{{ .Values.controlPlane.image }}:{{ .Values.controlPlane.tag | default (include "agentconnect.imageTag" .) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.controlPlane.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.controlPlane.port | quote }}
+            - name: HOST
+              value: "0.0.0.0"
+            # Downward-API values that later env entries (config / extraEnv) can
+            # reference via K8s $(…) expansion — e.g. a node-local OTel collector
+            # agent, OTEL_EXPORTER_OTLP_ENDPOINT=http://$(OTEL_COLLECTOR_HOST):4317.
+            # Set the consuming vars in your values. Inert on their own.
+            - name: OTEL_COLLECTOR_HOST
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.hostIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
+            {{- range $k, $v := .Values.controlPlane.config }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.databaseUrlKey }}
+            - name: API_KEY_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.apiKeyPepperKey }}
+            # Logto origins are startup topology. Browser/M2M identities,
+            # audiences, provider ids, and provider secrets are loaded from the
+            # CP-owned deployment_config singleton instead of pod env.
+            {{- if .Values.logto.endpoint }}
+            - name: LOGTO_ENDPOINT
+              value: {{ trimSuffix "/" .Values.logto.endpoint | quote }}
+            - name: OIDC_ISSUER
+              value: {{ printf "%s/oidc" (trimSuffix "/" .Values.logto.endpoint) | quote }}
+            {{- end }}
+            # The canonical Management API origin remains separate startup
+            # topology for Logto Cloud custom-domain deployments.
+            {{- $mgmtEndpoint := .Values.logto.mgmtEndpoint | default .Values.logto.endpoint }}
+            {{- if $mgmtEndpoint }}
+            - name: LOGTO_MGMT_ENDPOINT
+              value: {{ trimSuffix "/" $mgmtEndpoint | quote }}
+            {{- end }}
+            {{- if or .Values.apiHost .Values.publicUrl }}
+            # Onboarding daemon WS origin — the "Add daemon" command dials
+            # <PUBLIC_CP_URL> + WS_PATH (/daemon/ws).
+            #   • SUBDOMAIN mode (apiHost set): the CP lives on its own host, so
+            #     PUBLIC_CP_URL = https://<apiHost> ⇒ daemons dial
+            #     wss://<apiHost>/daemon/ws (the -api HTTPRoute forwards WS_PATH verbatim).
+            #   • same-origin (default): the CP is mounted under `/cp` on the website host
+            #     (the prefix the web image bakes + the edge route), so
+            #     PUBLIC_CP_URL = <publicUrl>/cp ⇒ wss://<host>/cp/daemon/ws.
+            # Absent (no apiHost, no publicUrl) ⇒ CP falls back to ws://127.0.0.1:8080.
+            - name: PUBLIC_CP_URL
+              value: {{ if .Values.apiHost }}{{ printf "https://%s" .Values.apiHost | quote }}{{ else }}{{ printf "%s/cp" (trimSuffix "/" .Values.publicUrl) | quote }}{{ end }}
+            {{- end }}
+            {{- if .Values.apiHost }}
+            # SUBDOMAIN mode: the -api HTTPRoute exposes the CP's /api/v1 routes as /v1 on this
+            # host (httproute.yaml), so the OpenAPI document keys its paths the way clients reach them.
+            - name: OPENAPI_PATH_PREFIX
+              value: /v1
+            {{- end }}
+            {{- if and .Values.apiHost .Values.publicUrl }}
+            # SUBDOMAIN mode (top-level `apiHost` set): the browser served at `publicUrl`
+            # calls the CP on the dedicated api host cross-origin, so allow the website
+            # origin. Bearer-token auth (no cookies) ⇒ one explicit origin is enough;
+            # same-origin mode leaves this unset (@fastify/cors stays disabled).
+            - name: CORS_ORIGIN
+              value: {{ trimSuffix "/" .Values.publicUrl | quote }}
+            {{- end }}
+            {{- if .Values.mcpHost }}
+            # Dedicated public MCP origin (the -mcp HTTPRoute): the canonical MCP
+            # resource URL becomes this origin's root — every URL the CP advertises
+            # (PRM `resource`, the MCP 401 challenge) says it, and RFC 9728 clients
+            # validate it byte-for-byte against the URL they dialed.
+            - name: PUBLIC_MCP_URL
+              value: {{ printf "https://%s" .Values.mcpHost | quote }}
+            {{- end }}
+            {{- if .Values.publicUrl }}
+            # The web console origin. The CP 302s BROWSERS here — the OAuth consent
+            # page (/oauth/consent; agentconnect-md/agentconnect docs/designs/agent-assistant.md §7.3) and other console
+            # destinations — and daemons build session deep links from it. Without
+            # it the CP falls back to its own public origin (PUBLIC_CP_URL), which
+            # serves no console in subdomain mode: the MCP consent redirect would
+            # 404 at the api host.
+            - name: PUBLIC_WEB_URL
+              value: {{ trimSuffix "/" .Values.publicUrl | quote }}
+            {{- end }}
+            {{- if include "agentconnect.relayActive" . }}
+            # Webchat rides the relay pool: the mint route
+            # (POST …/agents/:id/webchat/token) returns this URL for the browser to dial.
+            # Absent ⇒ the mint route 503s and the Playground is disabled. RELAY_TOKEN is
+            # the shared relay↔CP credential the relay presents on rc/auth — the CP must
+            # hold the SAME value to accept it (unset ⇒ token-mode auth is rejected).
+            - name: PUBLIC_RELAY_URL
+              value: {{ include "agentconnect.relayPublicUrl" . | quote }}
+            - name: RELAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.relayTokenKey }}
+            {{- end }}
+            {{- if .Values.openConnector.enabled }}
+            # open-connector (connectors integration): the CP brokers connector browsing
+            # + connection provisioning through this INTERNAL Service (ClusterIP, no edge
+            # hop). Set ⇒ the console shows "Add connectors"; unset ⇒ the routes 404.
+            - name: OPEN_CONNECTOR_URL
+              value: {{ printf "http://%s-open-connector:%v" (include "agentconnect.fullname" .) .Values.openConnector.port | quote }}
+            {{- end }}
+            {{- if .Values.objectStore.endpoint }}
+            # Uploaded-icon object store (agentconnect-md/agentconnect docs/designs/icon-uploads.md): non-secret S3 config from the
+            # `objectStore` block; the access key id + secret ride the namespace Secret with
+            # optional:true, so the pod starts even before they're added — the CP then just
+            # leaves icon upload off (its gate needs the full group) instead of crash-looping.
+            - name: S3_ENDPOINT
+              value: {{ .Values.objectStore.endpoint | quote }}
+            - name: S3_BUCKET
+              value: {{ .Values.objectStore.bucket | quote }}
+            - name: S3_PUBLIC_BASE_URL
+              value: {{ .Values.objectStore.publicBaseUrl | quote }}
+            - name: S3_REGION
+              value: {{ .Values.objectStore.region | default "auto" | quote }}
+            - name: S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.s3AccessKeyIdKey }}
+                  optional: true
+            - name: S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret }}
+                  key: {{ .Values.secrets.s3SecretAccessKeyKey }}
+                  optional: true
+            {{- end }}
+            {{- if .Values.daemonPool.enabled }}
+            # The control plane's cluster-access switch: it asserts the CP runs in-cluster (the
+            # pod's ServiceAccount is the credential) and accepts daemon-pool member identities
+            # only from its own namespace. The ServiceAccount name and the token audience are
+            # the app's identity contract.
+            - name: DAEMON_POOL_ENABLED
+              value: 'true'
+            {{- if .Values.computerPool.enabled }}
+            # Managed computers (computer-use.md §15.1): allocate, sleep and reclaim desktops through pool members.
+            - name: COMPUTER_POOL_ENABLED
+              value: 'true'
+            - name: COMPUTER_POOL_EPHEMERAL_IDLE_SEC
+              value: {{ .Values.computerPool.ephemeralIdleSeconds | quote }}
+            - name: COMPUTER_POOL_SLEEP_IDLE_SEC
+              value: {{ .Values.computerPool.sleepIdleSeconds | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if hasKey $.Values.controlPlane.extraEnv "CAPABILITY_REQUESTS_ENABLED" }}
+            {{- fail "controlPlane.extraEnv.CAPABILITY_REQUESTS_ENABLED collides with the features block: flip features.capabilityRequests instead" }}
+            {{- end }}
+            # Capability requests: daemons offer agents requestCapability (capability-requests.md); on unless turned off.
+            - name: CAPABILITY_REQUESTS_ENABLED
+              value: {{ ternary "true" "false" (ne .Values.features.capabilityRequests false) | quote }}
+            {{- if hasKey $.Values.controlPlane.extraEnv "AC_COMPUTER_PLAN" }}
+            {{- fail "controlPlane.extraEnv.AC_COMPUTER_PLAN collides with the chart-owned computerPlan values" }}
+            {{- end }}
+            # Computer quotas, the metered desktop volume size and egress choices (computer-use.md §15.4, §15.5).
+            - name: AC_COMPUTER_PLAN
+              value: {{ include "agentconnect.computerPlan" . | quote }}
+            {{- with (include "agentconnect.emailFrom" .) }}
+            # Sender the waitlist flow shows users ("check your inbox for mail from …"). Only
+            # NAMED here — whatever actually sends the activation mail lives outside this chart,
+            # and a mismatch sends people looking for mail from an address nothing sent.
+            - name: WAITLIST_FROM_EMAIL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.controlPlane.extraEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- if $sourceCache.enabled }}
+            {{- if hasKey .Values.controlPlane.extraEnv "AC_FILE_TRANSFER" }}
+            {{- fail "controlPlane.extraEnv.AC_FILE_TRANSFER collides with the chart-owned sourceCache values" }}
+            {{- end }}
+            {{- $limits := $sourceCache.limits | default dict }}
+            {{- $document := dict "version" 1 "region" (required "sourceCache.region is required when sourceCache.enabled" $sourceCache.region) "bucket" (required "sourceCache.bucket is required when sourceCache.enabled" $sourceCache.bucket) "prefix" ($sourceCache.prefix | default "") "forcePathStyle" ($sourceCache.forcePathStyle | default false) }}
+            {{- with $sourceCache.endpoint }}
+            {{- $_ := set $document "endpoint" . }}
+            {{- end }}
+            {{- with $sourceCache.publicEndpoint }}
+            {{- if not (hasPrefix "https://" .) }}
+            {{- fail "sourceCache.publicEndpoint must be an https:// origin" }}
+            {{- end }}
+            {{- $_ := set $document "publicEndpoint" . }}
+            {{- end }}
+            {{- $transferLimits := dict "partBytes" ($limits.transferPartBytes | default "512Mi") "urlSeconds" ($limits.transferUrlLifetime | default "30m") "putUrlSeconds" ($limits.putUrlLifetime | default "15m") }}
+            {{- with $limits.transferMaxBytes }}
+            {{- $_ := set $transferLimits "maxBytes" . }}
+            {{- end }}
+            {{- $_ := set $document "limits" $transferLimits }}
+            {{- $_ := set $document "credentials" (include "agentconnect.sourceCacheCredentials" $sourceCache | fromJson) }}
+            # Console file transfer: the Control Plane signs every URL for the Source Cache bucket; bytes never cross it.
+            - name: AC_FILE_TRANSFER
+              value: {{ toJson $document | quote }}
+            {{- end }}
+            {{- with .Values.computerScreenshots }}
+            {{- if .enabled }}
+            {{- if not $sourceCache.enabled }}
+            {{- fail "computerScreenshots.enabled needs sourceCache: screenshots are stored in its bucket" }}
+            {{- end }}
+            {{- if hasKey $.Values.controlPlane.extraEnv "AC_COMPUTER_SCREENSHOTS" }}
+            {{- fail "controlPlane.extraEnv.AC_COMPUTER_SCREENSHOTS collides with the chart-owned computerScreenshots values" }}
+            {{- end }}
+            {{- $screens := dict "version" 1 "region" $sourceCache.region "bucket" $sourceCache.bucket "prefix" ($sourceCache.prefix | default "") "forcePathStyle" ($sourceCache.forcePathStyle | default false) }}
+            {{- with $sourceCache.endpoint }}
+            {{- $_ := set $screens "endpoint" . }}
+            {{- end }}
+            {{- with $sourceCache.publicEndpoint }}
+            {{- $_ := set $screens "publicEndpoint" . }}
+            {{- end }}
+            {{- $_ := set $screens "limits" (dict "maxBytes" (.maxBytes | default "8Mi")) }}
+            {{- $_ := set $screens "retention" (dict "defaultDays" (int (.retentionDays | default 0)) "maxDays" (int (.maxRetentionDays | default 365))) }}
+            {{- $_ := set $screens "credentials" (include "agentconnect.sourceCacheCredentials" $sourceCache | fromJson) }}
+            # Computer screenshots: desktops upload and browsers read straight from the bucket; the Control Plane only signs.
+            - name: AC_COMPUTER_SCREENSHOTS
+              value: {{ toJson $screens | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.computerViewer.turn }}
+            {{- if and .urls .cloudflare.keyId }}{{ fail "computerViewer.turn: set urls (a coturn) or cloudflare.keyId, not both" }}{{ end }}
+            {{- if .cloudflare.keyId }}
+            # Console viewer TURN from Cloudflare: the Control Plane asks its API for each viewer's credentials.
+            - name: COMPUTER_TURN_CLOUDFLARE_KEY_ID
+              value: {{ .cloudflare.keyId | quote }}
+            - name: COMPUTER_TURN_TTL_SEC
+              value: {{ .ttlSeconds | default 21600 | quote }}
+            - name: COMPUTER_TURN_CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secrets.existingSecret }}
+                  key: {{ .cloudflare.apiTokenKey | default "COMPUTER_TURN_CLOUDFLARE_API_TOKEN" }}
+            {{- end }}
+            {{- if .urls }}
+            # Console viewer TURN: the Control Plane mints per-viewer credentials from coturn's shared secret.
+            - name: COMPUTER_TURN_URLS
+              value: {{ join "," .urls | quote }}
+            - name: COMPUTER_TURN_TTL_SEC
+              value: {{ .ttlSeconds | default 21600 | quote }}
+            - name: COMPUTER_TURN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.secrets.existingSecret }}
+                  key: {{ .secretKey | default "COMPUTER_TURN_SECRET" }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.computerViewer.stun.urls }}
+            # Console viewer STUN for hole punching, in place of the relays' own.
+            - name: COMPUTER_STUN_URLS
+              value: {{ join "," . | quote }}
+            {{- end }}
+          # /readyz: DB ping, 503 from SIGTERM. A 2s period lists a new pod seconds after it listens; 10 misses (~20s) ride out a DB blip.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 1
+            periodSeconds: 2
+            failureThreshold: 10
+          # liveness = "is the process alive?" — /livez is static and NEVER gated by
+          # shutdown, so the kubelet won't restart a pod that is merely draining.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          # preStop delays SIGTERM so this pod is removed from the Service endpoints
+          # first — a daemon whose socket closes (drained 1012) then reconnects to the
+          # new pod rather than racing back into this dying one. The Node slim
+          # runtime includes sh + sleep.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          resources:
+            {{- toYaml .Values.controlPlane.resources | nindent 12 }}
+          {{- if or $transferSecret $transferIdentity }}
+          volumeMounts:
+            {{- if $transferSecret }}
+            - name: source-cache-credentials
+              mountPath: /var/run/ac-source-cache
+              readOnly: true
+            {{- end }}
+            {{- if $transferIdentity }}
+            - name: source-cache-identity
+              mountPath: /var/run/ac-source-cache-identity
+              readOnly: true
+            {{- end }}
+          {{- end }}
+      {{- if or $transferSecret $transferIdentity }}
+      volumes:
+        {{- if $transferSecret }}
+        # No items: an optional session-token key need not exist in the Secret.
+        - name: source-cache-credentials
+          secret:
+            secretName: {{ $sourceCacheCredentials.secret.name }}
+            defaultMode: 0400
+        {{- end }}
+        {{- if $transferIdentity }}
+        # The bucket role's web identity for signing console transfers; the role must trust this ServiceAccount too.
+        - name: source-cache-identity
+          projected:
+            defaultMode: 0400
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: {{ $sourceCacheCredentials.serviceAccount.audience | default "sts.amazonaws.com" | quote }}
+                  expirationSeconds: 3600
+        {{- end }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentconnect.fullname" . }}-control-plane
+  labels:
+    {{- include "agentconnect.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agentconnect.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.controlPlane.port }}
+      targetPort: http
+{{- if .Values.controlPlane.podDisruptionBudget }}
+---
+# At one replica this blocks every voluntary eviction; move the CP with a completed rollout restart before draining its node.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "agentconnect.fullname" . }}-control-plane
+  labels:
+    {{- include "agentconnect.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "agentconnect.selectorLabels" (dict "ctx" . "component" "control-plane") | nindent 6 }}
+{{- end }}

@@ -1,0 +1,93 @@
+import type { ReactNode } from 'react'
+import { AzureDevOpsMark, GiteaMark, GithubMark, GitlabMark, PlatformMark } from '@/components/marks'
+import type { HookKind } from '@/lib/api'
+import { credentialAttention } from '@/lib/data'
+
+// Total over the hook kinds, so no code host inherits the webhook glyph; the webhook mark is plated so it reads on dark.
+const HOOK_KIND_MARK: Record<HookKind, ReactNode> = {
+  github: (
+    <span className="flex h-[13px] w-[13px] items-center justify-center">
+      <GithubMark fillPct={90} />
+    </span>
+  ),
+  gitlab: (
+    <span className="flex h-[13px] w-[13px] items-center justify-center">
+      <GitlabMark fillPct={90} />
+    </span>
+  ),
+  gitea: (
+    <span className="flex h-[13px] w-[13px] items-center justify-center">
+      <GiteaMark fillPct={90} />
+    </span>
+  ),
+  'azure-devops': (
+    <span className="flex h-[13px] w-[13px] items-center justify-center">
+      <AzureDevOpsMark fillPct={90} />
+    </span>
+  ),
+  webhook: <PlatformMark platform="webhook" />
+}
+
+interface IntegrationMarkSource {
+  id?: string
+  platform: string
+  revoked: boolean
+  rejected?: boolean
+}
+
+/** The corner dot on a revoked or rejected integration's mark — one shape for every platform and surface. */
+export function RevokedMarkDot() {
+  return (
+    <span
+      aria-hidden
+      data-revoked-dot
+      className="absolute -bottom-[2px] -right-[2px] z-[1] h-2 w-2 rounded-full border-[1.5px] border-(--surface-card) bg-(--status-error)"
+    />
+  )
+}
+
+export function IntegrationMarks({
+  integrations,
+  hookKinds
+}: {
+  integrations: readonly IntegrationMarkSource[]
+  hookKinds: readonly HookKind[]
+}) {
+  const distinctHookKinds = [...new Set(hookKinds)]
+  const total = integrations.length + distinctHookKinds.length
+  // Marks needing attention lead, so the three-mark cap never hides one.
+  const visibleIntegrations = [
+    ...integrations.filter(credentialAttention),
+    ...integrations.filter((i) => !credentialAttention(i))
+  ].slice(0, 3)
+  const visibleHookKinds = distinctHookKinds.slice(0, Math.max(0, 3 - visibleIntegrations.length))
+
+  if (total === 0) return null
+
+  return (
+    <span className="inline-flex min-w-0 items-center gap-2">
+      {/* `isolate` keeps the revoked dot's lift above the next overlapping mark inside this cluster. */}
+      <span className="isolate flex">
+        {visibleIntegrations.map((integration, index) => (
+          <span
+            key={integration.id ?? `${integration.platform}:${index}`}
+            className={`imark relative h-[21px] w-[21px] ${index === 0 ? '' : 'imark-overlap -ml-[7px]'}`}
+          >
+            <PlatformMark platform={integration.platform} />
+            {credentialAttention(integration) && <RevokedMarkDot />}
+          </span>
+        ))}
+        {/* No hover title: these sit beside platform marks, which carry none either. */}
+        {visibleHookKinds.map((kind, index) => (
+          <span
+            key={kind}
+            className={`imark h-[21px] w-[21px] ${visibleIntegrations.length + index === 0 ? '' : 'imark-overlap -ml-[7px]'}`}
+          >
+            {HOOK_KIND_MARK[kind]}
+          </span>
+        ))}
+      </span>
+      <span className="mono text-[12px] text-(--text-secondary)">+{total}</span>
+    </span>
+  )
+}

@@ -1,0 +1,106 @@
+// No 'use client' here: reached only from ModalProvider's tree (the client boundary).
+
+import type { WebPlatformModule } from '../contract'
+import { identityCards, inviteBotHint } from '../wizard-chrome'
+import { linearApi, type LinearApi } from './api'
+import { LinearWizardBody } from './Body'
+import { LinearWorkspaceCard, LinearWorkspaceHeaderActions, LinearWorkspaceRows } from './card'
+import { linearLinkInput } from './link'
+import { LinearMark } from './mark'
+import { LinearTeamName } from './team-name'
+import { linearSettingsFragments } from './settings'
+import { LinearTurnFacts } from './turn-facts'
+
+/** Linear's provider-native activity id: a v4 UUID. A daemon-local numeric stamp
+ *  can never match it, and neither can any other platform's id shape. */
+const LINEAR_ACTIVITY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** What the daemon joins the workspace name and the team name with (`linearChannelName`, §4.5). */
+const TEAM_LABEL_SEPARATOR = ' / '
+
+export const linearModule: WebPlatformModule<LinearApi> = {
+  platformId: 'linear',
+  integrationGroup: 'workflow',
+  docsPath: 'connect-automate/triggers-automation/linear',
+  Mark: LinearMark,
+  wizard: {
+    Body: LinearWizardBody,
+    /**
+     * Every connected workspace of the org is offered, unfenced (§7.4): the Bot row
+     * IS the workspace, `shareable: true` is structural on it, and adding a member
+     * needs no reuse fence — the CP refuses nothing the list could show. The chassis
+     * predicate already drops revoked rows and other platforms'.
+     */
+    freeBotFilter: () => true,
+    buildReuseInput: (bot, ctx) => linearLinkInput(ctx.agentId, bot.id),
+    affordances: {
+      // No transport CHOICE: `http` is the platform's single fixed transport, which
+      // is a different thing from offering two (contract: absent ⇒ fixed).
+      // Multi-agent is STRUCTURAL, not an opt-in: the provider stamps
+      // `shareable: true` on every workspace bot (§4.3), so reuse admits members
+      // while neither the wizard nor Settings offers a flag to move.
+      share: 'fixed'
+    },
+    // The pane replaces the identity chassis outright, so these two never render for
+    // Linear; the contract requires them of every module and they stay honest copy.
+    identityCards: () => identityCards('linear'),
+    // Not `inviteBotHint`: nobody invites the app to an issue. A Linear session starts
+    // by delegating the issue to the app or mentioning it, and neither is an invite.
+    inviteHint: () => inviteBotHint('issue', 'Platforms.linear.brand', true)
+  },
+  settingsFragments: linearSettingsFragments,
+  apiBindings: linearApi,
+  // What a delegation bubble folds behind "more": the issue, the team, the delegator, the description.
+  turnFacts: LinearTurnFacts,
+  // The TEAM is the channel (§4.3): one row per team, each with its dispatch default and an Off.
+  // The roster is the workspace's own, so nothing is left or dropped from here — a team goes
+  // quiet by turning its row Off, or the whole workspace by unlinking the agent.
+  channelList: {
+    roomNoun: 'team',
+    roomGlyph: '',
+    leave: 'none',
+    roster: 'derived',
+    // No `any`: every Linear event is addressed by construction (§6.1), so nothing would match it.
+    triggers: ['off', 'mention', 'decision'],
+    // A team's owner is its default seat, so By decision gates that owner per team; there is no bot router.
+    sharedDecision: 'conversation',
+    // A Linear row is a TEAM, and every issue in it is its own thread — appending would pool
+    // the whole team into one session, which is not what this setting means anywhere else.
+    sessionModes: ['createNew'],
+    // §4.3: a gated member acts in a team only as its default, so enabling the row is half the gate.
+    gatedNote: { key: 'linearGatedNote' },
+    // The daemon stores a team as "<Workspace name> / <Team name>" (§4.5), because a session list
+    // spanning every workspace needs both. These rows always sit under one workspace's own card,
+    // which already names it, so the row keeps the TEAM alone — and never the team KEY, which is
+    // an identifier rather than a label and is not in the stored name at all.
+    // A team leads with its own icon and color, the way Linear's own team picker draws it.
+    // …and prints its key after the name, off the row's own field, with the name linking to
+    // the team in Linear — neither is ever read back out of the label.
+    RowName: LinearTeamName,
+    splitRowLabel: (label) => {
+      const at = label.indexOf(TEAM_LABEL_SEPARATOR)
+      if (at < 0) return { name: label }
+      const team = label.slice(at + TEAM_LABEL_SEPARATOR.length).trim()
+      return team ? { name: team } : { name: label }
+    },
+    // §6.2: the default seat IS a gated agent's grant, and a Linear AgentSession has one writer (§4.6).
+    ownerChangeWarning: {
+      title: { key: 'ownerChange.title' },
+      body: { key: 'ownerChange.body' },
+      confirmLabel: { key: 'ownerChange.confirmLabel' }
+    }
+  },
+  // The host header names the workspace and unlinks it; the module adds Reconnect there and
+  // mounts the generic list of team rows beneath, both reading one card-scoped round trip.
+  agentCard: {
+    CardProvider: LinearWorkspaceCard,
+    HeaderActions: LinearWorkspaceHeaderActions,
+    Body: LinearWorkspaceRows
+  },
+  // Agent activities are append-only rows with their own ids (§15), so a duplicate
+  // across sources is the same activity; anything else never dedupes.
+  messageIdentity: (row) => (LINEAR_ACTIVITY_ID.test(row.ts) ? `ts:${row.ts}` : null),
+  // Linear rows arrive over one relay-terminated ingress in daemon `seq` order and
+  // carry no provider send-time the display must follow.
+  transcriptOrdering: 'seq'
+}

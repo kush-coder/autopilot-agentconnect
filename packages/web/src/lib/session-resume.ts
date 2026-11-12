@@ -1,0 +1,62 @@
+export type SessionResumeState = 'available' | 'checking' | 'unavailable'
+
+export interface SessionResumeMember {
+  agentId: string
+  /** Daemon that recorded this session's content. */
+  daemonId: string | null | undefined
+  /** The set whose shared store the content went to (the pool, or a group on one `postgres` store); null/absent ⇒ the recorder's private store. */
+  contentSetId?: string | null
+}
+
+/** Where a participant agent is placed NOW — the one machine of a `daemon` placement, or the set and, for an org's own group, the member holding it. */
+export interface SessionResumePlacement {
+  daemonId?: string | null
+  setId?: string | null
+  holderDaemonId?: string | null
+}
+
+/** Conversation members still on the live roster (§3.1a): a removed member keeps its transcript but no longer gates resume. */
+export function liveResumeMembers<T extends { agentId: string }>(
+  members: readonly T[] | null | undefined,
+  liveRoster: readonly { agentId: string }[] | null | undefined
+): readonly T[] | undefined {
+  if (!members) return undefined
+  if (!liveRoster) return members
+  const live = new Set(liveRoster.map((p) => p.agentId))
+  return members.filter((member) => live.has(member.agentId))
+}
+
+/**
+ * Select the ownership rows used by the resume gate. A session route may still
+ * represent a multi-agent conversation (notably the diagnostic `view=flat`
+ * route), so resolved conversation membership takes precedence over the
+ * selected session. While that lookup is pending, fail closed.
+ */
+export function sessionResumeMembers(
+  conversationMembers: readonly SessionResumeMember[] | null | undefined,
+  currentSession: SessionResumeMember | null,
+  lookupRequired: boolean,
+  lookupPending: boolean
+): readonly SessionResumeMember[] | null {
+  if (lookupPending) return null
+  if (conversationMembers?.length) return conversationMembers
+  if (lookupRequired) return []
+  return currentSession ? [currentSession] : null
+}
+
+/** Resumable only while every participant's CURRENT placement still reaches its content: a `daemon` placement or a group's holder must be the recorder (moves copy nothing), a set placement needs the content in that set's shared store (`contentSetId`) — no member id survives a rollout; the server still checks the member it reaches holds that store. `null` members = still loading; anything missing fails closed. */
+export function sessionResumeState(
+  members: readonly SessionResumeMember[] | null,
+  placementByAgent: ReadonlyMap<string, SessionResumePlacement | undefined>
+): SessionResumeState {
+  if (members === null) return 'checking'
+  if (members.length === 0) return 'unavailable'
+  return members.every((member) => {
+    const placement = placementByAgent.get(member.agentId)
+    if (!placement) return false
+    if (member.daemonId && (placement.daemonId ?? placement.holderDaemonId) === member.daemonId) return true
+    return Boolean(member.contentSetId) && placement.setId === member.contentSetId
+  })
+    ? 'available'
+    : 'unavailable'
+}

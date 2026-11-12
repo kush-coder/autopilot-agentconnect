@@ -1,0 +1,535 @@
+/**
+ * The platform tools that CHANGE something without posting a message: reactions,
+ * conversation creation, scheduled sends, and canvases.
+ *
+ * They act on THIS session's platform only — `integrationId` may pick another of the agent's
+ * bots there, resolved against the trusted session snapshot, never tool input — and are
+ * gated by a port the platform DECLARES rather than by its name: injected for a session on
+ * a declaring platform, absent everywhere else. What is different is the failure mode: a read
+ * that finds nothing is an empty list, while these either did the thing or did not, so each one
+ * lets the platform's own refusal (`missing_scope`, `name_taken`, `not_in_channel`) reach the agent verbatim.
+ *
+ * Body posts use message delivery or the platform session tools' fenced publication boundary.
+ */
+import { z } from 'zod'
+import type { PlatformCanvasEdit } from '../../platforms/contract.js'
+import { platformLabel } from '../../platforms/read-ports.js'
+import { EPHEMERAL_RESULT_NOTE } from '../../session/ephemeral-results.js'
+import type { SessionContext } from './context.js'
+import { askOnlyWithChannel, resolveGatewayForPlatform, type GatewayDeps } from './gateway.js'
+import type { WriteTarget } from './place-gate.js'
+import { optionalBoolean, optionalBoundedInt, optionalString, parseArgs, requiredEnum, requiredString } from './args.js'
+
+/** Slack's own bounds on a scheduled send, and the only ones any platform states. */
+const MIN_SCHEDULE_LEAD_MS = 2 * 60 * 1000
+const MAX_SCHEDULE_HORIZON_MS = 120 * 24 * 60 * 60 * 1000
+
+const botSelector = { integrationId: optionalString('integrationId') }
+
+export const ADD_REACTION_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  messageTs: requiredString('messageTs'),
+  emoji: requiredString('emoji')
+})
+
+export const GET_REACTIONS_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  messageTs: requiredString('messageTs')
+})
+
+export const DELETE_MESSAGE_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  messageTs: requiredString('messageTs')
+})
+
+export const CREATE_CONVERSATION_ARGS = z.object({
+  ...botSelector,
+  name: optionalString('name'),
+  isPrivate: optionalBoolean('isPrivate'),
+  users: z.array(requiredString('users')).max(100, 'users accepts at most 100 ids').optional()
+})
+
+export const SCHEDULE_MESSAGE_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  message: requiredString('message'),
+  postAt: requiredString('postAt')
+})
+
+export const LIST_BOOKMARKS_ARGS = z.object({ ...botSelector, channel: optionalString('channel') })
+
+export const ADD_BOOKMARK_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  title: requiredString('title'),
+  link: requiredString('link'),
+  emoji: optionalString('emoji')
+})
+
+export const REMOVE_BOOKMARK_ARGS = z.object({
+  ...botSelector,
+  channel: optionalString('channel'),
+  bookmarkId: requiredString('bookmarkId')
+})
+
+export const READ_LIST_ARGS = z.object({
+  ...botSelector,
+  listId: requiredString('listId'),
+  cursor: optionalString('cursor'),
+  limit: optionalBoundedInt('limit', 1, 200)
+})
+
+const listFields = z
+  .array(
+    z.object({
+      columnId: requiredString('columnId'),
+      type: requiredString('type'),
+      value: z.unknown()
+    }),
+    'fields must be an array of { columnId, type, value }'
+  )
+  .min(1, 'fields must name at least one column')
+
+export const ADD_LIST_ITEM_ARGS = z.object({
+  ...botSelector,
+  listId: requiredString('listId'),
+  fields: listFields
+})
+
+export const UPDATE_LIST_ITEM_ARGS = z.object({
+  ...botSelector,
+  listId: requiredString('listId'),
+  itemId: requiredString('itemId'),
+  fields: listFields
+})
+
+/** `searchPublicMessages` arguments — no platform, integration, or channel selector. Not because the
+ *  search is scoped to one conversation (it is not: a bot search covers the workspace's PUBLIC
+ *  channels) but because none of those selectors would mean anything. The session decides the
+ *  gateway and the credential, and the provider honours no channel narrowing at all. */
+export const SEARCH_PUBLIC_MESSAGES_ARGS = z.object({
+  query: requiredString('query'),
+  limit: optionalBoundedInt('limit', 1, 20),
+  cursor: optionalString('cursor'),
+  includeBots: optionalBoolean('includeBots'),
+  after: optionalString('after'),
+  before: optionalString('before')
+})
+
+export const CREATE_CANVAS_ARGS = z.object({
+  ...botSelector,
+  title: requiredString('title').max(255, 'title must be at most 255 characters'),
+  markdown: requiredString('markdown'),
+  channel: optionalString('channel')
+})
+
+export const READ_CANVAS_ARGS = z.object({ ...botSelector, canvasId: requiredString('canvasId') })
+
+export const UPDATE_CANVAS_ARGS = z.object({
+  ...botSelector,
+  canvasId: requiredString('canvasId'),
+  edits: z
+    .array(
+      z.object({
+        operation: requiredEnum('operation', [
+          'replace',
+          'insert_at_start',
+          'insert_at_end',
+          'insert_before',
+          'insert_after',
+          'delete'
+        ]),
+        sectionId: optionalString('sectionId'),
+        markdown: optionalString('markdown')
+      })
+    )
+    .min(1, 'edits must contain at least one change')
+    .max(20, 'edits accepts at most 20 changes')
+})
+
+/** These tools need only the live gateway; the reads' history fallbacks do not apply. */
+export interface PlatformActionDeps extends GatewayDeps {
+  /** The triggering message's `msgId`, or undefined for a turn no inbound message started (a
+   *  cron wake, an agent-to-agent wake, a turn resumed after a restart). Only search needs it:
+   *  the credential it stands for never leaves the platform adapter, because `entry.msg` is
+   *  persisted to the durable inbox and replayed. */
+  searchOrigin?: (ctx: SessionContext) => string | undefined
+  /** The write rule (assistant-mode.md §5.5), set per call by the dispatcher: a write passes it once its target is resolved, before anything is written. */
+  judgeWrite?: (target: WriteTarget) => Promise<unknown>
+}
+
+/** Resolve the target gateway plus the channel the call acts on, with the current
+ *  conversation's channel defaulting in only for this session's own bot — another bot has no
+ *  meaningful "current channel", exactly as `listChannelMembers` has it. */
+function resolveTarget(
+  ctx: SessionContext,
+  deps: PlatformActionDeps,
+  parsed: { integrationId?: string; channel?: string },
+  what: string
+) {
+  const platform = ctx.platform
+  const { gw, sameConvo, integrationId } = resolveGatewayForPlatform(
+    ctx,
+    deps,
+    platform,
+    parsed.integrationId,
+    askOnlyWithChannel(parsed.channel, what)
+  )
+  const channel = parsed.channel ?? (sameConvo ? ctx.channel : undefined)
+  if (!channel) throw new Error(`channel is required to ${what} on ${platform} (another bot than this session's)`)
+  return { platform, gw, channel, integrationId }
+}
+
+/** A write into one conversation on the resolved bot passes the write rule. */
+async function judgeConversation(
+  deps: PlatformActionDeps,
+  platform: string,
+  integrationId: string,
+  channel: string
+): Promise<void> {
+  await deps.judgeWrite?.({ kind: 'conversation', platform, integrationId, channel })
+}
+
+/** The refusal every handler here gives when the resolved connection lacks the facet the
+ *  registry promised — a bot that is up but on a build or transport without it. */
+function unsupported(platform: string, what: string): Error {
+  return new Error(`${what} is unavailable on this ${platformLabel(platform)} connection`)
+}
+
+export async function addReaction(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(ADD_REACTION_ARGS, args)
+  const { platform, gw, channel, integrationId } = resolveTarget(ctx, deps, parsed, 'react to a message')
+  await judgeConversation(deps, platform, integrationId, channel)
+  if (!gw.addReaction) throw unsupported(platform, 'reactions')
+  // Slack takes the shortcode bare; a model that wrapped it in colons meant the same thing.
+  const emoji = parsed.emoji.replace(/^:|:$/g, '')
+  await gw.addReaction(channel, parsed.messageTs, emoji)
+  return { platform, channel, messageTs: parsed.messageTs, emoji, added: true }
+}
+
+export async function getReactions(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(GET_REACTIONS_ARGS, args)
+  const { platform, gw, channel } = resolveTarget(ctx, deps, parsed, 'read reactions')
+  if (!gw.getReactions) throw unsupported(platform, 'reactions')
+  return { platform, channel, messageTs: parsed.messageTs, reactions: await gw.getReactions(channel, parsed.messageTs) }
+}
+
+/** Retire one message. Best-effort by contract: a platform refuses a message that is too old
+ *  or not the bot's own, and that refusal is `deleted: false`, not a thrown error. */
+export async function deleteMessage(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(DELETE_MESSAGE_ARGS, args)
+  const { platform, gw, channel, integrationId } = resolveTarget(ctx, deps, parsed, 'delete a message')
+  await judgeConversation(deps, platform, integrationId, channel)
+  if (!gw.deleteMessage) throw unsupported(platform, 'message deletion')
+  const deleted = await gw.deleteMessage(channel, parsed.messageTs)
+  return { platform, channel, messageTs: parsed.messageTs, deleted }
+}
+
+/**
+ * The conversation a bookmark tool acts on.
+ *
+ * `ctx.channel` is a default ONLY for this session's own integration. A call that picks another
+ * bot by `integrationId` may not be in this channel at all, and handing it the id just fails
+ * with `channel_not_found` — the shared selector contract already says another bot must name
+ * its channel, and `sameConvo` is how the resolver reports it.
+ */
+function bookmarkChannel(ctx: SessionContext, named: string | undefined, sameConvo: boolean): string {
+  if (named) return named
+  if (!sameConvo) throw new Error('channel is required when the bookmark is on another bot')
+  return ctx.channel
+}
+
+export async function listBookmarks(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(LIST_BOOKMARKS_ARGS, args)
+  const platform = ctx.platform
+  const { gw, sameConvo } = resolveGatewayForPlatform(
+    ctx,
+    deps,
+    platform,
+    parsed.integrationId,
+    askOnlyWithChannel(parsed.channel, 'list the bookmarks of this channel')
+  )
+  if (!gw.listBookmarks) throw unsupported(platform, 'bookmarks')
+  const channel = bookmarkChannel(ctx, parsed.channel, sameConvo)
+  return { platform, channel, bookmarks: await gw.listBookmarks(channel) }
+}
+
+export async function addBookmark(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(ADD_BOOKMARK_ARGS, args)
+  const platform = ctx.platform
+  const { gw, sameConvo, integrationId } = resolveGatewayForPlatform(
+    ctx,
+    deps,
+    platform,
+    parsed.integrationId,
+    askOnlyWithChannel(parsed.channel, 'add this bookmark')
+  )
+  if (!gw.addBookmark) throw unsupported(platform, 'bookmarks')
+  const channel = bookmarkChannel(ctx, parsed.channel, sameConvo)
+  await judgeConversation(deps, platform, integrationId, channel)
+  const bookmark = await gw.addBookmark(channel, {
+    title: parsed.title,
+    link: parsed.link,
+    ...(parsed.emoji ? { emoji: parsed.emoji } : {})
+  })
+  return { platform, channel, bookmark }
+}
+
+export async function removeBookmark(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(REMOVE_BOOKMARK_ARGS, args)
+  const platform = ctx.platform
+  const { gw, sameConvo, integrationId } = resolveGatewayForPlatform(
+    ctx,
+    deps,
+    platform,
+    parsed.integrationId,
+    askOnlyWithChannel(parsed.channel, 'remove this bookmark')
+  )
+  if (!gw.removeBookmark) throw unsupported(platform, 'bookmarks')
+  const channel = bookmarkChannel(ctx, parsed.channel, sameConvo)
+  await judgeConversation(deps, platform, integrationId, channel)
+  await gw.removeBookmark(channel, parsed.bookmarkId)
+  return { platform, channel, removed: parsed.bookmarkId }
+}
+
+export async function readList(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(READ_LIST_ARGS, args)
+  const platform = ctx.platform
+  const { gw } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'read this list'
+  })
+  if (!gw.readList) throw unsupported(platform, 'lists')
+  const page = await gw.readList(parsed.listId, {
+    ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+    ...(parsed.limit !== undefined ? { limit: parsed.limit } : {})
+  })
+  return { platform, listId: parsed.listId, ...page }
+}
+
+export async function addListItem(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(ADD_LIST_ITEM_ARGS, args)
+  const platform = ctx.platform
+  const { gw, integrationId } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'add this list item'
+  })
+  if (!gw.addListItem) throw unsupported(platform, 'lists')
+  await deps.judgeWrite?.({ kind: 'document', platform, integrationId, documentId: parsed.listId })
+  return { platform, listId: parsed.listId, item: await gw.addListItem(parsed.listId, parsed.fields) }
+}
+
+export async function updateListItem(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(UPDATE_LIST_ITEM_ARGS, args)
+  const platform = ctx.platform
+  const { gw, integrationId } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'update this list item'
+  })
+  if (!gw.updateListItem) throw unsupported(platform, 'lists')
+  await deps.judgeWrite?.({ kind: 'document', platform, integrationId, documentId: parsed.listId })
+  await gw.updateListItem(parsed.listId, parsed.itemId, parsed.fields)
+  return { platform, listId: parsed.listId, itemId: parsed.itemId, updated: true }
+}
+
+/** Epoch seconds from an ISO-8601 instant, or a refusal the agent can repair from. */
+function epochSecondsFrom(key: string, value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  const at = Date.parse(value)
+  if (Number.isNaN(at)) throw new Error(`${key} is not an ISO-8601 instant: ${value}`)
+  return Math.floor(at / 1000)
+}
+
+/**
+ * Search the workspace's PUBLIC channels, using this session's gateway and the credential the
+ * turn's own message carries.
+ *
+ * The current conversation selects the gateway and the credential; it does NOT bound the search
+ * space. An earlier revision filtered results to it and had to be reverted: a bot cannot search
+ * a private channel or DM at all, so the filter returned an empty list wherever the agent was
+ * actually being talked to. Do not reintroduce it — the fix for "search this conversation" is a
+ * different mechanism, not a filter over this one.
+ */
+export async function searchPublicMessages(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(SEARCH_PUBLIC_MESSAGES_ARGS, args)
+  const gw = ctx.integrationId ? deps.gatewayFor(ctx.integrationId) : undefined
+  if (!gw) throw new Error(`no live platform connection for integration ${ctx.integrationId ?? '(none)'}`)
+  if (!gw.searchPublicMessages) throw unsupported(ctx.platform, 'message search')
+  const after = epochSecondsFrom('after', parsed.after)
+  const before = epochSecondsFrom('before', parsed.before)
+  const results = await gw.searchPublicMessages(
+    parsed.query,
+    {
+      channel: ctx.channel,
+      ...(parsed.limit !== undefined ? { limit: parsed.limit } : {}),
+      ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+      ...(parsed.includeBots !== undefined ? { includeBots: parsed.includeBots } : {}),
+      ...(after !== undefined ? { after } : {}),
+      ...(before !== undefined ? { before } : {})
+    },
+    deps.searchOrigin?.(ctx)
+  )
+  // NO channel filter. An earlier revision bound the result to this conversation, which the
+  // measurements killed: a bot search reaches only PUBLIC channels, so in the DM or private
+  // channel where an agent is most often talked to, filtering to the current conversation
+  // returned an empty list every time. Workspace-wide public search is what this API is, and
+  // the tool says so rather than filtering a truthful answer down to nothing.
+  // Slack forbids storing what this API returns, so the result is STAMPED: the transcript
+  // recorder redacts a body carrying the marker, and the note tells the agent the same rule
+  // applies to it — do not copy these hits into memory, a canvas, or a file. First key on
+  // purpose, so a runtime that truncates a long echo still carries the marker.
+  return { policy: EPHEMERAL_RESULT_NOTE, platform: ctx.platform, query: parsed.query, ...results }
+}
+
+export async function createConversation(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(CREATE_CONVERSATION_ARGS, args)
+  const platform = ctx.platform
+  // ABOVE THE ASK: an argument no bot can repair must not cost a human a card and one of the two rounds the bridge allows, only to give the same message it always gave.
+  const users = parsed.users ?? []
+  if (!parsed.name && users.length === 0) throw new Error('pass `name` to create a channel, or `users` to open a DM')
+  if (!parsed.name && parsed.isPrivate !== undefined)
+    throw new Error('`isPrivate` describes a channel; drop it, or pass `name` to create one')
+  const { gw, integrationId } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'create this conversation'
+  })
+  if (!gw.createConversation) throw unsupported(platform, 'creating conversations')
+  await deps.judgeWrite?.({ kind: 'new', platform, integrationId, users })
+  const conversation = await gw.createConversation({
+    ...(parsed.name ? { name: parsed.name } : {}),
+    ...(parsed.isPrivate !== undefined ? { isPrivate: parsed.isPrivate } : {}),
+    ...(users.length > 0 ? { users } : {})
+  })
+  return { platform, conversation }
+}
+
+export async function scheduleMessage(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(SCHEDULE_MESSAGE_ARGS, args)
+  // ABOVE THE ASK: `postAt` is the same argument whichever bot the human names, so it must not cost them a card to be told it is unusable. Both bounds are the platform's, checked here so the agent gets a repairable message instead of a bare `time_in_past` / `time_too_far` from the provider.
+  const at = Date.parse(parsed.postAt)
+  if (Number.isNaN(at)) throw new Error(`postAt is not an ISO-8601 instant: ${parsed.postAt}`)
+  const lead = at - Date.now()
+  if (lead < MIN_SCHEDULE_LEAD_MS) throw new Error('postAt must be at least 2 minutes in the future')
+  if (lead > MAX_SCHEDULE_HORIZON_MS) throw new Error('postAt must be at most 120 days in the future')
+  const postAt = Math.floor(at / 1000)
+  const { platform, gw, channel, integrationId } = resolveTarget(ctx, deps, parsed, 'schedule a message')
+  await judgeConversation(deps, platform, integrationId, channel)
+  if (!gw.scheduleMessage) throw unsupported(platform, 'scheduled messages')
+  const scheduled = await gw.scheduleMessage(channel, parsed.message, postAt)
+  return { platform, ...scheduled, postAtIso: new Date(postAt * 1000).toISOString() }
+}
+
+export async function createCanvas(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(CREATE_CANVAS_ARGS, args)
+  const platform = ctx.platform
+  const { gw, integrationId } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'create this canvas'
+  })
+  if (!gw.createCanvas) throw unsupported(platform, 'canvases')
+  await deps.judgeWrite?.(
+    parsed.channel
+      ? { kind: 'conversation', platform, integrationId, channel: parsed.channel }
+      : { kind: 'new', platform, integrationId, users: [] }
+  )
+  return { platform, canvas: await gw.createCanvas(parsed.title, parsed.markdown, parsed.channel) }
+}
+
+export async function readCanvas(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(READ_CANVAS_ARGS, args)
+  const platform = ctx.platform
+  const { gw } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'read this canvas'
+  })
+  if (!gw.readCanvas) throw unsupported(platform, 'canvases')
+  return { platform, canvas: await gw.readCanvas(parsed.canvasId) }
+}
+
+export async function updateCanvas(
+  ctx: SessionContext,
+  args: Record<string, unknown>,
+  deps: PlatformActionDeps
+): Promise<unknown> {
+  const parsed = parseArgs(UPDATE_CANVAS_ARGS, args)
+  const platform = ctx.platform
+  // ABOVE THE ASK, and rejected here rather than at the provider: an anchored edit with no section, or a content edit with no body, is a mistake the agent can fix from the message — and no bot the human could name would fix it, so it must not cost them a card first.
+  const edits: PlatformCanvasEdit[] = parsed.edits.map((edit) => {
+    const anchored = edit.operation === 'insert_before' || edit.operation === 'insert_after'
+    if ((anchored || edit.operation === 'delete') && !edit.sectionId)
+      throw new Error(`${edit.operation} needs a sectionId from readCanvas`)
+    if (edit.operation !== 'delete' && !edit.markdown) throw new Error(`${edit.operation} needs markdown`)
+    return {
+      operation: edit.operation,
+      ...(edit.sectionId ? { sectionId: edit.sectionId } : {}),
+      ...(edit.markdown ? { markdown: edit.markdown } : {})
+    }
+  })
+  const { gw, integrationId } = resolveGatewayForPlatform(ctx, deps, platform, parsed.integrationId, {
+    ask: true,
+    purpose: 'update this canvas'
+  })
+  if (!gw.updateCanvas) throw unsupported(platform, 'canvases')
+  await deps.judgeWrite?.({ kind: 'document', platform, integrationId, documentId: parsed.canvasId })
+  await gw.updateCanvas(parsed.canvasId, edits)
+  return { platform, canvasId: parsed.canvasId, applied: edits.length }
+}

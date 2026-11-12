@@ -1,0 +1,4327 @@
+import { CodeHostFeedbackService } from './codehost/feedback.service.js'
+import { GitlabFeedbackProvider } from './gitlab/feedback-provider.js'
+import { GiteaFeedbackProvider } from './gitea/feedback-provider.js'
+import { parseGiteaVersion } from './gitea/version.js'
+import { PgDecisionRepo } from './persistence/repositories/decision.repo.js'
+import { PgBotDecisionRoutingRepo } from './persistence/repositories/bot-decision-routing.repo.js'
+import { PgCodeHostDecisionRoutingRepo } from './persistence/repositories/code-host-decision-routing.repo.js'
+import { HookRoutingService } from './hooks/hook-routing.service.js'
+import { PgAgentMemoryTransactionRepo } from './persistence/repositories/agent-memory-transaction.repo.js'
+import { AgentMemoryTransactionService } from './agent-memory/transaction.service.js'
+/**
+ * `container.ts` — the composition root (design §2.4).
+ *
+ * Manual DI, no framework: `buildContainer(config, clock, secretsProvider)`
+ * constructs the whole graph bottom-up — repos → services (C3/C4/C5) → the two
+ * edges (C2 HTTP, daemon WS) — and returns the wired pieces `app.ts` exposes.
+ * Explicit wiring keeps the eventual Go-split boundary visible and every arg
+ * swappable for a fake (the test harnesses in `test/fakes/*` assemble the SAME
+ * graph with the `Prisma`/`Clock`/`Transport`/`SecretsProvider` seams faked).
+ *
+ * This is the ONLY place outside `persistence/` aware of the concrete repo
+ * classes; services and edges below it see only ports.
+ */
+import type { FastifyInstance, FastifyServerOptions } from 'fastify'
+import type { PrismaClient } from './generated/prisma/client.js'
+import type { WebSocketServer } from 'ws'
+import {
+  DUTY_GRANT_MEMBERS_MAX,
+  HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
+  codeHostHookMetadataOf,
+  WORKSPACE_SESSION_READ_FEATURE,
+  PROVIDER_CREDENTIALS_V1_FEATURE,
+  AGENT_MODEL_PROVIDER_FEATURE,
+  FOLLOW_UP_WATCH_FEATURE,
+  GITHUB_APP_WEBHOOK_V1_FEATURE,
+  COMPUTER_WS_PUBLIC_PATH,
+  WECOM_PLATFORM
+} from '@agentconnect.md/protocol'
+
+import { type AppConfig, resolveWebAppUrl } from './config/env.js'
+import { resolveGithubAppConfig } from './github/config.js'
+import { resolveGitlabAppConfig } from './gitlab/config.js'
+import { GitlabApiClient, gitlabCurrentUser, type FetchLike as GitlabFetchLike } from './gitlab/api.js'
+import { resolveCommitAuthors } from './codehost/commit-authors.js'
+import { GitlabOauthService } from './gitlab/oauth.service.js'
+import { DELETION_PENDING_REASON, GitlabAccountService } from './gitlab/account.service.js'
+import { GitlabProvisioner } from './gitlab/provisioner.js'
+import { GitlabGitcredService } from './gitlab/gitcred.service.js'
+import { resolveGitlabSkillSourceProjects } from './orchestrator/skillSource.js'
+import { GitlabCredentialRotator } from './gitlab/rotator.js'
+import { GitlabRetirementSweeper } from './gitlab/retirement-sweeper.js'
+import { GitlabConvergeSweeper } from './gitlab/converge-sweeper.js'
+import { GitlabMembershipAuthzService } from './gitlab/membership-authz.service.js'
+import { CodeHostReviewBrokerService } from './codehost/review-lease.service.js'
+import { unionGitlabWebhookEvents } from './gitlab/webhook-events.js'
+import { resolveGiteaInstanceConfig } from './gitea/config.js'
+import { GiteaApiClient, type FetchLike as GiteaFetchLike } from './gitea/api.js'
+import { GiteaConnectionService } from './gitea/connection.service.js'
+import { GiteaProvisioner } from './gitea/provisioner.js'
+import { GiteaBindingService } from './gitea/binding.service.js'
+import { GiteaConvergeSweeper } from './gitea/converge-sweeper.js'
+import { GiteaGitcredService } from './gitea/gitcred.service.js'
+import { AzureDevOpsApiClient, readMicrosoftUser, type FetchLike as AzureDevOpsFetchLike } from './azure-devops/api.js'
+import { AzureDevOpsTokenCache } from './azure-devops/token-cache.js'
+import { AzureDevOpsConnectionService, azureDevOpsSecretFingerprint } from './azure-devops/connection.service.js'
+import { AzureDevOpsUserAuthzService } from './azure-devops/user-authz.js'
+import { AzureDevOpsBindingService } from './azure-devops/binding.service.js'
+import { AzureDevOpsGitcredService } from './azure-devops/gitcred.service.js'
+import { AzureDevOpsRepositoryGrantReattestor } from './azure-devops/repository-grant-reattestor.js'
+import { AzureDevOpsConnectFlowService } from './azure-devops/connect-flow.service.js'
+import { AzureDevOpsHookService } from './azure-devops/hook.service.js'
+import { azureDevOpsReviewPublisher } from './azure-devops/review-publisher.js'
+import { AzureDevOpsHookSweeper } from './azure-devops/hook-sweeper.js'
+import { AzureDevOpsMembershipAuthzService } from './azure-devops/membership-authz.service.js'
+import { AzureDevOpsUserIdentityService } from './azure-devops/user-identity.js'
+import { PgAzureDevOpsUserIdentityStore } from './persistence/repositories/azure-devops-user-identity.repo.js'
+import { azureDevOpsConnectKeys } from './azure-devops/connect.js'
+import { GiteaStatusCoordinator, GiteaStatusReporter } from './gitea/status-projection.js'
+import { AzureDevOpsStatusCoordinator, AzureDevOpsStatusReporter } from './azure-devops/status-projection.js'
+import { GiteaMembershipAuthzService } from './gitea/membership-authz.service.js'
+import { unionGiteaWebhookEvents } from './gitea/webhook-events.js'
+import { resolveSlackPlatformAppConfig } from './config/slack-platform.js'
+import { resolveFeishuPlatformApps } from './config/feishu-platform.js'
+import { resolveLinearPlatformAppConfig } from './config/linear-platform.js'
+import { resolveGoogleChatPlatformAppConfig } from './config/google-chat-platform.js'
+import { relayDeploymentSnapshot } from './config/deployment.js'
+import type { FetchLike } from './github/api.js'
+import { ConnectorsClient, parseBlocklist, parseWhitelist } from './connectors/index.js'
+import { GithubService } from './github/service.js'
+import { GithubAppRegistry } from './github/app-registry.js'
+import { GithubAppsService } from './github/apps.service.js'
+import { GithubAppOwnersService } from './github/app-owners.js'
+import { agentGithubScope } from './github/agent-scope.js'
+import { RepoCandidatesService } from './github/repo-candidates.js'
+import { GithubInstallationDoorbell } from './github/installation-doorbell.service.js'
+import { GithubCommentAuthzService } from './github/comment-authz.service.js'
+import { GithubRerequestService } from './github/rerequest.service.js'
+import { GithubReviewBrokerService } from './github/review-broker.service.js'
+import { PullRequestViewService } from './github/pull-request-view.service.js'
+import { SessionPullRequestLinkService } from './github/session-pull-request-link.service.js'
+import { SessionPullRequestFeedbackService } from './codehost/session-pull-request-feedback.service.js'
+import { FollowUpWatchService } from './codehost/follow-up-watch.service.js'
+import { CapabilityRequestService } from './capability/capability-request.service.js'
+import { gitlabHostOf, repoCapabilityFacts } from './capability/capability-facts.js'
+import { githubFollowUpWatchProvider } from './github/follow-up-watch.js'
+import { gitlabFollowUpWatchProvider } from './gitlab/follow-up-watch.js'
+import { GithubRunCoordinator, GithubRunReporter } from './github/run-reporter.js'
+import { CodeHostNoteProjectionService } from './codehost/note-projection.service.js'
+import { githubHookRunSubject } from './github/hook-run-subject.js'
+import { githubProjectionIntent } from './github/projection-intent.js'
+import { HookRedeliveryReconciler } from './orchestrator/hookRedeliveryReconciler.js'
+import { LogtoIdentityService, resolveLogtoMgmtConfig } from './github/logto-identity.js'
+import { GithubRepoIdentityService } from './github/repo-identity.js'
+import { GithubUserAuthzService } from './github/user-authz.js'
+import { RepositoryGrantReattestor, strictRepoAccessLookups } from './github/repository-grant-reattestor.js'
+import { type Clock, systemClock } from './domain/clock.js'
+import { K8sHttp } from '@agentconnect.md/k8s-client'
+import { PgDaemonAdmissionRepo } from './persistence/repositories/daemon-admission.repo.js'
+import { ClusterDaemonIdentityService, ClusterWorkloadIdentityService, loadClusterAccess } from './cluster/index.js'
+
+import {
+  PgDaemonRepo,
+  PgDaemonLifecycleOpRepo,
+  PgApiKeyRepo,
+  PgOAuthRepo,
+  PgRelayRepo,
+  PgAgentRepo,
+  PgAgentSecretStore,
+  PgProviderKeyStore,
+  PgAgentConfigWriter,
+  PgMemoryConnectionWriter,
+  PgAssignmentRepo,
+  PgSessionRepo,
+  PgSessionPullRequestFeedbackRepo,
+  PgFollowUpWatchRepo,
+  PgCapabilityRequestRepo,
+  PgSessionUsageRepo,
+  PgAgentApiEntryRepo,
+  PgWebchatConversationRepo,
+  PgAhpSessionBindingRepo,
+  PgWebchatMcpDelegationRepo,
+  PgWebchatMcpAccessGrantRepo,
+  PgWebchatMcpOperationRepo,
+  PgLaunchRepo,
+  PgSecretLeaseRepo,
+  PgUploadTicketRepo,
+  PgIntegrationRepo,
+  PgIntegrationChannelRepo,
+  PgBotRepo,
+  PgBotSecretStore,
+  PgBotCredentialWriter,
+  PgMcpProviderRepo,
+  PgMcpProviderSecretStore,
+  PgMcpGrantRepo,
+  PgMcpProviderOauthRepo,
+  PgMcpProviderOauthSecretStore,
+  PgMcpProviderOauthStateStore,
+  PgSkillSourceRepo,
+  PgComputerRepo,
+  PgComputerLeaseRepo,
+  PgComputerAuditRepo,
+  PgComputerScreenshotRepo,
+  PgComputerUsageRepo,
+  PgAgentSkillSourceStatusRepo,
+  PgOrganizationKnowledgeRepo,
+  PgOrganizationRecordRepo,
+  PgOrganizationEnvironmentRepo,
+  PgOrganizationEnvironmentResolver,
+  PgOrganizationEnvironmentSecretStore,
+  PgMemoryPluginInstallationRepo,
+  PgExternalMemoryConnectionRepo,
+  PgExternalMemoryConnectionSecretStore,
+  PgExternalMemoryGrantRepo,
+  PgAgentMemoryFileRepo,
+  PgAgentMemoryStoreOperationRepo,
+  PgAgentMemoryHistoryRepo,
+  PgThreadAffinityStore,
+  PgSlackInstallStore,
+  PgSlackPlatformInstallStore,
+  PgSlackWorkspaceInstallStore,
+  PgFeishuAppRegistrationStore,
+  PgWechatPendingLoginStore,
+  PgMsTeamsAgentBotRequestStore,
+  PgSlackUserConfigStore,
+  PgLinearTokenStore,
+  PgLinearInstallStateStore,
+  PgPresetAgentStore,
+  PresetAgentBackfill,
+  PgGithubInstallationRepo,
+  PgGithubInstallStateStore,
+  PgGithubAppRepo,
+  PgGithubAppSecretStore,
+  PgAgentRepoAuthorizationRepo,
+  PgAgentInstallationAuthorizationRepo,
+  PgCodeHostRepositoryRepo,
+  PgCodeHostTrustedActorRepo,
+  PgCodeHostRunProjectionRepo,
+  PgGitlabConnectionRepo,
+  PgGitlabAgentAccountRepo,
+  PgGitlabProjectBindingRepo,
+  PgGitlabConnectionSecretStore,
+  PgGitlabProjectCredentialRepo,
+  PgGitlabProjectCredentialSecretStore,
+  PgGitlabWebhookSecretStore,
+  PgGitlabInstanceStateStore,
+  PgGitlabOauthStateStore,
+  PgGiteaConnectionRepo,
+  PgGiteaConnectionSecretStore,
+  PgGiteaRepositoryBindingRepo,
+  PgGiteaWebhookSecretStore,
+  PgAzureDevOpsConnectionRepo,
+  PgAzureDevOpsConnectionSecretStore,
+  PgAzureDevOpsHookRepo,
+  PgAzureDevOpsRepositoryBindingRepo,
+  PgCodeHostReviewLeaseRepo,
+  PgSocialIdentityMutationGate,
+  PgGithubRepoIdentityStore,
+  PgCronRepo,
+  PgDutyGroupRepo,
+  PgMemberSetRepo,
+  PgHookRepo,
+  PgHookSecretStore,
+  PgRuntimeProfileRepo,
+  PgAuditRepo,
+  PgUserRepo,
+  PgOrgRepo,
+  PgOrgInviteLinkRepo,
+  PgWaitlistRepo
+} from './persistence/index.js'
+import type { PresetPoolPlacement } from './persistence/index.js'
+
+import { EpochService } from './orchestrator/epoch.js'
+import { ControlSender, NoConnection } from './orchestrator/outbound.js'
+import { SessionVisibilityPushService } from './orchestrator/visibilityPush.js'
+import { AgentSpecAssembler } from './orchestrator/agentSpecAssembler.js'
+import { Placement } from './orchestrator/placement.js'
+import { Watchdog } from './orchestrator/watchdog.js'
+import { CronRunReaper } from './orchestrator/cronRunReaper.js'
+import {
+  PoolMemberReaper,
+  POOL_MEMBER_REAP_AFTER_MS,
+  POOL_MEMBER_REAP_INTERVAL_MS
+} from './orchestrator/poolMemberReaper.js'
+import { RelaySweeper } from './orchestrator/relaySweeper.js'
+import { RelayRoster } from './orchestrator/relayRoster.js'
+import { WebchatMcpOperationReaper } from './orchestrator/webchatMcpOperationReaper.js'
+import { OAuthReaper, OAUTH_REAP_GRACE_MS, OAUTH_REAP_INTERVAL_MS } from './orchestrator/oauthReaper.js'
+import {
+  ComputerRegistrationReaper,
+  COMPUTER_REGISTRATION_REAP_GRACE_MS,
+  COMPUTER_REGISTRATION_REAP_INTERVAL_MS
+} from './orchestrator/computerRegistrationReaper.js'
+import { AgentMemoryStagingSweeper } from './orchestrator/agentMemoryStagingSweeper.js'
+import { AgentMemoryStoreService } from './agent-memory/store.service.js'
+import { HttpBotOrchestrator } from './orchestrator/httpBot.js'
+import { createSocketBotTenant } from './orchestrator/socketBotTenant.js'
+import { gatedDmSeeds, type GatedDmSeedResolver } from './orchestrator/linkedDm.js'
+import { resolveApprovalRoute, type ApprovalRouteResolver } from './orchestrator/approvalRoute.js'
+import { resolveReadAccess } from './orchestrator/readAccess.js'
+import { sessionsVisibleTo } from './http/read-access.js'
+import { convergeIntegrationGating } from './orchestrator/integrationPush.js'
+import { SlackBotIdentityReconciler } from './orchestrator/slackBotIdentityReconciler.js'
+import { slackConfigApi } from './http/slack-config-api.js'
+import { findTool } from './http/mcp/tools.js'
+
+import { ApiKeyCodec } from './registry/apiKey.js'
+import { DaemonAuthService } from './registry/authService.js'
+import { ApiKeyService } from './registry/apiKeyService.js'
+import { ComputerService } from './registry/computerService.js'
+import { ComputerLeaseService } from './registry/computerLeaseService.js'
+import { ComputerAuditLog } from './registry/computerAuditLog.js'
+import { ComputerChannelGrants } from './registry/computerChannelGrants.js'
+import { ComputerPool, COMPUTER_POOL_SWEEP_MS } from './registry/computerPool.js'
+import { ConnectedPoolMembers } from './orchestrator/computerPoolMembers.js'
+import {
+  cloudflareTurn,
+  cloudflareTurnConfigFrom,
+  coturnTurn,
+  relayTurnSecret,
+  turnConfigFrom
+} from './computer-viewer/turn.js'
+import { stunUrlsFrom } from './computer-viewer/stun.js'
+import { OAuthService } from './registry/oauthService.js'
+import { WebchatTokenService } from './registry/webchatToken.js'
+import { AhpCatalogCursor } from './registry/ahpCatalogCursor.js'
+import { AhpSessionService } from './registry/ahpSessions.js'
+import { makeSessionAccessResolver } from './http/session-access.js'
+import { AhpAuthorization } from './registry/ahpAuthorization.js'
+import { AhpGrantService } from './registry/ahpGrant.js'
+import { createWebchatTokenVerifier, everyTurnReachesItsContent } from './registry/webchatVerification.js'
+import { createAgentChatKeyVerifier } from './registry/agentChatKeyVerification.js'
+import { WebchatRemoteMcpService } from './registry/webchatRemoteMcpService.js'
+import { WebchatMcpGrantTokenCodec } from './registry/webchatMcpGrantToken.js'
+import { OrgInviteLinkCodec } from './registry/orgInviteLink.js'
+import { OrgInviteLinkService } from './registry/orgInviteLinkService.js'
+import { WaitlistService } from './registry/waitlistService.js'
+import { AgentId, DaemonId, HookId, OrgId } from './domain/ids.js'
+import { HookService } from './hooks/hook.service.js'
+import { RelayAuthService } from './registry/relayAuthService.js'
+import { DaemonRegistryService } from './registry/registryService.js'
+import { DaemonReleaseResolver } from './registry/daemonRelease.js'
+import { DaemonReleaseBroadcaster } from './registry/daemonReleaseBroadcaster.js'
+import { DeferredLifecycleOpSweeper } from './registry/deferredLifecycleOpSweeper.js'
+
+import { InMemorySessionEventSink } from './events/sink.js'
+import { SessionUsageWriter } from './usage/writer.js'
+import { createIconStore } from './icons/icon-store.js'
+import { createCredentialsProvider, createObjectClient } from '@agentconnect.md/object-store'
+import { loadFileTransferConfig } from './file-transfer/config.js'
+import { loadComputerScreenshotsConfig } from './computer-screenshots/config.js'
+import { createScreenshotBucket, isScreenshotObjectKey } from './computer-screenshots/bucket.js'
+import { ComputerScreenshots } from './registry/computerScreenshots.js'
+import { ComputerPlan } from './registry/computerPlan.js'
+import { loadComputerPlanConfig } from './computer-plan/config.js'
+import {
+  COMPUTER_SCREENSHOT_REAP_INTERVAL_MS,
+  ComputerScreenshotReaper
+} from './orchestrator/computerScreenshotReaper.js'
+import { createLifecycleGate } from './file-transfer/lifecycle-gate.js'
+import { createFileTransferService } from './file-transfer/service.js'
+import { createSharedImageService } from './file-transfer/shared-image.js'
+import { createFileTransfer, isTransferObjectKey, transferPendingMinimumDays } from './file-transfer/transfer.js'
+import { createGitlabAccountAvatarRenderer } from './http/gitlab-account-avatar.js'
+import type { IconUrlBases } from './agents/agent-icon.js'
+
+import type { SecretsProvider } from './secrets/providers/provider.js'
+import { makeSecretsProvider } from './secrets/providers/memory.js'
+import { SecretsBrokerService } from './secrets/secretsBroker.js'
+import { makeSecretCipher, type SecretCipher } from './secrets/cipher.js'
+import { effectiveOrgKeyPrefix } from './secrets/scope.js'
+import type { DeploymentConfigRuntime } from './persistence/deployment-config.js'
+
+import { ConnectionRegistry } from './ws/registry.js'
+import { RelayRegistry } from './ws/relay-registry.js'
+import { RelayControlSender } from './orchestrator/relayControl.js'
+import { replayMcpTo } from './orchestrator/mcpReplay.js'
+import { replaySnapshot } from './orchestrator/relaySnapshot.js'
+import { makeMcpPush } from './http/mcp-push.js'
+import { makeOauthRebind } from './http/provider-chain.js'
+import { McpProviderOauthService } from './mcp-oauth/service.js'
+import { McpProviderTokenService } from './mcp-oauth/token-service.js'
+import { McpOauthRefresher } from './mcp-oauth/refresher.js'
+import { guardedRequest } from './net/guarded-fetch.js'
+import type { Dial } from './mcp-oauth/discovery.js'
+import { replayMemoryConnectionsTo, syncMemoryConnectionsToDaemons } from './orchestrator/memoryConnectionReplay.js'
+import { relayHttpOrigin } from './orchestrator/mcpProvider.js'
+import { CollabRoutesService } from './orchestrator/collabRoutes.service.js'
+import { DutyLeaseService, DUTY_LEASE_DEFAULTS } from './orchestrator/dutyLease.js'
+import { registerPoolMetrics } from './observability/pool-metrics.js'
+import { registerOrgMetrics } from './observability/org-metrics.js'
+import { AgentDelivery } from './orchestrator/agentDelivery.js'
+import { AgentCronService } from './orchestrator/agentCrons.js'
+import { computerAccessFanOut } from './orchestrator/computerAccessFanOut.js'
+import { SetMemoryHomeReconciler } from './orchestrator/setMemoryHomeReconciler.js'
+import { AgentRoutingConverger } from './orchestrator/agentRouting.js'
+import { PlacementResolver, type ResolvableAgent } from './orchestrator/placementResolver.js'
+import { DutyRecomputeSweep } from './orchestrator/dutyRecompute.js'
+import { AgentMutationGate } from './orchestrator/agentMutationGate.js'
+import { AgentMoveService } from './orchestrator/agentMove.js'
+import { createDaemonWsServer } from './ws/gateway.js'
+import type { DaemonWsServerDeps } from './ws/gateway.js'
+import { createRelayWsServer } from './ws/relay-gateway.js'
+import { createComputerWsServer } from './ws/computer-gateway.js'
+import { ComputerChannelRegistry } from './ws/computer-registry.js'
+import { ComputerChannelKeys } from './registry/computerChannelKeys.js'
+import type { RelayWsServerDeps } from './ws/relay-gateway.js'
+
+import { buildHttpServer } from './http/server.js'
+import { relayHttpBase } from './http/relay-ingress.js'
+import type { HttpDeps } from './http/deps.js'
+import { createReadiness, type Readiness } from './http/readiness.js'
+import { retirePoolMember } from './http/daemon-removal.js'
+import { McpRateLimiter } from './http/mcp/rate-limit.js'
+import { RemoteGrantAuthenticator } from './http/mcp/remote-grant-authenticator.js'
+import { InternalInvocationAuth } from './http/mcp/internal-invocation-auth.js'
+import { webchatMcpDescriptorUrl } from './http/oauth/base.js'
+import { defaultWebchatMcpMetrics } from './observability/webchat-mcp.js'
+import { pingDb } from './persistence/prisma.js'
+import { runWithSharedTx, withSharedTxRouting } from './persistence/ambient-tx.js'
+import { verifySlackBot, verifySlackAppToken } from './http/slack-identity.js'
+import { verifyTelegramBot } from './http/telegram-identity.js'
+import { searchSkillRegistry } from './http/skills-registry.js'
+import { createPublicRepoResolver } from './github/public-repo.js'
+import { createTelegramBotIconSyncer } from './http/telegram-bot-profile.js'
+import { ensureDiscordMessageContentIntent, verifyDiscordBot } from './http/discord-identity.js'
+import { createDiscordBotProfileSyncer } from './http/discord-bot-profile.js'
+import type { CpPlatformRegistry } from './platforms/provider.js'
+import { buildCpPlatformRegistry } from './platforms/registry.js'
+import { codeHostProviders } from './codehost/registry.js'
+import { CodeHostTrustedActorService } from './codehost/trusted-actor.service.js'
+import { botIdentityProjector } from './platforms/bot-identity.js'
+import { buildPendingInstallReapers, platformBackgroundLoops } from './platforms/lifecycle.js'
+import { createQQCpProvider } from './platforms/qq/provider.js'
+import { QQCredentialRoutes } from './platforms/qq/routes.js'
+import { createDingTalkCpProvider } from './platforms/dingtalk/provider.js'
+import { dingTalkCredentialRoutes } from './platforms/dingtalk/routes.js'
+import { createMsTeamsCpProvider } from './platforms/msteams/provider.js'
+import { createWeChatCpProvider } from './platforms/wechat/provider.js'
+import { createWeComCpProvider } from './platforms/wecom/provider.js'
+import { weComCredentialRoutes } from './platforms/wecom/routes.js'
+import { weChatLoginRoutes } from './platforms/wechat/routes.js'
+import { WeChatLoginService } from './platforms/wechat/login.js'
+import { createWeChatLoginClient, WECHAT_DEFAULT_API_URL, type WeChatLoginClient } from './platforms/wechat/ilink.js'
+import { msTeamsRoutes } from './platforms/msteams/routes.js'
+import { msTeamsConnectRoutes, type MsTeamsConnectSeams } from './platforms/msteams/connect-routes.js'
+import { msTeamsRecoveryRoutes } from './platforms/msteams/recovery-routes.js'
+import { MsTeamsRecoveryOAuth } from './platforms/msteams/recovery.js'
+import { PgMsTeamsBindingMutations } from './persistence/repositories/msteams-binding-mutations.js'
+import { msTeamsConnectKeys } from './platforms/msteams/connect.js'
+import { MsTeamsCredentialReconciler } from './platforms/msteams/credential-reconciler.js'
+import { MsTeamsAgentBotRequests } from './platforms/msteams/agent-bot-requests.js'
+import { MsTeamsAgentBotKeeper } from './platforms/msteams/agent-bot-keeper.js'
+import { MsTeamsAgentBotClient } from './platforms/msteams/agent-bots.js'
+import {
+  msTeamsConnectAnchor,
+  msTeamsRelayApp,
+  resolveMsTeamsAgentBots,
+  resolveMsTeamsPlatformApp
+} from './platforms/msteams/deployment-app.js'
+import { createTelegramCpProvider } from './platforms/telegram/provider.js'
+import { createDiscordCpProvider } from './platforms/discord/provider.js'
+import { createSlackCpProvider, createSlackToolingCredentials } from './platforms/slack/provider.js'
+import { createFeishuCpProvider } from './platforms/feishu/provider.js'
+import { createLinearCpProvider } from './platforms/linear/provider.js'
+import { LinearCredentialReconciler } from './platforms/linear/credential-reconciler.js'
+import { LinearApiClient } from './platforms/linear/api.js'
+import { LinearTokenService } from './platforms/linear/token-service.js'
+import { LinearOrphanTokenSweeper } from './platforms/linear/orphan-token-sweeper.js'
+import { linearConnectRoutes, linearOauthCallbackRoutes } from './platforms/linear/routes.js'
+import { createGoogleChatCpProvider, googleChatClaimAnchor } from './platforms/googlechat/provider.js'
+import { GoogleChatCredentialReconciler } from './platforms/googlechat/credential-reconciler.js'
+import { googleChatAppRoutes, googleChatKeyRoutes } from './platforms/googlechat/routes.js'
+import { googleChatClaimRoutes } from './platforms/googlechat/claim.js'
+import { googleChatRecoveryRoutes } from './platforms/googlechat/recovery-routes.js'
+import { GoogleChatRecoveryOAuth } from './platforms/googlechat/recovery.js'
+import { PgGoogleChatBindingMutations } from './persistence/repositories/googlechat-binding-mutations.js'
+import { googleChatRelayApp } from './platforms/googlechat/deployment-app.js'
+import { slackInstallRoutes, slackConfigRoutes, slackOauthCallbackRoutes } from './http/routes/slack-install.js'
+import { slackPlatformInstallRoutes, slackPlatformCallbackRoutes } from './http/routes/slack-platform-install.js'
+import { slackWorkspaceIngress } from './platforms/slack/workspace-install.js'
+import { slackWorkspacePublicRoutes, slackWorkspaceClaimRoutes } from './http/routes/slack-workspace-install.js'
+import { feishuRegistrationRoutes } from './http/routes/feishu-registration.js'
+import { slackBotRefreshRoutes } from './http/routes/slack-bot-refresh.js'
+import { slackBotTokenRoutes } from './http/routes/slack-bot-token.js'
+import { telegramCheckRoutes } from './http/routes/telegram-check.js'
+import type {
+  FeishuRouteSeams,
+  GoogleChatRouteSeams,
+  LinearRouteSeams,
+  SlackRouteSeams,
+  TelegramRouteSeams
+} from './http/platform-route-seams.js'
+import { createFeishuAppTenantGuard, verifyFeishuBot } from './http/feishu-identity.js'
+import { createFeishuAppIconSyncer } from './http/feishu-app-icon.js'
+import { FeishuAppRegistrationService } from './http/feishu-registration.js'
+import { configureFeishuHttpApp } from './http/feishu-app-config.js'
+import { SlackSessionAccessService } from './http/slack-session-access.js'
+import { GithubSessionAccessService } from './http/github-session-access.js'
+import { GitlabSessionAccessService } from './http/gitlab-session-access.js'
+import { FeishuSessionAccessService } from './http/feishu-session-access.js'
+import { GoogleChatSessionAccessService } from './http/googlechat-session-access.js'
+import { createTelegramSessionAccess } from './platforms/telegram/session-access.js'
+import { createDiscordSessionAccess } from './platforms/discord/session-access.js'
+import { createMsTeamsSessionAccess } from './platforms/msteams/session-access.js'
+import { SessionAccessWarmer } from './http/session-access-warmer.js'
+import {
+  TENANTLESS_SENTINEL,
+  type AgentRecord,
+  type SessionMetaRecord,
+  type ExternalScopeRecord
+} from './persistence/ports.js'
+
+import { DEFAULT_ORG_ID, DEFAULT_OWNER_ID } from './config/defaults.js'
+
+/** The wired application graph returned by the composition root. */
+export interface Container {
+  /** The C2 BFF Fastify instance (also hosts `/health`). */
+  http: FastifyInstance
+  /** Mount the daemon WS gateway on the live `http.Server` (call after `listen`). */
+  wsGateway(app: FastifyInstance): WebSocketServer
+  /** Mount the relay control WS gateway (`rc/*`) on the live `http.Server` (call after `listen`). */
+  relayGateway(app: FastifyInstance): WebSocketServer
+  /** Mount the desktop daemons' Computer channel (`computer/*`) on the live `http.Server` (call after `listen`). */
+  computerGateway(app: FastifyInstance): WebSocketServer
+  /** The single-tenant anchors the devAuth stub injects. */
+  readonly defaults: { orgId: string; ownerId: string }
+  /** §9 platform-provider registry (S3) — every served platform (Telegram,
+   *  Discord, Slack, Feishu, Linear). Composed here so the graph is whole, and
+   *  now the authority for route mounting, the create body + its live check,
+   *  the pending-install reapers and the background convergence loops. Spec
+   *  assembly and `rc/bot-assign` adopt it in a follow-up PR. */
+  readonly platforms: CpPlatformRegistry
+  /** The process readiness gate — the bootstrap flips it at SIGTERM (`/readyz`). */
+  readonly readiness: Readiness
+  /** Live webchat preset entitlement + one-time assertion minting. Transport
+   *  handlers consume this seam without reconstructing authority checks. */
+  readonly webchatRemoteMcp: WebchatRemoteMcpService
+  /** Route-only remote-grant claim seam for the standard MCP route. */
+  readonly remoteGrantAuth: RemoteGrantAuthenticator
+  /** One-time async-local nonce seam for nested MCP REST requests. */
+  readonly internalInvocationAuth: InternalInvocationAuth
+  /** Arm the Clock-driven background loops (the cron-run reaper). Prod calls this
+   *  after `listen`; tests never do, so no live timer arms under a `FakeClock`. */
+  startBackground(): void
+  /** Graceful teardown: stop background loops, disconnect Prisma. */
+  shutdown(): Promise<void>
+}
+
+/** Extra knobs the composition root accepts (mostly for tests). */
+export interface ContainerOpts {
+  /** Fastify server options for the HTTP edge (e.g. `{ logger: true }`). */
+  fastify?: FastifyServerOptions
+  /** GitHub REST fetch override — integration tests stub the API without network. */
+  githubFetch?: FetchLike
+  /** GitLab HTTP edge stub for tests (mirrors githubFetch). */
+  gitlabFetch?: GitlabFetchLike
+  /** Gitea HTTP edge stub for tests (mirrors gitlabFetch). */
+  giteaFetch?: GiteaFetchLike
+  /** Entra and Azure DevOps HTTP edge stub for tests. */
+  azureDevOpsFetch?: AzureDevOpsFetchLike
+  /** Slack Web API fetch override for Session membership checks. */
+  slackFetch?: FetchLike
+  /** Feishu/Lark Open Platform fetch override for Session membership checks. */
+  feishuFetch?: FetchLike
+  /** npm dist-tags fetch override for the daemon "latest version" resolver — tests
+   *  stub it (absent under NODE_ENV=test ⇒ the resolver is inert, no network). */
+  daemonReleaseFetch?: FetchLike
+  /** open-connector admin API fetch override — integration tests stub it without
+   *  network (absent under NODE_ENV=test ⇒ the connectors client is not assembled). */
+  connectorsFetch?: FetchLike
+  /** Linear OAuth/GraphQL fetch override — the connect funnel's suites run a stubbed Linear. */
+  linearFetch?: FetchLike
+  /** The iLink login client — WeChat login suites run a fake one, never the network. */
+  weChatLoginClient?: WeChatLoginClient
+  /** The at-rest transform every persisted secret VALUE passes through. Absent ⇒
+   *  selected from `config.SECRET_CIPHER` (none → identity, vault-transit → Vault). */
+  secretCipher?: SecretCipher
+  /** Immutable DB-backed desired state loaded by the process bootstrap. */
+  deploymentConfig?: DeploymentConfigRuntime
+}
+
+/**
+ * Assemble the graph from an explicit `PrismaClient` (the only Prisma touch in
+ * the app is the repo classes here), a `Clock`, and a `SecretsProvider`.
+ */
+export function buildContainer(
+  config: AppConfig,
+  prisma: PrismaClient,
+  clock: Clock = systemClock,
+  secretsProvider: SecretsProvider = makeSecretsProvider(config),
+  opts: ContainerOpts = {}
+): Container {
+  // The ONE cipher every secret store seals/opens through — the SECRET_CIPHER
+  // config flips at-rest encryption for all of them together.
+  const secretCipher = opts.secretCipher ?? makeSecretCipher(config)
+
+  // Repositories see the shared-transaction router: outside `runWithSharedTx`
+  // it is the root client verbatim; inside it (CP-db-only delegated MCP
+  // operations, §8) every repo call joins one transaction. Transaction OPENING
+  // (and ping/disconnect) stays on the root client.
+  const rootPrisma = prisma
+  prisma = withSharedTxRouting(prisma)
+
+  // The single value-reading seam for organization secrets. Named before the repo
+  // map because both the registry repo's resolver and the assembler share ONE
+  // instance — and therefore the one configured cipher.
+  const organizationEnvironmentSecrets = new PgOrganizationEnvironmentSecretStore(prisma, secretCipher)
+
+  // LATE-BOUND platform registry (§9). The providers are constructed FAR below —
+  // they close over `httpDeps`, whose own route plugins do not exist yet — but
+  // holders built here (the bot repo's D6 identity projection, the orchestrators'
+  // spec assembly and `rc/bot-assign`) already need to reach them. `platforms` is
+  // a stable façade every holder can capture now; it forwards to the composed
+  // registry, and every read runs at write / reconcile / sync / request time,
+  // long after `buildContainer` has assigned it.
+  let composedPlatforms: CpPlatformRegistry | undefined = undefined
+  const requirePlatforms = (): CpPlatformRegistry => {
+    if (!composedPlatforms) throw new Error('platform registry read before composition')
+    return composedPlatforms
+  }
+  const platforms: CpPlatformRegistry = {
+    get: (platformId) => requirePlatforms().get(platformId),
+    all: () => requirePlatforms().all(),
+    ids: () => requirePlatforms().ids()
+  }
+
+  // Pool-born preset agents (preset-agents.md §3.2): on an install with a daemon
+  // pool, a new org's preset is placed on it at creation with the pool's runtime.
+  // An empty runtime is the opt-out, and an install with no pool member ignores it.
+  const presetPool: PresetPoolPlacement | null =
+    config.PRESET_AGENTS_ENABLED && config.PRESET_AGENT_POOL_RUNTIME
+      ? {
+          runtime: config.PRESET_AGENT_POOL_RUNTIME,
+          ...(config.PRESET_AGENT_POOL_MODEL ? { model: config.PRESET_AGENT_POOL_MODEL } : {})
+        }
+      : null
+
+  // ── C6 repositories (the ONLY @prisma/client importers) ───────────────────
+  const repos = {
+    daemonAdmission: new PgDaemonAdmissionRepo(prisma),
+    daemon: new PgDaemonRepo(prisma),
+    daemonLifecycleOp: new PgDaemonLifecycleOpRepo(prisma),
+    apiKey: new PgApiKeyRepo(prisma),
+    oauth: new PgOAuthRepo(prisma),
+    relay: new PgRelayRepo(prisma),
+    agent: new PgAgentRepo(prisma),
+    assignment: new PgAssignmentRepo(prisma),
+    session: new PgSessionRepo(prisma),
+    sessionPullRequestFeedback: new PgSessionPullRequestFeedbackRepo(prisma),
+    followUpWatch: new PgFollowUpWatchRepo(prisma),
+    capabilityRequest: new PgCapabilityRequestRepo(prisma),
+    sessionUsage: new PgSessionUsageRepo(prisma),
+    agentApiEntry: new PgAgentApiEntryRepo(prisma),
+    webchatConversation: new PgWebchatConversationRepo(prisma),
+    ahpSessionBinding: new PgAhpSessionBindingRepo(prisma),
+    webchatMcpDelegation: new PgWebchatMcpDelegationRepo(prisma, defaultWebchatMcpMetrics),
+    webchatMcpAccessGrant: new PgWebchatMcpAccessGrantRepo(prisma),
+    webchatMcpOperation: new PgWebchatMcpOperationRepo(prisma),
+    launch: new PgLaunchRepo(prisma),
+    lease: new PgSecretLeaseRepo(prisma),
+    uploadTicket: new PgUploadTicketRepo(prisma),
+    integration: new PgIntegrationRepo(prisma),
+    integrationChannel: new PgIntegrationChannelRepo(prisma),
+    // §11 D6: which values carry this bot's demux identity is the provider's
+    // declaration, read at write time through the façade above.
+    bot: new PgBotRepo(prisma, botIdentityProjector(platforms)),
+    botSecret: new PgBotSecretStore(prisma, secretCipher),
+    // Owns its transaction: install/revoke each write two tables behind the
+    // credential-generation fence, and serialize on the bot row (§5.3).
+    botCredential: new PgBotCredentialWriter(prisma, secretCipher),
+    decision: new PgDecisionRepo(prisma),
+    botDecisionRouting: new PgBotDecisionRoutingRepo(prisma),
+    codeHostDecisionRouting: new PgCodeHostDecisionRoutingRepo(prisma),
+    providerKey: new PgProviderKeyStore(prisma, secretCipher),
+    agentSecret: new PgAgentSecretStore(prisma, secretCipher),
+    agentConfig: new PgAgentConfigWriter(prisma, secretCipher),
+    mcpProvider: new PgMcpProviderRepo(prisma),
+    mcpProviderSecret: new PgMcpProviderSecretStore(prisma, secretCipher),
+    mcpGrant: new PgMcpGrantRepo(prisma, secretCipher),
+    mcpProviderOauth: new PgMcpProviderOauthRepo(prisma),
+    mcpProviderOauthSecret: new PgMcpProviderOauthSecretStore(prisma, secretCipher),
+    mcpProviderOauthState: new PgMcpProviderOauthStateStore(prisma),
+    skillSource: new PgSkillSourceRepo(prisma),
+    computer: new PgComputerRepo(prisma),
+    computerLease: new PgComputerLeaseRepo(prisma),
+    computerAudit: new PgComputerAuditRepo(prisma),
+    computerScreenshot: new PgComputerScreenshotRepo(prisma),
+    computerUsage: new PgComputerUsageRepo(prisma),
+    agentSkillSourceStatus: new PgAgentSkillSourceStatusRepo(prisma),
+    organizationKnowledge: new PgOrganizationKnowledgeRepo(prisma),
+    organizationRecord: new PgOrganizationRecordRepo(prisma),
+    // Owns its transactions: every organization-environment write runs the design
+    // §5 fence (org row → agent rows → re-read → validate → persist + bump
+    // configRevision), so it must be the transaction owner, not a composed repo.
+    organizationEnvironment: new PgOrganizationEnvironmentRepo(prisma),
+    organizationEnvironmentSecret: organizationEnvironmentSecrets,
+    organizationEnvironmentResolver: new PgOrganizationEnvironmentResolver(prisma, organizationEnvironmentSecrets),
+    memoryPluginInstallation: new PgMemoryPluginInstallationRepo(prisma),
+    externalMemoryConnection: new PgExternalMemoryConnectionRepo(prisma),
+    externalMemoryConnectionSecret: new PgExternalMemoryConnectionSecretStore(prisma, secretCipher),
+    externalMemoryGrant: new PgExternalMemoryGrantRepo(prisma, secretCipher),
+    // The `control-plane` memory home (memory-evolution.md §3.2.1): both own their transactions.
+    agentMemoryFile: new PgAgentMemoryFileRepo(prisma),
+    agentMemoryStoreOperation: new PgAgentMemoryStoreOperationRepo(prisma),
+    agentMemoryHistory: new PgAgentMemoryHistoryRepo(prisma),
+    // Owns its transactions: every external-memory check-then-write pair runs
+    // under the advisory mutation scopes, so it stays serialized across CP
+    // instances (rolling updates included).
+    memoryConnectionWriter: new PgMemoryConnectionWriter(prisma, secretCipher),
+    threadAffinity: new PgThreadAffinityStore(prisma),
+    slackInstall: new PgSlackInstallStore(prisma, secretCipher),
+    slackPlatformInstall: new PgSlackPlatformInstallStore(prisma),
+    slackWorkspaceInstall: new PgSlackWorkspaceInstallStore(prisma, secretCipher),
+    feishuAppRegistration: new PgFeishuAppRegistrationStore(prisma, secretCipher),
+    wechatPendingLogin: new PgWechatPendingLoginStore(prisma, secretCipher),
+    msTeamsAgentBotRequest: new PgMsTeamsAgentBotRequestStore(prisma, secretCipher),
+    slackUserConfig: new PgSlackUserConfigStore(prisma, secretCipher),
+    linearToken: new PgLinearTokenStore(prisma, secretCipher),
+    linearInstallState: new PgLinearInstallStateStore(prisma),
+    presetAgent: new PgPresetAgentStore(prisma),
+    cron: new PgCronRepo(prisma),
+    dutyGroup: new PgDutyGroupRepo(prisma),
+    memberSet: new PgMemberSetRepo(prisma),
+    // Fenced hook writes ask "may this daemon act for the hook's agent" — placement ∪ live duty
+    // holders, which a join on `agent.daemonId` cannot express. Lazy over `placementResolver`
+    // (assigned below; only ever called at report time).
+    hook: new PgHookRepo(prisma, {
+      servingDaemons: (agent: ResolvableAgent): Promise<string[]> => placementResolver.servingDaemons(agent),
+      routableDaemon: (agent: ResolvableAgent): Promise<DaemonId | null> => placementResolver.routableDaemon(agent)
+    }),
+    hookSecret: new PgHookSecretStore(prisma, secretCipher),
+    runtimeProfile: new PgRuntimeProfileRepo(prisma),
+    audit: new PgAuditRepo(prisma),
+    // Signup mints no org, so no repo here carries the preset-agent seam flag except
+    // the one org-creating repo below (preset-agents.md §3.2).
+    user: new PgUserRepo(prisma),
+    org: new PgOrgRepo(prisma, config.PRESET_AGENTS_ENABLED, presetPool, (orgId) => ({
+      mount: config.VAULT_TRANSIT_MOUNT,
+      keyName: `${effectiveOrgKeyPrefix(config.VAULT_TRANSIT_KEY, config.VAULT_TRANSIT_ORG_KEY_PREFIX)}${orgId}`
+    })),
+    orgInviteLink: new PgOrgInviteLinkRepo(prisma),
+    waitlist: new PgWaitlistRepo(prisma),
+    githubInstallation: new PgGithubInstallationRepo(prisma),
+    githubInstallState: new PgGithubInstallStateStore(prisma),
+    githubApp: new PgGithubAppRepo(prisma),
+    agentRepoAuth: new PgAgentRepoAuthorizationRepo(prisma),
+    agentInstallationAuth: new PgAgentInstallationAuthorizationRepo(prisma),
+    codeHostRepository: new PgCodeHostRepositoryRepo(prisma),
+    codeHostTrustedActor: new PgCodeHostTrustedActorRepo(prisma),
+    gitlabConnection: new PgGitlabConnectionRepo(prisma),
+    gitlabProjectBinding: new PgGitlabProjectBindingRepo(prisma),
+    gitlabAgentAccount: new PgGitlabAgentAccountRepo(prisma),
+    gitlabOauthState: new PgGitlabOauthStateStore(prisma),
+    gitlabInstanceState: new PgGitlabInstanceStateStore(prisma),
+    giteaConnection: new PgGiteaConnectionRepo(prisma),
+    giteaRepositoryBinding: new PgGiteaRepositoryBindingRepo(prisma),
+    azureDevOpsConnection: new PgAzureDevOpsConnectionRepo(prisma),
+    azureDevOpsRepositoryBinding: new PgAzureDevOpsRepositoryBindingRepo(prisma)
+  }
+
+  // ── C3/C4/C5 services ─────────────────────────────────────────────────────
+  const epoch = new EpochService(repos.daemon, clock)
+
+  const codec = new ApiKeyCodec({ API_KEY_PEPPER: config.API_KEY_PEPPER })
+  const webAppUrl = resolveWebAppUrl(config)
+  // In-cluster Kubernetes access: assembled ONLY when the daemon pool is enabled. Hoisted
+  // above the auth service because an in-cluster daemon authenticates against this client.
+  const clusterAccess = loadClusterAccess(config)
+  const clusterHttp = clusterAccess ? new K8sHttp(clusterAccess) : undefined
+  // The in-cluster daemon's token path; undefined ⇒ this deployment only accepts API keys.
+  // Shared by both doors a daemon can knock on — the CP socket and, through `rc/verify`,
+  // the relay — so the relay hop can never be the weaker one.
+  const clusterIdentity =
+    clusterAccess && clusterHttp
+      ? new ClusterDaemonIdentityService(clusterHttp, repos.daemon, clusterAccess.namespace)
+      : undefined
+  // The same review for workloads that are NOT daemons — today the usage collector.
+  // Undefined ⇒ those callers fall back to their own shared secret, or do not exist.
+  const clusterWorkloadIdentity =
+    clusterAccess && clusterHttp ? new ClusterWorkloadIdentityService(clusterHttp, clusterAccess.namespace) : undefined
+  const auth = new DaemonAuthService(
+    codec,
+    repos.apiKey,
+    epoch,
+    clock,
+    {
+      HEARTBEAT_SEC: config.HEARTBEAT_SEC,
+      // Single-sourced from the lease service's own horizon: the daemon derives its duty
+      // self-fence from this, so the two halves of `T_reassign > T_fence` cannot drift.
+      DUTY_LEASE_MS: DUTY_LEASE_DEFAULTS.leaseMs,
+      // Web console origin for daemon-built session deep links: explicit PUBLIC_WEB_URL, else
+      // a concrete CORS_ORIGIN (the browser console origin a two-origin deploy already lists),
+      // else PUBLIC_CP_URL for single-origin deploys. All unset ⇒ no webAppUrl sent (daemon
+      // uses its own config). See resolveWebAppUrl.
+      WEB_APP_URL: webAppUrl
+    },
+    // Resolves the daemon's org slug for the org-scoped deep link (`…/<orgSlug>/sessions/…`).
+    repos.org,
+    // The set `auth/ok` announces — the daemon's duty-enforcement predicate (daemon-groups.md §3).
+    repos.memberSet,
+    clusterIdentity
+  )
+  const apiKeys = new ApiKeyService(codec, repos.apiKey, repos.daemon, repos.audit, clock)
+  // Live Computer channels (computer-use.md §3.6): revoke, delete and policy changes reach a connected desktop at once.
+  const computerChannels = new ComputerChannelRegistry()
+  // Three missed heartbeats, the daemon watchdog's freeze threshold: for a desktop's status and a lease holder alike.
+  const missedBeatsMs = config.HEARTBEAT_SEC * config.MISSED_BEATS * 1000
+  // A desktop seen within missedBeatsMs got the newest key with that heartbeat; the margin covers the push itself.
+  const computerChannelKeys = new ComputerChannelKeys(
+    config.API_KEY_PEPPER,
+    config.COMPUTER_CREDENTIAL_TTL_SEC,
+    missedBeatsMs + 5_000
+  )
+  const computerLeases = new ComputerLeaseService(repos.computerLease, clock, {
+    holderTtlMs: missedBeatsMs,
+    staleAfterMs: missedBeatsMs,
+    channels: computerChannels,
+    audit: repos.audit,
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+  const computerAudit = new ComputerAuditLog(repos.computerAudit, clock)
+  // Managed computer quotas, metering and egress per organization (computer-use.md §15.4, §15.5).
+  const computerPlan = new ComputerPlan(
+    repos.computerUsage,
+    secretCipher,
+    clock,
+    loadComputerPlanConfig({ AC_COMPUTER_PLAN: config.AC_COMPUTER_PLAN }),
+    {
+      screenshotsStored: (orgId) => repos.computerScreenshot.storedBytes(orgId, new Date(clock.now())),
+      log: { warn: (o, m) => http.log.warn(o, m) }
+    }
+  )
+  computerPlan.bindChannels(computerChannels)
+  // Screenshot storage (computer-use.md §9): this process signs and checks; desktops upload and browsers read straight from the bucket.
+  const screenshotsConfig = loadComputerScreenshotsConfig({ AC_COMPUTER_SCREENSHOTS: config.AC_COMPUTER_SCREENSHOTS })
+  const computerScreenshots = screenshotsConfig
+    ? (() => {
+        const credentials = createCredentialsProvider(screenshotsConfig.credentials, {
+          region: screenshotsConfig.region,
+          env: process.env
+        })
+        const objects = createObjectClient({ config: screenshotsConfig, credentials, isKey: isScreenshotObjectKey })
+        return new ComputerScreenshots(
+          repos.computerScreenshot,
+          repos.session,
+          createScreenshotBucket({ config: screenshotsConfig, credentials, objects }),
+          clock,
+          { ...screenshotsConfig.retention, limits: (orgId) => computerPlan.screenshotLimits(orgId) },
+          { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) }
+        )
+      })()
+    : undefined
+  const computers = new ComputerService(codec, repos.computer, repos.apiKey, repos.audit, clock, {
+    channels: computerChannels,
+    leases: computerLeases,
+    staleAfterMs: missedBeatsMs,
+    ...(computerScreenshots ? { screenshots: computerScreenshots } : {}),
+    // Lazy: the delivery fan-out is assembled below and runs only when an access change lands.
+    onAgentAccessChanged: computerAccessFanOut({
+      agents: repos.agent,
+      delivery: () => agentDelivery,
+      log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+    })
+  })
+  const oauth = new OAuthService(repos.oauth, apiKeys, codec, clock)
+  const inviteLinks = new OrgInviteLinkService(
+    new OrgInviteLinkCodec(config.API_KEY_PEPPER),
+    repos.orgInviteLink,
+    clock
+  )
+  // Closed-beta admission (waitlist-and-login.md). The join-token codec shares the
+  // API_KEY_PEPPER (its own domain-separated HMAC) — the external admin app injects
+  // the SAME pepper to mint links the CP can verify (§6).
+  const waitlist = new WaitlistService(config.API_KEY_PEPPER, repos.waitlist, clock)
+
+  // Relay↔CP `rc/auth` dual-mode verifier (§8): shared RELAY_TOKEN and/or per-relay
+  // ApiKey. RELAY_TOKEN unset ⇒ token mode is off; org-less relay keys reuse the
+  // pepper-hash mechanism (no epoch — relays carry no fencing state).
+  const relayAuth = new RelayAuthService(
+    codec,
+    repos.apiKey,
+    clock,
+    {
+      ...(config.RELAY_TOKEN ? { RELAY_TOKEN: config.RELAY_TOKEN } : {}),
+      HEARTBEAT_SEC: config.HEARTBEAT_SEC
+    },
+    repos.daemonAdmission,
+    clusterIdentity
+  )
+  const relayStaleMs = config.RELAY_STALE_SEC * 1000
+
+  // Uploaded-icon object store (docs/designs/icon-uploads.md): a neutral S3-compatible
+  // target. Assembled ONLY when the FULL S3_* group is
+  // present; any missing ⇒ undefined, so the upload routes aren't mounted and the console
+  // hides Upload (icons stay glyph-only). This is deliberately forgiving, not fail-fast:
+  // secret keys (access key id / secret) may roll out independently from non-secret
+  // config, so a partial group leaves the feature off rather
+  // than crash-looping the CP.
+  const iconStore =
+    config.S3_ENDPOINT &&
+    config.S3_ACCESS_KEY_ID &&
+    config.S3_SECRET_ACCESS_KEY &&
+    config.S3_BUCKET &&
+    config.S3_PUBLIC_BASE_URL
+      ? createIconStore({
+          endpoint: config.S3_ENDPOINT,
+          accessKeyId: config.S3_ACCESS_KEY_ID,
+          secretAccessKey: config.S3_SECRET_ACCESS_KEY,
+          bucket: config.S3_BUCKET,
+          region: config.S3_REGION,
+          publicBaseUrl: config.S3_PUBLIC_BASE_URL
+        })
+      : undefined
+  // Bases the reconcile roster + DTOs resolve avatar URLs against: `cp` for the
+  // glyph/runtime PNG endpoint, `store` for uploaded `image` icons.
+  const iconBases: IconUrlBases = {
+    ...(config.PUBLIC_CP_URL ? { cp: config.PUBLIC_CP_URL } : {}),
+    ...(config.S3_PUBLIC_BASE_URL ? { store: config.S3_PUBLIC_BASE_URL } : {})
+  }
+
+  // GitLab OAuth app config, resolved before the spec assembler because the host axis
+  // rides every projected spec with a GitLab consumer (§24.4); absent ⇒ gitlab disabled.
+  const gitlabAppCfg = resolveGitlabAppConfig(config)
+  // The Gitea instance axis (gitea-integration.md §3): always resolved — an unset address is gitea.com.
+  const giteaCfg = resolveGiteaInstanceConfig(config)
+
+  // The ONE assembler of CP→daemon AgentSpecs — owns secret loading (the only
+  // AgentSecretStore VALUE reader) + icon bases, shared by every emission path:
+  // reconcile roster, agent/upsert replicate, icon refresh, move activation.
+  const agentSpecs = new AgentSpecAssembler(
+    repos.agentSecret,
+    iconBases,
+    repos.skillSource,
+    repos.organizationKnowledge,
+    (agentId, invalid) =>
+      http.log.warn(
+        {
+          agentId,
+          skillSourceId: invalid.sourceId,
+          skillSourceName: invalid.sourceName,
+          issues: invalid.issues
+        },
+        'omitting an invalid historical skill source from the daemon projection'
+      ),
+    repos.organizationEnvironmentResolver,
+    // Key names only — a tombstone means the key left BOTH wire maps, which also
+    // suppresses any same-key agent fallback (organization-secrets-and-variables.md §9).
+    (agentId, keys) =>
+      http.log.error(
+        { agentId, keys },
+        'organization environment keys resolved to nothing and were removed from the agent projection'
+      ),
+    // The additional-repository allowlist the workspace projection mirrors.
+    repos.agentRepoAuth,
+    // §24.4 host carriage: the axis, and the hook read that reveals the one GitLab
+    // consumer neither the workspace nor the allowlist does.
+    gitlabAppCfg?.baseUrl,
+    repos.hook,
+    giteaCfg.baseUrl,
+    { routings: repos.codeHostDecisionRouting, hooks: repos.hook },
+    // The installation grants projected beside the allowlist, never expanded into it.
+    repos.agentInstallationAuth,
+    // The Decisions each chat API gate names, shipped with it.
+    repos.decision,
+    // The Computers whose agent access grants each agent (computer-use.md §4.1).
+    repos.computer,
+    // Each agent's organization GitHub App, whose bot its commits are attributed to.
+    repos.githubApp
+  )
+
+  // Browser webchat token mint/verify (§10, A4): a short-lived HS256 JWT bound to
+  // {userId, user, agentId, orgId, conversationId}. The relay delegates verification
+  // here via rc/verify(webchat-token); the CP re-resolves the agent's CURRENT placement.
+  const webchatTokens = new WebchatTokenService(config.API_KEY_PEPPER)
+
+  const registry = new DaemonRegistryService(repos.daemon, repos.runtimeProfile, repos.daemonLifecycleOp, clock)
+  // Resolves the latest daemon version in the deployment's npm channel (the pinned
+  // `DAEMON_DIST_TAG`, default `latest`) for the console's "update available" hint.
+  // Inert under NODE_ENV=test unless a fetch is injected, so suites stay offline.
+  const daemonReleaseFetch = opts.daemonReleaseFetch ?? (config.NODE_ENV === 'test' ? undefined : globalThis.fetch)
+  const daemonRelease = daemonReleaseFetch
+    ? new DaemonReleaseResolver(config.DAEMON_DIST_TAG || 'latest', clock, daemonReleaseFetch)
+    : undefined
+
+  // open-connector integration (docs: connectors). Assembled only when the URL is
+  // configured AND a fetch is available (inert under NODE_ENV=test unless injected,
+  // so suites stay offline). Absent ⇒ the connectors routes 404.
+  const connectorsFetch = opts.connectorsFetch ?? (config.NODE_ENV === 'test' ? undefined : globalThis.fetch)
+  const connectors =
+    config.OPEN_CONNECTOR_URL && connectorsFetch
+      ? new ConnectorsClient({
+          baseUrl: config.OPEN_CONNECTOR_URL,
+          fetch: connectorsFetch,
+          whitelist: parseWhitelist(config.OPEN_CONNECTOR_PROVIDER_WHITELIST),
+          blocklist: parseBlocklist(config.OPEN_CONNECTOR_PROVIDER_BLOCKLIST)
+        })
+      : undefined
+
+  const events = new InMemorySessionEventSink()
+
+  // ONE usage report interface for both authenticated ingresses (the daemon EVT and
+  // the service batch endpoint), so neither can drift into its own storage semantics.
+  const usageWriter = new SessionUsageWriter(repos.sessionUsage)
+
+  // C5 lease broker (ref-only, no plaintext).
+  const secrets = new SecretsBrokerService(secretsProvider, repos.lease, clock)
+  void secrets // wired into the WS secrets handler in a later phase; constructed now so the graph is whole.
+
+  // The derived in-memory connection index every hot lookup hits.
+  const connReg = new ConnectionRegistry()
+
+  // The ONE answer to "which daemons serve this agent" — what its placement names, plus every
+  // current duty holder (orchestrator/placementResolver.ts).
+  const placementResolver = new PlacementResolver({
+    approved: (ids) => repos.daemonAdmission.allowed(ids),
+    duties: repos.dutyGroup,
+    // The set's members ready to take a trigger. Only the rendezvous fallback reads this: a set
+    // agent whose lease lapsed has no holder, and any member can claim it on receipt.
+    liveMembers: async (setId) => {
+      const members = new Set(await repos.memberSet.memberIdsOf(setId))
+      return connReg
+        .reachableDaemons()
+        .filter((d) => d.state === 'READY' && members.has(d.daemonId))
+        .map((d) => d.daemonId)
+    },
+    clock
+  })
+
+  // Webchat admin-catalog entitlement (every agent, in its owner's webchat conversation) and its short-lived access grants.
+  const webchatMcpGrantToken = new WebchatMcpGrantTokenCodec(config.API_KEY_PEPPER)
+  const webchatRemoteMcp = new WebchatRemoteMcpService({
+    clock,
+    tokenCodec: webchatMcpGrantToken,
+    conversations: repos.webchatConversation,
+    orgs: repos.org,
+    agents: repos.agent,
+    daemons: connReg,
+    placement: placementResolver,
+    authorities: repos.webchatMcpDelegation,
+    grants: repos.webchatMcpAccessGrant,
+    // The daemon installs this verbatim into the adapter's `agentconnect-admin`
+    // descriptor: the canonical PUBLIC resource URL, never the internal `/api/v1` mount.
+    mcpUrl: webchatMcpDescriptorUrl(config)
+  })
+  const remoteGrantAuth = new RemoteGrantAuthenticator({
+    clock,
+    tokenCodec: webchatMcpGrantToken,
+    conversations: repos.webchatConversation,
+    orgs: repos.org,
+    agents: repos.agent,
+    daemons: connReg,
+    placement: placementResolver,
+    grants: repos.webchatMcpAccessGrant,
+    authorities: repos.webchatMcpDelegation,
+    isCuratedTool: (toolName) => findTool(toolName) !== undefined
+  })
+  const internalInvocationAuth = new InternalInvocationAuth()
+
+  // The relay analogue — relayId → live relay socket, so the CP can push
+  // rc/daemon-revoke to connected relays (§9). Roster still comes from the DB.
+  const relayReg = new RelayRegistry()
+  const relayControl = new RelayControlSender(relayReg)
+
+  // github-app config resolved early: the hook compiler stamps the App broadcast
+  // slug beside each agent's targeted slug, the GithubService comes later.
+  const githubAppCfg = resolveGithubAppConfig(config)
+
+  // Platform-published Slack app (preset-agents.md §5.3) — undefined ⇒ feature
+  // absent (routes 404, console hides "Add to Slack"); partial set ⇒ fail-fast.
+  const slackPlatformApp = resolveSlackPlatformAppConfig(config)
+
+  // Regional Login Apps mirrored from Logto. Their credentials are the stable
+  // deployment tenant anchor used to admit Bot Apps from the same organization.
+  const feishuPlatformApps = resolveFeishuPlatformApps(config)
+
+  // The deployment's one Linear OAuth app (linear-integration.md §7.1) — undefined ⇒ the platform
+  // self-disables (no workspace can be connected); partial set ⇒ fail-fast.
+  const linearPlatformApp = resolveLinearPlatformAppConfig(config)
+
+  // The deployment-owned Google Chat app (google-chat-integration.md §3); undefined ⇒ only per-agent apps, partial set ⇒ fail-fast.
+  const googleChatPlatformApp = resolveGoogleChatPlatformAppConfig(config)
+
+  // Hook compiler/converger (webhook-triggers-and-github-events.md): CRUD routes
+  // broadcast through it, and a (re)registering relay gets the full-set replay.
+  // The installation repo feeds the github-kind compile (installationIds gate).
+  // §24.1: the resolved instance base, bound once here. Every GitLab URL in the
+  // process is composed from this client, so nothing can address another host.
+  const gitlabApi = gitlabAppCfg ? new GitlabApiClient(gitlabAppCfg.baseUrl, opts.gitlabFetch) : undefined
+  const gitlabWebhookSecretStore = gitlabAppCfg ? new PgGitlabWebhookSecretStore(prisma, secretCipher) : undefined
+  // The Gitea edge, bound once to the resolved instance; every Gitea URL in the process composes from it.
+  const giteaApi = new GiteaApiClient(giteaCfg.baseUrl, opts.giteaFetch)
+  const giteaWebhookSecretStore = new PgGiteaWebhookSecretStore(prisma, secretCipher)
+  // Azure DevOps service hook state (azure-devops-integration.md §11.2): sealed keys and recorded subscriptions.
+  const azureDevOpsHookRepo = new PgAzureDevOpsHookRepo(prisma, secretCipher)
+  const hookService = new HookService(
+    repos.hook,
+    repos.hookSecret,
+    repos.agent,
+    relayControl,
+    placementResolver,
+    githubAppCfg ? repos.githubInstallation : undefined,
+    githubAppCfg?.slug,
+    undefined,
+    gitlabAppCfg ? repos.gitlabProjectBinding : undefined,
+    gitlabWebhookSecretStore,
+    gitlabAppCfg ? repos.gitlabAgentAccount : undefined,
+    gitlabAppCfg?.baseUrl,
+    async (orgId, agentId) => {
+      // Re-read: the hook write advanced this agent's configRevision in its own transaction.
+      const agent = await repos.agent.get(orgId, agentId)
+      if (!agent) return
+      await agentDelivery.upsert(agent, (err, daemonId) => {
+        if (err instanceof NoConnection) {
+          http.log.debug({ agentId, daemonId }, 'agent/upsert skipped: daemon offline')
+        } else {
+          http.log.warn({ err, agentId, daemonId }, 'hook converge: agent spec reconcile failed')
+        }
+      })
+    },
+    // gitea-kind compile sources (gitea-integration.md §7): the binding, its bot connection, the sealed keys.
+    {
+      bindings: repos.giteaRepositoryBinding,
+      connections: repos.giteaConnection,
+      webhookSecrets: giteaWebhookSecretStore,
+      host: giteaCfg.baseUrl
+    },
+    repos.codeHostDecisionRouting,
+    githubAppCfg ? repos.githubApp : undefined,
+    // azure-devops-kind compile sources (azure-devops-integration.md §11.3): the hooked binding, its connection, keys and subscriptions.
+    {
+      bindings: repos.azureDevOpsRepositoryBinding,
+      connections: repos.azureDevOpsConnection,
+      hooks: azureDevOpsHookRepo
+    }
+  )
+
+  // The single fencing site (allocates seq, stamps epoch/launchId on C→D frames).
+  const sender = new ControlSender(connReg, repos.launch)
+
+  // Console file transfer (source-cache-file-transfer.md): this process signs every URL for the deployment's bucket.
+  const fileTransferConfig = loadFileTransferConfig({ AC_FILE_TRANSFER: config.AC_FILE_TRANSFER })
+  const fileTransferBucket = fileTransferConfig
+    ? (() => {
+        const credentials = createCredentialsProvider(fileTransferConfig.credentials, {
+          region: fileTransferConfig.region,
+          env: process.env
+        })
+        const objects = createObjectClient({ config: fileTransferConfig, credentials, isKey: isTransferObjectKey })
+        // Lazy over `http.log` (assigned below; only ever called once the gate starts).
+        const gate = createLifecycleGate({
+          objects,
+          prefix: fileTransferConfig.prefix,
+          minimumPendingDays: transferPendingMinimumDays(fileTransferConfig.limits.urlSeconds),
+          log: { info: (m) => http.log.info(m), warn: (m) => http.log.warn(m) }
+        })
+        const transfer = createFileTransfer({
+          config: fileTransferConfig,
+          credentials,
+          objects,
+          enabled: () => gate.enabled(),
+          multipart: () => gate.multipart()
+        })
+        return {
+          gate,
+          transfer,
+          service: createFileTransferService({ transfer, control: sender, tickets: repos.uploadTicket })
+        }
+      })()
+    : undefined
+  const fileTransfer = fileTransferBucket?.service
+  // Shared-image originals: the console's resolve works with or without a bucket; signing needs one.
+  const sharedImages = createSharedImageService({
+    ...(fileTransferBucket ? { transfer: fileTransferBucket.transfer } : {}),
+    control: sender
+  })
+
+  // Per-session memory-capture gate convergence (session-visibility.md §5.1):
+  // the CP is the authority on effective visibility; daemons only enforce it.
+  const visibilityPush = new SessionVisibilityPushService({
+    repos: { session: repos.session, agent: repos.agent },
+    control: sender,
+    connReg,
+    placement: placementResolver,
+    // The replay's inverse half: a reconnecting member's served set, not the recorded column.
+    duties: repos.dutyGroup,
+    clock,
+    // Lazy over `http.log` (assigned below; only ever called at push time).
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+
+  // Bot-agnostic collaboration routing snapshot fan-out (agent-collaboration
+  // §2.3/§6.2): relays get the all-org table; daemons get their org-scoped copy.
+  const collabRoutes = new CollabRoutesService(
+    repos.daemon,
+    repos.integration,
+    repos.agent,
+    relayControl,
+    sender,
+    placementResolver,
+    repos.dutyGroup,
+    clock
+  )
+
+  // Capability requests (capability-requests.md): built always so the console reads them; daemons are offered them only behind the flag.
+  const capabilityRequests = new CapabilityRequestService({
+    clock,
+    requests: repos.capabilityRequest,
+    agents: repos.agent,
+    mcpProviders: repos.mcpProvider,
+    skillSources: repos.skillSource,
+    orgs: repos.org,
+    facts: repoCapabilityFacts({
+      repoAuth: repos.agentRepoAuth,
+      installationAuth: repos.agentInstallationAuth,
+      mcpProviders: repos.mcpProvider,
+      mcpOauth: repos.mcpProviderOauth,
+      mcpSecrets: repos.mcpProviderSecret,
+      githubInstallations: repos.githubInstallation,
+      gitlabConnections: repos.gitlabConnection,
+      integrations: repos.integration,
+      knownPlatform: (platform) => platforms.get(platform) !== undefined,
+      liveSecretNames: async (orgId, agentId) =>
+        ((await repos.agentSecret.liveInfo(orgId, [agentId])).get(agentId) ?? []).map((secret) => secret.name),
+      spawnSecretNames: async (orgId, agentId) => (await repos.agentSecret.keys(orgId, [agentId])).get(agentId) ?? [],
+      gitlabHost: gitlabHostOf(gitlabAppCfg?.baseUrl),
+      crons: repos.cron
+    }),
+    ...(webAppUrl ? { webAppUrl } : {}),
+    placement: placementResolver,
+    daemon: (daemonId) => connReg.get(daemonId),
+    sendSettled: (daemonId, orgId, wake) => sender.capabilitySettled(daemonId, orgId, wake),
+    sendReopened: (daemonId, orgId, frame) => sender.capabilityReopened(daemonId, orgId, frame),
+    sendForward: (daemonId, orgId, frame) => sender.capabilityForward(daemonId, orgId, frame),
+    sendMcpRebound: (daemonId, orgId, frame) => sender.agentMcpRebound(daemonId, orgId, frame),
+    log: {
+      debug: (obj, message) => http.log.debug(obj, message),
+      warn: (obj, message) => http.log.warn(obj, message)
+    }
+  })
+
+  // The fan-out that rides the resolver (orchestrator/agentDelivery.ts).
+  const agentDelivery = new AgentDelivery({
+    control: sender,
+    specs: agentSpecs,
+    placement: placementResolver,
+    // §17.3 projection gate: live advertised features; unknown daemon reads fail-closed.
+    daemonFeatures: (daemonId) => connReg.get(daemonId)?.capabilities?.features,
+    // A pushed change may satisfy an open capability request; its wake follows the daemon's ack (§4.7.5).
+    upserted: (agent, acked) =>
+      void capabilityRequests
+        .agentUpserted(agent, acked)
+        .catch((err) => http.log.warn({ err, agentId: agent.id }, 'capability request: re-evaluation failed'))
+  })
+
+  // Code-host routing scopes (code-host-decisions.md §3.2): host choice, the scope's rules, and the hosts' specs.
+  const hookRouting = new HookRoutingService({
+    routings: repos.codeHostDecisionRouting,
+    hooks: repos.hook,
+    agents: repos.agent,
+    daemons: repos.daemon,
+    placement: placementResolver,
+    daemonFeatures: (daemonId) => connReg.get(daemonId)?.capabilities?.features,
+    hookService,
+    projectAgentSpec: async (orgId, agentId) => {
+      const agent = await repos.agent.get(orgId, agentId)
+      if (!agent) return
+      await agentDelivery.upsert(agent, (err, daemonId) => {
+        if (err instanceof NoConnection) http.log.debug({ agentId, daemonId }, 'agent/upsert skipped: daemon offline')
+        else http.log.warn({ err, agentId, daemonId }, 'hook routing: host spec reconcile failed')
+      })
+    },
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  hookService.attachRouting(hookRouting)
+
+  // The projections that BAKE IN the serving daemon — hook rules, HTTP-bot assignment, the
+  // collaboration snapshot. A duty grant or release moves who serves an agent exactly as a
+  // placement move does, so both go through this one fan-out rather than two copies of the list.
+  const agentRouting = new AgentRoutingConverger({
+    hooks: hookService,
+    collabRoutes,
+    // Lazy over `httpBot` (assigned below; only ever called at convergence time), the same
+    // late-binding the logger wrappers use.
+    httpBot: { syncBot: (botId: string) => httpBot.syncBot(botId) },
+    agents: repos.agent,
+    integrations: repos.integration,
+    bots: repos.bot,
+    clock,
+    delayMs: 250,
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+
+  // Duty lease exchange riding the heartbeat (k8s daemons; orchestrator/dutyLease.ts).
+  // The revision reader stamps each granted agent member with the CP's current
+  // spec revision, so a member that already has the agent can tell frozen from current.
+  const dutyLease = new DutyLeaseService(
+    repos.dutyGroup,
+    clock,
+    undefined,
+    { warn: (o, m) => http.log.warn(o, m) },
+    repos.agent,
+    agentRouting,
+    visibilityPush
+  )
+  // Duty-group projection: derived from Integration/CronDef rows on a rotation;
+  // deltas reach daemons via the heartbeat lease exchange, never from the sweep.
+  const dutyRecompute = new DutyRecomputeSweep(
+    repos.dutyGroup,
+    clock,
+    {
+      intervalMs: 30_000,
+      orgsPerTick: 25,
+      leaseMs: DUTY_LEASE_DEFAULTS.leaseMs,
+      kickDelayMs: 250
+    },
+    { warn: (o, m) => http.log.warn(o, m), error: (o, m) => http.log.error(o, m) },
+    agentRouting
+  )
+  // Pool capacity gauges (observability/pool-metrics.ts) — the §12 "alarm on vacant-duty age",
+  // reading the same lease horizon and deliverability cap the claim paths gate on.
+  const poolMetrics = registerPoolMetrics({
+    repo: repos.dutyGroup,
+    clock,
+    liveMs: DUTY_LEASE_DEFAULTS.leaseMs,
+    maxMembers: DUTY_GRANT_MEMBERS_MAX,
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+  // Per-org footprint gauges (observability/org-metrics.ts) — daemons/agents/sessions per org, the
+  // "who is using this install, and how much" read the pool gauges deliberately do not answer.
+  const orgMetrics = registerOrgMetrics({ repo: repos.org, clock, log: { warn: (o, m) => http.log.warn(o, m) } })
+  const agentMutations = new AgentMutationGate()
+  // An agent's own crons (`cron/self`): saved and deleted by the agent with no person's approval, a one-shot retired after its run.
+  const agentCrons = new AgentCronService({
+    crons: repos.cron,
+    agents: repos.agent,
+    integrations: repos.integration,
+    audit: repos.audit,
+    delivery: agentDelivery,
+    mutations: agentMutations,
+    recomputeDuties: (orgId: string) => dutyRecompute.kick(orgId),
+    ...(config.CAPABILITY_REQUESTS_ENABLED
+      ? {
+          cronsChanged: (agent) => capabilityRequests.orgChanged(agent.orgId, { kind: 'cron', agentId: agent.id }, null)
+        }
+      : {}),
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+
+  // Relay roster (shared-bot-relay.md §5): computed from the durable `relay` table
+  // (alive within the failover window), fed into `register/ok.relays` and fanned to
+  // daemons on register/sweep via the `relay/roster` EVT (sender is the broadcaster).
+  // Desktops dial the same relays for the data plane (computer-use.md §3.7), so roster changes reach their channels too.
+  const relayRoster = new RelayRoster(
+    repos.relay,
+    {
+      broadcastRelayRoster: (relays) => {
+        sender.broadcastRelayRoster(relays)
+        computerChannels.pushRelays(relays)
+      }
+    },
+    clock,
+    relayStaleMs
+  )
+  // Viewers reach the desktop through the relay pool's public origin, then any relay it dialed (computer-use.md §7, §10).
+  const coturn = turnConfigFrom(config)
+  const cloudflare = cloudflareTurnConfigFrom(config)
+  const computerTurn = cloudflare
+    ? cloudflareTurn(cloudflare, { warn: (o, m) => http.log.warn(o, m) })
+    : coturn
+      ? coturnTurn(coturn)
+      : undefined
+  // External STUN is the operator's explicit choice, as external TURN is; otherwise the relays' own.
+  const externalStun = stunUrlsFrom(config)
+  // Relays that serve TURN check viewer credentials with this; they receive it on rc/auth/ok (computer-use.md §7.2).
+  const computerRelayTurnSecret = relayTurnSecret(config.API_KEY_PEPPER)
+  const computerChannelGrants = new ComputerChannelGrants(repos.computer, computerChannelKeys, clock, {
+    staleAfterMs: missedBeatsMs,
+    relays: () => relayRoster.entries(),
+    viewerRelays: async () => [
+      ...(config.PUBLIC_RELAY_URL ? [config.PUBLIC_RELAY_URL] : []),
+      ...(await relayRoster.entries()).map((relay) => relay.url)
+    ],
+    ...(computerTurn ? { turn: computerTurn } : {}),
+    relayTurn: {
+      secret: computerRelayTurnSecret,
+      ttlSec: config.COMPUTER_TURN_TTL_SEC,
+      servers: () => relayRoster.turnServers()
+    },
+    stunUrls: externalStun ? () => Promise.resolve(externalStun) : () => relayRoster.stunUrls(),
+    onUse: (computerId) => computerPool?.touch(computerId),
+    viewerQuota: computerPlan
+  })
+  // Managed computers in the Kubernetes pool (computer-use.md §15.1): pool members hold the claims, this decides what they hold.
+  const computerPool = config.COMPUTER_POOL_ENABLED
+    ? new ComputerPool({
+        repo: repos.computer,
+        agents: repos.agent,
+        computers,
+        leases: computerLeases,
+        members: new ConnectedPoolMembers(connReg, { warn: (o, m) => http.log.warn(o, m) }),
+        plan: computerPlan,
+        clock,
+        timings: {
+          ephemeralIdleMs: config.COMPUTER_POOL_EPHEMERAL_IDLE_SEC * 1000,
+          sleepIdleMs: config.COMPUTER_POOL_SLEEP_IDLE_SEC * 1000
+        },
+        sweepIntervalMs: COMPUTER_POOL_SWEEP_MS,
+        log: { info: (o, m) => http.log.info(o, m), warn: (o, m) => http.log.warn(o, m) }
+      })
+    : undefined
+
+  // §14.8 (resource-visibility.md): which of a gated install's reported DMs open to the
+  // ordinary DM default because their counterpart is already in the agent's audience.
+  // Lazy over `logtoIdentity` and `http.log` for the same reason as the logger below —
+  // both are assigned further down and this only runs at report time.
+  const gatedDmSeedResolver: GatedDmSeedResolver = (channels, agent, bot) =>
+    gatedDmSeeds(channels, agent, bot, {
+      users: repos.user,
+      ...(logtoIdentity ? { identity: logtoIdentity } : {}),
+      log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+    })
+
+  // slack-approval-dm.md §3–§4: pick / revalidate a pending approval's DM recipient.
+  // Lazy over `logtoIdentity` and `http.log` exactly like the gated-DM resolver above.
+  const approvalRoute: ApprovalRouteResolver = (req, expectedOrgId) =>
+    resolveApprovalRoute(
+      req,
+      {
+        agent: repos.agent,
+        session: repos.session,
+        integration: repos.integration,
+        bot: repos.bot,
+        users: repos.user,
+        computer: repos.computer,
+        platforms,
+        ...(logtoIdentity ? { identity: logtoIdentity } : {}),
+        log: { debug: (o, m) => http.log.debug(o, m), warn: (o, m) => http.log.warn(o, m) }
+      },
+      expectedOrgId
+    )
+
+  // HTTP-bot assignment + attributed-route compilation (shared-bot-relay.md §4.2/§10).
+  // Its logger is lazy (a wrapper over `http.log`, which is created below) — only ever
+  // invoked at request/sweep time, well after `http` is assigned, so no TDZ hazard.
+  const httpBot = new HttpBotOrchestrator(
+    repos.bot,
+    repos.botSecret,
+    repos.botCredential,
+    repos.integration,
+    repos.integrationChannel,
+    repos.agent,
+    relayReg,
+    sender,
+    repos.threadAffinity,
+    repos.session,
+    {
+      info: (o, m) => http.log.info(o, m),
+      warn: (o, m) => http.log.warn(o, m),
+      debug: (o, m) => http.log.debug(o, m)
+    },
+    platforms,
+    agentDelivery,
+    placementResolver,
+    gatedDmSeedResolver,
+    { routings: repos.botDecisionRouting, daemons: repos.daemon },
+    repos.org
+  )
+  const stagedAgentMoves = new AgentMoveService({
+    agents: repos.agent,
+    assignments: repos.assignment,
+    integrations: repos.integration,
+    integrationChannels: repos.integrationChannel,
+    bots: repos.bot,
+    botSecrets: repos.botSecret,
+    platforms,
+    specs: agentSpecs,
+    chatAuthority: repos.session,
+    crons: repos.cron,
+    // The `duty/fetch` bundle's MCP + external-memory projections (same seams the
+    // reconcile roster below is given, same projector).
+    mcp: { providers: repos.mcpProvider, grants: repos.mcpGrant, relayRoster },
+    memory: {
+      connections: repos.externalMemoryConnection,
+      installations: repos.memoryPluginInstallation,
+      secrets: repos.externalMemoryConnectionSecret,
+      grants: repos.externalMemoryGrant,
+      relayRoster
+    },
+    control: sender,
+    hooks: hookService,
+    httpBot,
+    collabRoutes,
+    mutations: agentMutations,
+    sessionOwners: connReg,
+    placement: placementResolver,
+    memberSets: repos.memberSet,
+    taskLocks: { sessions: repos.session, stores: repos.memberSet },
+    liveness: connReg,
+    recomputeDuties: (orgId: string) => dutyRecompute.recomputeOrg(orgId),
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+
+  // C3 orchestrator with the live placement/rebalance surface fully wired.
+  const orchestrator = new Placement(
+    repos.daemon,
+    repos.agent,
+    repos.assignment,
+    repos.cron,
+    repos.lease,
+    repos.integration,
+    repos.botSecret,
+    agentSpecs,
+    repos.integrationChannel,
+    repos.bot,
+    platforms,
+    repos.session,
+    {
+      registry: connReg,
+      sender,
+      epoch,
+      clock,
+      config: {
+        REASSIGN_GRACE_SEC: config.REASSIGN_GRACE_SEC,
+        ACK_TIMEOUT_MS: config.ACK_TIMEOUT_MS
+      },
+      // MCP-proxy reconcile bundle (centralized-tool-management.md §7): the org providers
+      // a daemon's agents enabled + their grant keys + the relay roster to proxy through.
+      mcp: { providers: repos.mcpProvider, grants: repos.mcpGrant, relayRoster },
+      memory: {
+        connections: repos.externalMemoryConnection,
+        installations: repos.memoryPluginInstallation,
+        secrets: repos.externalMemoryConnectionSecret,
+        grants: repos.externalMemoryGrant,
+        relayRoster
+      },
+      // The duty half of the reconcile roster: pinned-to-me ∪ held-by-me.
+      duties: repos.dutyGroup,
+      placement: placementResolver,
+      log: { warn: (o, m) => http.log.warn(o, m) } // lazy over http.log (assigned below; called at reconcile time)
+    }
+  )
+
+  // Watchdog: missed-beats → freeze → reassign-grace → rebalance (Clock-driven).
+  const watchdog = new Watchdog(connReg, clock, orchestrator, {
+    HEARTBEAT_SEC: config.HEARTBEAT_SEC,
+    MISSED_BEATS: config.MISSED_BEATS,
+    REASSIGN_GRACE_SEC: config.REASSIGN_GRACE_SEC
+  })
+  void watchdog // armed by the auth/heartbeat handlers as that wiring lands; constructed now so the graph is whole.
+
+  // ── C2 HTTP edge ──────────────────────────────────────────────────────────
+  // Readiness gate: `/readyz` pings the DB and reports 503 once shutdown begins
+  // (issue #240). Owned here (has `prisma` for the ping); the bootstrap flips it.
+  const readiness = createReadiness(() => pingDb(rootPrisma))
+  // Best-effort, but never detached: shutdown must not disconnect Prisma while
+  // these projection wakeups are still running.
+  // A code host connected to the organization: requests waiting for that connection complete (capability-requests.md §4.6).
+  const codeHostConnected = async (
+    orgId: OrgId,
+    provider: 'github' | 'gitlab',
+    userId: string | null
+  ): Promise<void> => {
+    const profile = userId ? await repos.user.getProfile(userId).catch(() => null) : null
+    await capabilityRequests
+      .orgChanged(
+        orgId,
+        { kind: 'code-host', provider },
+        userId ? { kind: 'console', userId, name: profile?.displayName?.trim() || profile?.email || 'A member' } : null
+      )
+      .catch((err) => http.log.warn({ err, provider }, 'capability request: re-evaluation after a connection failed'))
+  }
+  const wakeGithubReviewProjections = async (installationId: bigint, orgId: OrgId): Promise<void> => {
+    const at = new Date(clock.now())
+    const results = await Promise.allSettled([
+      repos.hook.wakeReviewProjectionsForInstallation(installationId, at),
+      repos.hook.wakeReviewProjectionsForOrg(orgId, at)
+    ])
+    for (const [scope, result] of [
+      ['installation', results[0]],
+      ['org', results[1]]
+    ] as const) {
+      if (result.status === 'rejected') {
+        http.log.warn(
+          { err: result.reason, installationId: installationId.toString(), orgId, scope },
+          'github: review projection wake failed'
+        )
+      }
+    }
+  }
+  // github-app workspaces (opt-in): assembled only when GITHUB_APP_* is fully
+  // configured; absent ⇒ routes 404 and the WS gitcred handler denies.
+  // Organization Apps sign for their own installations (github-app-git-credentials.md §Organization GitHub Apps).
+  const githubAppRegistry = githubAppCfg
+    ? new GithubAppRegistry({
+        apps: repos.githubApp,
+        secrets: new PgGithubAppSecretStore(prisma, secretCipher),
+        installations: repos.githubInstallation
+      })
+    : undefined
+  const github = githubAppCfg
+    ? new GithubService({
+        cfg: githubAppCfg,
+        clock,
+        installations: repos.githubInstallation,
+        installState: repos.githubInstallState,
+        appRegistry: githubAppRegistry!,
+        repoAuths: repos.agentRepoAuth,
+        installationAuths: repos.agentInstallationAuth,
+        skillSources: repos.skillSource,
+        agents: repos.agent,
+        onInstallationFactsChanged: async (installationId, orgId) => {
+          await wakeGithubReviewProjections(installationId, orgId)
+          await codeHostConnected(orgId, 'github', null)
+        },
+        pepper: config.API_KEY_PEPPER,
+        log: { warn: (message) => http.log.warn(message) },
+        ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+      })
+    : undefined
+  // Organization Apps need the public origin: GitHub redirects the browser to its manifest and setup callbacks.
+  const orgAppRelayUrl = relayHttpBase(config.PUBLIC_RELAY_URL)
+  const githubApps =
+    github && githubAppRegistry && config.PUBLIC_CP_URL
+      ? new GithubAppsService({
+          apps: repos.githubApp,
+          secrets: new PgGithubAppSecretStore(prisma, secretCipher),
+          installations: repos.githubInstallation,
+          states: repos.githubInstallState,
+          registry: githubAppRegistry,
+          botUserId: (slug) => github.botUserId(slug),
+          agentScope: agentGithubScope({
+            repoAuths: repos.agentRepoAuth,
+            installationAuths: repos.agentInstallationAuth,
+            hooks: repos.hook
+          }),
+          covers: (installation, owner, repo) => github.installationCoversRepo(installation, owner, repo),
+          pepper: config.API_KEY_PEPPER,
+          clock,
+          publicCpUrl: config.PUBLIC_CP_URL,
+          ...(webAppUrl ? { webAppUrl } : {}),
+          ...(orgAppRelayUrl ? { publicRelayUrl: orgAppRelayUrl } : {}),
+          webhooks: {
+            assign: (w) =>
+              relayControl.githubAppAssign({
+                githubAppId: w.githubAppId,
+                appId: w.appId.toString(),
+                webhookSecret: w.webhookSecret
+              }),
+            unassign: (githubAppId) => relayControl.githubAppUnassign(githubAppId)
+          },
+          onInstallationChanged: async (installationId, orgId) => {
+            github.tokens.invalidateInstallation(installationId)
+            github.invalidateRepositoryRoster(installationId)
+            await wakeGithubReviewProjections(installationId, orgId)
+          },
+          onAppsChanged: (orgId) => hookService.rebroadcastGithubForOrg(orgId),
+          onAgentAppChanged: async (orgId, agentId) => {
+            // Re-read: the switch advanced this agent's configRevision in its own transaction.
+            const agent = await repos.agent.get(orgId, AgentId(agentId))
+            if (!agent) return
+            await agentDelivery.upsert(agent, (err, daemonId) => {
+              if (err instanceof NoConnection)
+                http.log.debug({ agentId, daemonId }, 'agent/upsert skipped: daemon offline')
+              else http.log.warn({ err, agentId, daemonId }, 'github app switch: agent spec reconcile failed')
+            })
+          },
+          log: { warn: (obj, msg) => http.log.warn(obj, msg) },
+          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+        })
+      : undefined
+  // GitLab.com OAuth administration (opt-in, gitlab-com-integration.md §9):
+  // assembled only when GITLAB_CLIENT_ID/SECRET are configured AND the public
+  // origin is known (the begin/callback URLs derive from it); absent ⇒ routes 404.
+  if (gitlabAppCfg && !config.PUBLIC_CP_URL) {
+    // A deploy mistake, not a mode: the begin/callback URLs derive from the public origin.
+    throw new Error('GITLAB_CLIENT_ID/SECRET are set but PUBLIC_CP_URL is not — set it or unset both')
+  }
+  const gitlabWebAppUrl = resolveWebAppUrl(config)
+  const gitlabOauthService =
+    gitlabAppCfg && config.PUBLIC_CP_URL
+      ? new GitlabOauthService({
+          cfg: gitlabAppCfg,
+          connections: repos.gitlabConnection,
+          secrets: new PgGitlabConnectionSecretStore(prisma, secretCipher),
+          states: repos.gitlabOauthState,
+          instanceState: repos.gitlabInstanceState,
+          cipher: secretCipher,
+          clock,
+          publicCpUrl: config.PUBLIC_CP_URL,
+          ...(gitlabWebAppUrl ? { webAppUrl: gitlabWebAppUrl } : {}),
+          api: gitlabApi!,
+          log: { warn: (obj, msg) => http.log.warn(obj, msg) },
+          onConnected: (orgId, userId) => codeHostConnected(OrgId(orgId), 'gitlab', userId)
+        })
+      : undefined
+  // Late-bound, like the other orchestrator refs here: the account service is
+  // built before the provisioner that owns the removal saga it resumes.
+  const gitlabRef: { current?: { provisioner: GitlabProvisioner } } = {}
+  // §7.2 identity: per-agent accounts, their PATs, and their memberships. Its
+  // mutation lease is the account row's, never a binding's.
+  const gitlabAccountService = gitlabOauthService
+    ? new GitlabAccountService({
+        oauth: gitlabOauthService,
+        accounts: repos.gitlabAgentAccount,
+        credentials: new PgGitlabProjectCredentialRepo(prisma),
+        credentialSecrets: new PgGitlabProjectCredentialSecretStore(prisma, secretCipher),
+        agents: repos.agent,
+        instanceState: repos.gitlabInstanceState,
+        cipher: secretCipher,
+        clock,
+        avatarPng: createGitlabAccountAvatarRenderer(iconStore),
+        // A removal that stopped at a pending deletion finishes once the sweep
+        // proves the account gone; nothing else would revisit that binding.
+        onRetired: (orgId) => {
+          void (async () => {
+            for (const binding of await repos.gitlabProjectBinding.listForOrg(orgId)) {
+              if (binding.state !== 'cleanup_pending' || binding.stateReason !== DELETION_PENDING_REASON) continue
+              await gitlabRef.current?.provisioner.disconnect(orgId, binding.id)
+            }
+          })().catch((err) => http.log.warn({ err, orgId }, 'gitlab removal resume after retirement failed'))
+        },
+        api: gitlabApi!,
+        log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+      })
+    : undefined
+  const gitlab = gitlabOauthService
+    ? {
+        api: gitlabApi!,
+        oauth: gitlabOauthService,
+        accounts: gitlabAccountService!,
+        provisioner: new GitlabProvisioner({
+          oauth: gitlabOauthService,
+          bindings: repos.gitlabProjectBinding,
+          accounts: gitlabAccountService!,
+          webhookSecrets: gitlabWebhookSecretStore!,
+          catalog: repos.codeHostRepository,
+          instanceState: repos.gitlabInstanceState,
+          clock,
+          ...(config.PUBLIC_RELAY_URL ? { publicRelayUrl: config.PUBLIC_RELAY_URL } : {}),
+          // §11.1: the union every enabled gitlab hook on the project wants.
+          desiredWebhookEvents: async (orgId, projectId) =>
+            unionGitlabWebhookEvents(
+              await repos.hook.listForOrgKind(OrgId(orgId), 'gitlab'),
+              projectId,
+              await codeHostFeedback.wants('gitlab', orgId, projectId),
+              (await repos.followUpWatch.watchedRepos(OrgId(orgId), 'gitlab')).includes(projectId)
+            ),
+          // Awaited under the run lease (§17.3 round 3): the durable clone-URL
+          // convergence rides the saga; only the daemon fan-out stays async.
+          syncWorkspacePaths: async (orgId, projectId, projectPath, cloneUrl) => {
+            const agentIds = await repos.agent.refreshGitlabProjectPath(OrgId(orgId), projectId, projectPath, cloneUrl)
+            for (const agentId of agentIds) {
+              void repos.agent
+                .getUnscoped(agentId)
+                .then(
+                  (agent) =>
+                    agent &&
+                    agentDelivery.upsert(agent, (err, daemonId) =>
+                      http.log.warn(
+                        { err, agentId, daemonId },
+                        'gitlab rename: agent/upsert failed (backstop: reconnect)'
+                      )
+                    )
+                )
+                .catch((err) => http.log.warn({ err, agentId }, 'gitlab rename: agent refresh fan-out failed'))
+            }
+          },
+          // Refresh both feedback subscriptions and trigger rules before testing the webhook.
+          onConverged: async (orgId, projectId) => {
+            await codeHostFeedback.sync('gitlab', orgId, projectId)
+            for (const row of await repos.hook.listForOrgKind(OrgId(orgId), 'gitlab')) {
+              if (row.repoId === projectId) await hookService.broadcast(row)
+            }
+          },
+          api: gitlabApi!,
+          log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+        })
+      }
+    : undefined
+  if (gitlab) gitlabRef.current = gitlab
+
+  // §7.4 PAT-rotation sweep; armed only by startBackground().
+  const gitlabRotator = gitlab
+    ? new GitlabCredentialRotator({
+        accounts: gitlab.accounts,
+        clock,
+        log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+      })
+    : undefined
+
+  // §19.4 retirement sweep: GitLab deletes a user asynchronously, so the run
+  // that asked cannot witness it — this loop does. Armed by startBackground().
+  const gitlabRetirementSweeper = gitlab
+    ? new GitlabRetirementSweeper({
+        accounts: gitlab.accounts,
+        clock,
+        log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+      })
+    : undefined
+
+  // §10.2 convergence sweep: re-drives what a contended pass still owes, the
+  // half of that obligation which survives a restart. Armed by startBackground().
+  const gitlabConvergeSweeper = gitlab
+    ? new GitlabConvergeSweeper({
+        provisioner: gitlab.provisioner,
+        clock,
+        log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+      })
+    : undefined
+
+  // The GitLab arm of rc/codehost-membership-authz (§12.2): live effective
+  // membership through the binding's read PAT. Absent configuration fails closed.
+  const gitlabMembershipAuthz = gitlab
+    ? new GitlabMembershipAuthzService({
+        hooks: repos.hook,
+        bindings: repos.gitlabProjectBinding,
+        accounts: repos.gitlabAgentAccount,
+        credentials: new PgGitlabProjectCredentialRepo(prisma),
+        credentialSecrets: new PgGitlabProjectCredentialSecretStore(prisma, secretCipher),
+        trustedActors: repos.codeHostTrustedActor,
+        clock,
+        api: gitlabApi!
+      })
+    : undefined
+
+  // Gitea (gitea-integration.md §4, §6): one bot connection per organization, the repository
+  // saga over the deployment-global claim, and the rules rebroadcast after every converge.
+  const rebroadcastGiteaRules = async (orgId: string, repoId: bigint): Promise<void> => {
+    await codeHostFeedback.sync('gitea', orgId, repoId)
+    for (const row of await repos.hook.listForOrgKind(OrgId(orgId), 'gitea')) {
+      if (row.repoId === repoId) await hookService.broadcast(row)
+    }
+  }
+  // Every agent with a Gitea consumer, re-projected: a spec push is what reaches a daemon's caches.
+  const reprojectGiteaConsumers = async (orgId: string): Promise<void> => {
+    const hookAgents = new Set(
+      (await repos.hook.listForOrgKind(OrgId(orgId), 'gitea')).filter((h) => h.enabled).map((h) => h.agentId)
+    )
+    for (const agent of await repos.agent.list(OrgId(orgId))) {
+      const consumer =
+        (agent.workspace.mode === 'git' && agent.workspace.credential?.provider === 'gitea') ||
+        hookAgents.has(agent.id) ||
+        (await repos.agentRepoAuth.listForAgent(agent.id)).some((row) => row.provider === 'gitea')
+      if (!consumer) continue
+      await agentDelivery.upsert(agent, (err, daemonId) => {
+        if (!(err instanceof NoConnection))
+          http.log.warn({ err, agentId: agent.id, daemonId }, 'gitea: agent re-projection failed')
+      })
+    }
+  }
+  const giteaConnectionService = new GiteaConnectionService({
+    connections: repos.giteaConnection,
+    secrets: new PgGiteaConnectionSecretStore(prisma, secretCipher),
+    bindings: repos.giteaRepositoryBinding,
+    cipher: secretCipher,
+    clock,
+    api: giteaApi,
+    // §4.3: a replacement advanced the epoch — every consumer's spec goes out again.
+    onCredentialEpochChanged: (orgId) => reprojectGiteaConsumers(orgId),
+    // A rejection degraded the bindings: their rules and their agents reflect it.
+    onBindingsDegraded: async (orgId, bindings) => {
+      for (const binding of bindings) await rebroadcastGiteaRules(orgId, binding.repoId)
+    },
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  const giteaProvisioner = new GiteaProvisioner({
+    connections: repos.giteaConnection,
+    tokens: giteaConnectionService,
+    bindings: repos.giteaRepositoryBinding,
+    webhookSecrets: giteaWebhookSecretStore,
+    catalog: repos.codeHostRepository,
+    clock,
+    ...(config.PUBLIC_RELAY_URL ? { publicRelayUrl: config.PUBLIC_RELAY_URL } : {}),
+    // Native CI subscriptions are enabled only on a verified supported instance version.
+    desiredWebhookEvents: async (orgId, repoId) => {
+      const binding = await repos.giteaRepositoryBinding.byRepo(orgId, repoId)
+      const connection = binding ? await repos.giteaConnection.get(orgId, binding.connectionId) : null
+      return unionGiteaWebhookEvents(
+        await repos.hook.listForOrgKind(OrgId(orgId), 'gitea'),
+        repoId,
+        await codeHostFeedback.wants('gitea', orgId, repoId),
+        parseGiteaVersion(connection?.instanceVersion)
+      )
+    },
+    syncWorkspacePaths: async (orgId, repoId, repoPath, cloneUrl) => {
+      const agentIds = await repos.agent.refreshCodeHostRepositoryPath(
+        OrgId(orgId),
+        'gitea',
+        repoId,
+        repoPath,
+        cloneUrl
+      )
+      for (const agentId of agentIds) {
+        void repos.agent
+          .getUnscoped(agentId)
+          .then(
+            (agent) =>
+              agent &&
+              agentDelivery.upsert(agent, (err, daemonId) =>
+                http.log.warn({ err, agentId, daemonId }, 'gitea rename: agent/upsert failed (backstop: reconnect)')
+              )
+          )
+          .catch((err) => http.log.warn({ err, agentId }, 'gitea rename: agent refresh fan-out failed'))
+      }
+    },
+    // AWAITED by the saga before a test delivery: the relay verifies only what it holds a key for.
+    onConverged: (orgId, repoId) => rebroadcastGiteaRules(orgId, repoId),
+    api: giteaApi,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  // §6 binding on first use: the path every write that names a repository binds it through.
+  const giteaBindingService = new GiteaBindingService({
+    connections: repos.giteaConnection,
+    tokens: giteaConnectionService,
+    bindings: repos.giteaRepositoryBinding,
+    provisioner: giteaProvisioner,
+    api: giteaApi
+  })
+  const gitea = {
+    connections: giteaConnectionService,
+    provisioner: giteaProvisioner,
+    bindings: giteaBindingService,
+    api: giteaApi
+  }
+
+  // Azure DevOps (azure-devops-integration.md §3-§5): connections through the deployment's Microsoft application or an own one.
+  const azureDevOpsApi = new AzureDevOpsApiClient({
+    ...(opts.azureDevOpsFetch ? { fetch: opts.azureDevOpsFetch } : {}),
+    now: () => clock.now()
+  })
+  const azureDevOpsDeploymentApp = resolveMsTeamsPlatformApp(config)
+  // Every agent whose workspace or grant names the connection, re-projected so daemon caches purge (§3.5).
+  const reprojectAzureDevOpsConsumers = async (orgId: string, connectionId: string): Promise<void> => {
+    for (const agent of await repos.agent.list(OrgId(orgId))) {
+      const credential = agent.workspace.mode === 'git' ? agent.workspace.credential : undefined
+      const consumer =
+        (credential !== undefined && 'connectionId' in credential && credential.connectionId === connectionId) ||
+        (await repos.agentRepoAuth.listForAgent(agent.id)).some((row) => row.connectionId === connectionId)
+      if (!consumer) continue
+      await agentDelivery.upsert(agent, (err, daemonId) => {
+        if (!(err instanceof NoConnection))
+          http.log.warn({ err, agentId: agent.id, daemonId }, 'azure devops: agent re-projection failed')
+      })
+    }
+  }
+  const azureDevOpsConnectionService = new AzureDevOpsConnectionService({
+    connections: repos.azureDevOpsConnection,
+    secrets: new PgAzureDevOpsConnectionSecretStore(prisma, secretCipher),
+    bindings: repos.azureDevOpsRepositoryBinding,
+    cipher: secretCipher,
+    clock,
+    api: azureDevOpsApi,
+    tokens: new AzureDevOpsTokenCache(() => clock.now()),
+    ...(azureDevOpsDeploymentApp
+      ? {
+          deploymentApplication: {
+            clientId: azureDevOpsDeploymentApp.appId,
+            clientSecret: azureDevOpsDeploymentApp.clientSecret
+          }
+        }
+      : {}),
+    onCredentialEpochChanged: (orgId, connection) => reprojectAzureDevOpsConsumers(orgId, connection.id),
+    secretFingerprint: azureDevOpsSecretFingerprint(config.API_KEY_PEPPER),
+    log: { warn: (obj, msg) => http.log.warn(obj, msg), info: (obj, msg) => http.log.info(obj, msg) }
+  })
+  // §11.2: subscriptions follow the repository's enabled hooks; every change recompiles the repository's rules.
+  const azureDevOpsHooks = new AzureDevOpsHookService({
+    connections: repos.azureDevOpsConnection,
+    bindings: repos.azureDevOpsRepositoryBinding,
+    hooks: azureDevOpsHookRepo,
+    service: azureDevOpsConnectionService,
+    api: azureDevOpsApi,
+    clock,
+    ...(config.PUBLIC_RELAY_URL ? { publicRelayUrl: config.PUBLIC_RELAY_URL } : {}),
+    listHooks: (orgId) => repos.hook.listForOrgKind(OrgId(orgId), 'azure-devops'),
+    onChanged: async (orgId, repoId) => {
+      for (const row of await repos.hook.listForOrgKind(OrgId(orgId), 'azure-devops')) {
+        if (row.repoId === repoId) await hookService.broadcast(row)
+      }
+    },
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  const azureDevOpsHookSweeper = new AzureDevOpsHookSweeper({
+    hooks: azureDevOpsHooks,
+    clock,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  // The Azure DevOps arm of rc/codehost-membership-authz (§11.4): the actor's groups against the repository's list chain.
+  const azureDevOpsMembershipAuthz = new AzureDevOpsMembershipAuthzService({
+    hooks: repos.hook,
+    bindings: repos.azureDevOpsRepositoryBinding,
+    connections: repos.azureDevOpsConnection,
+    service: azureDevOpsConnectionService,
+    api: azureDevOpsApi,
+    clock,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  const socialIdentityMutations = new PgSocialIdentityMutationGate(prisma)
+  const azureDevOpsUserIdentityStore = new PgAzureDevOpsUserIdentityStore(prisma)
+  const microsoftIdentityFor = async (userId: string) => {
+    const sub = await repos.user.getOidcSubject(userId)
+    return sub && logtoIdentity ? logtoIdentity.microsoftIdentityFor(sub, 0) : null
+  }
+  const azureDevOpsUserIdentity = new AzureDevOpsUserIdentityService({
+    api: azureDevOpsApi,
+    clock,
+    cipher: secretCipher,
+    store: azureDevOpsUserIdentityStore,
+    mutations: socialIdentityMutations,
+    connections: repos.azureDevOpsConnection,
+    subjectFor: (userId) => repos.user.getOidcSubject(userId),
+    microsoftIdentityFor,
+    ...(azureDevOpsDeploymentApp && webAppUrl
+      ? {
+          application: {
+            clientId: azureDevOpsDeploymentApp.appId,
+            clientSecret: azureDevOpsDeploymentApp.clientSecret,
+            webAppUrl
+          }
+        }
+      : {})
+  })
+  const azureDevOps = {
+    userIdentity: azureDevOpsUserIdentity,
+    connections: azureDevOpsConnectionService,
+    userAuthz: new AzureDevOpsUserAuthzService({
+      api: azureDevOpsApi,
+      service: azureDevOpsConnectionService,
+      microsoftIdentityFor,
+      microsoftTenantIdentityFor: (userId, linked, tenantId) =>
+        azureDevOpsUserIdentity.identityFor(userId, linked, tenantId)
+    }),
+    hooks: azureDevOpsHooks,
+    bindings: new AzureDevOpsBindingService({
+      connections: repos.azureDevOpsConnection,
+      bindings: repos.azureDevOpsRepositoryBinding,
+      service: azureDevOpsConnectionService,
+      api: azureDevOpsApi,
+      // A rename converges workspace clone URLs and grant paths, then re-projects those agents, as for Gitea.
+      onPathChanged: async (orgId, repoId, repoPath, cloneUrl) => {
+        const agentIds = await repos.agent.refreshCodeHostRepositoryPath(
+          OrgId(orgId),
+          'azure-devops',
+          repoId,
+          repoPath,
+          cloneUrl
+        )
+        for (const agentId of agentIds) {
+          void repos.agent
+            .getUnscoped(agentId)
+            .then(
+              (agent) =>
+                agent &&
+                agentDelivery.upsert(agent, (err, daemonId) =>
+                  http.log.warn({ err, agentId, daemonId }, 'azure devops rename: agent/upsert failed')
+                )
+            )
+            .catch((err) => http.log.warn({ err, agentId }, 'azure devops rename: agent refresh fan-out failed'))
+        }
+      }
+    }),
+    connect: new AzureDevOpsConnectFlowService({
+      api: azureDevOpsApi,
+      keys: azureDevOpsConnectKeys(config.API_KEY_PEPPER),
+      clock,
+      connections: azureDevOpsConnectionService,
+      connectionRepo: repos.azureDevOpsConnection,
+      ...(azureDevOpsDeploymentApp
+        ? {
+            deploymentApplication: {
+              clientId: azureDevOpsDeploymentApp.appId,
+              clientSecret: azureDevOpsDeploymentApp.clientSecret
+            }
+          }
+        : {}),
+      ...(webAppUrl ? { webAppUrl } : {}),
+      // A project that now allows triggers recovers the hooked repositories that waited for it.
+      onTriggersAllowed: (orgId, connectionId) => azureDevOpsHooks.convergeConnection(orgId, connectionId)
+    })
+  }
+  // The §6 convergence sweep, the half of a contended pass's obligation that survives a restart.
+  const giteaConvergeSweeper = new GiteaConvergeSweeper({
+    provisioner: giteaProvisioner,
+    clock,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  // The Gitea arm of rc/codehost-membership-authz (§8): the live collaborator permission through the bot token, then the teams.
+  const giteaMembershipAuthz = new GiteaMembershipAuthzService({
+    hooks: repos.hook,
+    bindings: repos.giteaRepositoryBinding,
+    connections: repos.giteaConnection,
+    tokens: giteaConnectionService,
+    trustedActors: repos.codeHostTrustedActor,
+    api: giteaApi,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+
+  // §16 informational run projection: the CP records the desired generation, the OWNING DAEMON
+  // writes the note. Assembled with the GitLab administration surface, since the ledger's
+  // credential fence comes from the acting agent's account on a project binding.
+  const codeHostNoteProjection = gitlab
+    ? new CodeHostNoteProjectionService({
+        projections: new PgCodeHostRunProjectionRepo(prisma),
+        runs: repos.hook,
+        agents: repos.agent,
+        bindings: repos.gitlabProjectBinding,
+        accounts: repos.gitlabAgentAccount,
+        orgs: repos.org,
+        clock,
+        ...(gitlabWebAppUrl ? { webAppUrl: gitlabWebAppUrl } : {}),
+        sender: {
+          daemonFeatures: (daemonId) => connReg.get(daemonId)?.capabilities?.features,
+          send: (daemonId, desired, orgId) => {
+            try {
+              sender.codeHostNoteDesired(daemonId, desired, orgId)
+            } catch (err) {
+              // An offline daemon leaves the desired generation pending — never an error path.
+              http.log.debug({ err, daemonId }, 'note projection: desired frame not sent — daemon offline')
+            }
+          }
+        },
+        log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+      })
+    : undefined
+
+  // gitea-integration.md §10.4: Gitea's run projection is a commit status the Control Plane writes itself (coordinator + reporter).
+  const giteaStatusReporterRef: { current?: GiteaStatusReporter } = {}
+  const giteaStatusProjection = new GiteaStatusCoordinator({
+    projections: new PgCodeHostRunProjectionRepo(prisma),
+    runs: repos.hook,
+    agents: repos.agent,
+    bindings: repos.giteaRepositoryBinding,
+    connections: repos.giteaConnection,
+    clock,
+    kick: () => giteaStatusReporterRef.current?.kick()
+  })
+  const giteaStatusReporter = new GiteaStatusReporter({
+    projections: new PgCodeHostRunProjectionRepo(prisma),
+    bindings: repos.giteaRepositoryBinding,
+    connections: repos.giteaConnection,
+    tokens: giteaConnectionService,
+    orgs: repos.org,
+    api: giteaApi,
+    clock,
+    ...(webAppUrl ? { webAppUrl } : {}),
+    log: {
+      info: (o, m) => http.log.info(o, m),
+      warn: (o, m) => http.log.warn(o, m),
+      error: (o, m) => http.log.error(o, m)
+    }
+  })
+  giteaStatusReporterRef.current = giteaStatusReporter
+
+  // azure-devops-integration.md §11.7: a pull-request status the Control Plane writes with the connection's token.
+  const azureDevOpsStatusReporterRef: { current?: AzureDevOpsStatusReporter } = {}
+  const azureDevOpsStatusProjection = new AzureDevOpsStatusCoordinator({
+    projections: new PgCodeHostRunProjectionRepo(prisma),
+    runs: repos.hook,
+    agents: repos.agent,
+    bindings: repos.azureDevOpsRepositoryBinding,
+    connections: repos.azureDevOpsConnection,
+    clock,
+    kick: () => azureDevOpsStatusReporterRef.current?.kick()
+  })
+  const azureDevOpsStatusReporter = new AzureDevOpsStatusReporter({
+    projections: new PgCodeHostRunProjectionRepo(prisma),
+    bindings: repos.azureDevOpsRepositoryBinding,
+    connections: repos.azureDevOpsConnection,
+    service: azureDevOpsConnectionService,
+    api: azureDevOpsApi,
+    orgs: repos.org,
+    clock,
+    ...(webAppUrl ? { webAppUrl } : {}),
+    log: {
+      info: (o, m) => http.log.info(o, m),
+      warn: (o, m) => http.log.warn(o, m),
+      error: (o, m) => http.log.error(o, m)
+    }
+  })
+  azureDevOpsStatusReporterRef.current = azureDevOpsStatusReporter
+
+  const readSessionBranch = async (
+    agent: AgentRecord,
+    session: SessionMetaRecord,
+    scope: 'session' | 'shared'
+  ): Promise<string | null> => {
+    // Resolve placement first because pool agents need not have a daemonId.
+    const daemonId = (await placementResolver.servingDaemon(agent)) ?? agent.daemonId
+    if (!daemonId) throw new Error('no daemon currently serves the session workspace')
+    const daemon = await registry.getAvailable(agent.orgId, daemonId)
+    if (!daemon) throw new Error('session workspace daemon is unavailable')
+    // Isolated worktree reads require the daemon's session-workspace capability.
+    if (scope === 'session' && !daemon.capabilities.features.includes(WORKSPACE_SESSION_READ_FEATURE)) {
+      throw new Error('session workspace daemon cannot read isolated worktrees yet')
+    }
+    const status = await sender.workspaceGitStatus(daemonId, {
+      agentId: agent.id,
+      ...(scope === 'session' ? { sessionId: session.id } : {})
+    })
+    return status.isRepo ? (status.branch ?? null) : null
+  }
+  // The console PR panel's read projection — long-lived so its short TTL cache actually absorbs mounts.
+  const pullRequestView = github ? new PullRequestViewService(github.tokens, clock, opts.githubFetch) : undefined
+  // §12.6's second identity source for that panel: the PR a session's own head branch has, for the
+  // sessions no pull-request run owns. Long-lived for the same reason — its TTL absorbs panel mounts.
+  const sessionPullRequestLink =
+    github && pullRequestView
+      ? new SessionPullRequestLinkService({
+          clock,
+          github,
+          tokens: github.tokens,
+          readSessionBranch,
+          latestSessionIdOfAgent: (agent) => repos.session.latestSessionIdForAgent(agent.orgId, agent.id),
+          log: { warn: (obj, message) => http.log.warn(obj, message) },
+          ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {})
+        })
+      : undefined
+  // The organization a signed GitHub delivery belongs to: its live, unsuspended installation's.
+  const githubSignalOrg = async (signal: { installationId: string }) => {
+    const installation = await repos.githubInstallation.getByInstallationId(BigInt(signal.installationId))
+    return installation && !installation.revokedAt && !installation.suspendedAt ? installation.orgId : null
+  }
+  const sessionPullRequestFeedback = new SessionPullRequestFeedbackService({
+    clock,
+    feedback: repos.sessionPullRequestFeedback,
+    sessions: repos.session,
+    agents: repos.agent,
+    sourceOf: githubSignalOrg,
+    validate: async (item, agent) => {
+      if (item.provider && item.provider !== 'github') return codeHostFeedback.validate(item, agent)
+      if (!item.installationId) return false
+      const installation = await repos.githubInstallation.getByInstallationId(item.installationId)
+      return !!installation && installation.orgId === item.orgId && !installation.revokedAt && !installation.suspendedAt
+    },
+    memberSets: repos.memberSet,
+    placement: placementResolver,
+    links: {
+      capture: (agent, session) =>
+        agent.workspace.mode === 'git' && agent.workspace.credential?.provider === 'github'
+          ? (sessionPullRequestLink?.capture(agent, session) ?? Promise.resolve({ status: 'absent' as const }))
+          : codeHostFeedback.capture(agent, session)
+    },
+    daemon: (daemonId) => connReg.get(daemonId),
+    send: (daemonId, request, orgId) => sender.sessionPullRequestFeedback(daemonId, orgId, request),
+    log: {
+      debug: (obj, message) => http.log.debug(obj, message),
+      warn: (obj, message) => http.log.warn(obj, message)
+    }
+  })
+  const gitlabFeedbackProvider =
+    gitlab && gitlabMembershipAuthz
+      ? new GitlabFeedbackProvider({
+          api: gitlabApi!,
+          clock,
+          bindings: repos.gitlabProjectBinding,
+          accounts: repos.gitlabAgentAccount,
+          credentials: new PgGitlabProjectCredentialRepo(prisma),
+          credentialSecrets: new PgGitlabProjectCredentialSecretStore(prisma, secretCipher),
+          secrets: gitlabWebhookSecretStore!,
+          membership: gitlabMembershipAuthz
+        })
+      : undefined
+  const codeHostFeedback: CodeHostFeedbackService = new CodeHostFeedbackService({
+    providers: [
+      ...(gitlabFeedbackProvider ? [gitlabFeedbackProvider] : []),
+      new GiteaFeedbackProvider({
+        api: giteaApi,
+        bindings: repos.giteaRepositoryBinding,
+        connections: repos.giteaConnection,
+        tokens: giteaConnectionService,
+        secrets: giteaWebhookSecretStore,
+        membership: giteaMembershipAuthz
+      })
+    ],
+    agents: repos.agent,
+    readBranch: (agent, session) => readSessionBranch(agent, session, 'session'),
+    queue: sessionPullRequestFeedback,
+    broadcast: (watch) => relayControl.feedbackWatch(watch),
+    // Built just below; a project a follow-up watches joins the project's feedback watch.
+    followUps: () => followUpWatch
+  })
+  // Event wake (assistant-mode.md §5.14): the feedback lane's second consumer, holding one wake per watch.
+  const followUpWatch = new FollowUpWatchService({
+    clock,
+    watches: repos.followUpWatch,
+    agents: repos.agent,
+    providers: [
+      ...(github ? [githubFollowUpWatchProvider(github)] : []),
+      ...(gitlabFeedbackProvider
+        ? [
+            gitlabFollowUpWatchProvider({
+              api: gitlabApi!,
+              bindings: repos.gitlabProjectBinding,
+              repoAuths: repos.agentRepoAuth,
+              feedback: gitlabFeedbackProvider
+            })
+          ]
+        : [])
+    ],
+    // A watched GitLab project's feedback watch and webhook converge as its watches come and go.
+    repositoryChanged: (object) => {
+      void codeHostFeedback
+        .sync(object.provider, object.orgId, object.repoId)
+        .catch((err) => http.log.warn({ err }, 'follow-up watch: feedback watch sync failed'))
+      if (object.provider === 'gitlab')
+        void gitlabRef.current?.provisioner
+          .convergeProject(object.orgId, object.repoId)
+          .catch((err) => http.log.warn({ err }, 'follow-up watch: webhook convergence failed'))
+    },
+    opener: async (object) =>
+      (
+        await repos.sessionPullRequestFeedback.owner(
+          object.orgId,
+          object.provider,
+          object.bindingId,
+          object.repoId,
+          object.number
+        )
+      )?.agentId ?? null,
+    placement: placementResolver,
+    daemon: (daemonId) => connReg.get(daemonId),
+    send: (daemonId, request, orgId) => sender.followUpWake(daemonId, orgId, request),
+    broadcast: (watch) => relayControl.followUpWatch(watch),
+    log: {
+      debug: (obj, message) => http.log.debug(obj, message),
+      warn: (obj, message) => http.log.warn(obj, message)
+    }
+  })
+  const githubReviewBroker = github
+    ? new GithubReviewBrokerService({
+        hook: repos.hook,
+        agent: repos.agent,
+        github,
+        clock,
+        placement: placementResolver
+      })
+    : undefined
+  // Formal reviews (§15.1/§15.2): GitLab's per-agent service account, the Gitea connection's bot user, or the Azure DevOps connection identity.
+  const codeHostReviewBroker = new CodeHostReviewBrokerService({
+    onPublished: (orgId, agentId, result, sessionId) =>
+      codeHostFeedback.reviewPublished(orgId, agentId, result, sessionId),
+    leases: new PgCodeHostReviewLeaseRepo(prisma),
+    hook: repos.hook,
+    agent: repos.agent,
+    clock,
+    placement: placementResolver,
+    publisher: async (orgId, provider, projectExternalId, agentId) => {
+      if (provider === 'gitea') {
+        const binding = await repos.giteaRepositoryBinding.byRepo(orgId, projectExternalId)
+        // A binding mid-removal or waiting on a replacement token publishes nothing.
+        if (!binding || binding.state === 'cleanup_pending' || binding.state === 'runtime_degraded') return null
+        const connection = await repos.giteaConnection.get(orgId, binding.connectionId)
+        if (!connection || connection.state !== 'connected') return null
+        return { serviceAccountExternalId: connection.botUserId, projectPath: binding.repoPath }
+      }
+      if (provider === 'azure-devops') {
+        const deps = { bindings: repos.azureDevOpsRepositoryBinding, connections: repos.azureDevOpsConnection }
+        return azureDevOpsReviewPublisher(deps, orgId, projectExternalId)
+      }
+      if (provider !== 'gitlab' || !gitlabAppCfg) return null
+      const binding = await repos.gitlabProjectBinding.byProject(orgId, projectExternalId)
+      if (!binding) return null
+      // A binding being repaired or torn down publishes nothing.
+      if (binding.state !== 'ready' && binding.state !== 'admin_degraded') return null
+      // §7.2: the ACTING agent's own account is the coordinator's subject key.
+      const account = await repos.gitlabAgentAccount.forAgentBinding(orgId, agentId, binding.id)
+      if (!account || account.serviceAccountUserId === null) return null
+      return { serviceAccountExternalId: account.serviceAccountUserId, projectPath: binding.projectPath }
+    }
+  })
+  const githubCommentAuthz = github
+    ? new GithubCommentAuthzService({
+        hooks: repos.hook,
+        installations: repos.githubInstallation,
+        github,
+        trustedActors: repos.codeHostTrustedActor
+      })
+    : undefined
+  const githubRerequest = githubAppCfg
+    ? new GithubRerequestService({
+        hooks: repos.hook,
+        appId: githubAppCfg.appId,
+        orgAppIdOf: async (installationId) => {
+          const row = await repos.githubInstallation.getByInstallationId(installationId)
+          if (!row?.githubAppId) return null
+          return (await repos.githubApp.getUnscoped(row.githubAppId))?.appId ?? null
+        }
+      })
+    : undefined
+  const githubRunReporterRef: { current?: GithubRunReporter } = {}
+  const githubRunCoordinator = github
+    ? new GithubRunCoordinator({
+        hooks: repos.hook,
+        agents: repos.agent,
+        clock,
+        kick: () => githubRunReporterRef.current?.kick()
+      })
+    : undefined
+  const githubRunReporter = github
+    ? new GithubRunReporter({
+        hooks: repos.hook,
+        agents: repos.agent,
+        orgs: repos.org,
+        ...(webAppUrl ? { webAppUrl } : {}),
+        ...(githubAppCfg?.slug ? { appSlug: githubAppCfg.slug } : {}),
+        github,
+        clock,
+        ...(githubRunCoordinator ? { repair: () => githubRunCoordinator.repair() } : {}),
+        ...(opts.githubFetch ? { fetchImpl: opts.githubFetch } : {}),
+        log: {
+          info: (o, m) => http.log.info(o, m),
+          warn: (o, m) => http.log.warn(o, m),
+          error: (o, m) => http.log.error(o, m)
+        }
+      })
+    : undefined
+  if (githubRunReporter) githubRunReporterRef.current = githubRunReporter
+  // Per-user repo authorization (identity assertion, design open question #7): needs the
+  // github module, the Logto Mgmt coupling AND real OIDC auth — devAuth
+  // principals have no identities to assert, so the gate stays off with the
+  // org-level model (installation coverage) as before.
+  // Installation doorbell (webhook-triggers decision 11): the relay's verified
+  // `installation*` pokes trigger an App-JWT re-pull + github-hook recompile.
+  // Logger is lazy over `http.log` (HttpBotOrchestrator precedent — pokes only
+  // arrive over the relay WS, long after `http` exists).
+  const installationDoorbell = github
+    ? new GithubInstallationDoorbell({
+        github,
+        installations: repos.githubInstallation,
+        recompileOrg: (orgId) => hookService.rebroadcastGithubForOrg(orgId),
+        onFactsChanged: async (installationId, orgId) => {
+          github.tokens.invalidateInstallation(installationId)
+          pullRequestView?.invalidateInstallation(installationId)
+          github.invalidateRepositoryRoster(installationId)
+          await wakeGithubReviewProjections(installationId, orgId)
+          githubRunReporter?.kick()
+        },
+        clock,
+        log: {
+          debug: (o, m) => http.log.debug(o, m),
+          info: (o, m) => http.log.info(o, m),
+          warn: (o, m) => http.log.warn(o, m)
+        }
+      })
+    : undefined
+
+  const githubAppOwners =
+    config.GITHUB_APP_CLIENT_ID && config.GITHUB_APP_CLIENT_SECRET && webAppUrl
+      ? new GithubAppOwnersService(
+          {
+            clientId: config.GITHUB_APP_CLIENT_ID,
+            clientSecret: config.GITHUB_APP_CLIENT_SECRET,
+            redirectUri: new URL('/auth/social/callback', webAppUrl).toString()
+          },
+          opts.githubFetch
+        )
+      : undefined
+  const logtoMgmtCfg = resolveLogtoMgmtConfig(config)
+  const githubRepoIdentity =
+    github && logtoMgmtCfg && config.OIDC_ISSUER
+      ? new GithubRepoIdentityService({
+          store: new PgGithubRepoIdentityStore(prisma),
+          mutations: socialIdentityMutations,
+          clock,
+          cipher: secretCipher,
+          github,
+          assertLinkable: (sub) => logtoIdentity!.assertGithubRepoLinkable(sub),
+          invalidate: (sub) => logtoIdentity!.forgetGithubLogin(sub),
+          ...(config.GITHUB_APP_CLIENT_ID && config.GITHUB_APP_CLIENT_SECRET && webAppUrl
+            ? {
+                oauth: {
+                  clientId: config.GITHUB_APP_CLIENT_ID,
+                  clientSecret: config.GITHUB_APP_CLIENT_SECRET,
+                  redirectUri: new URL('/auth/social/callback', webAppUrl).toString()
+                }
+              }
+            : {})
+        })
+      : undefined
+  const logtoIdentity: LogtoIdentityService | undefined =
+    logtoMgmtCfg && config.OIDC_ISSUER
+      ? new LogtoIdentityService(
+          logtoMgmtCfg,
+          clock,
+          socialIdentityMutations,
+          undefined,
+          {
+            // Lazy over `http.log` (assigned below; only ever called at lookup time).
+            debug: (o, m) => http.log.debug(o, m),
+            info: (o, m) => http.log.info(o, m)
+          },
+          {
+            identityTtlMs: config.SESSION_ACCESS_IDENTITY_TTL_SEC * 1000,
+            ...(githubRepoIdentity ? { githubRepoIdentity } : {}),
+            clearMicrosoftTenantIdentities: (sub) => azureDevOpsUserIdentityStore.clearBySubject(sub)
+          }
+        )
+      : undefined
+  const githubUserAuthz =
+    github && logtoIdentity
+      ? new GithubUserAuthzService({
+          identity: logtoIdentity,
+          github,
+          users: repos.user,
+          clock
+        })
+      : undefined
+  // The §2.3 session-access cache-policy knobs (session-access-cold-visit.md),
+  // shared by every plugin holding a resource-fact cache.
+  const sessionAccessTtls = {
+    recheckMs: config.SESSION_ACCESS_RECHECK_SEC * 1000,
+    publicTtlMs: config.SESSION_ACCESS_PUBLIC_TTL_SEC * 1000
+  }
+  const slackSessionAccess = new SlackSessionAccessService({
+    bots: repos.bot,
+    botSecrets: repos.botSecret,
+    clock,
+    ...sessionAccessTtls,
+    ...(logtoIdentity ? { identity: logtoIdentity } : {}),
+    ...(opts.slackFetch ? { fetchImpl: opts.slackFetch } : {}),
+    // Lazy over `http.log` (assigned below; only ever called at resolve time).
+    log: { warn: (o, m) => http.log.warn(o, m), debug: (o, m) => http.log.debug(o, m) }
+  })
+  const githubSessionAccess = new GithubSessionAccessService({
+    installations: repos.githubInstallation,
+    ...(github ? { github } : {}),
+    ...(githubUserAuthz ? { userAuthz: githubUserAuthz } : {}),
+    clock,
+    ...sessionAccessTtls,
+    identityTtlMs: config.SESSION_ACCESS_IDENTITY_TTL_SEC * 1000,
+    // Lazy over `http.log` (assigned below; only ever called at resolve time).
+    log: { warn: (o, m) => http.log.warn(o, m), debug: (o, m) => http.log.debug(o, m) }
+  })
+  const configuredSocialProviders =
+    opts.deploymentConfig?.values.auth.mode === 'oidc' ? opts.deploymentConfig.values.auth.socialProviders : []
+  const feishuLoginRegions = (['feishu', 'lark'] as const).filter((region) =>
+    opts.deploymentConfig ? configuredSocialProviders.includes(region) : Boolean(feishuPlatformApps[region])
+  )
+  const gitlabSessionAccess = new GitlabSessionAccessService({
+    bindings: repos.gitlabProjectBinding,
+    connections: repos.gitlabConnection,
+    users: repos.user,
+    clock,
+    configured: configuredSocialProviders.includes('gitlab'),
+    ...(gitlabApi ? { api: gitlabApi } : {}),
+    ...(gitlabOauthService ? { oauth: gitlabOauthService } : {}),
+    ...(logtoIdentity ? { identity: logtoIdentity } : {})
+  })
+  const feishuSessionAccess = new FeishuSessionAccessService({
+    bots: repos.bot,
+    botSecrets: repos.botSecret,
+    clock,
+    regions: feishuLoginRegions,
+    ...(logtoIdentity ? { identity: logtoIdentity } : {}),
+    ...(opts.feishuFetch ? { fetchImpl: opts.feishuFetch } : {}),
+    // Lazy over `http.log` (assigned below; only ever called at resolve time).
+    log: { warn: (o, m) => http.log.warn(o, m) }
+  })
+  const botSessionAccessDeps = {
+    bots: repos.bot,
+    botSecrets: repos.botSecret,
+    clock,
+    ...(logtoIdentity ? { identity: logtoIdentity } : {})
+  }
+  // The deployment's Chat app (google-chat-integration.md §10.10): its key stays on the CP and relay, so its rows' member checks use it from here.
+  const googleChatSessionAccess = new GoogleChatSessionAccessService(
+    {
+      ...botSessionAccessDeps,
+      users: repos.user,
+      configured: configuredSocialProviders.includes('google')
+    },
+    fetch,
+    googleChatPlatformApp
+  )
+  const telegramSessionAccess = createTelegramSessionAccess({
+    ...botSessionAccessDeps,
+    configured: configuredSocialProviders.includes('telegram')
+  })
+  const discordSessionAccess = createDiscordSessionAccess({
+    ...botSessionAccessDeps,
+    configured: configuredSocialProviders.includes('discord')
+  })
+  // The deployment's Teams app (teams-integration.md §8): its secret stays on the CP and relay, so its rows' member checks use it from here.
+  const msTeamsPlatformApp = resolveMsTeamsPlatformApp(config)
+  const msTeamsAgentBots = resolveMsTeamsAgentBots(config, msTeamsPlatformApp)
+  const msTeamsSessionAccess = createMsTeamsSessionAccess(
+    { ...botSessionAccessDeps, configured: configuredSocialProviders.includes('azuread') },
+    fetch,
+    msTeamsPlatformApp,
+    msTeamsAgentBots
+  )
+
+  // Built once and shared between the route deps (the live paths) and the
+  // platform providers below — one closure per platform, not two.
+  const syncTelegramBotIcon = createTelegramBotIconSyncer(iconStore)
+  const syncDiscordBotProfile = createDiscordBotProfileSyncer(iconStore)
+  const syncFeishuAppIcon = createFeishuAppIconSyncer(iconStore)
+
+  // "Trusted users" (webhook-triggers-and-github-events.md): the route resolves a typed login to the
+  // host's numeric id through the repository's own credential; each arm exists only where that host is.
+  const trustedActors = new CodeHostTrustedActorService({
+    trustedActors: repos.codeHostTrustedActor,
+    ...(github ? { github: { installations: repos.githubInstallation, service: github } } : {}),
+    ...(gitlab
+      ? {
+          gitlab: {
+            bindings: repos.gitlabProjectBinding,
+            accounts: repos.gitlabAgentAccount,
+            credentials: new PgGitlabProjectCredentialRepo(prisma),
+            credentialSecrets: new PgGitlabProjectCredentialSecretStore(prisma, secretCipher),
+            api: gitlabApi!
+          }
+        }
+      : {}),
+    gitea: {
+      bindings: repos.giteaRepositoryBinding,
+      connections: repos.giteaConnection,
+      tokens: giteaConnectionService,
+      api: giteaApi
+    }
+  })
+  const httpDeps: HttpDeps = {
+    capabilityRequests,
+    providerCredentialsChanged: (orgId, provider) => {
+      for (const peer of connReg.reachableDaemons()) {
+        if (!peer.capabilities?.features?.includes(PROVIDER_CREDENTIALS_V1_FEATURE)) continue
+        if (provider === 'anthropic' && !peer.capabilities.features.includes(AGENT_MODEL_PROVIDER_FEATURE)) continue
+        if (peer.orgId !== orgId && ![...(peer.orgByAgent?.values() ?? [])].includes(orgId)) continue
+        try {
+          peer.conn.send('provider-credentials/changed', { provider }, undefined, orgId)
+        } catch {
+          http.log.warn('Provider credential invalidation could not be delivered; the cache lease will expire')
+        }
+      }
+    },
+    runtimeConfig: {
+      webchatProtocol: config.WEBCHAT_PROTOCOL,
+      ahp: { enabled: config.AHP_MODE === 'on', publicAccess: config.AHP_PUBLIC_ACCESS },
+      ...(opts.deploymentConfig || gitlab
+        ? {
+            ...(opts.deploymentConfig ? { deploymentRevision: opts.deploymentConfig.revision } : {}),
+            publicRuntimeConfig: {
+              auth:
+                opts.deploymentConfig?.values.auth.mode === 'oidc' && config.OIDC_ISSUER
+                  ? {
+                      endpoint: new URL(config.OIDC_ISSUER).origin,
+                      issuer: config.OIDC_ISSUER,
+                      appId: opts.deploymentConfig.values.auth.browserClient.appId,
+                      apiResource: opts.deploymentConfig.values.auth.browserClient.apiResource,
+                      socialProviders: opts.deploymentConfig.values.auth.socialProviders,
+                      sso: opts.deploymentConfig.values.auth.sso
+                    }
+                  : null,
+              // The console derives workspace tiles from this host (§7).
+              gitlab: gitlab ? { instanceUrl: gitlab.api.baseUrl } : null
+            },
+            ...(fileTransfer ? { fileTransfer: () => fileTransfer.uploadLimits() } : {})
+          }
+        : fileTransfer
+          ? { fileTransfer: () => fileTransfer.uploadLimits() }
+          : {})
+    },
+    maxOrgsPerNonAdminUser: opts.deploymentConfig?.values.features.maxOrgsPerNonAdminUser ?? 1,
+    clock,
+    // The same late-bound façade the orchestrators above hold (see its
+    // definition): the providers below are constructed WITH `httpDeps` — their
+    // funnel plugins are route factories pre-bound to this very bundle — so the
+    // registry cannot exist before this object does. Every reader runs at
+    // Fastify `ready()` time or later, by which point it has been assigned.
+    platforms,
+    // The §6.5 code-host provider set, published here so routes take their
+    // per-host decisions through the bundle (gitea-integration.md §13.5).
+    codeHosts: codeHostProviders,
+    repos: {
+      daemonAdmission: repos.daemonAdmission,
+      agent: repos.agent,
+      assignment: repos.assignment,
+      memberSet: repos.memberSet,
+      dutyGroup: repos.dutyGroup,
+      daemonLifecycleOp: repos.daemonLifecycleOp,
+      cron: repos.cron,
+      hook: repos.hook,
+      hookSecret: repos.hookSecret,
+      relay: repos.relay,
+      session: repos.session,
+      sessionUsage: repos.sessionUsage,
+      agentApiEntry: repos.agentApiEntry,
+      webchatConversation: repos.webchatConversation,
+      ahpSessionBinding: repos.ahpSessionBinding,
+      user: repos.user,
+      org: repos.org,
+      waitlist: repos.waitlist,
+      integration: repos.integration,
+      integrationChannel: repos.integrationChannel,
+      bot: repos.bot,
+      botSecret: repos.botSecret,
+      botCredential: repos.botCredential,
+      decision: repos.decision,
+      botDecisionRouting: repos.botDecisionRouting,
+      codeHostDecisionRouting: repos.codeHostDecisionRouting,
+      providerKey: repos.providerKey,
+      agentSecret: repos.agentSecret,
+      agentConfig: repos.agentConfig,
+      mcpProvider: repos.mcpProvider,
+      mcpProviderSecret: repos.mcpProviderSecret,
+      mcpGrant: repos.mcpGrant,
+      mcpProviderOauth: repos.mcpProviderOauth,
+      mcpProviderOauthSecret: repos.mcpProviderOauthSecret,
+      mcpProviderOauthState: repos.mcpProviderOauthState,
+      skillSource: repos.skillSource,
+      computer: repos.computer,
+      agentSkillSourceStatus: repos.agentSkillSourceStatus,
+      organizationKnowledge: repos.organizationKnowledge,
+      organizationRecord: repos.organizationRecord,
+      organizationEnvironment: repos.organizationEnvironment,
+      organizationEnvironmentSecret: repos.organizationEnvironmentSecret,
+      organizationEnvironmentResolver: repos.organizationEnvironmentResolver,
+      memoryPluginInstallation: repos.memoryPluginInstallation,
+      externalMemoryConnection: repos.externalMemoryConnection,
+      externalMemoryConnectionSecret: repos.externalMemoryConnectionSecret,
+      externalMemoryGrant: repos.externalMemoryGrant,
+      memoryConnectionWriter: repos.memoryConnectionWriter,
+      agentMemoryHistory: repos.agentMemoryHistory,
+      agentMemoryFile: repos.agentMemoryFile,
+      slackInstall: repos.slackInstall,
+      slackPlatformInstall: repos.slackPlatformInstall,
+      slackWorkspaceInstall: repos.slackWorkspaceInstall,
+      feishuAppRegistration: repos.feishuAppRegistration,
+      wechatPendingLogin: repos.wechatPendingLogin,
+      msTeamsAgentBotRequest: repos.msTeamsAgentBotRequest,
+      slackUserConfig: repos.slackUserConfig,
+      linearToken: repos.linearToken,
+      linearInstallState: repos.linearInstallState,
+      presetAgent: repos.presetAgent,
+      githubInstallation: repos.githubInstallation,
+      githubApp: repos.githubApp,
+      agentRepoAuth: repos.agentRepoAuth,
+      agentInstallationAuth: repos.agentInstallationAuth,
+      codeHostRepository: repos.codeHostRepository,
+      codeHostTrustedActor: repos.codeHostTrustedActor,
+      gitlabConnection: repos.gitlabConnection,
+      gitlabProjectBinding: repos.gitlabProjectBinding,
+      followUpWatch: repos.followUpWatch,
+      gitlabAgentAccount: repos.gitlabAgentAccount,
+      gitlabInstanceState: repos.gitlabInstanceState,
+      giteaConnection: repos.giteaConnection,
+      giteaRepositoryBinding: repos.giteaRepositoryBinding,
+      azureDevOpsConnection: repos.azureDevOpsConnection,
+      azureDevOpsRepositoryBinding: repos.azureDevOpsRepositoryBinding,
+      audit: repos.audit,
+      webchatMcpOperation: repos.webchatMcpOperation,
+      oauth: repos.oauth
+    },
+    registry,
+    agentSpecs,
+    ...(daemonRelease ? { daemonRelease } : {}),
+    // The live connection index doubles as the read model's liveness overlay
+    // (structurally a `DaemonLiveness`): it knows who is connected RIGHT NOW.
+    liveness: connReg,
+    daemonConns: connReg,
+    control: sender,
+    agentDelivery,
+    placementResolver,
+    visibilityPush,
+    relayControl,
+    relayRoster,
+    httpBot,
+    collabRoutes,
+    agentMutations,
+    sessionOwners: connReg,
+    hooks: hookService,
+    hookRouting,
+    ...(githubRunReporter ? { kickGithubRunReporter: () => githubRunReporter.kick() } : {}),
+    recomputeDuties: (orgId: string) => dutyRecompute.kick(orgId),
+    auth,
+    apiKeys,
+    computers,
+    computerAudit,
+    computerViewer: computerChannelGrants,
+    computerLeases,
+    computerPlan,
+    ...(computerPool ? { computerPool } : {}),
+    ...(computerScreenshots ? { computerScreenshots } : {}),
+    oauth,
+    webchatTokens,
+    inviteLinks,
+    waitlist,
+    usageWriter,
+    ...(clusterWorkloadIdentity ? { clusterWorkloadIdentity } : {}),
+    events,
+    mcpRateLimit: new McpRateLimiter(clock),
+    remoteGrantAuth,
+    internalInvocationAuth,
+    // §8 CP-db-only operation atomicity: run `fn` with every repository call —
+    // including those made by nested app.inject routes — joined to ONE
+    // transaction (see persistence/ambient-tx.ts). Opened on the root client.
+    sharedTx: <T>(fn: () => Promise<T>) => rootPrisma.$transaction((tx) => runWithSharedTx(tx, fn)),
+    webchatMcpMetrics: defaultWebchatMcpMetrics,
+    readiness,
+    searchSkillRegistry,
+    resolvePublicRepo: createPublicRepoResolver(),
+    trustedActors,
+    ...(github ? { github } : {}),
+    ...(githubApps ? { githubApps } : {}),
+    ...(githubAppOwners ? { githubAppOwners } : {}),
+    ...(gitlab ? { gitlab } : {}),
+    gitea,
+    azureDevOps,
+    ...(pullRequestView ? { pullRequestView } : {}),
+    ...(sessionPullRequestLink ? { sessionPullRequestLink } : {}),
+    ...(githubUserAuthz ? { githubUserAuthz } : {}),
+    ...(logtoIdentity ? { logtoIdentity } : {}),
+    ...(githubRepoIdentity ? { githubRepoIdentity } : {}),
+    sessionAccessPlugins: [
+      slackSessionAccess,
+      githubSessionAccess,
+      gitlabSessionAccess,
+      feishuSessionAccess,
+      googleChatSessionAccess,
+      telegramSessionAccess,
+      discordSessionAccess,
+      msTeamsSessionAccess
+    ],
+    ...(iconStore ? { iconStore } : {}),
+    ...(fileTransfer ? { fileTransfer } : {}),
+    sharedImages,
+    ...(connectors ? { connectors } : {}),
+    config: httpServerConfigFrom(config, { DEFAULT_OWNER_ID, relayStaleMs })
+  }
+  // ── MCP provider OAuth (mcp-provider-oauth.md) ──────────────────────────────
+  // Assembled AFTER `httpDeps` and assigned back onto it: the funnel's `onConnected`
+  // re-binds through the same push helper and provider chain the routes use, so the
+  // service cannot be constructed before the bundle it pushes through exists.
+  const mcpPush = makeMcpPush(httpDeps)
+  // The CP's own outbound allowlist — never the relay's; the two egress permissions are
+  // separate by design (see `net/guarded-fetch.ts`).
+  const mcpOutboundAllowlist = new Set(
+    (config.CP_ALLOWED_OUTBOUND_HOSTS ?? '')
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean)
+  )
+  const mcpOauthDial: Dial = (url, init) => guardedRequest(url, { ...init, allowlist: mcpOutboundAllowlist })
+  const mcpTokenService = new McpProviderTokenService({
+    oauth: repos.mcpProviderOauth,
+    secrets: repos.mcpProviderOauthSecret,
+    cipher: secretCipher,
+    dial: mcpOauthDial,
+    clock
+  })
+  httpDeps.mcpTokenResolver = mcpTokenService
+  const mcpOauthRebind = makeOauthRebind(httpDeps, mcpPush, mcpTokenService)
+  const rebindProvider = async (orgId: OrgId, providerId: string): Promise<void> => {
+    const provider = await repos.mcpProvider.get(orgId, providerId)
+    if (!provider) return
+    await mcpOauthRebind(orgId, providerId, provider.name)
+    // The relay binding is live, so a request waiting for this connection completes now (capability-requests.md §4.6).
+    const userId = (await repos.mcpProviderOauth.get(orgId, providerId))?.connectedByUserId ?? null
+    const profile = userId ? await repos.user.getProfile(userId).catch(() => null) : null
+    await capabilityRequests
+      .orgChanged(
+        orgId,
+        { kind: 'mcp-oauth', server: provider.name },
+        userId ? { kind: 'console', userId, name: profile?.displayName?.trim() || profile?.email || 'A member' } : null
+      )
+      .catch((err) => http.log.warn({ err, providerId }, 'capability request: re-evaluation after connect failed'))
+  }
+  httpDeps.mcpProviderOauth = new McpProviderOauthService({
+    providers: repos.mcpProvider,
+    oauth: repos.mcpProviderOauth,
+    secrets: repos.mcpProviderOauthSecret,
+    states: repos.mcpProviderOauthState,
+    cipher: secretCipher,
+    dial: mcpOauthDial,
+    clock,
+    ...(config.PUBLIC_CP_URL ? { publicCpUrl: config.PUBLIC_CP_URL } : {}),
+    ...(gitlabWebAppUrl ? { webAppUrl: gitlabWebAppUrl } : {}),
+    onConnected: rebindProvider
+  })
+  // A disconnected grant stops being projected — but only the RELAY binding goes. The
+  // daemon definition is the agent-facing proxy url and grant key, neither of which a
+  // disconnect changes, and a later reconnect republishes only the binding.
+  httpDeps.mcpOauthUnbind = async (_orgId, provider) => {
+    mcpPush.unbindRelay(provider)
+  }
+
+  const http = buildHttpServer(httpDeps, opts.fastify)
+
+  // Reconciler for orphaned schedule runs: fails `running` cron_run rows whose
+  // completion report was lost so the console self-heals (design §3.14). Built
+  // here so the graph is whole; armed only by `startBackground()` (never in
+  // tests). Uses the Fastify logger, hence constructed after `http`.
+  // §Refresh sweep: renews an OAuth provider's access token before expiry and re-pushes
+  // the relay binding, which is the only thing that keeps `auth: oauth2` working. Built
+  // here so the graph is whole; armed only by `startBackground()`.
+  const mcpOauthRefresher = new McpOauthRefresher({
+    providers: repos.mcpProvider,
+    oauth: repos.mcpProviderOauth,
+    grants: repos.mcpGrant,
+    states: repos.mcpProviderOauthState,
+    tokens: mcpTokenService,
+    pushBinding: mcpOauthRebind,
+    clock,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+
+  // Announces a moved dist-tag to this replica's auto-upgrade daemons (daemon-auto-upgrade.md §4.1).
+  const releaseBroadcaster = daemonRelease
+    ? new DaemonReleaseBroadcaster({ resolver: daemonRelease, connections: connReg, control: sender, log: http.log })
+    : undefined
+  const deferredLifecycleOpSweeper = new DeferredLifecycleOpSweeper(repos.daemonLifecycleOp, clock, undefined, http.log)
+
+  const cronRunReaper = new CronRunReaper(
+    repos.cron,
+    clock,
+    { ttlMs: config.CRON_RUN_TTL_SEC * 1000, intervalMs: config.CRON_RUN_REAP_INTERVAL_SEC * 1000 },
+    http.log
+  )
+
+  // Deletes consumed or expired OAuth codes, dead OAuth access tokens and expired DCR clients (agent-assistant.md §7.4).
+  const oauthReaper = new OAuthReaper(
+    repos.oauth,
+    repos.apiKey,
+    clock,
+    { intervalMs: OAUTH_REAP_INTERVAL_MS, graceMs: OAUTH_REAP_GRACE_MS },
+    http.log
+  )
+
+  // Deletes expired and abandoned screenshots, objects first (computer-use.md §9).
+  const computerScreenshotReaper = computerScreenshots
+    ? new ComputerScreenshotReaper(
+        computerScreenshots,
+        clock,
+        { intervalMs: COMPUTER_SCREENSHOT_REAP_INTERVAL_MS },
+        http.log
+      )
+    : undefined
+
+  // Deletes computer registration tokens a week past their expiry (computer-use.md §3.6).
+  const computerRegistrationReaper = new ComputerRegistrationReaper(
+    repos.computer,
+    clock,
+    { intervalMs: COMPUTER_REGISTRATION_REAP_INTERVAL_MS, graceMs: COMPUTER_REGISTRATION_REAP_GRACE_MS },
+    http.log
+  )
+
+  // Same reconciler, hook runs: closes `running` hook_run rows whose completion
+  // report was lost (daemon offline at turn end / relay report dropped). The
+  // two-report lifecycle matches crons exactly, so the class is reused verbatim.
+  const hookRunReaper = new CronRunReaper(
+    repos.hook,
+    clock,
+    {
+      ttlMs: config.CRON_RUN_TTL_SEC * 1000,
+      intervalMs: config.CRON_RUN_REAP_INTERVAL_SEC * 1000,
+      label: 'hook-run-reaper'
+    },
+    http.log
+  )
+
+  // The `control-plane` memory home's op set, and the sweep behind the staged rows an abandoned append
+  // sequence leaves (memory-evolution.md §3.2.1); the sweep is armed only by `startBackground()`.
+  const agentMemoryTransaction = new AgentMemoryTransactionService(new PgAgentMemoryTransactionRepo(prisma), clock)
+  const agentMemoryStore = new AgentMemoryStoreService(repos.agentMemoryFile, clock, repos.agentMemoryStoreOperation)
+  const agentMemoryStagingSweeper = new AgentMemoryStagingSweeper(
+    repos.agentMemoryFile,
+    clock,
+    http.log,
+    undefined,
+    repos.agentMemoryStoreOperation
+  )
+
+  // Durable one-time assertion recovery. Invocation rows are reaped before
+  // expired delegations so a parent is never removed while cached/recoverable
+  // invocation state still depends on it.
+  const webchatMcpOperationReaper = new WebchatMcpOperationReaper(
+    repos.webchatMcpOperation,
+    repos.webchatMcpDelegation,
+    clock,
+    http.log,
+    defaultWebchatMcpMetrics
+  )
+
+  // Retires the daemon rows replaced pool member Pods leave behind (a pool member is bound to
+  // its Pod UID, so a new Pod means a new record). Org-less rows no `DELETE /daemons/:id`
+  // can reach, which is why they accumulate in every org's fleet. Only where cluster tokens
+  // are accepted at all: nowhere else can a pool member exist.
+  const poolMemberReaper = clusterIdentity
+    ? new PoolMemberReaper(
+        repos.daemon,
+        repos.webchatMcpDelegation,
+        (member, retiredBefore) => retirePoolMember(httpDeps, member, retiredBefore, http.log),
+        connReg,
+        clock,
+        { retireAfterMs: POOL_MEMBER_REAP_AFTER_MS, intervalMs: POOL_MEMBER_REAP_INTERVAL_MS },
+        http.log
+      )
+    : undefined
+
+  // Redelivery reconciliation (webhook-triggers P2.5): recovers github events
+  // lost to a relay-pool outage by asking GitHub to redeliver GUIDs that never
+  // produced a HookRun. Only exists when the App is configured; same lifecycle
+  // as the cron reaper.
+  const hookRedeliveryReconciler = github
+    ? new HookRedeliveryReconciler(
+        github,
+        repos.hook,
+        repos.relay,
+        clock,
+        {
+          intervalMs: 10 * 60 * 1000,
+          windowMs: 30 * 60 * 1000,
+          graceMs: 2 * 60 * 1000,
+          relayStaleMs
+        },
+        http.log
+      )
+    : undefined
+
+  const reprojectRepoGrant = async (orgId: OrgId, agentId: AgentId): Promise<void> => {
+    const agent = await repos.agent.get(orgId, agentId)
+    if (!agent) return
+    await agentDelivery.upsert(agent, (err, daemonId) => {
+      if (err instanceof NoConnection) http.log.debug({ agentId, daemonId }, 'agent/upsert skipped: daemon offline')
+      else http.log.warn({ err, agentId, daemonId }, 'grant re-attestation: spec reconcile failed')
+    })
+  }
+  const repoGrantReattestorConfig = {
+    intervalMs: config.REPO_GRANT_REATTEST_INTERVAL_SEC * 1000,
+    reattestAfterMs: config.REPO_GRANT_REATTEST_AFTER_SEC * 1000,
+    batch: config.REPO_GRANT_REATTEST_BATCH
+  }
+  // Each provider reuses its creation gate; Azure's loop does not depend on GitHub configuration.
+  const azureDevOpsGrantReattestor = new AzureDevOpsRepositoryGrantReattestor(
+    {
+      grants: repos.agentRepoAuth,
+      connections: repos.azureDevOpsConnection,
+      bindings: repos.azureDevOpsRepositoryBinding,
+      authz: azureDevOps.userAuthz,
+      audit: repos.audit,
+      reproject: reprojectRepoGrant,
+      clock,
+      log: http.log
+    },
+    repoGrantReattestorConfig
+  )
+  const repositoryGrantReattestor =
+    github && githubUserAuthz && logtoIdentity
+      ? new RepositoryGrantReattestor(
+          {
+            grants: repos.agentRepoAuth,
+            installations: repos.githubInstallation,
+            agentApp: async (agentId) => (await repos.agent.getUnscoped(agentId))?.githubAppId ?? null,
+            github,
+            // The creation gate's check, over lookups that keep a credential failure an error rather than "no access".
+            authz: new GithubUserAuthzService({
+              identity: logtoIdentity,
+              github: strictRepoAccessLookups(github),
+              users: repos.user,
+              clock
+            }),
+            audit: repos.audit,
+            reproject: reprojectRepoGrant,
+            clock,
+            log: http.log
+          },
+          repoGrantReattestorConfig
+        )
+      : undefined
+
+  // One-time preset backfill (preset-agents.md §3.2): existing orgs receive the
+  // `agentconnect` general preset; the preset_agent row is the per-org marker, so
+  // the sweep converges to a no-op after its first complete run.
+  const presetBackfill = config.PRESET_AGENTS_ENABLED ? new PresetAgentBackfill(prisma, http.log) : undefined
+
+  // The memory-home rollout flip (memory-evolution.md §3.2.1): one idempotent pass per boot, armed by startBackground().
+  const setMemoryHome = new SetMemoryHomeReconciler({
+    agents: repos.agent,
+    memberSets: repos.memberSet,
+    delivery: agentDelivery,
+    log: http.log
+  })
+
+  // Relay failover sweep (shared-bot-relay.md §5): deletes `relay` rows whose
+  // heartbeat lapsed and re-fans the shrunk roster to daemons. Same lifecycle as
+  // the cron reaper (armed by startBackground, never in tests).
+  const relaySweeper = new RelaySweeper(
+    repos.relay,
+    clock,
+    { staleMs: relayStaleMs, intervalMs: config.RELAY_REAP_INTERVAL_SEC * 1000 },
+    // On a reap: re-fan the shrunk roster to daemons. Whole-pool ingress means a dead
+    // relay strands no bot (the manifest request_url is a stable LB; the CP broadcasts
+    // to whoever is connected), so no per-bot re-placement is needed here.
+    async () => {
+      await relayRoster.broadcast()
+      // §14.3: a reaped relay may have held notice authorities — re-stamp survivors.
+      await httpBot.reconcileAll().catch((err) => http.log.error({ err }, 'relay sweep: HTTP-bot reconcile failed'))
+      const selected = (await relayRoster.entries())[0]
+      if (selected) {
+        await syncMemoryConnectionsToDaemons(relayHttpOrigin(selected.url), {
+          connections: repos.externalMemoryConnection,
+          installations: repos.memoryPluginInstallation,
+          secrets: repos.externalMemoryConnectionSecret,
+          grants: repos.externalMemoryGrant,
+          agents: repos.agent,
+          delivery: agentDelivery,
+          control: sender,
+          log: http.log
+        })
+      }
+    },
+    http.log
+  )
+
+  // Older Slack installs discarded some public app/workspace identity metadata.
+  // Repair those rows off the request path so Settings can render links and
+  // workspace groups without turning GET /bots into a Slack API fan-out.
+  const slackBotIdentityReconciler = new SlackBotIdentityReconciler(
+    repos.bot,
+    repos.botSecret,
+    async (botToken) => {
+      const result = await verifySlackBot(botToken)
+      return result.status === 'ok'
+        ? {
+            appId: result.appId,
+            botUserId: result.botUserId,
+            workspaceId: result.teamId,
+            workspaceName: result.teamName
+          }
+        : null
+    },
+    clock,
+    {
+      intervalMs: 15 * 60 * 1000,
+      onMentionIdentityChanged: (orgId) => collabRoutes.broadcast(orgId)
+    },
+    http.log
+  )
+
+  // The per-platform INJECTION seams the provider-contributed route plugins take
+  // as their second argument (`http/platform-route-seams.ts`) — what used to be
+  // twelve platform-named fields on `httpDeps`. Built here, once, and shared with
+  // the providers below so the routes and the registry cannot hold different
+  // clients. The tooling-credential facet is a single instance for the same
+  // reason: the funnel start, the config status route, the Settings→Bots refresh
+  // and `provider.providerToolingCredentials` are all this one object.
+  const slackSeams: SlackRouteSeams = {
+    configApi: slackConfigApi,
+    verifyBot: verifySlackBot,
+    verifyAppToken: verifySlackAppToken,
+    ...(slackPlatformApp ? { platformApp: slackPlatformApp } : {}),
+    // Named arguments, NOT `httpDeps`: the bundle no longer carries a Slack API
+    // client, and passing it here type-checked while making every production
+    // resolution `unreachable`.
+    toolingCredentials: createSlackToolingCredentials({
+      configApi: slackConfigApi,
+      store: repos.slackUserConfig
+    })
+  }
+  const telegramSeams: TelegramRouteSeams = { verifyBot: verifyTelegramBot }
+  const feishuTenantGuard = createFeishuAppTenantGuard((region) => feishuPlatformApps[region], undefined, {
+    loginEnabled: (region) => feishuLoginRegions.includes(region),
+    onFailure: (failure) => http.log.warn({ provider: 'feishu', ...failure }, 'feishu tenant verification failed')
+  })
+  const feishuSeams: FeishuRouteSeams = {
+    verifyBot: verifyFeishuBot,
+    tenantGuard: feishuTenantGuard,
+    configureHttpApp: configureFeishuHttpApp,
+    registrations: new FeishuAppRegistrationService(repos.feishuAppRegistration)
+  }
+  const weChatApiUrl = config.WECHAT_API_URL ?? WECHAT_DEFAULT_API_URL
+  const weChatLogins = new WeChatLoginService(
+    repos.wechatPendingLogin,
+    opts.weChatLoginClient ?? createWeChatLoginClient(weChatApiUrl),
+    weChatApiUrl,
+    () => clock.now()
+  )
+  // ONE Linear API client and ONE token service, shared by the funnel routes, the provider's
+  // disconnect edge and the orphan sweep — so "which store answers" and "when is a grant stale"
+  // cannot drift between them (linear-integration.md §4.4).
+  const linearApi = new LinearApiClient({ clock, ...(opts.linearFetch ? { fetchImpl: opts.linearFetch } : {}) })
+  const linearTokenService = new LinearTokenService({
+    get app() {
+      return linearPlatformApp
+    },
+    tokens: repos.linearToken,
+    api: linearApi,
+    clock,
+    log: { warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+  const linearSeams: LinearRouteSeams = {
+    ...(linearPlatformApp ? { app: linearPlatformApp } : {}),
+    api: linearApi,
+    tokens: linearTokenService
+  }
+
+  // Rotating the deployment Linear app leaves every workspace bot holding the stamped copy the
+  // relay verifies with, so a provider-owned pass re-stamps them (linear-integration.md §10.6).
+  // The same tick carries the §15 team pass. The app is read per tick, so a disabled deployment
+  // simply finds nothing to do. Built after the token service, which the team pass reads.
+  const linearCredentialReconciler = new LinearCredentialReconciler({
+    bots: repos.bot,
+    secrets: repos.botSecret,
+    credentials: repos.botCredential,
+    resync: (botId) => httpBot.syncBot(botId),
+    ...(linearPlatformApp ? { app: linearPlatformApp } : {}),
+    teams: {
+      integrations: repos.integration,
+      agents: repos.agent,
+      channels: repos.integrationChannel,
+      tokens: linearTokenService,
+      routableDaemon: (agent) => placementResolver.routableDaemon(agent)
+    },
+    clock,
+    intervalMs: 15 * 60 * 1000,
+    log: http.log
+  })
+  const linearOrphanTokenSweeper = new LinearOrphanTokenSweeper({
+    get app() {
+      return linearPlatformApp
+    },
+    tokens: repos.linearToken,
+    service: linearTokenService,
+    clock,
+    log: { info: (obj, msg) => http.log.info(obj, msg), warn: (obj, msg) => http.log.warn(obj, msg) }
+  })
+
+  // The Google Chat key and claim routes read the deployment app, Google, and the caller's Google identity from here.
+  const googleClient = opts.deploymentConfig?.values.logto?.googleConnector
+  const googleClientSecret = opts.deploymentConfig?.secrets['logto.googleConnectorClientSecret']
+  const googleChatSeams: GoogleChatRouteSeams = {
+    bindingMutations: new PgGoogleChatBindingMutations(prisma, (input) => botIdentityProjector(platforms)(input)),
+    ...(googleClient && googleClientSecret && webAppUrl
+      ? {
+          recovery: new GoogleChatRecoveryOAuth(
+            {
+              clientId: googleClient.clientId,
+              clientSecret: googleClientSecret,
+              webAppUrl
+            },
+            config.API_KEY_PEPPER,
+            clock,
+            (input, init) => fetch(input, init)
+          )
+        }
+      : {}),
+    ...(googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
+    fetch: (input, init) => fetch(input, init),
+    ...(logtoIdentity ? { identity: logtoIdentity } : {})
+  }
+  // The relay pool's public origin: the relays learn it from their snapshot and Google Chat apps are addressed under it (§11).
+  const relayPublicBase = relayHttpBase(config.PUBLIC_RELAY_URL) ?? undefined
+  // The relay's anchor points every unclaimed Workspace customer of the deployment app at the console's claim page (§10.4).
+  const googleChatAnchor = googleChatClaimAnchor(googleChatPlatformApp, webAppUrl)
+  if (googleChatPlatformApp && !googleChatAnchor) {
+    http.log.warn('google chat: no https console URL, so unclaimed Workspace organizations get no claim prompt')
+  }
+  // Removes the deployment app's key from any of its rows an older build stamped (§10.10).
+  const googleChatCredentialReconciler = new GoogleChatCredentialReconciler({
+    bots: repos.bot,
+    secrets: repos.botSecret,
+    credentials: repos.botCredential,
+    resync: (botId) => httpBot.syncBot(botId),
+    ...(googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
+    clock,
+    log: http.log
+  })
+
+  const msTeamsBindingMutations = new PgMsTeamsBindingMutations(prisma, (input) =>
+    botIdentityProjector(platforms)(input)
+  )
+  // Watches members' pending agent-bot requests until their packages are approved (teams-integration.md §8.6.6).
+  const msTeamsAgentBotRequests =
+    msTeamsPlatformApp && msTeamsAgentBots
+      ? new MsTeamsAgentBotRequests({
+          http: httpDeps,
+          app: msTeamsPlatformApp,
+          agentBots: msTeamsAgentBots,
+          bindingMutations: msTeamsBindingMutations,
+          log: http.log
+        })
+      : undefined
+  // Removes, renames and reaps the bots this deployment made for agents (teams-integration.md §8.6.5).
+  const msTeamsAgentBotKeeper =
+    msTeamsPlatformApp && msTeamsAgentBots
+      ? new MsTeamsAgentBotKeeper({
+          http: httpDeps,
+          client: new MsTeamsAgentBotClient({ app: msTeamsPlatformApp, agentBots: msTeamsAgentBots }),
+          agentBots: msTeamsAgentBots,
+          log: http.log
+        })
+      : undefined
+  const msTeamsSeams: MsTeamsConnectSeams = {
+    ...(msTeamsPlatformApp ? { app: msTeamsPlatformApp } : {}),
+    ...(msTeamsAgentBots ? { agentBots: msTeamsAgentBots } : {}),
+    keys: msTeamsConnectKeys(config.API_KEY_PEPPER),
+    bindingMutations: msTeamsBindingMutations,
+    ...(msTeamsAgentBotRequests ? { requests: msTeamsAgentBotRequests } : {}),
+    ...(webAppUrl ? { webAppUrl } : {}),
+    ...(msTeamsPlatformApp && webAppUrl
+      ? {
+          recovery: new MsTeamsRecoveryOAuth(
+            msTeamsPlatformApp,
+            webAppUrl,
+            config.API_KEY_PEPPER,
+            clock,
+            (input, init) => fetch(input, init)
+          )
+        }
+      : {})
+  }
+  // Removes the deployment app's secret from any of its rows an older build stamped (teams-integration.md §8.5).
+  const msTeamsCredentialReconciler = new MsTeamsCredentialReconciler({
+    bots: repos.bot,
+    secrets: repos.botSecret,
+    credentials: repos.botCredential,
+    resync: (botId) => httpBot.syncBot(botId),
+    ...(msTeamsPlatformApp ? { app: msTeamsPlatformApp } : {}),
+    clock,
+    log: http.log
+  })
+
+  // §9 platform-provider registry (S3): the behavioral CpPlatformProvider
+  // instances — all four platforms — constructed with the SAME verify/sync
+  // functions, route-dep bundle, funnel stores, and background-loop instances
+  // the live paths use (one implementation; the providers add no second code
+  // path). The Slack/Feishu funnel plugins are handed in PRE-BOUND to
+  // `httpDeps` — the very factories `server.ts` mounts — keeping provider
+  // construction one-directional (a provider never reaches back for a route
+  // factory). That is also why every holder captures the late-bound `platforms`
+  // façade defined near the top rather than this value directly.
+  //
+  // ADOPTED SO FAR: route mounting (`server.ts` asks each provider for its
+  // plugins per scope), the `POST /integrations` create body + its live
+  // `validateConfig` + `buildNewBotInstall` tail, the pending-install reapers and
+  // the background loops below, `loadConfig`'s env fold (through the static
+  // `platforms/env.ts` declaration — `loadConfig` runs before this registry can
+  // exist, since providers are constructed FROM the parsed config), (§9) ALL
+  // wire projection — `IntegrationSpec.config` on every spec-assembly path and
+  // both `rc/bot-assign` bags — the agent-icon fan-out's capability probe, the
+  // `rc/bot-assign` completeness gate, and the per-user tooling credentials. The
+  // twelve platform-named `httpDeps` slots this used to populate are gone: what
+  // core ASKS is answered by the registry, and what tests INJECT is the seams
+  // above.
+  composedPlatforms = buildCpPlatformRegistry([
+    createQQCpProvider(undefined, [QQCredentialRoutes(httpDeps)]),
+    createTelegramCpProvider({
+      botSecrets: repos.botSecret,
+      verifyBot: verifyTelegramBot,
+      syncBotIcon: syncTelegramBotIcon,
+      funnelRoutes: { org: [telegramCheckRoutes(httpDeps, telegramSeams)], publicCallback: [] }
+    }),
+    createDiscordCpProvider({
+      botSecrets: repos.botSecret,
+      verifyBot: verifyDiscordBot,
+      ensureMessageContentIntent: ensureDiscordMessageContentIntent,
+      syncBotProfile: syncDiscordBotProfile
+    }),
+    createSlackCpProvider({
+      unclaimedIngress: slackWorkspaceIngress(repos.slackWorkspaceInstall, slackPlatformApp, webAppUrl),
+      verifyBot: verifySlackBot,
+      verifyAppToken: verifySlackAppToken,
+      funnelRoutes: {
+        org: [
+          slackInstallRoutes(httpDeps, slackSeams),
+          slackPlatformInstallRoutes(httpDeps, slackSeams),
+          slackWorkspaceClaimRoutes(httpDeps, slackSeams),
+          slackConfigRoutes(httpDeps, slackSeams),
+          slackBotRefreshRoutes(httpDeps, slackSeams),
+          slackBotTokenRoutes(httpDeps, slackSeams)
+        ],
+        publicCallback: [
+          slackOauthCallbackRoutes(httpDeps, slackSeams),
+          slackPlatformCallbackRoutes(httpDeps, slackSeams),
+          slackWorkspacePublicRoutes(httpDeps, slackSeams)
+        ]
+      },
+      ...(slackSeams.toolingCredentials ? { toolingCredentials: slackSeams.toolingCredentials } : {}),
+      pendingInstalls: {
+        installs: repos.slackInstall,
+        platformInstalls: repos.slackPlatformInstall,
+        ttlMs: config.SLACK_INSTALL_TTL_SEC * 1000,
+        intervalMs: config.SLACK_INSTALL_REAP_INTERVAL_SEC * 1000
+      },
+      identityReconciler: slackBotIdentityReconciler
+    }),
+    createFeishuCpProvider({
+      verifyBot: verifyFeishuBot,
+      tenantGuard: feishuTenantGuard,
+      funnelRoutes: { org: [feishuRegistrationRoutes(httpDeps, feishuSeams)], publicCallback: [] },
+      syncAppIcon: syncFeishuAppIcon,
+      pendingInstalls: {
+        registrations: repos.feishuAppRegistration,
+        intervalMs: config.SLACK_INSTALL_REAP_INTERVAL_SEC * 1000
+      }
+    }),
+    // Linear is registered unconditionally so the served platform set stays the same object in
+    // every deployment; the DEPLOYMENT APP is what is optional, and its absence self-disables the
+    // platform from the inside (linear-integration.md §7.1).
+    createLinearCpProvider({
+      ...(linearPlatformApp ? { app: linearPlatformApp } : {}),
+      tokens: repos.linearToken,
+      credentialReconciler: linearCredentialReconciler,
+      tokenService: linearTokenService,
+      funnelRoutes: {
+        org: [linearConnectRoutes(httpDeps, linearSeams)],
+        publicCallback: [linearOauthCallbackRoutes(httpDeps, linearSeams)]
+      },
+      pendingInstalls: {
+        installStates: repos.linearInstallState,
+        intervalMs: config.SLACK_INSTALL_REAP_INTERVAL_SEC * 1000
+      },
+      orphanTokenSweeper: linearOrphanTokenSweeper
+    }),
+    // Registered unconditionally for per-agent apps; the deployment-owned app is claimed, never installed per agent.
+    createGoogleChatCpProvider({
+      fetch: googleChatSeams.fetch,
+      installRoutes: {
+        org: [
+          // The console offers the listing only where a claim can complete, so only with the anchor.
+          googleChatAppRoutes(googleChatAnchor && googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
+          googleChatKeyRoutes(httpDeps, googleChatSeams),
+          googleChatClaimRoutes(httpDeps, googleChatSeams),
+          googleChatRecoveryRoutes(httpDeps, googleChatSeams)
+        ],
+        publicCallback: []
+      },
+      ...(googleChatPlatformApp ? { app: googleChatPlatformApp } : {}),
+      credentialReconciler: googleChatCredentialReconciler,
+      ...(relayPublicBase ? { publicRelayUrl: relayPublicBase } : {})
+    }),
+    createDingTalkCpProvider({ installRoutes: [dingTalkCredentialRoutes(httpDeps)] }),
+    createMsTeamsCpProvider({
+      installRoutes: [
+        msTeamsRoutes(httpDeps, fetch, msTeamsPlatformApp),
+        msTeamsConnectRoutes(httpDeps, msTeamsSeams),
+        msTeamsRecoveryRoutes(httpDeps, msTeamsSeams)
+      ],
+      ...(msTeamsPlatformApp ? { app: msTeamsPlatformApp } : {}),
+      ...(msTeamsAgentBots ? { agentBots: msTeamsAgentBots } : {}),
+      ...(msTeamsAgentBotRequests ? { agentBotRequests: msTeamsAgentBotRequests } : {}),
+      ...(msTeamsAgentBotKeeper ? { agentBotKeeper: msTeamsAgentBotKeeper } : {}),
+      credentialReconciler: msTeamsCredentialReconciler,
+      ...(relayPublicBase ? { publicRelayUrl: relayPublicBase } : {})
+    }),
+    createWeChatCpProvider({
+      ...(config.WECHAT_API_URL ? { apiUrl: config.WECHAT_API_URL } : {}),
+      routes: [weChatLoginRoutes(httpDeps, weChatLogins)],
+      logins: repos.wechatPendingLogin,
+      reapIntervalMs: config.SLACK_INSTALL_REAP_INTERVAL_SEC * 1000
+    }),
+    createWeComCpProvider({
+      installRoutes: [weComCredentialRoutes(httpDeps)],
+      isInstalled: async (botId) =>
+        (await repos.bot.getByExternalIdentity(WECOM_PLATFORM, botId, TENANTLESS_SENTINEL)) !== null
+    })
+  ])
+
+  // Pending-install TTL reapers + provider-owned convergence loops, from the
+  // providers' §9 declarations (`platforms/lifecycle.ts`) instead of the four
+  // hand-listed instances this used to hold. Same lifecycle as the cron reaper:
+  // built here so the graph is whole, armed only by `startBackground()`.
+  const pendingInstallReapers = buildPendingInstallReapers(platforms, clock, http.log)
+  const backgroundLoops = platformBackgroundLoops(platforms)
+
+  // §4 session-access warmer (session-access-cold-visit.md, Phase 3): keeps the
+  // resource facts behind ACTIVE external scopes leased so a cold console visit
+  // skips the per-resource provider sweep. Poked from `event/session` ingest;
+  // observes only through the plugins' classifying warm entries (§4.2(3)).
+  // Built here so the graph is whole, armed only by `startBackground()`.
+  const sessionAccessWarmer = new SessionAccessWarmer({
+    sessions: repos.session,
+    targets: new Map([
+      ['slack', (scope: ExternalScopeRecord) => slackSessionAccess.warmAudience(scope)],
+      ['github', (scope: ExternalScopeRecord) => githubSessionAccess.warmShape(scope)]
+    ]),
+    clock,
+    publicTtlMs: sessionAccessTtls.publicTtlMs,
+    log: {
+      debug: (o, m) => http.log.debug(o, m),
+      info: (o, m) => http.log.info(o, m),
+      warn: (o, m) => http.log.warn(o, m)
+    }
+  })
+
+  // ── daemon WS edge (mounted on the live http.Server after listen) ──────────
+  const ahpAuthorization = new AhpAuthorization({
+    grants: new AhpGrantService(config.API_KEY_PEPPER, () => clock.now()),
+    tokens: webchatTokens,
+    keys: apiKeys,
+    keyRows: repos.apiKey,
+    oauthGrants: repos.oauth,
+    agents: repos.agent,
+    daemons: connReg,
+    conversations: repos.webchatConversation,
+    apiEntries: repos.agentApiEntry,
+    sessions: repos.session,
+    memberSets: repos.memberSet,
+    orgs: repos.org,
+    remoteMcp: webchatRemoteMcp,
+    placement: placementResolver,
+    users: repos.user,
+    ...(iconStore ? { iconStore } : {}),
+    config,
+    now: () => clock.now(),
+    sessionAccess: async (claims, session) => {
+      const oidcSubject = await repos.user.getOidcSubject(claims.userId)
+      return makeSessionAccessResolver(httpDeps).forPrincipal(
+        { orgId: OrgId(claims.orgId), userId: claims.userId, log: http.log, ...(oidcSubject ? { oidcSubject } : {}) },
+        [
+          {
+            visibility: session.visibility,
+            externalProvider: session.externalProvider ?? null,
+            externalScopeId: session.externalScopeId ?? null
+          }
+        ]
+      )
+    },
+    reachesContent: (orgId, ids) =>
+      everyTurnReachesItsContent(
+        { sessions: repos.session, agents: repos.agent, placement: placementResolver, memberSets: repos.memberSet },
+        orgId,
+        ids
+      )
+  })
+  const wsDeps: DaemonWsServerDeps = {
+    admission: repos.daemonAdmission,
+    ahpSessions: new AhpSessionService({
+      authorization: ahpAuthorization,
+      bindings: repos.ahpSessionBinding,
+      cursors: new AhpCatalogCursor(config.API_KEY_PEPPER, () => clock.now())
+    }),
+    log: { error: (o, m) => http.log.error(o, m), warn: (o, m) => http.log.warn(o, m) },
+    auth,
+    placementResolver,
+    lifecycleOps: repos.daemonLifecycleOp,
+    registry,
+    ...(daemonRelease ? { daemonRelease } : {}),
+    orchestrator,
+    connReg,
+    session: repos.session,
+    webchatConversation: repos.webchatConversation,
+    webchatRemoteMcp,
+    launch: repos.launch,
+    user: repos.user,
+    platforms,
+    visibilityPush,
+    httpBotDaemonReady: async (daemonId) => {
+      await Promise.all([
+        httpBot.daemonReady(daemonId),
+        hookRouting
+          .daemonReady(daemonId)
+          .catch((err: unknown) => http.log.warn({ err, daemonId }, 'hook routing: daemon-ready resync deferred'))
+      ])
+    },
+    httpBotDaemonOffline: (daemonId) => httpBot.daemonOffline(daemonId),
+    pullRequestFeedback: sessionPullRequestFeedback,
+    followUpWatch,
+    ...(config.CAPABILITY_REQUESTS_ENABLED ? { capabilityRequests } : {}),
+    agentCrons,
+    codeHostFeedback,
+    events,
+    usageWriter,
+    integration: repos.integration,
+    bot: repos.bot,
+    // A daemon socket's lifecycle report takes the same fenced revocation as the relay's, minus a relay release it never had.
+    socketBotRevocation: {
+      matches: (bot, reported) => platforms.get(bot.platform)?.socketLifecycleRevocation?.(bot, reported) === true,
+      revoke: (botId, reason, eventAtMs) => httpBot.revokeBot(botId, reason, { eventAtMs }, { evidence: 'event' })
+    },
+    socketBotTenant: createSocketBotTenant({
+      bots: repos.bot,
+      secrets: repos.botSecret,
+      integrations: repos.integration,
+      platforms,
+      log: http.log
+    }),
+    githubInstallation: repos.githubInstallation,
+    gitlabProjectBinding: repos.gitlabProjectBinding,
+    ...(gitlabAppCfg ? { gitlabBaseUrl: gitlabAppCfg.baseUrl } : {}),
+    integrationChannel: repos.integrationChannel,
+    slackSessionAccess,
+    gatedDmSeeds: gatedDmSeedResolver,
+    approvalRoute,
+    // The console's own session visibility for whoever asks a cross-platform read; lazy over the HTTP deps built above.
+    readAccess: (req, expectedOrgId) =>
+      resolveReadAccess(
+        req,
+        {
+          agent: repos.agent,
+          integration: repos.integration,
+          bot: repos.bot,
+          org: repos.org,
+          users: repos.user,
+          platforms,
+          ...(logtoIdentity ? { identity: logtoIdentity } : {}),
+          commitAuthorsFor: (viewer) =>
+            resolveCommitAuthors(viewer, {
+              ...(logtoIdentity
+                ? {
+                    socialAccount: async (userId) => {
+                      const sub = await repos.user.getOidcSubject(userId)
+                      return sub ? logtoIdentity.socialAccountFor(sub) : null
+                    }
+                  }
+                : {}),
+              ...(gitlabOauthService && gitlabApi && gitlabAppCfg
+                ? {
+                    gitlab: {
+                      host: new URL(gitlabAppCfg.baseUrl).host,
+                      connections: repos.gitlabConnection,
+                      currentUser: async (orgId, connectionId) =>
+                        gitlabCurrentUser(await gitlabOauthService.withAccessToken(orgId, connectionId), gitlabApi)
+                    }
+                  }
+                : {}),
+              azureDevOps: {
+                connections: repos.azureDevOpsConnection,
+                userFor: (connection, objectId, email) =>
+                  azureDevOpsConnectionService.withApi(connection, (token) =>
+                    readMicrosoftUser(azureDevOpsApi, token, {
+                      organization: connection.organization,
+                      tenantId: connection.tenantId,
+                      objectId,
+                      email
+                    })
+                  )
+              }
+            }),
+          sessionsVisible: sessionsVisibleTo(httpDeps, () => http.log)
+        },
+        expectedOrgId
+      ),
+    // §14.8: the report path can now create an ENABLED row, so it needs the same
+    // re-converge a visibility flip performs — the reporter's own bindRules predate it.
+    integrationConverge: (agent) =>
+      convergeIntegrationGating({ repos, agentDelivery, httpBot, platforms }, agent, {
+        warn: (o, m) => http.log.warn(o as Record<string, unknown>, m)
+      }),
+    sessionAccessWarmer,
+    agentMutations,
+    recoverStagedAgent: (agentId, daemonId, moveId) => stagedAgentMoves.recoverStaged(agentId, daemonId, moveId),
+    collabRoutes,
+    dutyLease,
+    computerLeases,
+    computerChannelGrants,
+    ...(computerPool ? { computerPool } : {}),
+    memberSets: repos.memberSet,
+    agentBundle: (agent) => stagedAgentMoves.bundleFor(agent),
+    cron: repos.cron,
+    hook: repos.hook,
+    agent: repos.agent,
+    organizationKnowledge: repos.organizationKnowledge,
+    organizationRecord: repos.organizationRecord,
+    externalMemoryConnection: repos.externalMemoryConnection,
+    agentMemoryStore,
+    agentMemoryTransaction,
+    agentMemoryHistory: repos.agentMemoryHistory,
+    agentSkillSourceStatus: repos.agentSkillSourceStatus,
+    ...(github ? { github } : {}),
+    ...(github
+      ? {
+          repoCandidates: new RepoCandidatesService({
+            installationAuths: repos.agentInstallationAuth,
+            repoAuths: repos.agentRepoAuth,
+            installations: repos.githubInstallation,
+            github
+          })
+        }
+      : {}),
+    // gitcred v2 (§13.1): the gitlab arm serves the agent's own account PATs; absent ⇒ disabled.
+    ...(gitlab
+      ? {
+          gitlabGitcred: new GitlabGitcredService({
+            bindings: repos.gitlabProjectBinding,
+            accounts: repos.gitlabAgentAccount,
+            credentials: new PgGitlabProjectCredentialRepo(prisma),
+            credentialSecrets: new PgGitlabProjectCredentialSecretStore(prisma, secretCipher),
+            repoAuths: repos.agentRepoAuth,
+            skillSourceProjects: (agent) => resolveGitlabSkillSourceProjects(agent, repos.skillSource),
+            clock,
+            baseUrl: gitlab.api.baseUrl
+          })
+        }
+      : {}),
+    // gitcred v2 (gitea-integration.md §9): the gitea arm serves the organization's bot token.
+    giteaGitcred: new GiteaGitcredService({
+      connections: repos.giteaConnection,
+      secrets: new PgGiteaConnectionSecretStore(prisma, secretCipher),
+      bindings: repos.giteaRepositoryBinding,
+      repoAuths: repos.agentRepoAuth,
+      clock,
+      baseUrl: giteaCfg.baseUrl
+    }),
+    // Azure DevOps leases (azure-devops-integration.md §6.1): the connection's cached token, to the proxy plane only.
+    azureDevOpsGitcred: new AzureDevOpsGitcredService({
+      agents: repos.agent,
+      authz: azureDevOps.userAuthz,
+      connections: repos.azureDevOpsConnection,
+      bindings: repos.azureDevOpsRepositoryBinding,
+      repoAuths: repos.agentRepoAuth,
+      service: azureDevOpsConnectionService,
+      api: azureDevOpsApi,
+      clock
+    }),
+    // The SAME token service the funnel, the disconnect edge and the sweep hold — the `linearcred`
+    // broker must not become a second opinion on when a grant is stale (linear-integration.md §4.4).
+    linearTokens: linearTokenService,
+    providerKey: repos.providerKey,
+    decision: repos.decision,
+    ...(fileTransfer ? { fileTransfer } : {}),
+    sharedImages,
+    ...(githubReviewBroker ? { githubReviewBroker } : {}),
+    codeHostReviewBroker,
+    ...(githubRunCoordinator ? { githubRunCoordinator } : {}),
+    ...(codeHostNoteProjection ? { codeHostNoteProjection } : {}),
+    giteaStatusProjection,
+    azureDevOpsStatusProjection,
+    relayRoster: () => relayRoster.entries(),
+    clock,
+    config: {
+      HEARTBEAT_SEC: config.HEARTBEAT_SEC,
+      ACK_TIMEOUT_MS: config.ACK_TIMEOUT_MS,
+      WS_PATH: config.WS_PATH,
+      DATABASE_POOL_MAX: config.DATABASE_POOL_MAX,
+      ...(config.DAEMON_HANDSHAKE_CONCURRENCY
+        ? { DAEMON_HANDSHAKE_CONCURRENCY: config.DAEMON_HANDSHAKE_CONCURRENCY }
+        : {})
+    }
+  }
+
+  // ── relay control WS edge (rc/*) — the third gateway on the shared http.Server ─
+  // Register fan-out is deliberately asynchronous with respect to
+  // `rc/registered`, but it still belongs to this process lifecycle. Track the
+  // guarded promises so shutdown cannot disconnect Prisma while a just-opened
+  // relay is still reading the roster/rules baseline (and tests cannot race
+  // their database cleanup against that work).
+  const relayRegistrationTasks = new Set<Promise<void>>()
+  const trackRelayRegistrationTask = (task: Promise<void>): void => {
+    relayRegistrationTasks.add(task)
+    void task.then(
+      () => relayRegistrationTasks.delete(task),
+      () => relayRegistrationTasks.delete(task)
+    )
+  }
+
+  const relayDeploymentConfig = relayDeploymentSnapshot(
+    opts.deploymentConfig,
+    googleChatAnchor,
+    relayPublicBase,
+    webAppUrl,
+    // The relay answers a Teams tenant no organization connected with the deployment app's own card (teams-integration.md §8.4).
+    msTeamsConnectAnchor(msTeamsPlatformApp, webAppUrl),
+    // The relay sends the app's rows' Bot Connector calls and mints their Graph tokens (§8.5).
+    msTeamsRelayApp(msTeamsPlatformApp, config.API_KEY_PEPPER, msTeamsAgentBots),
+    // The relay sends the app's customer rows' Chat API calls (google-chat-integration.md §10.10).
+    googleChatRelayApp(googleChatPlatformApp)
+  )
+  const relayWsDeps: RelayWsServerDeps = {
+    log: http.log,
+    auth: relayAuth,
+    verifyAhpKey: (req) => ahpAuthorization.verifyKey(req),
+    verifyAhpBrowser: (req) => ahpAuthorization.verifyBrowser(req),
+    verifyComputerRelayToken: (credential, computerId) =>
+      computerChannelGrants.verifyRelayToken(credential, computerId),
+    computerTurnSecret: computerRelayTurnSecret,
+    relays: repos.relay,
+    relayReg,
+    clock,
+    ...(relayDeploymentConfig ? { deploymentConfig: relayDeploymentConfig } : {}),
+    // rc/verify(webchat-token): validate the token, then re-resolve the agent's CURRENT
+    // placement (agent.daemonId + connReg READY) — placement can move between mint + dial.
+    verifyWebchatToken: createWebchatTokenVerifier({
+      tokens: webchatTokens,
+      agents: repos.agent,
+      daemons: connReg,
+      conversations: repos.webchatConversation,
+      apiEntries: repos.agentApiEntry,
+      sessions: repos.session,
+      memberSets: repos.memberSet,
+      orgs: repos.org,
+      remoteMcp: webchatRemoteMcp,
+      placement: placementResolver
+    }),
+    // rc/verify(agent-chat-key): the HTTP key checks, then the caller's chat id mapped to its conversation (§10.4).
+    verifyAgentChatKey: createAgentChatKeyVerifier({
+      keys: apiKeys,
+      agents: repos.agent,
+      daemons: connReg,
+      conversations: repos.webchatConversation,
+      apiEntries: repos.agentApiEntry,
+      sessions: repos.session,
+      memberSets: repos.memberSet,
+      orgs: repos.org,
+      remoteMcp: webchatRemoteMcp,
+      placement: placementResolver,
+      users: repos.user,
+      ...(iconStore ? { iconStore } : {}),
+      reachesContent: (orgId, ids) =>
+        everyTurnReachesItsContent(
+          { sessions: repos.session, agents: repos.agent, placement: placementResolver, memberSets: repos.memberSet },
+          orgId,
+          ids
+        )
+    }),
+    // Current-permission fallback for GitHub comment webhooks whose
+    // author_association snapshot is stale or inconsistent across event types.
+    // Missing GitHub configuration fails closed.
+    authorizeGithubComment: async (req) => (githubCommentAuthz ? githubCommentAuthz.allowed(req) : false),
+    authorizeGithubRerequest: async (req) => (githubRerequest ? githubRerequest.resolve(req) : { allowed: false }),
+    // Provider fail-per-value: each arm answers only for its own host; an unknown host is denied.
+    authorizeCodeHostMembership: async (req) => {
+      if (req.provider === 'gitea') return giteaMembershipAuthz.allowed(req)
+      if (req.provider === 'azure-devops') return azureDevOpsMembershipAuthz.allowed(req)
+      return gitlabMembershipAuthz ? gitlabMembershipAuthz.allowed(req) : false
+    },
+    // One verified delivery the relay observed (gitea-integration.md §6, §7): the binding is marked
+    // verified and a rotated key promoted; a provider this deployment does not manage is ignored.
+    onCodeHostDelivery: async (observed) => {
+      if (!/^[1-9]\d*$/.test(observed.repoExternalId)) return
+      // §11.2: the binding is verified, and a delivery under the next key promotes it once every subscription switched.
+      if (observed.provider === 'azure-devops') {
+        await azureDevOpsHooks.observeDelivery({
+          repoId: BigInt(observed.repoExternalId),
+          at: new Date(observed.receivedAt),
+          ...(observed.verifiedWith !== undefined ? { verifiedWith: observed.verifiedWith } : {})
+        })
+        return
+      }
+      if (observed.provider !== 'gitea') return
+      // Gitea keeps no previous key, so a delivery verified under one names nothing this binding holds.
+      if (observed.verifiedWith === 'previous') return
+      await giteaProvisioner.observeDelivery({
+        repoId: BigInt(observed.repoExternalId),
+        at: new Date(observed.receivedAt),
+        ...(observed.verifiedWith !== undefined ? { verifiedWith: observed.verifiedWith } : {})
+      })
+    },
+    // TURN bytes per Computer the relays forwarded, metered on the report's day (computer-use.md §15.5).
+    onComputerMediaUsage: (usage) => computerPlan.recordRelayed(usage.entries, new Date(usage.to)),
+    onCodeHostFeedback: (signal) => codeHostFeedback.receive(signal),
+    onPullRequestFeedback: async (signal) => {
+      const orgId = await githubSignalOrg(signal)
+      if (!orgId) return false
+      // A wake-only event resumes no session; the lane's own feedback is unchanged.
+      if (!signal.wakeOnly) await sessionPullRequestFeedback.enqueueForOrg(orgId, signal)
+      if (signal.event) {
+        await followUpWatch.receive({
+          object: {
+            orgId,
+            provider: 'github',
+            bindingId: '',
+            repoId: BigInt(signal.repoId),
+            subject: signal.subject ?? 'pull',
+            number: signal.pullNumber
+          },
+          deliveryKey: signal.deliveryKey,
+          kind: signal.event,
+          feedback: !signal.wakeOnly
+        })
+      }
+      return true
+    },
+    // A relay just (re)registered — refresh every daemon's roster, (re)assign every
+    // HTTP bots' ingress + routes (§5, idempotent), AND replay the compiled hook
+    // rules to the fresh connection (its table is a memory copy). All fire-and-forget,
+    // so the DB reads MUST NOT reject unhandled (that would crash the CP under Node's
+    // throw-on-unhandled-rejection): swallow + log, mirroring the sweeper's guarded
+    // `relaySweeper.tick` path.
+    onRegistered: (ch) => {
+      trackRelayRegistrationTask(
+        codeHostFeedback
+          .replayTo(ch)
+          .catch((err) => http.log.error({ err }, 'relay: feedback subscription replay failed'))
+      )
+      trackRelayRegistrationTask(
+        relayRoster.broadcast().catch((err) => http.log.error({ err }, 'relay: roster sync on register failed'))
+      )
+      // Seed ONLY the fresh relay with every http bot's assign + persisted thread
+      // affinity (per-relay replay — no re-broadcast to the whole pool)…
+      trackRelayRegistrationTask(
+        httpBot.replayTo(ch).catch((err) => http.log.error({ err }, 'relay: HTTP-bot replay on register failed'))
+      )
+      // …then converge the WHOLE pool: a joined relay changes the connected roster,
+      // which moves §14.3 notice authorities — existing relays must learn the new
+      // assignment or two pods could both (or neither) believe they hold it.
+      trackRelayRegistrationTask(
+        httpBot.reconcileAll().catch((err) => http.log.error({ err }, 'relay: HTTP-bot reconcile on register failed'))
+      )
+      if (ch.features?.includes(FOLLOW_UP_WATCH_FEATURE)) {
+        trackRelayRegistrationTask(
+          replaySnapshot(ch, 'follow-up-watch', relayControl, () =>
+            followUpWatch.replayTo((watch) => ch.send('rc/follow-up-watch', watch))
+          ).catch((err) => http.log.error({ err }, 'relay: follow-up watch replay failed'))
+        )
+      }
+      trackRelayRegistrationTask(
+        replaySnapshot(ch, 'hook', relayControl, (withhold) => hookService.replayTo(ch, withhold)).catch((err) =>
+          http.log.error({ err }, 'relay: hook-rule replay on register failed')
+        )
+      )
+      if (githubApps && ch.features?.includes(GITHUB_APP_WEBHOOK_V1_FEATURE)) {
+        trackRelayRegistrationTask(
+          replaySnapshot(ch, 'github-app', relayControl, () =>
+            githubApps.replayWebhooksTo((w) =>
+              ch.send('rc/github-app-assign', {
+                githubAppId: w.githubAppId,
+                appId: w.appId.toString(),
+                webhookSecret: w.webhookSecret
+              })
+            )
+          ).catch((err) => http.log.error({ err }, 'relay: github app webhook replay failed'))
+        )
+      }
+      // Seed the fresh relay with every MCP provider binding (its table starts empty;
+      // bindings are pool-wide, so a later-joining relay must be replayed or requests 401).
+      trackRelayRegistrationTask(
+        replaySnapshot(ch, 'mcp', relayControl, (withhold) =>
+          replayMcpTo(
+            ch,
+            {
+              providers: repos.mcpProvider,
+              secrets: repos.mcpProviderSecret,
+              grants: repos.mcpGrant,
+              tokens: mcpTokenService,
+              log: http.log
+            },
+            withhold
+          )
+        ).catch((err) => http.log.error({ err }, 'relay: mcp binding replay on register failed'))
+      )
+      trackRelayRegistrationTask(
+        (async () => {
+          const memoryDeps = {
+            connections: repos.externalMemoryConnection,
+            installations: repos.memoryPluginInstallation,
+            secrets: repos.externalMemoryConnectionSecret,
+            grants: repos.externalMemoryGrant,
+            log: http.log
+          }
+          // The relay binding must exist before a daemon is pointed at it.
+          await replaySnapshot(ch, 'memory', relayControl, (withhold) =>
+            replayMemoryConnectionsTo(ch, memoryDeps, withhold)
+          )
+          const selected = (await relayRoster.entries())[0]
+          if (!selected) return
+          await syncMemoryConnectionsToDaemons(relayHttpOrigin(selected.url), {
+            ...memoryDeps,
+            agents: repos.agent,
+            delivery: agentDelivery,
+            control: sender
+          })
+        })().catch(() => http.log.error('relay: memory binding/daemon sync on register failed'))
+      )
+      // Ship the collaboration routing snapshot baseline to the fresh relay (§6.5
+      // reconnect baseline). Fire-and-forget + guarded like the others.
+      trackRelayRegistrationTask(
+        collabRoutes
+          .broadcastTo(ch)
+          .catch((err) => http.log.error({ err }, 'relay: collab-routes baseline on register failed'))
+      )
+    },
+    // Delivery-stage HookRun bookkeeping (`rc/run-report` EVT): `accepted` opens
+    // the row running, `failed` records the delivery failure. Unknown hooks drop.
+    onRunReport: async (report) => {
+      const firedAt = new Date(report.firedAt)
+      if (Number.isNaN(firedAt.getTime())) return
+      const host = codeHostHookMetadataOf(report)
+      const github = host?.provider === 'github' ? host.metadata : undefined
+      const projectionIntent = githubProjectionIntent(report.event, github, report.reviewPolicy)
+      const delivery = await repos.hook.recordDeliveryResult(HookId(report.hookId), {
+        deliveryKey: report.deliveryKey,
+        firedAt,
+        status: report.status,
+        agentId: AgentId(report.agentId),
+        ...(report.configRevision !== undefined ? { configRevision: BigInt(report.configRevision) } : {}),
+        ...(report.dispatchRevision !== undefined ? { dispatchRevision: BigInt(report.dispatchRevision) } : {}),
+        ...(report.dispatchDaemonId !== undefined
+          ? { dispatchDaemonId: DaemonId(report.dispatchDaemonId) }
+          : report.daemonId
+            ? { dispatchDaemonId: DaemonId(report.daemonId) }
+            : {}),
+        ...(report.reviewPolicy !== undefined ? { reviewPolicySnapshot: report.reviewPolicy } : {}),
+        ...(report.reportingMode !== undefined ? { reportingModeSnapshot: report.reportingMode } : {}),
+        ...(report.gateMode !== undefined ? { gateModeSnapshot: report.gateMode } : {}),
+        projectionIntent,
+        ...githubHookRunSubject(host),
+        ...(report.event ? { event: report.event } : {}),
+        ...(report.reason ? { reason: report.reason } : {})
+      })
+      if (delivery.accepted && report.status === 'accepted') {
+        if (github && delivery.newlyObserved) {
+          void repos.hook
+            .refreshGithubRepoFullName(HookId(report.hookId), BigInt(github.repoId), github.repoFullName, firedAt)
+            .then(({ hooks, agentIds }) =>
+              Promise.all([
+                ...hooks.map((hook) => hookService.broadcast(hook)),
+                ...agentIds.map(async (agentId) => {
+                  const agent = await repos.agent.getUnscoped(agentId)
+                  if (!agent) return
+                  await agentDelivery.upsert(agent, (err, daemonId) => {
+                    if (err instanceof NoConnection) {
+                      http.log.debug({ agentId, daemonId }, 'github rename: agent/upsert skipped — daemon offline')
+                    } else {
+                      http.log.warn(
+                        { err, agentId, daemonId },
+                        'github rename: agent/upsert failed (backstop: reconnect roster)'
+                      )
+                    }
+                  })
+                })
+              ])
+            )
+            .catch((err) =>
+              http.log.warn({ err, hookId: report.hookId }, 'github ingress: repository rename convergence failed')
+            )
+        }
+        void githubRunCoordinator
+          ?.afterAccepted(HookId(report.hookId), report.deliveryKey)
+          .catch((err) => http.log.warn({ err, hookId: report.hookId }, 'github check: accepted convergence failed'))
+      } else if (
+        delivery.accepted &&
+        report.status === 'failed' &&
+        report.reason === HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED
+      ) {
+        void githubRunCoordinator
+          ?.afterReport(HookId(report.hookId), report.deliveryKey)
+          .catch((err) =>
+            http.log.warn({ err, hookId: report.hookId }, 'github check: manual-request convergence failed')
+          )
+      }
+      // §16 delivery-stage edge: an accepted gitlab MR fire opens `queued`, a delivery failure
+      // reads `skipped`. Fire-and-forget like the Check convergence above — the desired generation
+      // is durable, so a lost projection edge is repaired by the next one.
+      if (delivery.accepted && codeHostNoteProjection && host?.provider === 'gitlab') {
+        void (async () => {
+          const hook = await repos.hook.getUnscoped(HookId(report.hookId))
+          if (hook?.kind !== host.provider) return
+          const edge = {
+            hookId: report.hookId,
+            agentId: report.agentId,
+            deliveryKey: report.deliveryKey,
+            orgId: hook.orgId,
+            state: 'queued' as const,
+            reason: report.reason ?? null,
+            gitlab: host.metadata,
+            snapshot: report,
+            at: firedAt
+          }
+          if (report.status === 'accepted') await codeHostNoteProjection.afterAccepted(edge)
+          else await codeHostNoteProjection.afterDeliveryFailed(edge)
+        })().catch((err) =>
+          http.log.warn({ err, hookId: report.hookId }, 'note projection: delivery convergence failed')
+        )
+      }
+      // gitea-integration.md §10.4: the same delivery-stage edge for the commit-status projection.
+      if (host?.provider === 'gitea') {
+        void (async () => {
+          const hook = await repos.hook.getUnscoped(HookId(report.hookId))
+          if (hook?.kind !== host.provider) return
+          const edge = {
+            hookId: report.hookId,
+            agentId: report.agentId,
+            deliveryKey: report.deliveryKey,
+            orgId: hook.orgId,
+            state: 'queued' as const,
+            reason: report.reason ?? null,
+            gitea: host.metadata,
+            snapshot: report,
+            at: firedAt
+          }
+          if (report.status === 'accepted') await giteaStatusProjection.afterAccepted(edge)
+          else await giteaStatusProjection.afterDeliveryFailed(edge)
+        })().catch((err) => http.log.warn({ err, hookId: report.hookId }, 'gitea status: delivery convergence failed'))
+      }
+      // azure-devops-integration.md §11.7: the same edge for the pull-request status; an update kind names no head yet.
+      if (host?.provider === 'azure-devops') {
+        void (async () => {
+          const hook = await repos.hook.getUnscoped(HookId(report.hookId))
+          if (hook?.kind !== host.provider) return
+          const edge = {
+            hookId: report.hookId,
+            agentId: report.agentId,
+            deliveryKey: report.deliveryKey,
+            orgId: hook.orgId,
+            state: 'queued' as const,
+            reason: report.reason ?? null,
+            azureDevOps: host.metadata,
+            snapshot: report,
+            at: firedAt
+          }
+          if (report.status === 'accepted') await azureDevOpsStatusProjection.afterAccepted(edge)
+          else await azureDevOpsStatusProjection.afterDeliveryFailed(edge)
+        })().catch((err) =>
+          http.log.warn({ err, hookId: report.hookId }, 'azure-devops status: delivery convergence failed')
+        )
+      }
+    },
+    // The in-Slack config modal picked a channel's default agent — persist + recompile
+    // the bot's routes. Swallow+log: a store error must not close the shared relay link.
+    onSetChannelAgent: async (m) => {
+      try {
+        await httpBot.setChannelAgent(m.botId, m.channelId, m.agentId)
+      } catch (err) {
+        http.log.error({ err, botId: m.botId }, 'relay: set-channel-agent failed')
+      }
+    },
+    // HTTP Slack ingest observed the bot itself join/leave a channel and re-listed
+    // its complete membership. Persist across every install and refresh relay routes.
+    onBotChannels: async (m) => {
+      try {
+        await httpBot.replaceChannels(m.botId, m.channels)
+      } catch (err) {
+        http.log.error({ err, botId: m.botId }, 'relay: bot-channels snapshot failed')
+      }
+    },
+    // A closed relay shrinks the roster — re-stamp §14.3 notice authorities on the survivors (fire-and-forget).
+    onRelayGone: () => {
+      // A retiring CP's own drain closes every relay; the replacement re-places bots when each re-registers.
+      if (readiness.isShuttingDown()) return
+      void httpBot
+        .reconcileAll()
+        .catch((err) => http.log.error({ err }, 'relay: HTTP-bot reconcile on disconnect failed'))
+    },
+    // A definitive revocation, fenced and recording its evidence; acknowledged, so a failure propagates and the relay retries.
+    onBotRevoked: async (m) =>
+      httpBot.revokeBot(
+        m.botId,
+        m.reason,
+        {
+          ...(m.credentialRevision !== undefined ? { revision: m.credentialRevision } : {}),
+          ...(m.eventAtMs !== undefined ? { eventAtMs: m.eventAtMs } : {})
+        },
+        { ...(m.evidence ? { evidence: m.evidence } : {}), ...(m.code ? { code: m.code } : {}) }
+      ),
+    // One relay's probe answer: its observation re-aggregates the bot's mark; acknowledged, so a failure propagates.
+    onBotCredentialCheck: async (m, relayId) => httpBot.recordCredentialCheck(m, relayId),
+    // A single-tenant Google Chat row's learned tenant key; acknowledged, so a failure propagates and the relay retries.
+    onBotTenant: async (m) => httpBot.recordTenant(m.botId, m.tenantId),
+    // Incremental direct-conversation report: surface a configurable row on every
+    // install, with its visibility-appropriate default. Swallow+log.
+    onBotConversation: async (m) => {
+      try {
+        await httpBot.reportConversation(m.botId, m.conversation)
+      } catch (err) {
+        http.log.error({ err, botId: m.botId }, 'relay: bot-conversation report failed')
+      }
+    },
+    // Durable thread-affinity REPORT leg — persist + broadcast (rc/assign). Swallow+log:
+    // a store error must not close the shared relay link.
+    onThreadAssign: async (m) => {
+      try {
+        await httpBot.recordThreadAssign(m)
+      } catch (err) {
+        http.log.error({ err, botId: m.botId }, 'relay: thread-assign failed')
+      }
+    },
+    // Durable room membership is independent of compatibility owner affinity.
+    onThreadParticipant: async (m) => {
+      try {
+        await httpBot.recordThreadParticipant(m)
+      } catch (err) {
+        http.log.error({ err, botId: m.botId }, 'relay: thread-participant failed')
+      }
+    },
+    // Pull-on-miss BACKSTOP leg — may throw → the handler answers a retryable error.
+    threadLookup: (m) => httpBot.lookupThread(m),
+    // Installation doorbell poke — fire-and-forget into the throttled re-pull
+    // (the doorbell owns single-flight/cooldown and swallows its own errors).
+    onGithubInstallation: async (m) => {
+      // A dedicated App's own webhook: re-pull that App's roster, which also claims a new installation.
+      if (m.appId !== undefined) {
+        void githubApps
+          ?.syncFromWebhook(BigInt(m.appId))
+          .catch((err) => http.log.warn({ err, appId: m.appId }, 'relay: dedicated GitHub App sync failed'))
+        return
+      }
+      if (!installationDoorbell) {
+        http.log.debug({ installationId: m.installationId }, 'relay: doorbell ignored — GITHUB_APP_* not configured')
+        return
+      }
+      installationDoorbell.poke(m)
+    },
+    config: {
+      RELAY_WS_PATH: config.RELAY_WS_PATH,
+      HEARTBEAT_SEC: config.HEARTBEAT_SEC
+    }
+  }
+
+  return {
+    http,
+    wsGateway: (app: FastifyInstance) => createDaemonWsServer(app, wsDeps),
+    relayGateway: (app: FastifyInstance) => createRelayWsServer(app, relayWsDeps),
+    computerGateway: (app: FastifyInstance) =>
+      createComputerWsServer(app, {
+        computers,
+        policies: computers,
+        repo: repos.computer,
+        keys: computerChannelKeys,
+        registry: computerChannels,
+        leases: computerLeases,
+        audit: computerAudit,
+        ...(computerScreenshots ? { screenshots: computerScreenshots } : {}),
+        egress: (orgId) => computerPlan.egressFor(orgId),
+        relays: () => relayRoster.entries(),
+        clock,
+        heartbeatSec: config.HEARTBEAT_SEC,
+        log: http.log,
+        paths: [config.COMPUTER_WS_PATH, COMPUTER_WS_PUBLIC_PATH],
+        config: {
+          DATABASE_POOL_MAX: config.DATABASE_POOL_MAX,
+          ...(config.DAEMON_HANDSHAKE_CONCURRENCY
+            ? { DAEMON_HANDSHAKE_CONCURRENCY: config.DAEMON_HANDSHAKE_CONCURRENCY }
+            : {})
+        }
+      }),
+    defaults: { orgId: DEFAULT_ORG_ID, ownerId: DEFAULT_OWNER_ID },
+    platforms,
+    readiness,
+    webchatRemoteMcp,
+    remoteGrantAuth,
+    internalInvocationAuth,
+    startBackground() {
+      fileTransferBucket?.gate.start()
+      cronRunReaper.start()
+      releaseBroadcaster?.start()
+      daemonRelease?.start()
+      deferredLifecycleOpSweeper.start()
+      hookRunReaper.start()
+      oauthReaper.start()
+      computerRegistrationReaper.start()
+      computerPool?.start()
+      computerPlan.start()
+      computerScreenshotReaper?.start()
+      poolMemberReaper?.start()
+      webchatMcpOperationReaper.start()
+      agentMemoryStagingSweeper.start()
+      githubRunReporter?.start()
+      giteaStatusReporter.start()
+      azureDevOpsStatusReporter.start()
+      hookRedeliveryReconciler?.start()
+      repositoryGrantReattestor?.start()
+      azureDevOpsGrantReattestor.start()
+      mcpOauthRefresher.start()
+      gitlabRotator?.start()
+      gitlabRetirementSweeper?.start()
+      gitlabConvergeSweeper?.start()
+      giteaConvergeSweeper.start()
+      azureDevOpsHookSweeper.start()
+      // §3.5: the deployment secret moves only across a restart, so one pass at boot re-stamps it.
+      void azureDevOpsConnectionService
+        .reconcileDeploymentSecret()
+        .catch((err) => http.log.warn({ err }, 'azure devops: deployment secret reconcile failed'))
+      for (const reaper of pendingInstallReapers) reaper.start()
+      relaySweeper.start()
+      dutyRecompute.start()
+      sessionAccessWarmer.start()
+      sessionPullRequestFeedback?.start()
+      followUpWatch.start()
+      capabilityRequests.start()
+      for (const loop of backgroundLoops) loop.start()
+      // One-shot (not a re-arming loop): the worklist empties itself; a partially
+      // failed boot resumes on the next one. Never blocks listen.
+      void presetBackfill?.run().catch((err) => http.log.error({ err }, 'preset-backfill: sweep failed'))
+      void setMemoryHome.run().catch((err) => http.log.error({ err }, 'set-memory-home: pass failed'))
+    },
+    async shutdown() {
+      fileTransferBucket?.gate.stop()
+      cronRunReaper.stop()
+      daemonRelease?.stop()
+      releaseBroadcaster?.stop()
+      deferredLifecycleOpSweeper.stop()
+      hookRunReaper.stop()
+      oauthReaper.stop()
+      computerRegistrationReaper.stop()
+      computerPool?.stop()
+      computerPlan.stop()
+      computerScreenshotReaper?.stop()
+      poolMemberReaper?.stop()
+      const webchatMcpOperationSettled = webchatMcpOperationReaper.stopAndSettle()
+      agentMemoryStagingSweeper.stop()
+      githubApps?.stop()
+      githubRunReporter?.stop()
+      giteaStatusReporter.stop()
+      azureDevOpsStatusReporter.stop()
+      hookRedeliveryReconciler?.stop()
+      repositoryGrantReattestor?.stop()
+      azureDevOpsGrantReattestor.stop()
+      mcpOauthRefresher.stop()
+      gitlabRotator?.stop()
+      gitlabRetirementSweeper?.stop()
+      gitlabConvergeSweeper?.stop()
+      giteaConvergeSweeper.stop()
+      azureDevOpsHookSweeper.stop()
+      installationDoorbell?.stop()
+      for (const reaper of pendingInstallReapers) reaper.stop()
+      relaySweeper.stop()
+      dutyRecompute.stop()
+      poolMetrics.stop()
+      orgMetrics.stop()
+      sessionAccessWarmer.stop()
+      sessionPullRequestFeedback?.stop()
+      followUpWatch.stop()
+      capabilityRequests.stop()
+      for (const loop of backgroundLoops) loop.stop()
+      visibilityPush.stop()
+      await Promise.allSettled([
+        webchatMcpOperationSettled,
+        ...relayRegistrationTasks,
+        visibilityPush.settle(),
+        sessionAccessWarmer.settle(),
+        dutyRecompute.settle(),
+        ...(sessionPullRequestFeedback ? [sessionPullRequestFeedback.settle()] : []),
+        followUpWatch.settle(),
+        capabilityRequests.settle(),
+        ...(installationDoorbell ? [installationDoorbell.settle()] : [])
+      ])
+      await rootPrisma.$disconnect()
+    }
+  }
+}
+
+/**
+ * Project the validated environment onto the HTTP layer's config slice.
+ *
+ * Extracted and exported so this seam is testable on its own: it is an explicit
+ * field list, tests elsewhere hand-build `HttpDeps`, and a variable forgotten
+ * here therefore reads as unset in production while every focused test still
+ * passes. That has happened.
+ */
+export function httpServerConfigFrom(
+  config: AppConfig,
+  extras: { DEFAULT_OWNER_ID: string; relayStaleMs: number }
+): HttpDeps['config'] {
+  const { DEFAULT_OWNER_ID, relayStaleMs } = extras
+  return {
+    DEFAULT_OWNER_ID,
+    NODE_ENV: config.NODE_ENV,
+    WS_PATH: config.WS_PATH,
+    HOST: config.HOST,
+    PORT: config.PORT,
+    // Reconnect grace for the daemon read model: mirror the watchdog's freeze
+    // threshold (missed-beats × heartbeat) so a CP restart shows daemons as
+    // `connecting` for the few seconds they take to re-handshake, not `offline`.
+    DAEMON_OFFLINE_GRACE_MS: config.HEARTBEAT_SEC * config.MISSED_BEATS * 1000,
+    ...(config.PUBLIC_CP_URL ? { PUBLIC_CP_URL: config.PUBLIC_CP_URL } : {}),
+    ...(config.OPENAPI_PATH_PREFIX ? { OPENAPI_PATH_PREFIX: config.OPENAPI_PATH_PREFIX } : {}),
+    ...(config.PUBLIC_MCP_URL ? { PUBLIC_MCP_URL: config.PUBLIC_MCP_URL } : {}),
+    ...(config.DAEMON_DIST_TAG ? { DAEMON_DIST_TAG: config.DAEMON_DIST_TAG } : {}),
+    ...(config.COMPUTER_IMAGE ? { COMPUTER_IMAGE: config.COMPUTER_IMAGE } : {}),
+    ...(config.OIDC_ISSUER ? { OIDC_ISSUER: config.OIDC_ISSUER } : {}),
+    ...(config.LOGTO_MGMT_ENDPOINT ? { OIDC_UPSTREAM: config.LOGTO_MGMT_ENDPOINT } : {}),
+    ...(config.OIDC_AUDIENCE ? { OIDC_AUDIENCE: config.OIDC_AUDIENCE } : {}),
+    WAITLIST_MODE: config.WAITLIST_MODE,
+    ...(config.CORS_ORIGIN !== undefined ? { CORS_ORIGIN: config.CORS_ORIGIN } : {}),
+    ...(config.PUBLIC_WEB_URL ? { PUBLIC_WEB_URL: config.PUBLIC_WEB_URL } : {}),
+    SLACK_INSTALL_TTL_SEC: config.SLACK_INSTALL_TTL_SEC,
+    ...(config.PUBLIC_RELAY_URL ? { PUBLIC_RELAY_URL: config.PUBLIC_RELAY_URL } : {}),
+    ...(config.MSTEAMS_APP_LABEL ? { MSTEAMS_APP_LABEL: config.MSTEAMS_APP_LABEL } : {}),
+    AHP_MODE: config.AHP_MODE,
+    WEBCHAT_PROTOCOL: config.WEBCHAT_PROTOCOL,
+    ...(config.USAGE_INGEST_TOKEN ? { USAGE_INGEST_TOKEN: config.USAGE_INGEST_TOKEN } : {}),
+    USAGE_COLLECTOR_SERVICE_ACCOUNT: config.USAGE_COLLECTOR_SERVICE_ACCOUNT,
+    ...(config.S3_PUBLIC_BASE_URL ? { S3_PUBLIC_BASE_URL: config.S3_PUBLIC_BASE_URL } : {}),
+    RELAY_STALE_MS: relayStaleMs
+  }
+}

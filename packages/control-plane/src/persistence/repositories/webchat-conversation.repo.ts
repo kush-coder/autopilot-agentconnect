@@ -1,0 +1,284 @@
+// Webchat conversation ownership and roster metadata (no content); `webchat_conversation.agentId` mirrors the primary row.
+import { randomUUID } from 'node:crypto'
+import { Prisma, type PrismaClient } from '../../generated/prisma/client.js'
+import type { PrismaLike } from '../prisma.js'
+import type {
+  WebchatConversationBinding,
+  WebchatConversationRepo,
+  WebchatParticipant,
+  WebchatResumeBinding
+} from '../ports.js'
+import { AgentId, SessionId, type OrgId } from '../../domain/ids.js'
+
+/** CP-minted webchat conversation ids are UUIDs. Daemon-local A2A children can
+ * retain `platform: webchat` while using an `a2a:<caller>` channel; repository
+ * reads must treat that synthetic coordinate as a miss instead of handing it to
+ * a UUID-backed Prisma column. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export class PgWebchatConversationRepo implements WebchatConversationRepo {
+  constructor(private readonly db: PrismaLike) {}
+
+  private inTx<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    if ('$transaction' in this.db) return (this.db as PrismaClient).$transaction(fn)
+    return fn(this.db as Prisma.TransactionClient)
+  }
+
+  async create(binding: WebchatConversationBinding, memberAgentIds: AgentId[] = [], apiKeyId?: string): Promise<void> {
+    await this.inTx(async (tx) => {
+      await tx.webchatConversation.create({
+        data: {
+          id: binding.conversationId,
+          orgId: binding.orgId,
+          agentId: binding.agentId,
+          userId: binding.userId,
+          ...(apiKeyId ? { apiKeyId } : {})
+        }
+      })
+      await tx.webchatConversationAgent.createMany({
+        data: [
+          {
+            conversationId: binding.conversationId,
+            agentId: binding.agentId,
+            role: 'primary',
+            ord: 0,
+            addedByUserId: binding.userId
+          },
+          ...memberAgentIds.map((agentId, i) => ({
+            conversationId: binding.conversationId,
+            agentId,
+            role: 'member',
+            ord: i + 1,
+            addedByUserId: binding.userId
+          }))
+        ]
+      })
+    })
+  }
+
+  async ensure(binding: WebchatConversationBinding, apiKeyId?: string): Promise<void> {
+    try {
+      await this.create(binding, [], apiKeyId)
+    } catch (err) {
+      // A concurrent first turn created the same id; converge on its row.
+      const raced = await this.db.webchatConversation.findUnique({
+        where: { id: binding.conversationId },
+        select: { id: true }
+      })
+      if (!raced) throw err
+    }
+  }
+
+  async apiKeyNames(orgId: OrgId, conversationIds: readonly string[]): Promise<Map<string, string>> {
+    const ids = conversationIds.filter((id) => UUID_RE.test(id))
+    if (ids.length === 0) return new Map()
+    const rows = await this.db.webchatConversation.findMany({
+      where: { id: { in: ids }, orgId, apiKey: { isNot: null } },
+      select: { id: true, apiKey: { select: { name: true, displayTail: true } } }
+    })
+    // An unnamed key is still named by its tail, the way the key list shows it.
+    return new Map(
+      rows.flatMap((r) =>
+        r.apiKey ? [[r.id, r.apiKey.name?.trim() || `API key ${r.apiKey.displayTail}`] as const] : []
+      )
+    )
+  }
+
+  async participants(orgId: OrgId, conversationId: string): Promise<WebchatParticipant[]> {
+    if (!UUID_RE.test(conversationId)) return []
+    // Roster rows carry no org of their own, so the fence rides the relational
+    // filter on the owning conversation (org-scoped-data-layer.md §3.6): a
+    // cross-org id yields the same empty roster as an unknown one, and every
+    // caller already fails closed on empty.
+    const rows = await this.db.webchatConversationAgent.findMany({
+      where: { conversationId, conversation: { orgId }, removedAt: null },
+      orderBy: { ord: 'asc' },
+      select: { agentId: true, role: true, currentSessionId: true }
+    })
+    return rows.map((r) => ({
+      agentId: AgentId(r.agentId),
+      role: r.role === 'primary' ? 'primary' : 'member',
+      currentSessionId: r.currentSessionId
+    }))
+  }
+
+  async addParticipant(orgId: OrgId, conversationId: string, agentId: AgentId, addedByUserId: string): Promise<void> {
+    await this.inTx(async (tx) => {
+      // Org fence on the conversation itself, inside the same transaction as the
+      // roster insert: a cross-org id adds nothing (§3.6).
+      const conversation = await tx.webchatConversation.findFirst({
+        where: { id: conversationId, orgId },
+        select: { id: true }
+      })
+      if (!conversation) return
+      const last = await tx.webchatConversationAgent.aggregate({
+        where: { conversationId },
+        _max: { ord: true }
+      })
+      const ord = (last._max.ord ?? 0) + 1
+      // A removed member rejoins at the end of the roster; a live one stays where it is.
+      const restored = await tx.webchatConversationAgent.updateMany({
+        where: { conversationId, agentId, removedAt: { not: null } },
+        data: { removedAt: null, removedByUserId: null, ord, addedByUserId, addedAt: new Date() }
+      })
+      if (restored.count > 0) return
+      await tx.webchatConversationAgent.createMany({
+        data: [{ conversationId, agentId, role: 'member', ord, addedByUserId }],
+        skipDuplicates: true
+      })
+    })
+  }
+
+  async hasRemovedParticipants(orgId: OrgId, conversationId: string): Promise<boolean> {
+    if (!UUID_RE.test(conversationId)) return false
+    const removed = await this.db.webchatConversationAgent.findFirst({
+      where: { conversationId, conversation: { orgId }, removedAt: { not: null } },
+      select: { agentId: true }
+    })
+    return removed !== null
+  }
+
+  async removeParticipant(
+    orgId: OrgId,
+    conversationId: string,
+    agentId: AgentId,
+    removedByUserId: string
+  ): Promise<'removed' | 'absent' | 'primary'> {
+    if (!UUID_RE.test(conversationId)) return 'absent'
+    return this.inTx(async (tx) => {
+      // Lock the conversation row so a removal serializes with joins and session-pointer writes (§3.6 org fence included).
+      const locked = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+        SELECT "id" FROM "webchat_conversation" WHERE "id" = ${conversationId}::uuid AND "orgId" = ${orgId} FOR UPDATE
+      `)
+      if (locked.length === 0) return 'absent'
+      const live = await tx.webchatConversationAgent.findMany({
+        where: { conversationId, removedAt: null },
+        select: { agentId: true, role: true }
+      })
+      const row = live.find((p) => p.agentId === agentId)
+      if (!row) return 'absent'
+      if (row.role === 'primary' || live.length <= 1) return 'primary'
+      await tx.webchatConversationAgent.update({
+        where: { conversationId_agentId: { conversationId, agentId } },
+        data: {
+          removedAt: new Date(),
+          removedByUserId,
+          currentSessionId: null,
+          currentSessionRev: { increment: 1 }
+        }
+      })
+      return 'removed'
+    })
+  }
+
+  async findOwner(conversationId: string, agentId: AgentId): Promise<string | null> {
+    if (!UUID_RE.test(conversationId)) return null
+    // Removed members still match: a late session event from one must stay owned by the conversation's user.
+    const row = await this.db.webchatConversation.findFirst({
+      where: {
+        id: conversationId,
+        OR: [{ agentId }, { participants: { some: { agentId } } }]
+      },
+      select: { userId: true }
+    })
+    return row?.userId ?? null
+  }
+
+  async owns(binding: WebchatConversationBinding): Promise<boolean> {
+    const row = await this.db.webchatConversation.findFirst({
+      where: {
+        id: binding.conversationId,
+        orgId: binding.orgId,
+        agentId: binding.agentId,
+        userId: binding.userId
+      },
+      select: { id: true }
+    })
+    return row !== null
+  }
+
+  async resumeBinding(conversationId: string, orgId: OrgId): Promise<WebchatResumeBinding | null> {
+    if (!UUID_RE.test(conversationId)) return null
+    const row = await this.db.webchatConversation.findFirst({
+      where: { id: conversationId, orgId },
+      select: {
+        agentId: true,
+        userId: true,
+        currentSessionId: true,
+        participants: { where: { removedAt: null }, select: { currentSessionId: true } }
+      }
+    })
+    if (!row) return null
+    // One slot per roster participant, null where that participant has not materialized a session
+    // yet (a partial roster is a normal state); the conversation's own pointer only on a pre-roster row.
+    const currentSessionIds =
+      row.participants.length > 0
+        ? row.participants.map((p) => (p.currentSessionId === null ? null : SessionId(p.currentSessionId)))
+        : [row.currentSessionId === null ? null : SessionId(row.currentSessionId)]
+    return { primaryAgentId: AgentId(row.agentId), ownerUserId: row.userId, currentSessionIds }
+  }
+
+  async ownedBy(conversationId: string, orgId: OrgId, userId: string): Promise<{ primaryAgentId: AgentId } | null> {
+    const row = await this.db.webchatConversation.findFirst({
+      where: { id: conversationId, orgId, userId },
+      select: { agentId: true }
+    })
+    return row ? { primaryAgentId: AgentId(row.agentId) } : null
+  }
+
+  async upsertSessionTargeted(
+    binding: Omit<WebchatConversationBinding, 'conversationId'>,
+    targetSessionId: string
+  ): Promise<{ conversationId: string }> {
+    const existing = await this.db.webchatConversation.findFirst({
+      where: { userId: binding.userId, targetSessionId, orgId: binding.orgId, agentId: binding.agentId },
+      select: { id: true }
+    })
+    if (existing) return { conversationId: existing.id }
+    const conversationId = randomUUID()
+    try {
+      await this.inTx(async (tx) => {
+        await tx.webchatConversation.create({
+          data: {
+            id: conversationId,
+            orgId: binding.orgId,
+            agentId: binding.agentId,
+            userId: binding.userId,
+            targetSessionId,
+            // The adoption IS the current-session fence — installed atomically
+            // at creation, not by a later milestone.
+            currentSessionId: targetSessionId
+          }
+        })
+        await tx.webchatConversationAgent.create({
+          data: {
+            conversationId,
+            agentId: binding.agentId,
+            role: 'primary',
+            ord: 0,
+            addedByUserId: binding.userId,
+            currentSessionId: targetSessionId
+          }
+        })
+      })
+    } catch (err) {
+      // A concurrent mint won the (userId, targetSessionId) unique — converge on its row.
+      const raced = await this.db.webchatConversation.findFirst({
+        where: { userId: binding.userId, targetSessionId, orgId: binding.orgId, agentId: binding.agentId },
+        select: { id: true }
+      })
+      if (raced) return { conversationId: raced.id }
+      throw err
+    }
+    return { conversationId }
+  }
+
+  async target(conversationId: string): Promise<{ targetSessionId: string | null; ownerUserId: string } | null> {
+    if (!UUID_RE.test(conversationId)) return null
+    const row = await this.db.webchatConversation.findUnique({
+      where: { id: conversationId },
+      select: { targetSessionId: true, userId: true }
+    })
+    return row ? { targetSessionId: row.targetSessionId, ownerUserId: row.userId } : null
+  }
+}

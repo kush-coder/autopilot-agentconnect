@@ -1,0 +1,355 @@
+import { describe, it, expect, vi } from 'vitest'
+import { FakeClock } from '@agentconnect.md/connection'
+import {
+  CONTINUATION_THREADS_FEATURE,
+  SESSION_MODE_AUTO_V1_FEATURE,
+  WEBCHAT_THREADS_FEATURE
+} from '@agentconnect.md/protocol'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Daemon } from '../src/daemon.js'
+import { fakeSlackAppFactory } from './fakes/slack-app.js'
+import { isAppendCoordinate } from '../src/session/append-coordinate.js'
+import { sessionKey, transcriptChannelKey } from '../src/store/local-store.js'
+
+/**
+ * channel-session-mode.md §3 — a conversation on `append` keys every message onto ONE
+ * session, while answers keep posting where the question was asked.
+ *
+ * These drive the real ingress ladder and read what dispatch was handed, because the whole
+ * point of §3.1 is WHERE the coordinate is resolved: after routing picks the target and
+ * before anything keys on the result. A test that called the resolver directly would pass
+ * against an implementation that resolved it too late to matter.
+ */
+
+type Mode = 'createNew' | 'append' | 'auto'
+
+function scaffold(mode: Mode, agents: string[] = ['bot-a'], features?: Record<string, unknown>): string {
+  const root = mkdtempSync(join(tmpdir(), 'ac-append-'))
+  writeFileSync(
+    join(root, 'config.json'),
+    JSON.stringify({
+      version: 1,
+      controlPlane: { enabled: false },
+      ...(features ? { features } : {}),
+      // These cases judge the row purge on the 7-day window it had before workspaces got their own.
+      sessions: { retention: '7d' },
+      runtimes: { claude: { command: 'node', args: ['unused'] } }
+    })
+  )
+  for (const id of agents) {
+    const adir = join(root, 'agents', id)
+    mkdirSync(adir, { recursive: true })
+    writeFileSync(
+      join(adir, 'agent.json'),
+      JSON.stringify({
+        id,
+        name: id,
+        status: 'active',
+        runtime: 'claude',
+        workspace: { mode: 'from-scratch', path: join(adir, 'workspace') },
+        integrations: [
+          {
+            id: `int-${id}`,
+            platform: 'slack',
+            core: {
+              bindRules: [{ match: { kind: 'auto' }, channel: 'C1' }],
+              // Only a conversation that departs from the default is listed, so `createNew`
+              // exercises the absent-entry path rather than an explicit one. A SECOND agent
+              // always stays on the default — that is what makes per-target resolution visible.
+              ...(mode !== 'createNew' && id === 'bot-a' ? { sessionModes: [{ channel: 'C1', mode }] } : {})
+            },
+            config: { botToken: 'xoxb', appToken: 'xapp' }
+          }
+        ],
+        output: { mode: 'low' }
+      })
+    )
+  }
+  return root
+}
+
+async function boot(
+  mode: Mode,
+  realDispatch = false,
+  agents: string[] = ['bot-a'],
+  features?: Record<string, unknown>
+) {
+  const daemon = new Daemon({
+    root: scaffold(mode, agents, features),
+    hostFactory: () =>
+      ({
+        __started: true,
+        start: vi.fn(async () => {}),
+        newSession: vi.fn(async () => 'acp-1'),
+        prompt: vi.fn(async () => 'end_turn'),
+        cancel: vi.fn(),
+        stop: vi.fn()
+      }) as never,
+    slackAppFactory: fakeSlackAppFactory()
+  })
+  await daemon.start()
+  const calls: { agentId: string; msg: { thread?: string; sessionThread?: string } }[] = []
+  // `realDispatch` keeps the genuine gate, inbox lane and session-key derivation. It is
+  // what makes the §3.1 property observable at all: a stub captures the coordinate the
+  // ingress ladder resolved, but only the real path proves everything downstream keys on
+  // the SAME one rather than re-deriving it from the physical thread.
+  if (!realDispatch)
+    (daemon as never as { dispatch: unknown }).dispatch = vi.fn(async (agentId: string, msg: never) => {
+      calls.push({ agentId, msg })
+    })
+  return { daemon, calls }
+}
+
+const human = (over: Record<string, unknown>) => ({
+  msgId: `slack:C1:${over.ts ?? '1720000000.000100'}`,
+  traceId: 't',
+  source: 'user',
+  platform: 'slack',
+  channel: 'C1',
+  sender: { id: 'U1', isBot: false },
+  text: 'hello',
+  mentionedBots: [],
+  isDm: false,
+  ...over
+})
+
+const route = async (daemon: Daemon, msg: unknown) =>
+  await (daemon as never as { onInboundOutcome: (m: unknown, s: string[]) => Promise<unknown> }).onInboundOutcome(msg, [
+    'int-bot-a',
+    'int-bot-b'
+  ])
+
+describe('append mode keys one session per conversation', () => {
+  it('joins two top-level messages and a thread reply onto one coordinate', async () => {
+    const { daemon, calls } = await boot('append')
+
+    await route(daemon, human({ ts: '1720000000.000100' }))
+    await route(daemon, human({ ts: '1720000000.000200', msgId: 'slack:C1:1720000000.000200' }))
+    // A reply inside a thread the conversation happens to be using joins the same session:
+    // in `append` every admitted message does, top-level or not.
+    await route(
+      daemon,
+      human({ ts: '1720000000.000300', msgId: 'slack:C1:1720000000.000300', thread: '1720000000.000100' })
+    )
+
+    expect(calls).toHaveLength(3)
+    const coordinates = calls.map((c) => c.msg.sessionThread)
+    expect(coordinates.every(isAppendCoordinate)).toBe(true)
+    expect(new Set(coordinates).size).toBe(1)
+
+    // The delivery coordinate is untouched, which is what keeps the answer in the room the
+    // question came from: two of these have no thread, the third has its own.
+    expect(calls.map((c) => c.msg.thread)).toEqual([undefined, undefined, '1720000000.000100'])
+    await daemon.stop()
+  })
+
+  // The gate, the durable inbox lane and `plan.sessionKey` are all keyed on the session
+  // coordinate, so two top-level messages in an append conversation must land on ONE key —
+  // otherwise both pass the in-flight check and run concurrent turns against one ACP
+  // session, and `!stop` addresses a session that does not exist.
+  it('derives ONE session key inside the real dispatch path for two top-level messages', async () => {
+    const { daemon } = await boot('append', true)
+    // The key dispatch computed, captured where it first uses it. Asserting here rather
+    // than on a persisted row keeps the test on the property §3.1 is about — the gate, the
+    // inbox lane and the session manager agreeing on one coordinate — instead of on how far
+    // a turn gets in a harness with no real platform audience.
+    const keys: string[] = []
+    const inner = daemon as never as { bindSessionSource: (...a: unknown[]) => Promise<string> }
+    const original = inner.bindSessionSource.bind(inner)
+    inner.bindSessionSource = async (agentId: unknown, key: unknown, ...rest: unknown[]) => {
+      keys.push(key as string)
+      return await original(agentId, key, ...rest)
+    }
+
+    await route(daemon, human({ ts: '1720000000.000100' }))
+    await route(daemon, human({ ts: '1720000000.000200', msgId: 'slack:C1:1720000000.000200' }))
+    await vi.waitFor(() => expect(keys.length).toBe(2))
+
+    // Two keys would mean two gates, two concurrent turns against one ACP session, and a
+    // `!stop` that addresses neither.
+    expect(new Set(keys).size).toBe(1)
+    // The coordinate carries a colon of its own, so match its shape inside the key rather
+    // than splitting the key into segments.
+    expect(keys[0]).toMatch(/:append:\d+:/)
+    await daemon.stop()
+  })
+
+  // Resolution is per TARGET precisely so two agents in one room need not agree. Pinning it
+  // here because the alternative — one answer written onto a shared message — is the mistake
+  // §3.1 exists to prevent, and it is invisible until a channel actually has two agents.
+  it('resolves per target, so one agent can append while another keeps its threads', async () => {
+    const { daemon, calls } = await boot('append', false, ['bot-a', 'bot-b'])
+    await route(daemon, human({ ts: '1720000000.000100' }))
+
+    expect(calls.map((c) => c.agentId).sort()).toEqual(['bot-a', 'bot-b'])
+    const byAgent = new Map(calls.map((c) => [c.agentId, c.msg]))
+    expect(isAppendCoordinate(byAgent.get('bot-a')!.sessionThread)).toBe(true)
+    expect(byAgent.get('bot-b')!.sessionThread).toBeUndefined()
+    await daemon.stop()
+  })
+
+  // A BEHAVIOUR CHANGE pinned deliberately (message-intake.md §5 step 1): the per-agent admission
+  // `recordUnrouted` wrote for every append session in the room is gone, so until Stage 3's
+  // background block lands an append session sees only what it admitted — an `append:<epoch>`
+  // coordinate matches no row's physical thread, which is what the createNew disjunct relies on.
+  it('records an unrouted message with no admission the append session could read it through', async () => {
+    const { daemon } = await boot('append', true)
+    const store = (daemon as never as { store: any }).store
+    const scope = (
+      daemon as never as { transportScopeForIntegrationIds: (i: string[]) => string | undefined }
+    ).transportScopeForIntegrationIds(['int-bot-a'])
+    const channel = transcriptChannelKey('C1', scope)
+
+    await route(daemon, human({ ts: '1720000000.000100', text: 'first' }))
+    await vi.waitFor(async () =>
+      expect(await store.db.prepare('SELECT seq FROM transcript_recipient').all()).toHaveLength(1)
+    )
+    // §7: an AgentConnect-authored post nothing can attribute is recorded and never routed.
+    await route(
+      daemon,
+      human({
+        ts: '1720000000.000200',
+        msgId: 'slack:C1:1720000000.000200',
+        text: 'an unattributable echo',
+        sender: { id: 'U_FAKE_BOT', isBot: true }
+      })
+    )
+
+    const rows = (await store.db
+      .prepare('SELECT text FROM transcript WHERE channel = ? ORDER BY seq')
+      .all(channel)) as { text: string }[]
+    expect(rows.map((r) => r.text)).toEqual(['first', 'an unattributable echo'])
+    const coordinate = (await store.currentAppendCoordinate('bot-a', 'C1', scope)) as string
+    const visible = await store.transcriptSince(
+      {
+        transcriptChannel: channel,
+        coordinate,
+        sessionKey: sessionKey('slack', 'C1', coordinate, 'bot-a', scope),
+        agentId: 'bot-a'
+      },
+      null
+    )
+    expect(visible.map((r: { text: string }) => r.text)).toEqual(['first'])
+    await daemon.stop()
+  })
+
+  it('leaves a createNew conversation keying on its thread, as it always did', async () => {
+    const { daemon, calls } = await boot('createNew')
+
+    await route(daemon, human({ ts: '1720000000.000100' }))
+    await route(
+      daemon,
+      human({ ts: '1720000000.000300', msgId: 'slack:C1:1720000000.000300', thread: '1720000000.000100' })
+    )
+
+    expect(calls).toHaveLength(2)
+    expect(calls.every((c) => c.msg.sessionThread === undefined)).toBe(true)
+    await daemon.stop()
+  })
+})
+
+// auto-session-mode.md §3.1: with the daemon's Auto switch off, an auto conversation routes as Per thread.
+describe('auto mode with the coordinator switched off', () => {
+  it('keys on its thread, as a createNew conversation does', async () => {
+    const { daemon, calls } = await boot('auto', false, ['bot-a'], { autoSessionMode: false })
+
+    await route(daemon, human({ ts: '1720000000.000100' }))
+    await route(
+      daemon,
+      human({ ts: '1720000000.000300', msgId: 'slack:C1:1720000000.000300', thread: '1720000000.000100' })
+    )
+
+    expect(calls).toHaveLength(2)
+    expect(calls.every((c) => c.msg.sessionThread === undefined)).toBe(true)
+    await daemon.stop()
+  })
+
+  it('advertises the mode unless the operator switches it off', async () => {
+    const featuresOf = async (features?: Record<string, unknown>) => {
+      const { daemon } = await boot('auto', false, ['bot-a'], features)
+      const advertised = (daemon as never as { registrationFeatures: () => string[] }).registrationFeatures()
+      await daemon.stop()
+      return advertised
+    }
+    // A coordinator answers in threads, and is continued in one, under the same switch (webchat-threads.md §7, §8).
+    const threads = [SESSION_MODE_AUTO_V1_FEATURE, WEBCHAT_THREADS_FEATURE, CONTINUATION_THREADS_FEATURE]
+    expect(await featuresOf()).toEqual(expect.arrayContaining(threads))
+    const off = await featuresOf({ autoSessionMode: false })
+    for (const feature of threads) expect(off).not.toContain(feature)
+  })
+})
+
+describe("idle retention keeps a conversation's current append session (#2812)", () => {
+  const DAY = 24 * 3_600_000
+
+  async function bootKept(mode: 'createNew' | 'append') {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      root: scaffold(mode),
+      hostFactory: () => ({ start: vi.fn(async () => {}), stop: vi.fn() }) as never,
+      slackAppFactory: fakeSlackAppFactory(),
+      clock
+    })
+    await daemon.start()
+    const inner = daemon as never as {
+      store: any
+      sessionRetentionSweepInFlight: boolean
+      sweepSessionRetention: () => Promise<void>
+      transportScopeForIntegrationIds: (ids: string[]) => string | undefined
+    }
+    const scope = inner.transportScopeForIntegrationIds(['int-bot-a'])
+    const seed = async (coordinate: string): Promise<string> => {
+      const key = sessionKey('slack', 'C1', coordinate, 'bot-a', scope)
+      await inner.store.upsertSession({
+        key,
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: coordinate,
+        transportScope: scope ?? null,
+        acpSessionId: `acp-${coordinate}`,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: 0
+      })
+      return key
+    }
+    // Wait out the startup pass, which drops a call that lands while it runs.
+    const sweep = async () => {
+      while (inner.sessionRetentionSweepInFlight) await new Promise((resolve) => setTimeout(resolve, 5))
+      await inner.sweepSessionRetention()
+    }
+    return { daemon, clock, store: inner.store, scope, seed, sweep }
+  }
+
+  it('keeps an idle current session past the window, and collects the one `!new` superseded', async () => {
+    const { daemon, clock, store, scope, seed, sweep } = await bootKept('append')
+    const first = await store.resolveAppendCoordinate('bot-a', 'C1', scope, 1)
+    const firstKey = await seed(first)
+    clock.advance(30 * DAY)
+    await sweep()
+    expect(await store.getSession(firstKey)).toBeDefined()
+    expect(await store.currentAppendCoordinate('bot-a', 'C1', scope)).toBe(first)
+
+    // `!new` rotates the reservation, so the old session is ordinary again and its idle row goes.
+    const second = await store.advanceAppendCoordinate('bot-a', 'C1', first, scope, 2)
+    const secondKey = await seed(second)
+    await sweep()
+    expect(await store.getSession(firstKey)).toBeUndefined()
+    expect(await store.getSession(secondKey)).toBeDefined()
+    expect(await store.currentAppendCoordinate('bot-a', 'C1', scope)).toBe(second)
+    await daemon.stop()
+  })
+
+  it('collects it and clears its reservation once the conversation no longer appends', async () => {
+    const { daemon, clock, store, scope, seed, sweep } = await bootKept('createNew')
+    const key = await seed(await store.resolveAppendCoordinate('bot-a', 'C1', scope, 1))
+    clock.advance(8 * DAY)
+    await sweep()
+    expect(await store.getSession(key)).toBeUndefined()
+    expect(await store.currentAppendCoordinate('bot-a', 'C1', scope)).toBeUndefined()
+    await daemon.stop()
+  })
+})

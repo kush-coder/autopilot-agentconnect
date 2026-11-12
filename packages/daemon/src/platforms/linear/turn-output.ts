@@ -1,0 +1,811 @@
+/**
+ * Linear's **streaming turn-output surface** (linear-integration.md §5).
+ *
+ * Linear activities are APPEND-ONLY snapshots: `agentActivityCreate` never
+ * coalesces, so even identical `(action, parameter)` pairs stack in the feed.
+ * The converger therefore runs in a discrete-update posture — coalesce
+ * aggressively, post meaningfully — and every collapse rule below is ours, not
+ * the platform's. GitHub's turn-FINAL shape is deliberately not used: Linear's
+ * product is the live feed, so this surface emits as it goes.
+ */
+import type { SessionUpdate } from '@agentclientprotocol/sdk/unstable'
+import { WorkBoundary } from '../../messages/message-boundary.js'
+import { appendGithubMarkdownChrome, GithubReplyCollector } from '../../github/poster.js'
+import { renderAttributionMessage } from '../../messages/attribution.js'
+import { splitAtParagraphBoundary } from '../../messages/stream-boundary.js'
+import { isNoResponseBody, isNoResponsePrefix } from '../../session/no-response.js'
+import { extractToolOutput } from '../../session/tool-output.js'
+import type { TurnOutputContext } from '../turn-output.js'
+import { flattenUnsafeLinks } from '../../messages/agent-links.js'
+import type { WorkspaceFileLinkResolver } from '../../messages/workspace-file-links.js'
+import { sanitizeTitle } from './message-strategy.js'
+
+/** Linear's plan-entry vocabulary. `canceled` has no ACP source today; it exists because
+ *  the plan array is a full replace and a future entry may need it. */
+export type LinearPlanStatus = 'pending' | 'inProgress' | 'completed' | 'canceled'
+
+export interface LinearPlanEntry {
+  content: string
+  status: LinearPlanStatus
+}
+
+export interface LinearExternalUrl {
+  label: string
+  url: string
+}
+
+/** The converger's Linear-shaped IR (§5). `activity` becomes `agentActivityCreate`;
+ *  `plan` / `external-urls` become `agentSessionUpdate`. */
+export type LinearAction =
+  | { kind: 'activity'; type: 'thought'; body: string; ephemeral?: boolean }
+  | { kind: 'activity'; type: 'action'; action: string; parameter: string; result?: string }
+  | { kind: 'activity'; type: 'response'; body: string }
+  | { kind: 'activity'; type: 'error'; body: string }
+  | { kind: 'activity'; type: 'elicitation'; body: string }
+  | { kind: 'plan'; entries: LinearPlanEntry[] }
+  | { kind: 'external-urls'; add: LinearExternalUrl[] }
+  | { kind: 'attachment'; input: LinearAttachmentInput }
+  // The bare answer for the console transcript, emitted whether or not a `response` posts.
+  | { kind: 'transcript'; text: string }
+
+/** One `attachmentCreate` input — the issue's Resources entry. Linear keys it on `(issueId, url)`,
+ *  so re-sending the same URL updates the entry rather than adding a second one. */
+export interface LinearAttachmentInput {
+  issueId: string
+  url: string
+  title: string
+  subtitle?: string
+}
+
+/** One `agentActivityCreate` input, flattened. The egress port owns the GraphQL shape. */
+export interface LinearActivityInput {
+  type: 'thought' | 'action' | 'response' | 'error' | 'elicitation'
+  body?: string
+  action?: string
+  parameter?: string
+  result?: string
+  ephemeral?: boolean
+}
+
+/** One `agentSessionUpdate` input. Both fields are full-array replace on Linear's side. */
+export interface LinearSessionUpdateInput {
+  plan?: LinearPlanEntry[]
+  addedExternalUrls?: LinearExternalUrl[]
+}
+
+/**
+ * What `apply` needs from Linear, and nothing more (§4.6 single-writer egress).
+ *
+ * The per-integration connection satisfies this structurally, and it — not this
+ * module — owns the send queue, the brokered token, and the retry ladder. Kept
+ * as a port so the surface can be tested without a connection at all.
+ */
+export interface LinearEgressPort {
+  /** Append one activity to the AgentSession's feed. */
+  postActivity(sessionId: string, activity: LinearActivityInput): Promise<void>
+  /** Patch the AgentSession's plan / external URLs. */
+  updateSession(sessionId: string, update: LinearSessionUpdateInput): Promise<void>
+  /** Add (or refresh, by URL) one entry in the issue's Resources. */
+  createIssueAttachment(input: LinearAttachmentInput): Promise<void>
+}
+
+/** The core turn, as Linear's applier sees it. `Pending` satisfies it structurally. */
+export interface LinearTurn {
+  conn?: unknown
+  plan: {
+    /** The Linear AgentSession UUID — the normalized `thread` coordinate (§4.5). */
+    thread?: string
+    platform: string
+    agentId: string
+    sessionKey: string
+    /** The console transcript coordinates the settling answer is recorded under. */
+    transcriptChannel?: string
+    statusThread?: string
+    sessionThread?: string
+  }
+}
+
+/** What the applier needs from core: the transcript, which is not platform-shaped. */
+export interface LinearTurnHost {
+  appendTranscript(row: {
+    channel: string
+    thread: string
+    /** The session the row is admitted into (message-intake.md §4.2). */
+    admission: { agentId: string; sessionKey: string }
+    ts: string
+    sender: string
+    kind: 'text'
+    text: string
+  }): Promise<void>
+  monotonicTs(): string
+}
+
+/** Linear's opaque per-turn state (§5): the hard chrome budget and the last plan
+ *  actually pushed, so an unchanged plan costs no `agentSessionUpdate`. */
+export interface LinearTurnState {
+  /** Remaining non-settling activities; a settling `response`/`error` never draws on it. */
+  activityBudget: number
+  lastPlanHash?: string
+  /** The egress transport CAPTURED at turn start. Held rather than looked up per action
+   *  because reconciliation can drop the integration's binding mid-turn, and a turn that
+   *  cannot reach Linear can never post the settling activity that ends its session. */
+  conn?: LinearEgressPort
+}
+
+/** Raw attribution identity for the response footer. Structurally the same record the
+ *  code-host posters take, so core resolves it once for every Markdown surface. */
+export interface LinearAttribution {
+  agentName: string
+  agentUrl: string
+  runtime: string
+  model: string
+  sessionUrl: string
+}
+
+/**
+ * Core's shared per-turn attribution record, as this surface names it.
+ *
+ * A pure rename, and it earns its existence: core calls the identity `bot`, but on Linear the
+ * bot is the deployment's one OAuth app (§4.3), so the footer must name the ACTING AGENT —
+ * which is the same field core already resolves from the agent, not from the app.
+ */
+export function linearAttributionOf(info: {
+  botName: string
+  botUrl: string
+  runtime: string
+  model: string
+  sessionUrl: string
+}): LinearAttribution {
+  return {
+    agentName: info.botName,
+    agentUrl: info.botUrl,
+    runtime: info.runtime,
+    model: info.model,
+    sessionUrl: info.sessionUrl
+  }
+}
+
+export type LinearOutputMode = 'none' | 'minimal' | 'low' | 'medium' | 'high'
+
+/** What one output mode lets the converger emit (§5.2). */
+export interface LinearModePolicy {
+  /** `agent_thought_chunk` → ephemeral thought. */
+  readonly reasoning: boolean
+  /** Intermediate `agent_message_chunk` → non-ephemeral progress thought. */
+  readonly progress: boolean
+  readonly actions: boolean
+  /** Tool output carried on the action's `result` field. */
+  readonly actionResults: boolean
+  readonly plan: boolean
+  /** §10.3: the pull/merge requests the agent's text named, as the session's external links. */
+  readonly links: boolean
+  /** The settling `response` — and, with it, `error` and `elicitation`: `none` is truly silent. */
+  readonly response: boolean
+}
+
+// The default is `low`, and it already includes actions, plan and links: an agent-session feed
+// is FOR progress visibility, which is the opposite of a chat channel's default.
+const MODE_POLICY: Record<LinearOutputMode, LinearModePolicy> = {
+  none: {
+    reasoning: false,
+    progress: false,
+    actions: false,
+    actionResults: false,
+    plan: false,
+    links: false,
+    response: false
+  },
+  minimal: {
+    reasoning: false,
+    progress: false,
+    actions: false,
+    actionResults: false,
+    plan: false,
+    links: false,
+    response: true
+  },
+  low: {
+    reasoning: false,
+    progress: true,
+    actions: true,
+    actionResults: false,
+    plan: true,
+    links: true,
+    response: true
+  },
+  medium: {
+    reasoning: true,
+    progress: true,
+    actions: true,
+    actionResults: false,
+    plan: true,
+    links: true,
+    response: true
+  },
+  high: { reasoning: true, progress: true, actions: true, actionResults: true, plan: true, links: true, response: true }
+}
+
+/** How much agent text the link collector keeps: a turn's PR link lives near its end. */
+const MAX_LINK_SCAN_CHARS = 64_000
+
+const GITHUB_PULL_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)\b/g
+const GITLAB_MERGE_REQUEST_URL = /https?:\/\/[\w.-]+(?::\d+)?\/[\w./-]+?\/-\/merge_requests\/(\d+)\b/g
+
+/**
+ * §10.3: the pull/merge-request links in the agent's own text, labelled the way the code host
+ * would (`PR #123`, `MR !45`), each URL once. The collector reads what the agent SAID, not what
+ * it did: a `gh pr create` prints the URL and a model repeats it in the answer, so the text is
+ * where a turn's PR shows up on every runtime without a tool-specific hook.
+ */
+export function codeHostLinks(text: string): LinearExternalUrl[] {
+  const seen = new Set<string>()
+  const out: LinearExternalUrl[] = []
+  const add = (url: string, label: string) => {
+    if (seen.has(url)) return
+    seen.add(url)
+    out.push({ label, url })
+  }
+  for (const match of text.matchAll(GITHUB_PULL_URL)) add(match[0], `PR #${match[1]}`)
+  for (const match of text.matchAll(GITLAB_MERGE_REQUEST_URL)) add(match[0], `MR !${match[1]}`)
+  return out
+}
+
+/** Reasoning tail clamp, matching every other renderer's `MAX_REASONING`. */
+export const MAX_REASONING = 2800
+/** Head clamp on an action's `result` (§5.1). */
+export const MAX_ACTION_RESULT = 2800
+/** Clamp on an action's `parameter` summary. */
+export const MAX_ACTION_PARAMETER = 500
+/** Soft per-turn action cap; the overflow is reported once as "… and N more". */
+export const MAX_TURN_ACTIONS = 40
+/** Hard per-turn CHROME budget enforced at the egress edge, under every soft cap. The settling
+ *  `response`/`error` is exempt: the cap bounds progress noise, never the turn's one answer. */
+export const MAX_TURN_ACTIVITIES = 200
+/** Message-text tail kept for sentinel detection — far more than the sentinel's own line needs. */
+const SENTINEL_TAIL_CHARS = 512
+
+/** Posted when the turn produced no final text but still owes Linear a settling `response`. */
+export const EMPTY_RESPONSE_BODY = 'Done.'
+/** v1 elicitation copy (§10.4): a pointer to the console, not an approval protocol. */
+export const PERMISSION_ELICITATION_BODY = 'This step needs approval'
+/** The pointer's label — a link when the turn knows its console URL, a plain sentence when it does not. */
+export const PERMISSION_ELICITATION_POINTER = 'open in session'
+const PERMISSION_ELICITATION_FALLBACK = 'open the session in the console'
+/** The gate's follow-through, so an append-only feed never ends on an open question (§10.4). */
+export const PERMISSION_APPROVED_BODY = 'Approved — continuing.'
+export const PERMISSION_DENIED_BODY = 'Denied — the step was skipped.'
+/** Caps on the elicitation's request clause: the action's name, then its one-line input. */
+const MAX_ELICITATION_TOOL = 80
+const MAX_ELICITATION_DETAIL = 200
+
+/** What needs approving, as an approval surface names it: the action, and its one-line input. */
+export interface LinearApprovalRequest {
+  tool: string
+  detail?: string
+}
+
+export function linearModePolicy(mode: LinearOutputMode): LinearModePolicy {
+  return MODE_POLICY[mode]
+}
+
+function normalizeMode(mode: string): LinearOutputMode {
+  return mode in MODE_POLICY ? (mode as LinearOutputMode) : 'low'
+}
+
+function flatText(raw: string | undefined, max = 200): string {
+  return (raw ?? '').replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+/** Escape the Markdown punctuation that would otherwise break a link label. */
+function escapeMarkdown(raw: string): string {
+  return raw.replace(/([\\`*_[\]<>])/g, '\\$1')
+}
+
+function httpUrl(raw: string | undefined): string | undefined {
+  if (!raw) return undefined
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    return url.toString().replace(/\(/g, '%28').replace(/\)/g, '%29')
+  } catch {
+    return undefined
+  }
+}
+
+function markdownLink(label: string, raw: string | undefined): string {
+  const url = httpUrl(raw)
+  const text = escapeMarkdown(label)
+  return url ? `[${text}](${url})` : text
+}
+
+/**
+ * The response footer, in plain Markdown.
+ *
+ * The sentence itself is the platform-neutral one every surface shares; the code hosts'
+ * `<sub>`/`<img>` chrome is deliberately not reused, because Linear renders Markdown and
+ * not raw HTML.
+ */
+export function linearAttributionFooter(attribution?: LinearAttribution): string {
+  if (!attribution) return ''
+  const sessionUrl = httpUrl(attribution.sessionUrl)
+  const message = renderAttributionMessage({
+    agent: markdownLink(flatText(attribution.agentName) || 'unknown agent', attribution.agentUrl),
+    runtime: escapeMarkdown(flatText(attribution.runtime)),
+    model: escapeMarkdown(flatText(attribution.model)),
+    ...(sessionUrl ? { renderSession: (label: string) => markdownLink(label, sessionUrl) } : {})
+  })
+  return `\n\n${message}`
+}
+
+/** The request as one fence-inert, Markdown-inert clause: the action, and its input in quotes when
+ *  the runtime gave one. Provider text, so it is flattened by the same sanitizer the header uses. */
+function elicitationRequestClause(request?: LinearApprovalRequest): string {
+  const tool = escapeMarkdown(sanitizeTitle(request?.tool ?? '', MAX_ELICITATION_TOOL))
+  if (!tool) return ''
+  const detail = escapeMarkdown(sanitizeTitle(request?.detail ?? '', MAX_ELICITATION_DETAIL))
+  return detail ? ` — ${tool}: "${detail}"` : ` — ${tool}`
+}
+
+/** Pull a compact input summary out of a tool call's `rawInput` for the `parameter` field. */
+export function summarizeToolInput(rawInput: unknown): string {
+  if (typeof rawInput === 'string') return flatText(rawInput, MAX_ACTION_PARAMETER)
+  if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) return ''
+  const input = rawInput as Record<string, unknown>
+  for (const key of ['command', 'cmd', 'path', 'file_path', 'query', 'url', 'pattern', 'prompt']) {
+    const value = input[key]
+    if (typeof value === 'string' && value.trim()) return flatText(value, MAX_ACTION_PARAMETER)
+  }
+  const scalars = Object.entries(input)
+    .filter(([, value]) => typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+    .map(([key, value]) => `${key}=${String(value)}`)
+  return flatText(scalars.join(' '), MAX_ACTION_PARAMETER)
+}
+
+/** Head-clamp a tool result: the head is where a command says what it did. */
+function clampResult(raw: string | undefined): string | undefined {
+  const text = raw?.trim()
+  if (!text) return undefined
+  return text.length > MAX_ACTION_RESULT ? `${text.slice(0, MAX_ACTION_RESULT)}\n…` : text
+}
+
+function toPlanEntry(entry: { content?: unknown; status?: unknown }): LinearPlanEntry {
+  const status = entry.status === 'in_progress' ? 'inProgress' : entry.status === 'completed' ? 'completed' : 'pending'
+  return { content: typeof entry.content === 'string' ? entry.content : '', status }
+}
+
+/** The subset of an ACP update this converger reads. */
+interface LinearUpdateView {
+  sessionUpdate?: string
+  content?: { type?: string; text?: string }
+  toolCallId?: string
+  title?: string
+  status?: string
+  rawInput?: unknown
+  rawOutput?: unknown
+  entries?: { content?: unknown; status?: unknown }[]
+}
+
+/** A run of consecutive same-title tool calls, held until something separates it from the next. */
+interface PendingAction {
+  title: string
+  parameters: string[]
+  result?: string
+  count: number
+}
+
+/**
+ * One turn's Linear production rules (§5.1).
+ *
+ * The idle WINDOW is core's (it re-arms the shared ~2 s timer on `hasBuffered()` and
+ * flushes through `flushBuffered()`), so this class holds no timers of its own and is
+ * deterministic under test on every platform.
+ */
+export class LinearConverger {
+  private readonly work = new WorkBoundary()
+  private readonly policy: LinearModePolicy
+  private readonly collector = new GithubReplyCollector()
+  // The collector reports a suppressed turn as "no final answer", which is indistinguishable
+  // from a silent one — so the sentinel is detected here, on a mode-independent message tail.
+  private sentinelTail = ''
+  // Every message chunk, mode-independent, for the §10.3 link collector at turn end.
+  private messageText = ''
+  private narration = ''
+  private reasoning = ''
+  private reasoningDirty = false
+  private readonly toolTitles = new Map<string, string>()
+  private readonly toolParameters = new Map<string, string>()
+  private readonly toolResults = new Map<string, string>()
+  private readonly openTools = new Set<string>()
+  private readonly settledTools = new Set<string>()
+  private pending?: PendingAction
+  private actionsEmitted = 0
+  private droppedActions = 0
+  private planEntries?: LinearPlanEntry[]
+  private planDirty = false
+  private lastPlanKey?: string
+  private readonly openGates = new Set<string>()
+  private settled = false
+
+  constructor(
+    private readonly mode: LinearOutputMode,
+    private readonly showFooter: boolean,
+    private readonly resolveFileLink?: WorkspaceFileLinkResolver
+  ) {
+    this.policy = MODE_POLICY[mode]
+  }
+
+  /** Diagnostic only; never parsed. */
+  outputMode(): LinearOutputMode {
+    return this.mode
+  }
+
+  /** True while anything is pending — core (re)arms the shared idle timer on it. */
+  hasBuffered(): boolean {
+    if (this.settled) return false
+    return (
+      this.pending !== undefined ||
+      this.reasoningDirty ||
+      this.planDirty ||
+      (this.openTools.size > 0 && this.narration.trim().length > 0)
+    )
+  }
+
+  onUpdate(update: SessionUpdate): LinearAction[] {
+    if (this.settled) return []
+    // The collector reads the WHOLE stream, independently of what this mode emits: it is
+    // what selects the one logical final answer at turn end.
+    this.collector.onUpdate(update)
+    const u = update as LinearUpdateView
+    switch (u.sessionUpdate) {
+      case 'agent_message_chunk': {
+        if (u.content?.type !== 'text') return []
+        const text = u.content.text ?? ''
+        this.sentinelTail = (this.sentinelTail + text).slice(-SENTINEL_TAIL_CHARS)
+        this.messageText = (this.messageText + text).slice(-MAX_LINK_SCAN_CHARS)
+        if (this.policy.progress) this.narration += text
+        return []
+      }
+      case 'agent_thought_chunk': {
+        if (!this.policy.reasoning) return []
+        const text = u.content?.text ?? ''
+        if (!text) return []
+        this.reasoning += text
+        if (this.reasoning.length > MAX_REASONING * 2) this.reasoning = this.reasoning.slice(-MAX_REASONING * 2)
+        this.reasoningDirty = true
+        return []
+      }
+      case 'tool_call':
+      case 'tool_call_update':
+        return this.onToolUpdate(u)
+      case 'plan': {
+        if (!this.policy.plan) return []
+        // Last write wins inside the window; the emit happens on the next flush (§5.3).
+        this.planEntries = (u.entries ?? []).map(toPlanEntry)
+        this.planDirty = true
+        return []
+      }
+      default:
+        return []
+    }
+  }
+
+  /** Idle-window flush. Narration is cut here only while a tool call is in flight — that is
+   *  the one proof the text is progress and not the closing answer the `response` will carry. */
+  flushBuffered(): LinearAction[] {
+    if (this.settled) return []
+    const narration = this.openTools.size > 0 ? this.flushNarration(false) : []
+    return [...narration, ...this.takePending(), ...this.drainReasoning(), ...this.drainPlan()]
+  }
+
+  /** Drain everything for a turn ending abnormally: the runtime narrated its terminal error
+   *  into the message stream and there is no later flush, so take the WHOLE buffer. */
+  flushTerminal(): LinearAction[] {
+    if (this.settled) return []
+    return [...this.flushNarration(true), ...this.takePending(), ...this.drainReasoning(), ...this.drainPlan()]
+  }
+
+  /**
+   * Turn end: the settling `response`.
+   *
+   * A `response` is what drives the Linear session to `complete`, so exactly one is emitted
+   * per turn — and it OPENS the settled state, after which this converger emits nothing.
+   * `AC_NO_RESPONSE` is the one exception: the pre-spawn ack already exists, so a suppressed
+   * turn is ack-only and no settling response follows (§5.1).
+   */
+  onFinal(attribution?: LinearAttribution): LinearAction[] {
+    if (this.settled) return []
+    this.settled = true
+    if (isNoResponseBody(this.sentinelTail.trim())) return this.discard()
+    const final = this.collector.finalText(true, { resolveFileLink: this.resolveFileLink })?.trim() ?? ''
+    // `none` is transcript-only (§5.2): the answer is still recorded, the feed still sees nothing.
+    if (!this.policy.response) {
+      this.discard()
+      return final ? [{ kind: 'transcript', text: final }] : []
+    }
+    // The residual narration IS the final answer on an append-only feed, so it is never
+    // re-posted as a thought here; the trailing ephemeral reasoning would be replaced by the
+    // response on arrival, so it is dropped rather than paying an API call.
+    this.narration = ''
+    this.reasoningDirty = false
+    const out: LinearAction[] = [...this.takePending(), ...this.drainPlan()]
+    // Links land before the response, so the session panel shows the PR by the time it settles.
+    const links = this.policy.links ? codeHostLinks(this.messageText) : []
+    if (links.length > 0) out.push({ kind: 'external-urls', add: links })
+    if (this.droppedActions > 0) {
+      out.push({ kind: 'activity', type: 'thought', body: `… and ${this.droppedActions} more tool calls` })
+    }
+    out.push({ kind: 'activity', type: 'response', body: this.responseBody(final, attribution) })
+    // A silent turn's bounded placeholder is Linear chrome, not something the agent said.
+    if (final) out.push({ kind: 'transcript', text: final })
+    return out
+  }
+
+  /**
+   * Turn failure: the settling `error`, carrying core's `turnFailureReason`.
+   *
+   * The buffer is flushed FIRST so a runtime that narrated its own terminal error into the
+   * message stream is not repeated — a flushed thought that already states the reason is
+   * dropped in favor of the `error` activity, which is what moves the Linear session to
+   * `error` rather than leaving it active.
+   */
+  onFailure(reason: string): LinearAction[] {
+    if (this.settled) return []
+    this.settled = true
+    if (!this.policy.response) return this.discard()
+    const flushed = [...this.flushNarration(true), ...this.takePending()]
+    const deduped = flushed.filter((a) => !(a.kind === 'activity' && a.type === 'thought' && a.body.includes(reason)))
+    return [...deduped, { kind: 'activity', type: 'error', body: reason }]
+  }
+
+  /** A permission gate blocks the turn: name what is being approved and point at the console (§10.4).
+   *  One row per gate id — two gates that read the same are two things a human must decide, so each
+   *  owns a row and a closure; only a RE-announcement of a gate already open collapses. */
+  onPermissionBlocked(gateId: string, sessionUrl?: string, request?: LinearApprovalRequest): LinearAction[] {
+    if (this.settled || !this.policy.response || this.openGates.has(gateId)) return []
+    const link = httpUrl(sessionUrl)
+    const pointer = link ? markdownLink(PERMISSION_ELICITATION_POINTER, link) : PERMISSION_ELICITATION_FALLBACK
+    const body = `${PERMISSION_ELICITATION_BODY}${elicitationRequestClause(request)} · ${pointer}`
+    this.openGates.add(gateId)
+    return [...this.flushNarration(true), ...this.takePending(), { kind: 'activity', type: 'elicitation', body }]
+  }
+
+  /** One gate closed: a human decision is announced so the feed never stops at the question, while a
+   *  gate that went away without one (turn cancelled, request abandoned) closes quietly. Progress
+   *  chrome, so `minimal` posts the response only (§5.2). */
+  onPermissionResolved(gateId: string, allowed?: boolean): LinearAction[] {
+    if (!this.openGates.delete(gateId)) return []
+    if (allowed === undefined || this.settled || !this.policy.progress) return []
+    return [{ kind: 'activity', type: 'thought', body: allowed ? PERMISSION_APPROVED_BODY : PERMISSION_DENIED_BODY }]
+  }
+
+  private discard(): LinearAction[] {
+    this.narration = ''
+    this.reasoning = ''
+    this.reasoningDirty = false
+    this.pending = undefined
+    this.planDirty = false
+    return []
+  }
+
+  private responseBody(final: string, attribution?: LinearAttribution): string {
+    const footer = this.showFooter ? linearAttributionFooter(attribution) : ''
+    return appendGithubMarkdownChrome(final || EMPTY_RESPONSE_BODY, footer)
+  }
+
+  private onToolUpdate(u: LinearUpdateView): LinearAction[] {
+    if (!this.policy.actions) return []
+    const id = u.toolCallId
+    const title = this.rememberTool(u)
+    if (id) {
+      if (u.rawInput !== undefined) {
+        const parameter = summarizeToolInput(u.rawInput)
+        if (parameter) this.toolParameters.set(id, parameter)
+      }
+      if (u.content !== undefined || u.rawOutput !== undefined) {
+        const output = extractToolOutput(u)
+        if (output) this.toolResults.set(id, output)
+      }
+    }
+    const terminal = u.status === 'completed' || u.status === 'failed'
+    if (id) {
+      if (terminal) this.openTools.delete(id)
+      else this.openTools.add(id)
+    }
+    // Only new work closes narration; updates to an existing tool can arrive mid-sentence.
+    const boundary = this.work.opens(u) ? this.flushNarration(true) : []
+    // §15-1 is resolved live — Linear stacks every create, so an action is emitted ONCE, at
+    // terminal status. A start-status call contributes nothing but its title and input.
+    if (!terminal || !id || this.settledTools.has(id)) return boundary
+    this.settledTools.add(id)
+    const parameter = this.toolParameters.get(id) ?? ''
+    const result = this.policy.actionResults ? clampResult(this.toolResults.get(id)) : undefined
+    this.toolParameters.delete(id)
+    this.toolResults.delete(id)
+    if (this.pending?.title === title) {
+      this.pending.count += 1
+      if (parameter) this.pending.parameters.push(parameter)
+      if (result) this.pending.result = result
+      return boundary
+    }
+    const released = this.takePending()
+    this.pending = { title, parameters: parameter ? [parameter] : [], count: 1, ...(result ? { result } : {}) }
+    return [...boundary, ...released]
+  }
+
+  private rememberTool(u: LinearUpdateView): string {
+    const id = u.toolCallId
+    if (u.title) {
+      if (id) this.toolTitles.set(id, u.title)
+      return u.title
+    }
+    return (id && this.toolTitles.get(id)) ?? id ?? 'tool'
+  }
+
+  /** Release the held run as one action row. Over the cap it is counted, not emitted. */
+  private takePending(): LinearAction[] {
+    const held = this.pending
+    if (!held) return []
+    this.pending = undefined
+    if (this.actionsEmitted >= MAX_TURN_ACTIONS) {
+      this.droppedActions += 1
+      return []
+    }
+    this.actionsEmitted += 1
+    return [
+      {
+        kind: 'activity',
+        type: 'action',
+        action: held.count > 1 ? `${held.title} ×${held.count}` : held.title,
+        parameter: flatText(held.parameters.join('\n'), MAX_ACTION_PARAMETER),
+        ...(held.result ? { result: held.result } : {})
+      }
+    ]
+  }
+
+  /** Emit buffered narration as a progress thought. Always releases a held action first, so
+   *  the feed keeps the order the stream had — and so a run split by narration stops collapsing. */
+  private flushNarration(whole: boolean): LinearAction[] {
+    const trimmed = this.narration.trim()
+    if (!trimmed) {
+      this.narration = ''
+      return []
+    }
+    // Hold while the body could still become the bare sentinel, so a suppressed turn never
+    // leaks a partial thought before `onFinal` drops it.
+    if (isNoResponsePrefix(trimmed)) return []
+    let text: string
+    if (whole) {
+      text = this.narration
+      this.narration = ''
+    } else {
+      const { ready, tail } = splitAtParagraphBoundary(this.narration)
+      if (!ready.trim()) return []
+      this.narration = tail
+      text = ready
+    }
+    const body = flattenUnsafeLinks(text.trim(), { resolveFileLink: this.resolveFileLink })
+    const actions = this.takePending()
+    if (body.trim()) actions.push({ kind: 'activity', type: 'thought', body })
+    return actions
+  }
+
+  /** Emit the reasoning accumulated SINCE THE LAST FLUSH. The in-place renderers keep a
+   *  cumulative buffer because they edit one message; an append-only feed must send deltas,
+   *  or every flush re-posts the whole turn's thinking. */
+  private drainReasoning(): LinearAction[] {
+    if (!this.reasoningDirty) return []
+    this.reasoningDirty = false
+    const trimmed = this.reasoning.trim()
+    this.reasoning = ''
+    if (!trimmed) return []
+    const safe = flattenUnsafeLinks(trimmed, { resolveFileLink: this.resolveFileLink })
+    if (!safe.trim()) return []
+    const tail = safe.length > MAX_REASONING ? `…${safe.slice(-MAX_REASONING)}` : safe
+    return [{ kind: 'activity', type: 'thought', body: tail, ephemeral: true }]
+  }
+
+  private drainPlan(): LinearAction[] {
+    if (!this.planDirty || !this.planEntries) return []
+    this.planDirty = false
+    const key = JSON.stringify(this.planEntries)
+    if (key === this.lastPlanKey) return []
+    this.lastPlanKey = key
+    return [{ kind: 'plan', entries: this.planEntries }]
+  }
+}
+
+/** Build this turn's converger. Fresh per turn, so a config change applies from the next one. */
+export function createLinearConverger(ctx: TurnOutputContext<unknown>): LinearConverger {
+  return new LinearConverger(normalizeMode(ctx.mode), ctx.showFooter, ctx.resolveFileLink)
+}
+
+/** Seed the opaque per-turn state slot core stores and never reads. */
+export function initialLinearTurnState(): LinearTurnState {
+  return { activityBudget: MAX_TURN_ACTIVITIES }
+}
+
+function toActivityInput(action: Extract<LinearAction, { kind: 'activity' }>): LinearActivityInput {
+  switch (action.type) {
+    case 'action':
+      return {
+        type: 'action',
+        action: action.action,
+        parameter: action.parameter,
+        ...(action.result ? { result: action.result } : {})
+      }
+    case 'thought':
+      return { type: 'thought', body: action.body, ...(action.ephemeral ? { ephemeral: true } : {}) }
+    default:
+      return { type: action.type, body: action.body }
+  }
+}
+
+/** The two activities that drive the Linear session out of `active` — a turn owes exactly one. */
+function isSettlingActivity(action: Extract<LinearAction, { kind: 'activity' }>): boolean {
+  return action.type === 'response' || action.type === 'error'
+}
+
+/**
+ * Apply one converger action to Linear, through the connection's own send queue.
+ *
+ * The port is the one CAPTURED on the turn state at turn start, falling back to whatever the
+ * turn carries — so an integration unbound mid-turn still settles through the transport this
+ * turn holds a lease on. A headless turn or a session with no AgentSession coordinate no-ops.
+ */
+export async function applyLinearAction<TTurn extends LinearTurn>(
+  turn: TTurn,
+  state: LinearTurnState,
+  action: LinearAction,
+  host?: LinearTurnHost
+): Promise<void> {
+  // The transcript is core's, not Linear's: the answer is recorded under the session's
+  // coordinates whether or not a Linear port exists — the feed chrome stays Linear's own.
+  if (action.kind === 'transcript') {
+    const { transcriptChannel, statusThread, sessionThread } = turn.plan
+    if (!host || !transcriptChannel || !statusThread) return
+    await host.appendTranscript({
+      channel: transcriptChannel,
+      // The row carries the PHYSICAL thread; the session rides the admission.
+      thread: statusThread,
+      admission: { agentId: turn.plan.agentId, sessionKey: turn.plan.sessionKey },
+      ts: host.monotonicTs(),
+      sender: turn.plan.agentId,
+      kind: 'text',
+      text: action.text
+    })
+    return
+  }
+  const port = state.conn ?? (turn.conn as LinearEgressPort | undefined)
+  const sessionId = turn.plan.thread
+  if (!port || !sessionId) return
+  switch (action.kind) {
+    case 'activity': {
+      // The hard backstop under every soft cap: a runaway turn cannot exhaust the workspace's
+      // hourly budget on one session's feed. It bounds CHROME only — a settling activity is
+      // exempt, because dropping it would lose the answer and leave the session active forever.
+      if (!isSettlingActivity(action)) {
+        if (state.activityBudget <= 0) return
+        state.activityBudget -= 1
+      }
+      await port.postActivity(sessionId, toActivityInput(action))
+      return
+    }
+    case 'plan': {
+      const hash = JSON.stringify(action.entries)
+      if (hash === state.lastPlanHash) return
+      state.lastPlanHash = hash
+      await port.updateSession(sessionId, { plan: action.entries })
+      return
+    }
+    case 'external-urls': {
+      if (action.add.length === 0) return
+      await port.updateSession(sessionId, { addedExternalUrls: action.add })
+      return
+    }
+    case 'attachment': {
+      // Issue-scoped, not feed chrome: it never draws on the activity budget.
+      await port.createIssueAttachment(action.input)
+      return
+    }
+  }
+}

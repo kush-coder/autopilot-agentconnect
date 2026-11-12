@@ -1,0 +1,17 @@
+# Require Conventional Commits syntax in pull request titles and at least one commit.
+enabled: true
+titleAndCommits: true
+anyCommit: true
+types:
+  - feat
+  - fix
+  - docs
+  - style
+  - refactor
+  - perf
+  - test
+  - build
+  - ci
+  - chore
+  - revert
+  - release

@@ -1,0 +1,949 @@
+/**
+ * `BotArbitrationRouter` (shared-bot-relay.md §10) — the relay-side arbitration table
+ * for HTTP bots. Holds each assigned bot's attributed routing table (pushed by
+ * the CP via `rc/bot-assign` / `rc/routes`) plus live thread affinity, and
+ * resolves one inbound message to its target `{ agentId, daemonId, integrationId }`.
+ *
+ * The ladder mirrors the daemon's local arbitration (routing-table.ts) but over
+ * ALREADY-ATTRIBUTED routes, and adapted for the multi-agent ambiguity (all agents
+ * answer as one bot user id): channel ownership → thread continuity → keyword
+ * (agent slug) → the channel's own default → the group's default agent for a bare
+ * @bot / DM. There is NO unscoped mention rule (it would starve keyword
+ * disambiguation, §10.4); the bare @bot fallback is the `defaultAgentId` rung instead.
+ *
+ * Pure data + a pure `arbitrate()` — no I/O, no Slack, no sockets — so it unit
+ * tests without a live ingest.
+ */
+import {
+  arbitrateSharedBot,
+  arbitrateSharedBotResult,
+  sharedBotScopeMatches,
+  sharedBotSessionKey,
+  type SharedBotArbitration
+} from '@agentconnect.md/activation-policy'
+import type {
+  AttributedRoute,
+  RcAgentDirEntry,
+  RcBotAssign,
+  RcConversationDefault,
+  RcRoutedConversation,
+  RcRoutes,
+  WireNormalizedMessage
+} from '@agentconnect.md/protocol'
+import { isThreadRootMessage } from '@agentconnect.md/message'
+
+/** A bot's full relay-side assignment (from `rc/bot-assign`). Secret material. */
+export interface BotAssignment {
+  botId: string
+  orgSlug?: string
+  installedAgentIds?: string[]
+  // S1a open reader (protocol route.ts Platform policy): the wire field is an
+  // open string; the assign handler refuses an unsupported platform gracefully.
+  platform: string
+  // The third shape is the signing-secret-ONLY bag: a relay-verified platform whose every write
+  // lives on the daemon has no provider token to hand the relay, only the webhook signing secret.
+  // The fourth is EMPTY: the provider signs each callback itself for the app `apiAppId` names,
+  // so the relay holds no secret at all (Google Chat).
+  secrets:
+    | { botToken: string; signingSecret: string }
+    | { verificationToken: string; encryptKey?: string }
+    | { signingSecret: string }
+    | Record<never, never>
+  /** Provider app id — the O(1) HTTP demux key when present. */
+  apiAppId?: string
+  /** Slack workspace id (== Events API `team_id`). Present ⇒ this bot is one
+   *  workspace install of a DISTRIBUTED app: every sibling install shares the app
+   *  id AND the signing secret, so this bot may only be demuxed on the composite
+   *  `(api_app_id, team_id)` key — never by app id or signature scan alone. */
+  teamId?: string
+  /** The tenant this assignment belongs to, captured for EVERY install kind —
+   *  unlike {@link BotAssignment.teamId}, which the CP sets only for a
+   *  distributed app's install. NOT a demux index key: it is the ingress tenant
+   *  FENCE (ingress-tenant-fence.md §3). `verify` proves a delivery was signed
+   *  with this app's signing secret; the fence proves it came from this bot's
+   *  workspace, which a same-secret sibling in another organization would
+   *  otherwise satisfy just as well. */
+  workspaceId?: string
+  /** Every tenant key this bot serves: one customer row of a multi-tenant app (google-chat-integration.md §10.3), whose siblings share the audience, so it is demuxed only on the composite `(apiAppId, tenant)` keys and fenced strictly. */
+  tenantIds?: string[]
+  /** The console's claim page, present only on the deployment app's anchor: the plugin answers an event no sibling serves with it (§10.4). */
+  claimUrl?: string
+  /** Who installed a Slack workspace not yet connected, whom its setup reply names. */
+  installerUserId?: string
+  /** A single-tenant row's own tenant keys, recorded from its traffic (§10.3): the plugin fences with them by its platform's rules; core neither indexes nor fences on them. */
+  ownTenantIds?: string[]
+  /** A bot the deployment created for one agent (teams-integration.md §8.6.7): its credential is derived for the row, never the app's own. */
+  agentBot?: boolean
+  /** Install GENERATION of `secrets` (CP-assigned). Echoed back on `rc/bot-revoked`
+   *  so the CP can refuse a revocation that was observed under a credential a
+   *  re-install has since replaced — Slack does not order lifecycle events. */
+  credentialRevision?: number
+  /** Provider bot identity — used for mention + echo suppression. */
+  botUserId?: string
+  members: { daemonId: string; agentIds: string[] }[]
+  /** Member directory (id→name) — the options for the config modal's agent selector. */
+  agents: { agentId: string; name: string; daemonId?: string; integrationId?: string }[]
+  routes: AttributedRoute[]
+  defaultAgentId?: string
+  defaultDaemonId?: string
+  /** Conversation-gated members (resource-visibility.md §14): thread continuity to
+   *  one of these agents is honoured only while it still has a channel-scoped route
+   *  in the conversation — a binding made before the gate was applied must not keep
+   *  routing a private agent in a now-Off conversation. */
+  gatedAgentIds?: string[]
+  /** Channels switched OFF. The ladder below has rungs no missing route can suppress
+   *  — thread continuity, the unscoped keyword slug, `defaultAgentId` — so Off is a
+   *  fence rather than an omission: a muted channel resolves to nothing. */
+  mutedChannels?: string[]
+  /** The muted channels that are Off rather than a held decision: fenced like any mute, and an addressed message there gets the §14.3 notice. */
+  offChannels?: string[]
+  /** §14.3: the relayId that posts this bot's CHANNEL gating notices (stamped by the CP from the connected roster). */
+  noticeAuthority?: string
+  /** Per-conversation defaults (linear-integration.md §6.2): the ladder rung between
+   *  the unscoped keyword slug and `defaultAgentId`, and the grant a gated agent holds
+   *  where a conversation row's owner compiles to a default instead of a route. */
+  conversationDefaults?: RcConversationDefault[]
+  /** True where that projection is what the platform does with a row's owner. On such
+   *  an assignment the affinity gate's rejection of a gated binding is TERMINAL. */
+  ownerAsDefault?: boolean
+  /** Executable By decision routing conversations and the one daemon that evaluates each (message-intake.md §6). */
+  routedConversations?: RcRoutedConversation[]
+}
+
+/** The routing state an `rc/routes` hot update replaces — everything a re-assign would
+ *  carry except secrets, demux identity, and `botUserId`. One exported shape because the
+ *  CP frame, the ingress manager, and the router all have to agree on it: a field added to
+ *  the frame but forgotten in one of the hand-offs silently pins relays to the old value. */
+export type RoutesPatch = Pick<
+  BotAssignment,
+  | 'members'
+  | 'agents'
+  | 'routes'
+  | 'defaultAgentId'
+  | 'defaultDaemonId'
+  | 'gatedAgentIds'
+  | 'mutedChannels'
+  | 'offChannels'
+  | 'noticeAuthority'
+  | 'conversationDefaults'
+  | 'routedConversations'
+>
+
+/** Map the CP's `rc/routes` frame to the hot-update patch (the `toBotAssignment` of the
+ *  routes-only leg). Sole assembler of the patch — see {@link RoutesPatch}. */
+export function toRoutesPatch(r: RcRoutes): RoutesPatch {
+  const routes = usableRoutes(r.routes)
+  return {
+    members: r.members,
+    agents: mapAgentDirectory(r.agents),
+    routes,
+    routedConversations: usableRoutedConversations(r.routedConversations ?? [], routes),
+    ...(r.defaultAgentId ? { defaultAgentId: r.defaultAgentId } : {}),
+    ...(r.defaultDaemonId ? { defaultDaemonId: r.defaultDaemonId } : {}),
+    gatedAgentIds: r.gatedAgentIds,
+    mutedChannels: r.mutedChannels,
+    offChannels: r.offChannels,
+    ...(r.noticeAuthority ? { noticeAuthority: r.noticeAuthority } : {}),
+    conversationDefaults: r.conversationDefaults
+  }
+}
+
+/** Fail closed: a By decision route that names no Decision is dropped, never arbitrated as a candidate. */
+export function usableRoutes<R extends { match: { kind: string }; decisionId?: string | undefined }>(routes: R[]): R[] {
+  return routes.filter((route) => route.match.kind !== 'decision' || !!route.decisionId)
+}
+
+/** Keep only routed conversations whose channel still has a decision route with the same Decision (a stale snapshot otherwise). */
+export function usableRoutedConversations(
+  routed: readonly RcRoutedConversation[],
+  routes: readonly AttributedRoute[]
+): RcRoutedConversation[] {
+  return routed.filter((c) =>
+    routes.some((r) => r.match.kind === 'decision' && r.scope?.channel === c.channel && r.decisionId === c.decisionId)
+  )
+}
+
+/** Keep the directory shape identical on full assignments and `rc/routes` updates. */
+export function mapAgentDirectory(entries: readonly RcAgentDirEntry[]): BotAssignment['agents'] {
+  return entries.map((entry) => ({
+    agentId: entry.agentId,
+    name: entry.name,
+    daemonId: entry.daemonId,
+    ...(entry.integrationId ? { integrationId: entry.integrationId } : {})
+  }))
+}
+
+/** The package verdict plus, in a routed conversation, the host the CP named for it (relay-local). */
+export type RelayArbitration = SharedBotArbitration & { evaluationDaemonId?: string }
+
+/** The arbitration verdict — a target the daemon dispatches to. */
+export interface RouteTarget {
+  agentId: string
+  daemonId: string
+  integrationId: string
+}
+
+/** One constrained recipient of a routed message, flagged participant from this relay's participant set. */
+export interface RoutedConstraintEntry extends RouteTarget {
+  participant: boolean
+  via: 'mention' | 'implicit'
+}
+
+export interface ConversationTarget {
+  target: RouteTarget
+  /** Explicit only for a human mention. Agent-authored traffic can join a peer by
+   * mention, but remains implicit so it cannot clear a human's `!stop` latch. */
+  via: 'mention' | 'implicit'
+}
+
+/** `channel/thread` — the per-conversation affinity + rc/assign key. Package
+ *  policy since the relay fold-in; re-exported to keep the import path. */
+export const sessionKeyOf: (msg: Pick<WireNormalizedMessage, 'channel' | 'thread'>) => string = sharedBotSessionKey
+
+const scopeMatches: (r: AttributedRoute, msg: WireNormalizedMessage) => boolean = sharedBotScopeMatches
+
+/** An explicit address: the message names the bot's identity, or its normalizer stamped it a mention (Google Chat states the cause before the identity is known). */
+export function explicitlyAddressesBot(
+  a: Pick<BotAssignment, 'botUserId'> | undefined,
+  msg: WireNormalizedMessage
+): boolean {
+  return (a?.botUserId !== undefined && msg.mentionedBots.includes(a.botUserId)) || msg.trigger === 'mention'
+}
+
+const target = (r: AttributedRoute): RouteTarget => ({
+  agentId: r.agentId,
+  daemonId: r.daemonId,
+  integrationId: r.integrationId
+})
+
+/**
+ * Arbitrate one inbound message against a bot's attributed routes (pure).
+ * `affinity` maps a sessionKey to a prior target (thread continuity), refreshed by
+ * the caller after each routed turn and seeded durably by `rc/assign`.
+ *
+ * Since the relay fold-in the ladder itself is package-owned policy
+ * (`arbitrateSharedBot`, `@agentconnect.md/activation-policy` — see its header
+ * for the declared ladder structure and how it relates to the daemon ladder);
+ * `BotAssignment` structurally satisfies the package's assignment facts, and
+ * this module keeps the stateful remainder (the affinity/participant
+ * bookkeeping and the peer fan-out below).
+ */
+export function arbitrate(
+  a: BotAssignment,
+  msg: WireNormalizedMessage,
+  affinity: Map<string, RouteTarget>,
+  /** send-message-routing-rework.md §2.3: a VERIFIED AgentConnect author routes through
+   *  this ladder exactly as a human would, with itself excluded so it cannot self-wake.
+   *  Unverified bots — including third-party ones — still stop at the explicit mention. */
+  verifiedAgentAuthor?: string
+): RouteTarget | null {
+  return arbitrateSharedBot(a, msg, affinity, verifiedAgentAuthor)
+}
+
+/** Cap on a bot's negative-affinity set before it is flushed (bounds CP lookups). */
+const MAX_NEGATIVE_AFFINITY = 10_000
+const MAX_PARTICIPANT_CONVERSATIONS = 10_000
+
+export class BotArbitrationRouter {
+  private readonly bots = new Map<string, BotAssignment>()
+  /** Per-bot thread affinity: botId → (sessionKey → target). */
+  private readonly affinity = new Map<string, Map<string, RouteTarget>>()
+  /** Every agent that has joined a conversation on this HTTP bot. Unlike `affinity`,
+   * this is a set: a shared-bot thread can span several daemons and has no single owner. */
+  private readonly participants = new Map<string, Map<string, Map<string, RouteTarget>>>()
+  /** Per-bot NEGATIVE affinity: sessionKeys the CP confirmed hold no owner. Prevents
+   *  an un-owned thread's every follow-up from re-hitting the CP (`rc/thread-lookup`). */
+  private readonly noAffinity = new Map<string, Set<string>>()
+
+  upsert(a: BotAssignment): void {
+    const prev = this.bots.get(a.botId)
+    // Preserve a resolved botUserId across a routes-only hot update.
+    if (prev?.botUserId && a.botUserId === undefined) a.botUserId = prev.botUserId
+    this.bots.set(a.botId, a)
+    if (!this.affinity.has(a.botId)) this.affinity.set(a.botId, new Map())
+    if (!this.participants.has(a.botId)) this.participants.set(a.botId, new Map())
+  }
+
+  /** Replace routes/members/agents/default WITHOUT touching secrets or botUserId (rc/routes). */
+  updateRoutes(botId: string, patch: RoutesPatch): void {
+    const a = this.bots.get(botId)
+    if (!a) return
+    a.members = patch.members
+    a.agents = patch.agents
+    a.routes = patch.routes
+    a.defaultAgentId = patch.defaultAgentId
+    a.defaultDaemonId = patch.defaultDaemonId
+    a.gatedAgentIds = patch.gatedAgentIds
+    a.mutedChannels = patch.mutedChannels
+    a.offChannels = patch.offChannels
+    a.noticeAuthority = patch.noticeAuthority
+    // An owner edit converges through here, so the defaults are replaced with the routes:
+    // otherwise a connected relay keeps the old default — and the old grant — forever.
+    a.conversationDefaults = patch.conversationDefaults
+    // Replaced whole, so a patch without the field (an older CP) clears every evaluation host.
+    a.routedConversations = patch.routedConversations
+  }
+
+  remove(botId: string): BotAssignment | undefined {
+    const a = this.bots.get(botId)
+    this.bots.delete(botId)
+    this.affinity.delete(botId)
+    this.participants.delete(botId)
+    this.noAffinity.delete(botId)
+    return a
+  }
+
+  get(botId: string): BotAssignment | undefined {
+    return this.bots.get(botId)
+  }
+
+  /** Resolve an opaque relay-status target to the current canonical daemon route.
+   *  Both agentId and integrationId must still belong to this bot; stale/tampered
+   *  buttons are rejected instead of falling through to a channel's current owner. */
+  targetForAgent(botId: string, agentId: string, integrationId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const routes = a.routes.filter((r) => r.agentId === agentId && r.integrationId === integrationId)
+    if (routes.length === 0) return undefined
+    const daemonIds = new Set(routes.map((r) => r.daemonId))
+    // A target must resolve to one canonical daemon. Fail closed on an inconsistent
+    // routing snapshot instead of letting route array order choose where a click goes.
+    if (daemonIds.size !== 1) return undefined
+    const route = routes[0]!
+    if (!a.members.some((m) => m.daemonId === route.daemonId && m.agentIds.includes(agentId))) return undefined
+    return target(route)
+  }
+
+  /** Resolve one explicitly rendered integration through the current member
+   * directory. Unlike message routing, a card action does not require a still-live
+   * conversation rule: the daemon's active-card map is its terminal fence. */
+  integrationTarget(botId: string, agentId: string, integrationId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const candidates = a.agents.filter(
+      (entry) => entry.agentId === agentId && entry.integrationId === integrationId && entry.daemonId !== undefined
+    )
+    if (candidates.length !== 1) return undefined
+    const candidate = candidates[0]!
+    if (!a.members.some((m) => m.daemonId === candidate.daemonId && m.agentIds.includes(candidate.agentId))) {
+      return undefined
+    }
+    return { agentId: candidate.agentId, daemonId: candidate.daemonId!, integrationId }
+  }
+
+  /** Resolve an agent picker value to one canonical route for this HTTP bot.
+   *  Repeated scoped/keyword rules are fine when they point at the same integration;
+   *  conflicting placements fail closed instead of choosing by array order. */
+  targetForAgentId(botId: string, agentId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const routes = a.routes.filter((r) => r.agentId === agentId)
+    const targets = new Set(routes.map((r) => `${r.daemonId}\u0000${r.integrationId}`))
+    if (targets.size !== 1) return undefined
+    const route = routes[0]!
+    if (!a.members.some((m) => m.daemonId === route.daemonId && m.agentIds.includes(agentId))) return undefined
+    return target(route)
+  }
+
+  /** The agent that currently owns `channelId` (a channel-scoped route), if any —
+   *  the config modal's initial selection. */
+  channelOwner(botId: string, channelId: string): string | undefined {
+    return this.bots.get(botId)?.routes.find((r) => r.scope?.channel === channelId)?.agentId
+  }
+
+  /** Resolve a bot that has exactly one fully-attributed integration. This is the
+   * rolling-compatibility fallback for Lark / Feishu cards rendered before their
+   * action value carried an explicit agent + integration target. */
+  soleTarget(botId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const candidates = a.agents.flatMap((entry) =>
+      entry.daemonId && entry.integrationId
+        ? [{ agentId: entry.agentId, daemonId: entry.daemonId, integrationId: entry.integrationId }]
+        : []
+    )
+    if (candidates.length !== 1) return undefined
+    const candidate = candidates[0]!
+    if (!a.members.some((m) => m.daemonId === candidate.daemonId && m.agentIds.includes(candidate.agentId))) {
+      return undefined
+    }
+    return candidate
+  }
+
+  /**
+   * Resolve the sole gated install without relying on a routing rule. A fully
+   * gated bot deliberately compiles no unscoped route, but Feishu callback
+   * credentials are receive-only: its daemon must still receive an addressed
+   * Off-conversation message so it can discover the row and post the notice.
+   */
+  soleGatedTarget(botId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const gated = new Set(a.gatedAgentIds ?? [])
+    const candidates = a.agents.flatMap((entry) =>
+      gated.has(entry.agentId) && entry.daemonId && entry.integrationId
+        ? [{ agentId: entry.agentId, daemonId: entry.daemonId, integrationId: entry.integrationId }]
+        : []
+    )
+    if (candidates.length !== 1) return undefined
+    const candidate = candidates[0]!
+    if (!a.members.some((m) => m.daemonId === candidate.daemonId && m.agentIds.includes(candidate.agentId))) {
+      return undefined
+    }
+    return candidate
+  }
+
+  /** True iff `channelId` is Off. `arbitrate()` already refuses it; the caller needs
+   *  this to tell a mute apart from the other reasons arbitration returns null. */
+  channelMuted(botId: string, channelId: string): boolean {
+    return this.bots.get(botId)?.mutedChannels?.includes(channelId) ?? false
+  }
+
+  /** True iff `channelId` is Off rather than a held decision — the muted case that answers an address with the notice. */
+  channelOff(botId: string, channelId: string): boolean {
+    return this.bots.get(botId)?.offChannels?.includes(channelId) ?? false
+  }
+
+  /** A channel-scoped `auto`/`decision` owner re-resolves every message on any pod, so it needs no durable thread binding. */
+  channelAutoOwned(botId: string, channelId: string): boolean {
+    const a = this.bots.get(botId)
+    // An `ownerAsDefault` decision owner is a default seat below continuity, so its sessions stay bound.
+    return (
+      a?.routes.some(
+        (r) =>
+          r.scope?.channel === channelId &&
+          (r.match.kind === 'auto' || (r.match.kind === 'decision' && a.ownerAsDefault !== true))
+      ) ?? false
+    )
+  }
+
+  /** The bound Decision of a By decision conversation, for every human delivery in it. */
+  decisionIdFor(botId: string, channelId: string): string | undefined {
+    return this.bots
+      .get(botId)
+      ?.routes.find((r) => r.scope?.channel === channelId && r.match.kind === 'decision' && r.decisionId)?.decisionId
+  }
+
+  /** The daemon the CP named to evaluate a routed conversation; the host fence for `rd/route` and reports. */
+  evaluationDaemonIdFor(botId: string, channelId: string): string | undefined {
+    return this.bots.get(botId)?.routedConversations?.find((c) => c.channel === channelId)?.evaluationDaemonId
+  }
+
+  /** A human message in an executable By decision routed conversation goes once to its host (message-intake.md §6). */
+  routedConversationFor(
+    botId: string,
+    msg: WireNormalizedMessage
+  ): { decisionId: string; evaluationDaemonId: string } | undefined {
+    const a = this.bots.get(botId)
+    if (!a || msg.sender.isBot) return undefined
+    if (a.botUserId !== undefined && msg.sender.id === a.botUserId) return undefined
+    if (a.mutedChannels?.includes(msg.channel)) return undefined
+    const routed = a.routedConversations?.find((c) => c.channel === msg.channel)
+    if (!routed || this.decisionIdFor(botId, msg.channel) !== routed.decisionId) return undefined
+    return { decisionId: routed.decisionId, evaluationDaemonId: routed.evaluationDaemonId }
+  }
+
+  /** The target constraint of one routed message, read without touching participants, affinity, or reports. */
+  routedConstraint(botId: string, msg: WireNormalizedMessage): RoutedConstraintEntry[] {
+    const a = this.bots.get(botId)
+    if (!a) return []
+    const key = sessionKeyOf(msg)
+    const remembered = this.participants.get(botId)?.get(key)
+    const out = new Map<string, RoutedConstraintEntry>()
+    const add = (agentId: string, participant: boolean, via: 'mention' | 'implicit'): void => {
+      const current = this.agentTarget(botId, agentId, msg.channel)
+      if (!current) return
+      const prior = out.get(agentId)
+      out.set(agentId, {
+        ...current,
+        participant: participant || prior?.participant === true,
+        via: via === 'mention' || prior?.via === 'mention' ? 'mention' : 'implicit'
+      })
+    }
+    for (const agentId of remembered?.keys() ?? []) add(agentId, true, 'implicit')
+    const owner = this.affinity.get(botId)?.get(key)
+    if (owner) add(owner.agentId, true, 'implicit')
+    // An explicit selection names an agent through the unscoped keyword slug; a bare @bot names none.
+    const addressed = msg.isDm || (a.botUserId !== undefined && msg.mentionedBots.includes(a.botUserId))
+    if (addressed) {
+      const text = msg.text.toLowerCase()
+      for (const route of a.routes) {
+        if (route.match.kind !== 'keyword' || route.scope) continue
+        if (!text.includes(route.match.value.toLowerCase())) continue
+        add(route.agentId, remembered?.has(route.agentId) === true, 'mention')
+      }
+    }
+    return [...out.values()].slice(0, 64)
+  }
+
+  /** The bot's member directory for a routed conversation, after the mute and gating fences. */
+  routedCandidates(botId: string, channelId: string): RouteTarget[] {
+    const a = this.bots.get(botId)
+    if (!a) return []
+    const out = new Map<string, RouteTarget>()
+    for (const entry of a.agents) {
+      if (out.has(entry.agentId)) continue
+      const current = this.agentTarget(botId, entry.agentId, channelId)
+      if (current) out.set(entry.agentId, current)
+      if (out.size >= 64) break
+    }
+    return [...out.values()]
+  }
+
+  /** The channel's decision-route owner, the compatibility owner of a routed conversation. */
+  channelDecisionOwner(botId: string, channelId: string): RouteTarget | undefined {
+    const route = this.bots
+      .get(botId)
+      ?.routes.find((r) => r.scope?.channel === channelId && r.match.kind === 'decision')
+    return route ? target(route) : undefined
+  }
+
+  /** An agent on the host daemon with an install on this bot: the carrier that gives the host its org and integration. */
+  hostCarrier(botId: string, channelId: string, daemonId: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    if (!a) return undefined
+    const onHost = (agentId: string | undefined): RouteTarget | undefined => {
+      if (!agentId) return undefined
+      const current = this.agentTarget(botId, agentId, channelId)
+      return current?.daemonId === daemonId ? current : undefined
+    }
+    const owner = a.routes.find((r) => r.scope?.channel === channelId && r.match.kind === 'decision')?.agentId
+    const found = onHost(owner) ?? onHost(a.defaultAgentId)
+    if (found) return found
+    for (const entry of a.agents) {
+      if (entry.daemonId !== daemonId) continue
+      const current = onHost(entry.agentId)
+      if (current) return current
+    }
+    return undefined
+  }
+
+  /** Apply a channel-owner pick to the current routing snapshot immediately.
+   *  The CP remains authoritative and will replace this optimistic update via
+   *  `rc/routes`; preserving the existing match keeps the channel trigger stable. */
+  setChannelOwner(botId: string, channelId: string, tgt: RouteTarget): void {
+    const a = this.bots.get(botId)
+    if (!a) return
+    for (const route of a.routes) {
+      if (route.scope?.channel !== channelId) continue
+      route.agentId = tgt.agentId
+      route.daemonId = tgt.daemonId
+      route.integrationId = tgt.integrationId
+    }
+  }
+
+  setBotUserId(botId: string, botUserId: string): void {
+    const a = this.bots.get(botId)
+    if (a) a.botUserId = botUserId
+  }
+
+  /** Durable thread affinity from `rc/assign` (survives relay restart / re-assign). */
+  setAffinity(botId: string, sessionKey: string, tgt: RouteTarget): void {
+    ;(this.affinity.get(botId) ?? this.affinity.set(botId, new Map()).get(botId)!).set(sessionKey, tgt)
+    this.setParticipant(botId, sessionKey, tgt)
+    // A now-owned thread must leave the negative cache (a Switch-agent / late assign).
+    this.noAffinity.get(botId)?.delete(sessionKey)
+  }
+
+  /** Durable conversation member from an `rc/participant-assign` projection. */
+  setParticipant(botId: string, sessionKey: string, tgt: RouteTarget): void {
+    const byConversation = this.participants.get(botId) ?? this.participants.set(botId, new Map()).get(botId)!
+    const members = byConversation.get(sessionKey) ?? new Map<string, RouteTarget>()
+    if (!byConversation.has(sessionKey)) {
+      if (byConversation.size >= MAX_PARTICIPANT_CONVERSATIONS) byConversation.clear()
+      byConversation.set(sessionKey, members)
+    }
+    members.set(tgt.agentId, tgt)
+  }
+
+  /** The remembered participant set of one conversation, re-resolved through the current
+   *  member directory so each target carries the daemon that holds the agent NOW, with the
+   *  mute and gating fences applied. The recipients of a conversation-addressed session
+   *  event that must reach every participant (the native Stop), not one arbitrated owner. */
+  conversationParticipants(botId: string, sessionKey: string, channelId: string): RouteTarget[] {
+    const remembered = this.participants.get(botId)?.get(sessionKey)
+    if (!remembered) return []
+    const targets: RouteTarget[] = []
+    for (const agentId of remembered.keys()) {
+      const target = this.agentTarget(botId, agentId, channelId)
+      if (target) targets.push(target)
+    }
+    return targets
+  }
+
+  /** Read the current affinity for a thread WITHOUT resolving (the report leg's
+   *  first-route / changed-target detection reads this before `route()` mutates it). */
+  peekAffinity(botId: string, sessionKey: string): RouteTarget | undefined {
+    return this.affinity.get(botId)?.get(sessionKey)
+  }
+
+  /**
+   * True iff `msg` is a genuine un-mentioned follow-up IN A THREAD the relay holds no
+   * affinity for — the only shape worth a CP `rc/thread-lookup`. Excludes: echoes,
+   * addressed messages (a mention/DM route themselves), thread-root messages (own ts ==
+   * thread ts), threads we already own, and threads the CP already said are un-owned.
+   */
+  isUnmentionedThreadFollowup(botId: string, msg: WireNormalizedMessage): boolean {
+    const a = this.bots.get(botId)
+    if (!a) return false
+    if (msg.sender.isBot) return false
+    if (a.botUserId !== undefined && msg.sender.id === a.botUserId) return false
+    const addressed = (a.botUserId !== undefined && msg.mentionedBots.includes(a.botUserId)) || msg.isDm
+    if (addressed) return false
+    // A thread ROOT routes itself (its own send established the affinity) — only
+    // genuine follow-ups are worth a lookup. The coordinate parse belongs to the
+    // message package, which mints the `platform:channel:native` format.
+    if (!msg.thread || isThreadRootMessage(msg)) return false
+    const sessionKey = sessionKeyOf(msg)
+    if (this.affinity.get(botId)?.has(sessionKey)) return false
+    if (this.noAffinity.get(botId)?.has(sessionKey)) return false
+    return true
+  }
+
+  /** A routed thread reply this relay knows nobody in: worth one CP lookup before its constraint is frozen. */
+  routedThreadNeedsLookup(botId: string, msg: WireNormalizedMessage): boolean {
+    if (!msg.thread || isThreadRootMessage(msg)) return false
+    const key = sessionKeyOf(msg)
+    if ((this.participants.get(botId)?.get(key)?.size ?? 0) > 0) return false
+    if (this.affinity.get(botId)?.has(key)) return false
+    return !this.noAffinity.get(botId)?.has(key)
+  }
+
+  /** Seed affinity from a CP `rc/thread-lookup/ok` target: validate the agent is a
+   *  current member of that daemon, backfill integrationId from its route, install the
+   *  affinity. Returns the seeded target, or null if the agent is not a current member. */
+  seedLookupTarget(
+    botId: string,
+    sessionKey: string,
+    lookup: { agentId: string; daemonId: string; integrationId?: string }
+  ): RouteTarget | null {
+    const a = this.bots.get(botId)
+    if (!a) return null
+    if (!a.members.some((m) => m.daemonId === lookup.daemonId && m.agentIds.includes(lookup.agentId))) return null
+    const route = a.routes.find((r) => r.agentId === lookup.agentId)
+    const tgt: RouteTarget = {
+      agentId: lookup.agentId,
+      daemonId: lookup.daemonId,
+      // The CP names the holder's install on this bot; the local directory is the backfill
+      // for an older CP that omits it, and the empty string for a route-less member.
+      integrationId:
+        lookup.integrationId ??
+        route?.integrationId ??
+        a.agents.find((x) => x.agentId === lookup.agentId)?.integrationId ??
+        ''
+    }
+    this.setAffinity(botId, sessionKey, tgt)
+    return tgt
+  }
+
+  /** Record that the CP holds NO owner for `sessionKey` (a `rc/thread-lookup/ok` miss),
+   *  so subsequent un-mentioned follow-ups in the same thread don't re-hit the CP. */
+  rememberNoAffinity(botId: string, sessionKey: string): void {
+    let set = this.noAffinity.get(botId)
+    if (!set) {
+      set = new Set()
+      this.noAffinity.set(botId, set)
+    }
+    if (set.size >= MAX_NEGATIVE_AFFINITY) set.clear()
+    set.add(sessionKey)
+  }
+
+  /** Resolve one message; records live affinity for the resolved thread. */
+  route(botId: string, msg: WireNormalizedMessage): RouteTarget | null {
+    const result = this.routeResult(botId, msg)
+    return result.kind === 'target' ? result.target : null
+  }
+
+  /** {@link route} keeping the terminal `grant-withdrawn` refusal distinguishable from
+   *  an ordinary miss, so the caller drops instead of continuing down the ladder. */
+  routeResult(botId: string, msg: WireNormalizedMessage): RelayArbitration {
+    const a = this.bots.get(botId)
+    if (!a) return { kind: 'none' }
+    const aff = this.affinity.get(botId) ?? this.affinity.set(botId, new Map()).get(botId)!
+    const result = arbitrateSharedBotResult(a, msg, aff)
+    if (result.kind !== 'target') return result
+    aff.set(sessionKeyOf(msg), result.target)
+    const evaluationDaemonId = this.evaluationDaemonIdFor(botId, msg.channel)
+    return evaluationDaemonId ? { ...result, evaluationDaemonId } : result
+  }
+
+  /**
+   * The STOP-only bound-target lookup (linear-integration.md §9.3): this bot's stored
+   * affinity for `sessionKey`, validated against current membership but NOT against the
+   * grant — a stop can only end work, so it must still reach a holder whose conversation
+   * default has since moved away. Never falls through to arbitration: the new default
+   * must not answer inside a session another runtime holds.
+   */
+  boundTarget(botId: string, sessionKey: string): RouteTarget | undefined {
+    const a = this.bots.get(botId)
+    const bound = this.affinity.get(botId)?.get(sessionKey)
+    if (!a || !bound) return undefined
+    if (!a.members.some((m) => m.daemonId === bound.daemonId && m.agentIds.includes(bound.agentId))) return undefined
+    if (bound.integrationId) return bound
+    const integrationId =
+      a.routes.find((r) => r.agentId === bound.agentId)?.integrationId ??
+      a.agents.find((x) => x.agentId === bound.agentId)?.integrationId
+    return integrationId ? { ...bound, integrationId } : undefined
+  }
+
+  /**
+   * Resolve a NAMED agent to its route on this bot, bypassing the arbitration ladder
+   * entirely (send-message-routing-rework.md §6).
+   *
+   * This is the verified-agent-author path: the target came from a recipient set the
+   * author's daemon resolved and the relay verified, so there is nothing to arbitrate.
+   * Bypassing the ladder is the point, not a shortcut — it is what keeps an agent
+   * message off thread affinity, keyword matching, and the `defaultAgentId` fallback,
+   * so a bare shared-bot mention (which resolves to no agent, §8.5) can never be turned
+   * into "the channel's default agent" here.
+   *
+   * Still membership-checked: the agent must be a current member of this bot on a live
+   * daemon, exactly as every other resolution path requires. Null otherwise.
+   */
+  agentTarget(botId: string, agentId: string, channelId: string): RouteTarget | null {
+    const a = this.bots.get(botId)
+    if (!a) return null
+    // A channel switched Off resolves to no target at all — the same fence `arbitrate`
+    // applies ahead of every rung. Bypassing the ladder must not mean bypassing this:
+    // Off means the agent does not respond there, explicitly including an @-mention, so
+    // an agent mention must not become the one way into a silenced channel.
+    if (a.mutedChannels?.includes(channelId)) return null
+    const member = a.members.find((m) => m.agentIds.includes(agentId))
+    const route = a.routes.find((r) => r.agentId === agentId)
+    const daemonId = member?.daemonId ?? route?.daemonId ?? a.agents.find((x) => x.agentId === agentId)?.daemonId
+    if (!daemonId) return null
+    // A conversation-GATED agent (§14) is reachable only while it still holds a
+    // channel-scoped route here — a binding made before the gate was applied must not keep
+    // routing a private agent into a now-Off conversation — or is a target of this routed
+    // conversation's routing, which only an editor of that agent could have saved.
+    if (a.gatedAgentIds?.includes(agentId)) {
+      const scoped =
+        a.routes.some((r) => r.agentId === agentId && r.scope?.channel === channelId) ||
+        !!a.routedConversations?.find((c) => c.channel === channelId)?.targetAgentIds?.includes(agentId)
+      if (!scoped) return null
+    }
+    const integrationId = route?.integrationId ?? a.agents.find((x) => x.agentId === agentId)?.integrationId
+    if (!integrationId) return null
+    return { agentId, daemonId, integrationId }
+  }
+
+  /**
+   * Resolve an AgentConnect-authored message through the ordinary ladder, with the
+   * verified author excluded (send-message-routing-rework.md §2.3).
+   *
+   * Deliberately does NOT record thread affinity: an agent continuing a conversation is
+   * not the same event as a human establishing who owns the thread, and letting agent
+   * traffic rewrite the binding would let two agents hand ownership back and forth away
+   * from the human who started it.
+   */
+  routeAgentAuthored(botId: string, msg: WireNormalizedMessage, authorAgentId: string): RouteTarget | null {
+    const a = this.bots.get(botId)
+    if (!a) return null
+    const aff = this.affinity.get(botId) ?? new Map<string, RouteTarget>()
+    return arbitrate(a, msg, aff, authorAgentId)
+  }
+
+  /** Resolve every recipient of one conversation event and remember the joined set.
+   *
+   * The ordinary ladder may still produce a primary for compatibility/reporting, but it
+   * does not bound delivery. Existing participants, every newly mentioned route, and
+   * every scoped `auto` route are independent targets. This state lives beside affinity
+   * because affinity intentionally models one legacy owner and collapses in the exact
+   * multi-agent shape this method serves. */
+  conversationTargets(
+    botId: string,
+    msg: WireNormalizedMessage,
+    primary?: RouteTarget | null,
+    verifiedAgentAuthor?: string,
+    joinedAgentIds: readonly string[] = [],
+    onJoin?: (target: RouteTarget) => void,
+    admitsNewJoin?: (target: RouteTarget) => boolean
+  ): ConversationTarget[] {
+    const a = this.bots.get(botId)
+    if (!a || a.mutedChannels?.includes(msg.channel)) return []
+    const key = sessionKeyOf(msg)
+    const byConversation = this.participants.get(botId) ?? new Map<string, Map<string, RouteTarget>>()
+    const remembered = byConversation.get(key) ?? new Map<string, RouteTarget>()
+
+    const explicitIds = new Set<string>()
+    const namesBot = explicitlyAddressesBot(a, msg)
+    if (namesBot) {
+      for (const route of a.routes) {
+        if (route.match.kind !== 'mention' || !scopeMatches(route, msg)) continue
+        if (route.agentId !== verifiedAgentAuthor) explicitIds.add(route.agentId)
+      }
+      // A human explicitly addressed this bot. Even when channel ownership is an
+      // `auto` rule, the compatibility primary is the named target and must receive
+      // target-specific mention semantics so it can clear its own `!stop` latch.
+      if (verifiedAgentAuthor === undefined && primary) explicitIds.add(primary.agentId)
+    }
+
+    const selected = new Map<string, ConversationTarget>()
+    const add = (candidate: RouteTarget, via: 'mention' | 'implicit'): void => {
+      if (candidate.agentId === verifiedAgentAuthor) return
+      const current = this.agentTarget(botId, candidate.agentId, msg.channel)
+      if (!current) return
+      const previousParticipant = remembered.get(current.agentId)
+      // Policy is part of admission, not merely this event's delivery. A denied
+      // agent-authored edge must not leave behind local or durable membership that
+      // a later human follow-up could activate. Existing legitimate membership is
+      // retained; the caller still re-checks policy before each agent-authored copy.
+      if (!previousParticipant && admitsNewJoin && !admitsNewJoin(current)) return
+      const effectiveVia = verifiedAgentAuthor === undefined && via === 'mention' ? 'mention' : 'implicit'
+      const previous = selected.get(current.agentId)
+      if (!previous || effectiveVia === 'mention') selected.set(current.agentId, { target: current, via: effectiveVia })
+      if (!byConversation.has(key)) {
+        if (byConversation.size >= MAX_PARTICIPANT_CONVERSATIONS) byConversation.clear()
+        byConversation.set(key, remembered)
+        this.participants.set(botId, byConversation)
+      }
+      remembered.set(current.agentId, current)
+      if (
+        !previousParticipant ||
+        previousParticipant.daemonId !== current.daemonId ||
+        previousParticipant.integrationId !== current.integrationId
+      ) {
+        onJoin?.(current)
+      }
+    }
+
+    if (primary) add(primary, explicitIds.has(primary.agentId) ? 'mention' : 'implicit')
+    for (const route of a.routes) {
+      if (explicitIds.has(route.agentId)) add(target(route), 'mention')
+      // An `ownerAsDefault` decision owner joins only as the primary: a session there has one writer.
+      const candidate =
+        route.match.kind === 'auto' ||
+        (route.match.kind === 'decision' &&
+          a.ownerAsDefault !== true &&
+          verifiedAgentAuthor === undefined &&
+          !msg.sender.isBot)
+      if (candidate && scopeMatches(route, msg)) add(target(route), 'implicit')
+    }
+    // The verified final carries exact resolved agent ids across provider
+    // splitting/echo. They JOIN the room but never replace its existing members,
+    // and agent-authored joins remain implicit so they cannot lift a human stop.
+    for (const agentId of joinedAgentIds) {
+      const joined = this.agentTarget(botId, agentId, msg.channel)
+      if (joined) add(joined, 'implicit')
+    }
+    for (const participant of remembered.values()) add(participant, 'implicit')
+    return [...selected.values()]
+  }
+
+  /** Every currently-assigned bot (ingest lifecycle reconciliation). */
+  all(): BotAssignment[] {
+    return [...this.bots.values()]
+  }
+}
+
+// A non-empty list of non-empty strings, deduplicated; null for anything else.
+function tenantKeyList(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null
+  if (!value.every((id): id is string => typeof id === 'string' && id.length > 0)) return null
+  return [...new Set(value)]
+}
+
+// An absolute https URL; null for anything else.
+function httpsUrl(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  try {
+    return new URL(value).protocol === 'https:' ? value : null
+  } catch {
+    return null
+  }
+}
+
+/** Map the CP's `rc/bot-assign` frame to the manager's {@link BotAssignment}
+ *  (drop absent optionals so the strict-optional shape holds). Returns null for a
+ *  secret bag neither typed shape matches (§6.7 open reader: a platform this build
+ *  predates) — the caller logs and skips; the assign handler would refuse the
+ *  platform anyway, this just refuses it before touching credentials. */
+export function toBotAssignment(a: RcBotAssign): BotAssignment | null {
+  // §6.7: the opaque ingress bag is the ONE carrier of the demux identity. The
+  // named top-level twins left the wire schema with the S3 protocol cleanup
+  // (emission had already stopped, #556), so there is nothing to fall back to —
+  // a non-string slot in the bag reads as absent, and an absent identity means
+  // the verify-scan path, exactly as a manual-paste install always demuxed.
+  const ingress = (a.ingress ?? {}) as {
+    apiAppId?: unknown
+    teamId?: unknown
+    workspaceId?: unknown
+    botUserId?: unknown
+    appUserName?: unknown
+    tenantIds?: unknown
+    claimUrl?: unknown
+    installerUserId?: unknown
+    ownTenantIds?: unknown
+    agentBot?: unknown
+  }
+  const apiAppId = typeof ingress.apiAppId === 'string' ? ingress.apiAppId : undefined
+  // A multi-tenant app's rows: a malformed tenant list or claim page refuses the assignment outright, since reading
+  // either as absent would turn the row into one that serves every tenant of its audience.
+  const tenantIds = ingress.tenantIds === undefined ? undefined : tenantKeyList(ingress.tenantIds)
+  const claimUrl = ingress.claimUrl === undefined ? undefined : httpsUrl(ingress.claimUrl)
+  // A single-tenant row's recorded keys: malformed reads as refused too, or the row would forget its fence.
+  const ownTenantIds = ingress.ownTenantIds === undefined ? undefined : tenantKeyList(ingress.ownTenantIds)
+  if (tenantIds === null || claimUrl === null || ownTenantIds === null) return null
+  const secrets: BotAssignment['secrets'] | null =
+    'botToken' in a.secrets && typeof a.secrets.botToken === 'string' && typeof a.secrets.signingSecret === 'string'
+      ? { botToken: a.secrets.botToken, signingSecret: a.secrets.signingSecret }
+      : 'verificationToken' in a.secrets && typeof a.secrets.verificationToken === 'string'
+        ? {
+            verificationToken: a.secrets.verificationToken,
+            ...(typeof a.secrets.encryptKey === 'string' ? { encryptKey: a.secrets.encryptKey } : {})
+          }
+        : // §6.7 third shape — signing secret alone, from a platform whose egress is entirely the
+          // daemon's. The ABSENT `botToken` is what separates it from a half-filled Slack bag: a
+          // present-but-unusable token must still fail closed rather than fall through to here.
+          !('botToken' in a.secrets) && 'signingSecret' in a.secrets && typeof a.secrets.signingSecret === 'string'
+          ? { signingSecret: a.secrets.signingSecret }
+          : // The fourth shape holds NOTHING: the provider signs every callback and `apiAppId` is the
+            // audience the relay checks it against, so the identity is what makes the bag usable — an
+            // empty bag without it, or any bag with keys no shape reads, still fails closed.
+            Object.keys(a.secrets).length === 0 && apiAppId
+            ? {}
+            : null
+  if (!secrets) return null
+  const teamId = typeof ingress.teamId === 'string' ? ingress.teamId : undefined
+  // An older CP omits it; the fence then reads whatever `teamId` carries, which
+  // is exactly today's behaviour (ingress-tenant-fence.md §3.3 fail-open).
+  const workspaceId = typeof ingress.workspaceId === 'string' ? ingress.workspaceId : undefined
+  // A token-verified platform names its app's own user identity `appUserName`; it is the same
+  // mention/echo identity `botUserId` carries for the others.
+  const botUserId =
+    typeof ingress.botUserId === 'string'
+      ? ingress.botUserId
+      : typeof ingress.appUserName === 'string'
+        ? ingress.appUserName
+        : undefined
+  const routes = usableRoutes(a.routes)
+  return {
+    botId: a.botId,
+    ...(a.orgSlug ? { orgSlug: a.orgSlug } : {}),
+    ...(a.installedAgentIds ? { installedAgentIds: a.installedAgentIds } : {}),
+    platform: a.platform,
+    secrets,
+    ...(apiAppId ? { apiAppId } : {}),
+    ...(teamId ? { teamId } : {}),
+    ...(workspaceId ? { workspaceId } : {}),
+    ...(tenantIds ? { tenantIds } : {}),
+    ...(claimUrl ? { claimUrl } : {}),
+    ...(typeof ingress.installerUserId === 'string' ? { installerUserId: ingress.installerUserId } : {}),
+    ...(ownTenantIds ? { ownTenantIds } : {}),
+    ...(ingress.agentBot === true ? { agentBot: true } : {}),
+    ...(a.credentialRevision !== undefined ? { credentialRevision: a.credentialRevision } : {}),
+    ...(botUserId ? { botUserId } : {}),
+    members: a.members,
+    agents: mapAgentDirectory(a.agents),
+    routes,
+    routedConversations: usableRoutedConversations(a.routedConversations ?? [], routes),
+    ...(a.defaultAgentId ? { defaultAgentId: a.defaultAgentId } : {}),
+    ...(a.defaultDaemonId ? { defaultDaemonId: a.defaultDaemonId } : {}),
+    gatedAgentIds: a.gatedAgentIds,
+    mutedChannels: a.mutedChannels,
+    offChannels: a.offChannels,
+    conversationDefaults: a.conversationDefaults,
+    ownerAsDefault: a.ownerAsDefault,
+    ...(a.noticeAuthority ? { noticeAuthority: a.noticeAuthority } : {})
+  }
+}

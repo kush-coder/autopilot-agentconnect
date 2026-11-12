@@ -1,0 +1,172 @@
+/**
+ * `WebchatTokenService` — mints + verifies the short-lived webchat token the browser
+ * presents to the relay pool (shared-bot-relay.md §10, milestone A4).
+ *
+ * The browser can't hand the relay an OIDC token the relay could verify (the relay
+ * holds no JWKS / no DB), so the CP mints a self-contained token AFTER the console's
+ * normal human-auth + agent-visibility check, and the relay delegates verification
+ * back to the CP via `rc/verify(webchat-token)`. The token is a compact HS256 JWT —
+ * carrying `{ userId, user, agentId, orgId, conversationId }` and an optional
+ * private-session owner proof with a short expiry.
+ * The conversation id was already registered to that identity in CP metadata before
+ * minting. The CP re-resolves the agent's CURRENT placement (daemonId) at verify time
+ * (placement can change between mint and dial), so the token never encodes it.
+ *
+ * The signing key is DERIVED from `API_KEY_PEPPER` (domain-separated) so no new secret
+ * config is required; it never leaves the CP.
+ */
+import { createHmac } from 'node:crypto'
+import { SignJWT, jwtVerify } from 'jose'
+
+/** The identity a minted webchat token attests; authorized at mint, and membership and visibility again at every verify. */
+export interface WebchatTokenClaims {
+  userId: string
+  /** Display handle for the transcript author line. */
+  user: string
+  /** Public avatar URL, when the profile has one — the identity a platform mirror posts under. */
+  userPicture?: string
+  /** A session continuation's author on the target session's platform, as `<platform>:<tenant>:<memberId>` keys. */
+  userIdentities?: string[]
+  agentId: string
+  orgId: string
+  conversationId: string
+  /** Server-selected transport; old tokens without this field belong to legacy Webchat. */
+  protocol?: 'legacy' | 'ahp'
+  /** Exact private-session owner proven by the mint-time identity expansion. */
+  privateSessionOwnerIdentity?: string
+  /** A hook target's merged-conversation peers mint authorized (#2500), each with its proven private owner. */
+  conversationPeers?: ConversationPeerClaim[]
+}
+
+/** One peer session a hook continuation token may also address. */
+export interface ConversationPeerClaim {
+  sessionId: string
+  privateOwnerIdentity?: string
+}
+
+/** A verdict carries at most 16 participants (`RcVerifyResult.participants`) and the target takes one, so mint caps the peers here too. */
+export const MAX_CONVERSATION_PEERS = 15
+
+/** Parses the peer claim, dropping the whole list when any entry is malformed. */
+function conversationPeersOf(raw: unknown): ConversationPeerClaim[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_CONVERSATION_PEERS) return undefined
+  const peers: ConversationPeerClaim[] = []
+  for (const entry of raw as unknown[]) {
+    const { sessionId, privateOwnerIdentity } = (entry ?? {}) as Record<string, unknown>
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return undefined
+    if (privateOwnerIdentity !== undefined && typeof privateOwnerIdentity !== 'string') return undefined
+    peers.push({ sessionId, ...(typeof privateOwnerIdentity === 'string' ? { privateOwnerIdentity } : {}) })
+  }
+  return peers
+}
+
+/** At most this many identity keys ride a token — the verdict's own cap. */
+export const MAX_USER_IDENTITIES = 8
+
+/** A viewer's identity keys on one platform (`<platform>:<tenant>:<memberId>`), capped for the token. */
+export function platformIdentities(platform: string | null, identitySet: Iterable<string>): string[] {
+  if (!platform) return []
+  return [...identitySet].filter((key) => key.startsWith(`${platform}:`)).slice(0, MAX_USER_IDENTITIES)
+}
+
+/** Parses the identity claim, dropping the whole list when any entry is malformed. */
+function userIdentitiesOf(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_USER_IDENTITIES) return undefined
+  return raw.every((key) => typeof key === 'string' && key.length > 0 && key.length <= 512)
+    ? (raw as string[])
+    : undefined
+}
+
+/** A minted token and the instant its `exp` claim names. */
+export interface MintedWebchatToken {
+  token: string
+  expiresAt: Date
+}
+
+// v2 is intentionally incompatible with the pre-conversation-binding verifier:
+// a new token must not be accepted by an old CP during a rolling deployment.
+const KEY_INFO = 'agentconnect.webchat-token.v2'
+const DEFAULT_TTL_SEC = 300 // 5 min — long enough to dial the relay, short enough to bound misuse
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+export class WebchatTokenService {
+  private readonly key: Uint8Array
+
+  constructor(
+    pepper: string,
+    private readonly ttlSec: number = DEFAULT_TTL_SEC
+  ) {
+    // Domain-separated HMAC of the pepper → a dedicated 256-bit signing key.
+    this.key = new Uint8Array(createHmac('sha256', pepper).update(KEY_INFO).digest())
+  }
+
+  /** Mint a short-lived token for `claims` (call ONLY after human-auth + canView). */
+  async mint(claims: WebchatTokenClaims): Promise<MintedWebchatToken> {
+    // One `exp` for the signature and the returned `expiresAt`, so a caller renews on the token's own clock.
+    const exp = Math.floor(Date.now() / 1000) + this.ttlSec
+    const token = await new SignJWT({
+      user: claims.user,
+      ...(claims.userPicture ? { userPicture: claims.userPicture } : {}),
+      ...(claims.userIdentities?.length ? { userIdentities: claims.userIdentities } : {}),
+      agentId: claims.agentId,
+      orgId: claims.orgId,
+      conversationId: claims.conversationId,
+      ...(claims.protocol ? { protocol: claims.protocol } : {}),
+      ...(claims.privateSessionOwnerIdentity
+        ? { privateSessionOwnerIdentity: claims.privateSessionOwnerIdentity }
+        : {}),
+      ...(claims.conversationPeers?.length ? { conversationPeers: claims.conversationPeers } : {})
+    })
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject(claims.userId)
+      .setIssuedAt()
+      .setExpirationTime(exp)
+      .sign(this.key)
+    return { token, expiresAt: new Date(exp * 1000) }
+  }
+
+  /** Verify signature + expiry and return the claims, or null on any failure. */
+  async verify(token: string): Promise<WebchatTokenClaims | null> {
+    try {
+      const { payload } = await jwtVerify(token, this.key, { algorithms: ['HS256'] })
+      const {
+        sub,
+        user,
+        userPicture,
+        userIdentities,
+        agentId,
+        orgId,
+        conversationId,
+        protocol,
+        privateSessionOwnerIdentity,
+        conversationPeers
+      } = payload as Record<string, unknown>
+      const peers = conversationPeersOf(conversationPeers)
+      const identities = userIdentitiesOf(userIdentities)
+      if (
+        typeof sub !== 'string' ||
+        typeof agentId !== 'string' ||
+        typeof orgId !== 'string' ||
+        typeof conversationId !== 'string' ||
+        !UUID_RE.test(conversationId) ||
+        (protocol !== undefined && protocol !== 'legacy' && protocol !== 'ahp')
+      ) {
+        return null
+      }
+      return {
+        userId: sub,
+        user: typeof user === 'string' ? user : sub,
+        ...(typeof userPicture === 'string' ? { userPicture } : {}),
+        ...(identities ? { userIdentities: identities } : {}),
+        agentId,
+        orgId,
+        conversationId: conversationId.toLowerCase(),
+        ...(protocol ? { protocol: protocol as 'legacy' | 'ahp' } : {}),
+        ...(typeof privateSessionOwnerIdentity === 'string' ? { privateSessionOwnerIdentity } : {}),
+        ...(peers ? { conversationPeers: peers } : {})
+      }
+    } catch {
+      return null // bad signature / expired / malformed
+    }
+  }
+}

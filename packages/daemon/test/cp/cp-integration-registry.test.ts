@@ -1,0 +1,156 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { IntegrationSpec } from '@agentconnect.md/protocol'
+import { CpIntegrationRegistry } from '../../src/cp/cp-integration-registry.js'
+
+const A1 = '11111111-1111-4111-8111-111111111111'
+const A2 = '22222222-2222-4222-8222-222222222222'
+const integration = (id: string, agentId = A1, token = 'xoxb-one'): IntegrationSpec => ({
+  integrationId: id,
+  agentId,
+  platform: 'slack',
+  core: {
+    mode: 'direct',
+    bindRules: [],
+    mutedChannels: [],
+    gated: false,
+    sessionModes: [],
+    decisions: { bindings: [], definitions: [] }
+  },
+  config: { botToken: token, appToken: 'xapp-one' }
+})
+
+function makeReg() {
+  const onChange = vi.fn()
+  const warn = vi.fn()
+  const reg = new CpIntegrationRegistry(mkdtempSync(join(tmpdir(), 'ac-cpintreg-')), { warn }, onChange)
+  return { reg, onChange, warn }
+}
+
+describe('CpIntegrationRegistry (memory-only)', () => {
+  it('upserts/replaces integrations by id without requiring an agent.json', () => {
+    const { reg } = makeReg()
+    reg.upsert(integration('i1'))
+    reg.upsert(integration('i1', A1, 'xoxb-two'))
+    expect(reg.forAgent(A1)).toHaveLength(1)
+    expect(reg.forAgent(A1)[0]).toMatchObject({ id: 'i1', origin: 'cp', config: { botToken: 'xoxb-two' } })
+  })
+
+  it('reports convergence only once a full roster arrived, not on a single upsert', () => {
+    const { reg } = makeReg()
+    expect(reg.hasConverged()).toBe(false)
+    reg.upsert(integration('i1'))
+    expect(reg.hasConverged()).toBe(false)
+    reg.converge([])
+    expect(reg.hasConverged()).toBe(true)
+  })
+
+  it('keeps agent ownership, removes by id, and exact-prunes one agent only', () => {
+    const { reg } = makeReg()
+    reg.converge([integration('i1'), integration('i2'), integration('i3', A2)])
+    reg.retainForAgent(A1, new Set(['i2']))
+    expect(reg.forAgent(A1).map((item) => item.id)).toEqual(['i2'])
+    expect(reg.forAgent(A2).map((item) => item.id)).toEqual(['i3'])
+    reg.remove('i3')
+    expect(reg.forAgent(A2)).toEqual([])
+  })
+
+  it('rejects an unusable envelope without retaining secret material', () => {
+    const { reg, warn } = makeReg()
+    const core: IntegrationSpec['core'] = {
+      mode: 'direct',
+      bindRules: [],
+      mutedChannels: [],
+      gated: false,
+      sessionModes: [],
+      decisions: { bindings: [], definitions: [] }
+    }
+    // No config at all.
+    reg.upsert({ integrationId: 'bad', agentId: A1, platform: 'slack', core } as IntegrationSpec)
+    // A payload the module schema refuses.
+    reg.upsert({
+      integrationId: 'bad2',
+      agentId: A1,
+      platform: 'slack',
+      core,
+      config: { nope: true }
+    } as IntegrationSpec)
+    // An unregistered platform id (S1a open reader; the registry is the refusal).
+    reg.upsert({
+      integrationId: 'bad3',
+      agentId: A1,
+      platform: 'mastodon',
+      core,
+      config: { botToken: 'x' }
+    } as IntegrationSpec)
+    // A DIRECT slack spec without the app-level token (the retired wire refine,
+    // preserved at this seam).
+    reg.upsert({
+      integrationId: 'bad4',
+      agentId: A1,
+      platform: 'slack',
+      core,
+      config: { botToken: 'xoxb-x' }
+    } as IntegrationSpec)
+    expect(reg.forAgent(A1)).toEqual([])
+    expect(warn).toHaveBeenCalledTimes(4)
+  })
+
+  it('reports every applied or dropped Decision bundle before onChange', () => {
+    const applied = vi.fn()
+    const onChange = vi.fn(() => expect(applied).toHaveBeenCalled())
+    const reg = new CpIntegrationRegistry(
+      mkdtempSync(join(tmpdir(), 'ac-cpintreg-')),
+      { onDecisionConfigApplied: applied },
+      onChange
+    )
+    const first = integration('i1')
+    const second = integration('i1', A1, 'xoxb-two')
+    reg.upsert(first)
+    expect(applied).toHaveBeenLastCalledWith('i1', undefined, first.core.decisions, first.core.sessionModes ?? [])
+    reg.converge([second, integration('i2')])
+    expect(applied).toHaveBeenCalledWith(
+      'i1',
+      first.core.decisions,
+      second.core.decisions,
+      second.core.sessionModes ?? []
+    )
+    reg.remove('i1')
+    expect(applied).toHaveBeenLastCalledWith('i1', second.core.decisions, undefined, undefined)
+    reg.retainForAgent(A1, new Set())
+    expect(applied).toHaveBeenLastCalledWith('i2', expect.anything(), undefined, undefined)
+  })
+})
+
+// assistant-mode.md §5.3: a push that newly lists a place external is the downgrade transition's trigger.
+describe('CpIntegrationRegistry external places', () => {
+  const withExternal = (externalChannels: string[]): IntegrationSpec => ({
+    ...integration('i1'),
+    core: { ...integration('i1').core, externalChannels }
+  })
+
+  it('hands every applied spec over, naming only the places it newly lists and none on the first spec', () => {
+    const applied = vi.fn()
+    const reg = new CpIntegrationRegistry(
+      mkdtempSync(join(tmpdir(), 'ac-cpintreg-')),
+      { onExternalChannels: applied },
+      vi.fn()
+    )
+    const added = () => applied.mock.calls.map(([id, , channels]) => [id, channels])
+    reg.upsert(withExternal(['C1']))
+    reg.upsert(withExternal(['C1', 'C2']))
+    reg.upsert(withExternal(['C2']))
+    reg.converge([withExternal(['C2'])])
+    reg.converge([withExternal(['C2', 'C3'])])
+    expect(added()).toEqual([
+      ['i1', []],
+      ['i1', ['C2']],
+      ['i1', []],
+      ['i1', []],
+      ['i1', ['C3']]
+    ])
+    expect(applied.mock.calls.at(-1)![1]).toBe(reg.forAgent(A1)[0])
+  })
+})

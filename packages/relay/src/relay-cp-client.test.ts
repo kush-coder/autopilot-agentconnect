@@ -1,0 +1,1239 @@
+import { describe, it, expect, vi } from 'vitest'
+import {
+  FRAME_FRAGMENTS_FEATURE,
+  fragmentFrame,
+  MAX_FRAME_BYTES,
+  BOT_CREDENTIAL_CHECK_FEATURE,
+  CODEHOST_FEEDBACK_FEATURE,
+  FOLLOW_UP_WATCH_FEATURE,
+  COMPUTER_MEDIA_USAGE_FEATURE,
+  BOT_TENANT_FEATURE,
+  buildRelayCpFrame,
+  RELAY_CP_SUBPROTOCOL,
+  RELAY_PROJECTION_SNAPSHOT_V1_FEATURE,
+  GITHUB_APP_WEBHOOK_V1_FEATURE,
+  GITEA_V1_FEATURE,
+  AZURE_DEVOPS_HOOKS_V1_FEATURE,
+  DECISION_ROUTING_FORWARD_V1_FEATURE,
+  DECISION_ROUTING_V1_FEATURE,
+  DECISION_TRIGGER_V1_FEATURE,
+  GITLAB_COM_V1_FEATURE,
+  GITLAB_INSTANCE_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V2_FEATURE,
+  HOOK_GITHUB_INSTALLATION_V1_FEATURE,
+  HOOK_INSTRUCTIONS_V1_FEATURE,
+  OWNER_DEFAULT_DECISION_V1_FEATURE,
+  PULL_REQUEST_FEEDBACK_FEATURE,
+  WEBCHAT_SESSION_CONTINUATION_FEATURE,
+  type RelayCpFrame
+} from '@agentconnect.md/protocol'
+import { FakeClock, type Transport } from '@agentconnect.md/connection'
+import { RelayCpClient, type RelayCpClientDeps } from './relay-cp-client.js'
+import type { Logger } from './log.js'
+
+const RELAY_ID = '11111111-1111-4111-8111-111111111111'
+const DAEMON_ID = '22222222-2222-4222-8222-222222222222'
+const TOKEN = 'x'.repeat(32)
+const COMMENT_AUTHZ = {
+  hookId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  installationId: '1234567',
+  repoId: '987654321',
+  repoFullName: 'acme/infra',
+  senderLogin: 'alice',
+  configRevision: '3',
+  dispatchRevision: '5'
+} as const
+const RUN_REPORT = {
+  hookId: COMMENT_AUTHZ.hookId,
+  deliveryKey: 'delivery-1',
+  firedAt: '2026-07-07T00:00:00.000Z',
+  agentId: '33333333-3333-4333-8333-333333333333',
+  status: 'failed',
+  reason: 'review_request_required'
+} as const
+const REREQUEST = {
+  checkRunId: '86617583005',
+  repoId: '987654321',
+  headSha: 'a'.repeat(40),
+  deliveryKey: 'delivery-rerun-1'
+} as const
+const HOOK_RULE = {
+  hookId: COMMENT_AUTHZ.hookId,
+  kind: 'webhook',
+  agentId: RUN_REPORT.agentId,
+  daemonId: DAEMON_ID,
+  sessionMode: 'perDelivery',
+  webhook: { urlToken: 'whk_example' }
+} as const
+const silentLog: Logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
+
+/** Flush the native promise microtask/macrotask queue (the FSM's handshake chain
+ *  is promise-driven; its timers use the injected FakeClock). */
+const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+class FakeTransport implements Transport {
+  readonly subprotocol = RELAY_CP_SUBPROTOCOL
+  sent: RelayCpFrame[] = []
+  closed?: { code: number; reason: string }
+  private msgCb?: (t: string) => void
+  private closeCb?: (c: number, r: string) => void
+
+  send(text: string): void {
+    this.sent.push(JSON.parse(text) as RelayCpFrame)
+  }
+  onMessage(cb: (t: string) => void): void {
+    this.msgCb = cb
+  }
+  onClose(cb: (c: number, r: string) => void): void {
+    this.closeCb = cb
+  }
+  close(code: number, reason: string): void {
+    this.closed = { code, reason }
+    this.closeCb?.(code, reason)
+  }
+
+  // ── test helpers ──
+  inject(frame: RelayCpFrame): void {
+    this.msgCb?.(JSON.stringify(frame))
+  }
+  injectText(text: string): void {
+    this.msgCb?.(text)
+  }
+  simulateClose(code: number): void {
+    this.closeCb?.(code, 'test')
+  }
+  lastReq(type: string): RelayCpFrame | undefined {
+    return [...this.sent].reverse().find((f) => f.type === type)
+  }
+}
+
+/** Answer the auth + register REQs already sitting on `transport`. */
+async function completeHandshake(
+  transport: FakeTransport,
+  heartbeatSec = 15,
+  deploymentConfig?: { revision: number; githubWebhookSecret?: string },
+  serverFeatures: string[] = []
+): Promise<void> {
+  const auth = transport.lastReq('rc/auth')!
+  transport.inject(
+    buildRelayCpFrame(
+      'rc/auth/ok',
+      {
+        heartbeatSec,
+        serverTime: '2026-07-07T00:00:00.000Z',
+        ...(deploymentConfig ? { deploymentConfig } : {})
+      },
+      { corr: auth.id }
+    )
+  )
+  await flush()
+  const reg = transport.lastReq('rc/register')!
+  transport.inject(buildRelayCpFrame('rc/registered', { relayId: RELAY_ID, serverFeatures }, { corr: reg.id }))
+  await flush()
+}
+
+/** Drive a client from start() through to READY against `transport`. */
+async function handshakeToReady(
+  client: RelayCpClient,
+  transport: FakeTransport,
+  heartbeatSec = 15,
+  deploymentConfig?: { revision: number; githubWebhookSecret?: string }
+): Promise<void> {
+  client.start()
+  await flush()
+  await completeHandshake(transport, heartbeatSec, deploymentConfig)
+}
+
+/** A client whose every dial hands out a FRESH transport, so a close can be
+ *  followed through the reconnect the way a CP restart is. */
+function makeReconnectingClient(over: Partial<RelayCpClientDeps> = {}) {
+  const clock = new FakeClock()
+  const transports: FakeTransport[] = []
+  const connect = vi.fn(async (_opts?: { handshakeTimeoutMs?: number }) => {
+    const transport = new FakeTransport()
+    transports.push(transport)
+    return transport
+  })
+  const client = new RelayCpClient({
+    auth: { method: 'token', credential: TOKEN },
+    name: 'relay-0',
+    daemonUrl: 'wss://relay-0.example',
+    heartbeatDefaultMs: 15_000,
+    clock,
+    connect,
+    log: silentLog,
+    jitter: () => 0,
+    ...over
+  })
+  /** Close the live transport and complete the handshake on the replacement. */
+  const reconnect = async (): Promise<FakeTransport> => {
+    clock.advance(1_000)
+    await flush()
+    const next = transports.at(-1)!
+    await completeHandshake(next)
+    return next
+  }
+  return { client, clock, transports, connect, reconnect }
+}
+
+function makeClient(over: Partial<RelayCpClientDeps> = {}) {
+  const clock = new FakeClock()
+  const transport = new FakeTransport()
+  const onRegistered = vi.fn()
+  const onRevoke = vi.fn()
+  const onReady = vi.fn()
+  const connect = vi.fn(async () => transport)
+  const client = new RelayCpClient({
+    auth: { method: 'token', credential: TOKEN },
+    name: 'relay-0',
+    daemonUrl: 'wss://relay-0.example',
+    heartbeatDefaultMs: 15_000,
+    clock,
+    connect,
+    log: silentLog,
+    jitter: () => 0,
+    onRegistered,
+    onRevoke,
+    onReady,
+    ...over
+  })
+  return { client, clock, transport, connect, onRegistered, onRevoke, onReady }
+}
+
+describe('RelayCpClient', () => {
+  it('runs rc/auth → rc/register → READY and reports the relayId', async () => {
+    const { client, transport, onRegistered, onReady } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const auth = transport.lastReq('rc/auth')!
+    expect(auth.payload).toEqual({ method: 'token', credential: TOKEN })
+    const reg = transport.lastReq('rc/register')!
+    expect(reg.payload).toEqual({
+      name: 'relay-0',
+      daemonUrl: 'wss://relay-0.example',
+      features: [
+        FRAME_FRAGMENTS_FEATURE,
+        WEBCHAT_SESSION_CONTINUATION_FEATURE,
+        GITLAB_COM_V1_FEATURE,
+        GITLAB_INSTANCE_V1_FEATURE,
+        PULL_REQUEST_FEEDBACK_FEATURE,
+        CODEHOST_FEEDBACK_FEATURE,
+        FOLLOW_UP_WATCH_FEATURE,
+        GITEA_V1_FEATURE,
+        AZURE_DEVOPS_HOOKS_V1_FEATURE,
+        DECISION_TRIGGER_V1_FEATURE,
+        DECISION_ROUTING_V1_FEATURE,
+        DECISION_ROUTING_FORWARD_V1_FEATURE,
+        HOOK_DECISION_ROUTING_V1_FEATURE,
+        HOOK_DECISION_ROUTING_V2_FEATURE,
+        OWNER_DEFAULT_DECISION_V1_FEATURE,
+        HOOK_GITHUB_INSTALLATION_V1_FEATURE,
+        HOOK_INSTRUCTIONS_V1_FEATURE,
+        RELAY_PROJECTION_SNAPSHOT_V1_FEATURE,
+        GITHUB_APP_WEBHOOK_V1_FEATURE
+      ]
+    })
+
+    expect(client.state).toBe('READY')
+    expect(client.relayId).toBe(RELAY_ID)
+    expect(client.isReady()).toBe(true)
+    expect(onRegistered).toHaveBeenCalledWith(RELAY_ID)
+    expect(onReady).toHaveBeenCalledOnce()
+  })
+
+  it('advertises its STUN address on rc/register when it serves one', async () => {
+    const { client, transport } = makeClient({ stunUrl: 'stun:stun-0.example:3478' })
+    await handshakeToReady(client, transport)
+    expect(transport.lastReq('rc/register')!.payload).toMatchObject({ stunUrl: 'stun:stun-0.example:3478' })
+  })
+
+  it('registers its TURN URLs only once rc/auth/ok hands over the TURN secret', async () => {
+    const turnUrls = ['turn:turn-0.example:3478?transport=udp', 'turns:turn-0.example:443?transport=tcp']
+    for (const secret of [undefined, 't'.repeat(43)]) {
+      const onSecret = vi.fn()
+      const { client, transport } = makeClient({ turn: { urls: turnUrls, onSecret } })
+      client.start()
+      await flush()
+      const auth = transport.lastReq('rc/auth')!
+      transport.inject(
+        buildRelayCpFrame(
+          'rc/auth/ok',
+          {
+            heartbeatSec: 15,
+            serverTime: '2026-07-07T00:00:00.000Z',
+            ...(secret ? { computerTurnSecret: secret } : {})
+          },
+          { corr: auth.id }
+        )
+      )
+      await flush()
+      const register = transport.lastReq('rc/register')!.payload as { turnUrls?: string[] }
+      if (secret) {
+        expect(onSecret).toHaveBeenCalledWith(secret)
+        expect(register.turnUrls).toEqual(turnUrls)
+      } else {
+        expect(onSecret).not.toHaveBeenCalled()
+        expect(register.turnUrls).toBeUndefined()
+      }
+      await client.stop()
+    }
+  })
+
+  it('applies a replay that arrives in the same turn as rc/registered, after onReady', async () => {
+    const calls: string[] = []
+    const { client, transport } = makeClient({
+      onReady: () => calls.push('ready'),
+      onHookAssign: (rule) => calls.push(`hook-assign ${rule.hookId}`)
+    })
+    client.start()
+    await flush()
+    const auth = transport.lastReq('rc/auth')!
+    transport.inject(
+      buildRelayCpFrame('rc/auth/ok', { heartbeatSec: 15, serverTime: new Date(0).toISOString() }, { corr: auth.id })
+    )
+    await flush()
+    const reg = transport.lastReq('rc/register')!
+    // One socket read: the register reply and the first rule the CP replays right behind it.
+    transport.inject(buildRelayCpFrame('rc/registered', { relayId: RELAY_ID }, { corr: reg.id }))
+    transport.inject(buildRelayCpFrame('rc/hook-assign', HOOK_RULE))
+    await flush()
+
+    expect(client.state).toBe('READY')
+    expect(calls).toEqual(['ready', `hook-assign ${HOOK_RULE.hookId}`])
+    expect(transport.sent.filter((f) => f.type === 'error')).toEqual([])
+  })
+
+  it('still refuses a control that precedes the register reply', async () => {
+    const onHookAssign = vi.fn()
+    const { client, transport } = makeClient({ onHookAssign })
+    client.start()
+    await flush()
+    const auth = transport.lastReq('rc/auth')!
+    transport.inject(
+      buildRelayCpFrame('rc/auth/ok', { heartbeatSec: 15, serverTime: new Date(0).toISOString() }, { corr: auth.id })
+    )
+    await flush()
+    transport.inject(buildRelayCpFrame('rc/hook-assign', HOOK_RULE))
+    expect(transport.lastReq('error')?.payload).toMatchObject({ code: 'PROTOCOL_STATE' })
+
+    const reg = transport.lastReq('rc/register')!
+    transport.inject(buildRelayCpFrame('rc/registered', { relayId: RELAY_ID }, { corr: reg.id }))
+    await flush()
+    expect(client.state).toBe('READY')
+    expect(onHookAssign).not.toHaveBeenCalled()
+  })
+
+  it('applies the authenticated deployment snapshot during startup', async () => {
+    const onDeploymentConfig = vi.fn()
+    const { client, transport } = makeClient({ onDeploymentConfig })
+    const snapshot = { revision: 8, githubWebhookSecret: 'ghw_secret' }
+    await handshakeToReady(client, transport, 15, snapshot)
+    expect(onDeploymentConfig).toHaveBeenCalledOnce()
+    expect(onDeploymentConfig).toHaveBeenCalledWith(snapshot)
+  })
+
+  it('leaves the startup environment in place when the CP stores no document', async () => {
+    const onDeploymentConfig = vi.fn()
+    const onDeploymentSnapshot = vi.fn()
+    const { client, transport } = makeClient({ onDeploymentConfig, onDeploymentSnapshot })
+    const snapshot = { revision: 0, publicRelayUrl: 'https://relay.example.test' }
+    await handshakeToReady(client, transport, 15, snapshot)
+    expect(onDeploymentConfig).not.toHaveBeenCalled()
+    expect(onDeploymentSnapshot).toHaveBeenCalledWith(snapshot)
+  })
+
+  it('freezes an absent startup snapshot until the relay process restarts', async () => {
+    const clock = new FakeClock()
+    const transports: FakeTransport[] = []
+    const onDeploymentConfig = vi.fn()
+    const client = new RelayCpClient({
+      auth: { method: 'token', credential: TOKEN },
+      name: 'relay-0',
+      daemonUrl: 'wss://relay-0.example',
+      heartbeatDefaultMs: 15_000,
+      clock,
+      connect: async () => {
+        const transport = new FakeTransport()
+        transports.push(transport)
+        return transport
+      },
+      log: silentLog,
+      jitter: () => 0,
+      onDeploymentConfig
+    })
+
+    client.start()
+    await flush()
+    const first = transports[0]!
+    const firstAuth = first.lastReq('rc/auth')!
+    first.inject(
+      buildRelayCpFrame(
+        'rc/auth/ok',
+        { heartbeatSec: 15, serverTime: new Date(0).toISOString() },
+        { corr: firstAuth.id }
+      )
+    )
+    await flush()
+    const firstRegister = first.lastReq('rc/register')!
+    first.inject(buildRelayCpFrame('rc/registered', { relayId: RELAY_ID }, { corr: firstRegister.id }))
+    await flush()
+
+    first.simulateClose(1012)
+    clock.advance(1_000)
+    await flush()
+    const second = transports[1]!
+    const secondAuth = second.lastReq('rc/auth')!
+    second.inject(
+      buildRelayCpFrame(
+        'rc/auth/ok',
+        {
+          heartbeatSec: 15,
+          serverTime: new Date(0).toISOString(),
+          deploymentConfig: { revision: 9, githubWebhookSecret: 'must-not-hot-reload' }
+        },
+        { corr: secondAuth.id }
+      )
+    )
+    await flush()
+
+    expect(onDeploymentConfig).not.toHaveBeenCalled()
+    await client.stop()
+  })
+
+  it('hands every connection’s snapshot, or its absence, to onDeploymentSnapshot', async () => {
+    const clock = new FakeClock()
+    const transports: FakeTransport[] = []
+    const onDeploymentSnapshot = vi.fn()
+    const client = new RelayCpClient({
+      auth: { method: 'token', credential: TOKEN },
+      name: 'relay-0',
+      daemonUrl: 'wss://relay-0.example',
+      heartbeatDefaultMs: 15_000,
+      clock,
+      connect: async () => {
+        const transport = new FakeTransport()
+        transports.push(transport)
+        return transport
+      },
+      log: silentLog,
+      jitter: () => 0,
+      onDeploymentSnapshot
+    })
+    const anchored = {
+      revision: 9,
+      googleChatAnchor: { projectNumber: '100000000000', claimUrl: 'https://console.example.test/googlechat/claim' }
+    }
+    const connect = async (index: number, deploymentConfig?: typeof anchored) => {
+      const transport = transports[index]!
+      const auth = transport.lastReq('rc/auth')!
+      transport.inject(
+        buildRelayCpFrame(
+          'rc/auth/ok',
+          {
+            heartbeatSec: 15,
+            serverTime: new Date(0).toISOString(),
+            ...(deploymentConfig ? { deploymentConfig } : {})
+          },
+          { corr: auth.id }
+        )
+      )
+      await flush()
+      const register = transport.lastReq('rc/register')!
+      transport.inject(buildRelayCpFrame('rc/registered', { relayId: RELAY_ID }, { corr: register.id }))
+      await flush()
+    }
+
+    client.start()
+    await flush()
+    await connect(0, anchored)
+    expect(onDeploymentSnapshot).toHaveBeenLastCalledWith(anchored)
+    transports[0]!.simulateClose(1012)
+    clock.advance(1_000)
+    await flush()
+    await connect(1)
+    expect(onDeploymentSnapshot).toHaveBeenCalledTimes(2)
+    expect(onDeploymentSnapshot).toHaveBeenLastCalledWith(undefined)
+    await client.stop()
+  })
+
+  it('emits rc/heartbeat at the CP-dictated cadence', async () => {
+    const { client, clock, transport } = makeClient()
+    await handshakeToReady(client, transport, 20) // heartbeatSec = 20
+
+    transport.sent.length = 0
+    clock.advance(20_000)
+    expect(transport.lastReq('rc/heartbeat')).toBeDefined()
+    transport.sent.length = 0
+    clock.advance(20_000)
+    expect(transport.lastReq('rc/heartbeat')).toBeDefined() // re-arms
+  })
+
+  it('dispatches rc/daemon-revoke to onRevoke', async () => {
+    const { client, transport, onRevoke } = makeClient()
+    await handshakeToReady(client, transport)
+    transport.inject(buildRelayCpFrame('rc/daemon-revoke', { daemonId: DAEMON_ID }))
+    expect(onRevoke).toHaveBeenCalledWith(DAEMON_ID)
+  })
+
+  it('dispatches owner affinity and participant membership independently', async () => {
+    const onAssign = vi.fn()
+    const onParticipantAssign = vi.fn()
+    const { client, transport } = makeClient({ onAssign, onParticipantAssign })
+    await handshakeToReady(client, transport)
+    const target = {
+      botId: RELAY_ID,
+      sessionKey: 'C1/ts',
+      agentId: RELAY_ID,
+      daemonId: DAEMON_ID
+    }
+
+    transport.inject(buildRelayCpFrame('rc/assign', target))
+    transport.inject(buildRelayCpFrame('rc/participant-assign', target))
+
+    expect(onAssign).toHaveBeenCalledWith(target)
+    expect(onParticipantAssign).toHaveBeenCalledWith(target)
+  })
+
+  it('dispatches purpose-separated memory connection bindings', async () => {
+    const onMemoryConnectionAssign = vi.fn()
+    const onMemoryConnectionUnassign = vi.fn()
+    const { client, transport } = makeClient({ onMemoryConnectionAssign, onMemoryConnectionUnassign })
+    await handshakeToReady(client, transport)
+    const assign = {
+      connectionId: RELAY_ID,
+      revision: 3,
+      upstreamUrl: 'https://memory.example/mcp',
+      headers: [{ name: 'Authorization', value: 'upstream-secret' }],
+      grantKeyHashes: ['a'.repeat(64)]
+    }
+    transport.inject(buildRelayCpFrame('rc/memoryconnection-assign', assign))
+    transport.inject(
+      buildRelayCpFrame('rc/memoryconnection-unassign', {
+        connectionId: RELAY_ID,
+        revision: 3,
+        grantKeyHash: 'a'.repeat(64)
+      })
+    )
+
+    expect(onMemoryConnectionAssign).toHaveBeenCalledWith(assign)
+    expect(onMemoryConnectionUnassign).toHaveBeenCalledWith({
+      connectionId: RELAY_ID,
+      revision: 3,
+      grantKeyHash: 'a'.repeat(64)
+    })
+  })
+
+  it('emitGithubInstallation sends the doorbell when READY, drops it otherwise', async () => {
+    const { client, transport } = makeClient()
+    // Not READY yet — the poke is dropped (safe: the CP's pull paths converge).
+    client.emitGithubInstallation({ installationId: '1234567', action: 'created' })
+    expect(transport.sent).toHaveLength(0)
+
+    await handshakeToReady(client, transport)
+    client.emitGithubInstallation({ installationId: '1234567', action: 'created' })
+    const poke = transport.lastReq('rc/github-installation')!
+    expect(poke.payload).toEqual({ installationId: '1234567', action: 'created' })
+  })
+
+  it('emitCodeHostDelivery reports a verified delivery when READY, drops it otherwise', async () => {
+    const { client, transport } = makeClient()
+    const observed = {
+      provider: 'gitea',
+      repoExternalId: '7701234',
+      deliveryKey: '11111111-2222-4333-8444-555555555555',
+      receivedAt: '2026-09-12T00:00:00.000Z',
+      verifiedWith: 'next' as const
+    }
+    // Not READY yet — dropped (safe: the binding stays unverified until the next delivery).
+    client.emitCodeHostDelivery(observed)
+    expect(transport.sent).toHaveLength(0)
+
+    await handshakeToReady(client, transport)
+    client.emitCodeHostDelivery(observed)
+    expect(transport.lastReq('rc/codehost-delivery')!.payload).toEqual(observed)
+  })
+
+  it('persists PR feedback only after the CP advertises the compatible receiver', async () => {
+    const { client, transport } = makeClient()
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, [PULL_REQUEST_FEEDBACK_FEATURE])
+    const signal = {
+      deliveryKey: 'delivery-feedback-1',
+      installationId: '1234567',
+      repoId: '987654321',
+      repoFullName: 'acme/infra',
+      pullNumber: 77
+    } as const
+
+    const pending = client.reportPullRequestFeedback(signal)
+    await flush()
+    const request = transport.lastReq('rc/pull-request-feedback')!
+    transport.inject(
+      buildRelayCpFrame(
+        'rc/pull-request-feedback/ok',
+        { deliveryKey: signal.deliveryKey, accepted: true },
+        { corr: request.id }
+      )
+    )
+    await expect(pending).resolves.toBe(true)
+
+    transport.simulateClose(1012)
+    await expect(client.reportPullRequestFeedback(signal)).rejects.toMatchObject({ retryable: true })
+  })
+
+  it('reports TURN bytes per Computer only to a CP that meters them, and says when the link is down', async () => {
+    const usage = {
+      from: '2026-10-20T00:00:00.000Z',
+      to: '2026-10-20T00:01:00.000Z',
+      entries: [{ computerId: '00000000-0000-4000-8000-0000000000aa', bytes: 2048 }]
+    }
+    const { client, transport } = makeClient()
+    expect(client.reportComputerMediaUsage(usage)).toEqual({ ready: false, taken: false })
+    client.start()
+    await flush()
+    await completeHandshake(transport)
+    expect(client.reportComputerMediaUsage(usage)).toEqual({ ready: true, taken: false })
+    expect(transport.lastReq('rc/computer-media-usage')).toBeUndefined()
+
+    const metered = makeClient()
+    metered.client.start()
+    await flush()
+    await completeHandshake(metered.transport, 15, undefined, [COMPUTER_MEDIA_USAGE_FEATURE])
+    expect(metered.client.reportComputerMediaUsage(usage)).toEqual({ ready: true, taken: true })
+    expect(metered.transport.lastReq('rc/computer-media-usage')?.payload).toEqual(usage)
+  })
+
+  it('sends a wake-only event only to a CP that holds follow-up watches, and applies their EVTs', async () => {
+    const watches: unknown[] = []
+    const { client, transport } = makeClient()
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, [PULL_REQUEST_FEEDBACK_FEATURE])
+    const signal = {
+      deliveryKey: 'delivery-merged-1',
+      installationId: '1234567',
+      repoId: '987654321',
+      repoFullName: 'example-org/example-repo',
+      pullNumber: 77,
+      subject: 'pull',
+      event: 'merged',
+      wakeOnly: true
+    } as const
+    await expect(client.reportFollowUpEvent(signal)).resolves.toBe(false)
+    expect(transport.lastReq('rc/pull-request-feedback')).toBeUndefined()
+
+    const watching = makeClient({ onFollowUpWatch: (watch) => watches.push(watch) })
+    watching.client.start()
+    await flush()
+    await completeHandshake(watching.transport, 15, undefined, [PULL_REQUEST_FEEDBACK_FEATURE, FOLLOW_UP_WATCH_FEATURE])
+    const pending = watching.client.reportFollowUpEvent(signal)
+    await flush()
+    const request = watching.transport.lastReq('rc/pull-request-feedback')!
+    expect(request.payload).toMatchObject({ event: 'merged', wakeOnly: true })
+    watching.transport.inject(
+      buildRelayCpFrame(
+        'rc/pull-request-feedback/ok',
+        { deliveryKey: signal.deliveryKey, accepted: true },
+        { corr: request.id }
+      )
+    )
+    await expect(pending).resolves.toBe(true)
+
+    const watch = {
+      provider: 'github',
+      installationId: '1234567',
+      repoId: '987654321',
+      subject: 'pull',
+      number: 77,
+      watched: true
+    } as const
+    watching.transport.inject(buildRelayCpFrame('rc/follow-up-watch', watch))
+    await flush()
+    expect(watches).toEqual([watch])
+  })
+
+  it('sends rc/bot-revoked evidence only to a CP that advertises credential checks', async () => {
+    const report = {
+      botId: RELAY_ID,
+      reason: 'tokens_revoked',
+      credentialRevision: 3,
+      evidence: 'probe',
+      code: 'token_revoked'
+    } as const
+    const answer = async (transport: FakeTransport, pending: Promise<boolean>) => {
+      await flush()
+      const request = transport.lastReq('rc/bot-revoked')!
+      transport.inject(buildRelayCpFrame('rc/bot-revoked/ok', { botId: RELAY_ID, applied: true }, { corr: request.id }))
+      await expect(pending).resolves.toBe(true)
+      return request.payload
+    }
+
+    const older = makeClient()
+    older.client.start()
+    await flush()
+    await completeHandshake(older.transport)
+    const legacy = await answer(older.transport, older.client.reportBotRevoked(report))
+    expect(legacy).toEqual({ botId: RELAY_ID, reason: 'tokens_revoked', credentialRevision: 3 })
+
+    const current = makeClient()
+    current.client.start()
+    await flush()
+    await completeHandshake(current.transport, 15, undefined, [BOT_CREDENTIAL_CHECK_FEATURE])
+    expect(await answer(current.transport, current.client.reportBotRevoked(report))).toEqual(report)
+  })
+
+  it('reports a credential check only to a CP that advertises it, settled by any reply', async () => {
+    const check = {
+      botId: RELAY_ID,
+      credentialRevision: 3,
+      result: 'rejected',
+      code: 'invalid_auth',
+      observedAtMs: 1_000
+    } as const
+    const { client, transport } = makeClient()
+    await expect(client.reportBotCredentialCheck(check)).resolves.toBe(false) // link down
+
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, [BOT_CREDENTIAL_CHECK_FEATURE])
+    const pending = client.reportBotCredentialCheck(check)
+    await flush()
+    const request = transport.lastReq('rc/bot-credential-check')!
+    expect(request.payload).toEqual(check)
+    // `applied: false` (a replaced credential, an older observation) settles it just the same.
+    transport.inject(
+      buildRelayCpFrame('rc/bot-credential-check/ok', { botId: RELAY_ID, applied: false }, { corr: request.id })
+    )
+    await expect(pending).resolves.toBe(true)
+
+    const older = makeClient()
+    older.client.start()
+    await flush()
+    await completeHandshake(older.transport)
+    await expect(older.client.reportBotCredentialCheck(check)).resolves.toBe(false)
+    expect(older.transport.lastReq('rc/bot-credential-check')).toBeUndefined()
+  })
+
+  it('reports a learned tenant only to a CP that advertises it, settled by any reply', async () => {
+    const report = { botId: RELAY_ID, tenantId: 'customers/C0000000000' }
+    const { client, transport } = makeClient()
+    await expect(client.reportBotTenant(report)).resolves.toBe(false) // link down
+
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, [BOT_TENANT_FEATURE])
+    const pending = client.reportBotTenant(report)
+    await flush()
+    const request = transport.lastReq('rc/bot-tenant')!
+    expect(request.payload).toEqual(report)
+    // `applied: false` (a key the row knew, or refused) settles it just the same.
+    transport.inject(buildRelayCpFrame('rc/bot-tenant/ok', { botId: RELAY_ID, applied: false }, { corr: request.id }))
+    await expect(pending).resolves.toBe(true)
+
+    const older = makeClient()
+    older.client.start()
+    await flush()
+    await completeHandshake(older.transport)
+    await expect(older.client.reportBotTenant(report)).resolves.toBe(false)
+    expect(older.transport.lastReq('rc/bot-tenant')).toBeUndefined()
+  })
+
+  // v1's single bot-wide watermark let replicas overwrite each other, so only v2's per-relay observations are fed.
+  it('treats a CP that advertises only bot-credential-check-v1 as having no credential checks', async () => {
+    expect(BOT_CREDENTIAL_CHECK_FEATURE).toBe('bot-credential-check-v2')
+    const { client, transport } = makeClient()
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, ['bot-credential-check-v1'])
+
+    expect(client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE)).toBe(false)
+    await expect(
+      client.reportBotCredentialCheck({ botId: RELAY_ID, credentialRevision: 1, result: 'ok', observedAtMs: 1 })
+    ).resolves.toBe(false)
+    expect(transport.lastReq('rc/bot-credential-check')).toBeUndefined()
+  })
+
+  it('remembers what the last registration advertised while the link is down', async () => {
+    const { client, transport } = makeClient()
+    expect(client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE)).toBe(false)
+    client.start()
+    await flush()
+    await completeHandshake(transport, 15, undefined, [BOT_CREDENTIAL_CHECK_FEATURE])
+    expect(client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE)).toBe(true)
+
+    // A probe between links keeps its tier instead of falling back to revoking.
+    transport.simulateClose(1012)
+    expect(client.advertisedFeature(BOT_CREDENTIAL_CHECK_FEATURE)).toBe(true)
+  })
+
+  it('emitBotChannels reports the snapshot when READY and signals deferral otherwise', async () => {
+    const { client, transport } = makeClient()
+    const snapshot = { botId: RELAY_ID, channels: [{ id: 'C1', name: 'deploys' }] }
+
+    expect(client.emitBotChannels(snapshot)).toBe(false)
+    expect(transport.sent).toHaveLength(0)
+
+    await handshakeToReady(client, transport)
+    expect(client.emitBotChannels(snapshot)).toBe(true)
+    expect(transport.lastReq('rc/bot-channels')?.payload).toEqual(snapshot)
+  })
+
+  it('emits participant joins without overloading thread-owner reports', async () => {
+    const { client, transport } = makeClient()
+    const target = {
+      botId: RELAY_ID,
+      sessionKey: 'C1/ts',
+      agentId: RELAY_ID,
+      daemonId: DAEMON_ID
+    }
+
+    expect(client.emitThreadParticipant(target)).toBe(false)
+    await handshakeToReady(client, transport)
+    expect(client.emitThreadParticipant(target)).toBe(true)
+
+    expect(transport.lastReq('rc/thread-participant')?.payload).toEqual(target)
+    expect(transport.lastReq('rc/thread-assign')).toBeUndefined()
+  })
+
+  it('reconnects with backoff on a non-fatal close', async () => {
+    const clock = new FakeClock()
+    const transports: FakeTransport[] = []
+    const connect = vi.fn(async () => {
+      const t = new FakeTransport()
+      transports.push(t)
+      return t
+    })
+    const client = new RelayCpClient({
+      auth: { method: 'token', credential: TOKEN },
+      name: 'relay-0',
+      daemonUrl: 'wss://relay-0.example',
+      heartbeatDefaultMs: 15_000,
+      clock,
+      connect,
+      log: silentLog,
+      jitter: () => 0
+    })
+    client.start()
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1)
+    // The initial socket dies before/after handshake — non-fatal (1012) → DEGRADED.
+    transports[0]!.simulateClose(1012)
+    expect(client.state).toBe('DEGRADED')
+    // Backoff base = 1000ms (jitter 0). Nothing before, a reconnect after.
+    clock.advance(999)
+    expect(connect).toHaveBeenCalledTimes(1)
+    clock.advance(1)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(2)
+  })
+
+  it('treats a 4401 close as fatal and never reconnects', async () => {
+    const { client, clock, transport, connect } = makeClient()
+    await handshakeToReady(client, transport)
+    transport.simulateClose(4401)
+    expect(client.state).toBe('CLOSED')
+    clock.advance(60_000)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1) // no reconnect
+  })
+
+  it('verify() waits out a link that is not READY, then rejects when it never becomes READY', async () => {
+    const { client, clock } = makeClient()
+    let settled = false
+    const outcome = client
+      .verify('daemon-key', 'creds')
+      .catch((err: unknown) => err)
+      .finally(() => (settled = true))
+    clock.advance(9_000)
+    await flush()
+    expect(settled).toBe(false)
+    clock.advance(1_000)
+    await flush()
+    await expect(outcome).resolves.toMatchObject({ message: expect.stringMatching(/not ready/) })
+  })
+
+  it('verify() sent while the link is reconnecting goes out once it is READY', async () => {
+    const { client, transport } = makeClient()
+    const p = client.verify('webchat-token', 'the-browser-token')
+    await flush()
+    expect(transport.lastReq('rc/verify')).toBeUndefined()
+    await handshakeToReady(client, transport)
+    await flush()
+    const req = transport.lastReq('rc/verify')!
+    transport.inject(
+      buildRelayCpFrame(
+        'rc/verify/ok',
+        { ok: true, agentId: DAEMON_ID, daemonId: DAEMON_ID, orgId: 'org-1', conversationId: DAEMON_ID },
+        { corr: req.id }
+      )
+    )
+    await expect(p).resolves.toMatchObject({ ok: true })
+  })
+
+  it('verify() round-trips rc/verify → rc/verify/ok when READY', async () => {
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+    const p = client.verify('daemon-key', 'the-daemon-key')
+    await flush()
+    const req = transport.lastReq('rc/verify')!
+    expect(req.payload).toEqual({ kind: 'daemon-key', credential: 'the-daemon-key' })
+    transport.inject(
+      buildRelayCpFrame('rc/verify/ok', { ok: true, daemonId: DAEMON_ID, orgId: 'org-1' }, { corr: req.id })
+    )
+    await expect(p).resolves.toMatchObject({ ok: true, daemonId: DAEMON_ID })
+  })
+
+  it('marks webchat verification as conversation-binding aware', async () => {
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+    const p = client.verify('webchat-token', 'the-browser-token')
+    await flush()
+    const req = transport.lastReq('rc/verify')!
+    expect(req.payload).toEqual({
+      kind: 'webchat-token',
+      credential: 'the-browser-token',
+      conversationBinding: 'v1'
+    })
+    transport.inject(
+      buildRelayCpFrame(
+        'rc/verify/ok',
+        {
+          ok: true,
+          agentId: DAEMON_ID,
+          daemonId: DAEMON_ID,
+          orgId: 'org-1',
+          conversationId: DAEMON_ID
+        },
+        { corr: req.id }
+      )
+    )
+    await expect(p).resolves.toMatchObject({ ok: true, conversationId: DAEMON_ID })
+  })
+
+  it('authorizeGithubComment() round-trips one metadata-only request', async () => {
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const p = client.authorizeGithubComment(COMMENT_AUTHZ)
+    await flush()
+    const req = transport.lastReq('rc/github-comment-authz')!
+    expect(req.payload).toEqual(COMMENT_AUTHZ)
+    transport.inject(buildRelayCpFrame('rc/github-comment-authz/ok', { allowed: true }, { corr: req.id }))
+
+    await expect(p).resolves.toBe(true)
+    expect(client.state).toBe('READY')
+    expect(transport.closed).toBeUndefined()
+  })
+
+  it('authorizeGithubComment() treats an old CP error as a single-shot failure and keeps the link READY', async () => {
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const result = client.authorizeGithubComment(COMMENT_AUTHZ)
+    await flush()
+    const req = transport.lastReq('rc/github-comment-authz')!
+    transport.inject(
+      buildRelayCpFrame('error', { code: 'UNKNOWN_FRAME', message: 'unsupported', retryable: false }, { corr: req.id })
+    )
+
+    await expect(result).rejects.toMatchObject({ code: 'UNKNOWN_FRAME', retryable: false })
+    expect(transport.sent.filter((frame) => frame.type === 'rc/github-comment-authz')).toHaveLength(1)
+    expect(client.state).toBe('READY')
+    expect(transport.closed).toBeUndefined()
+  })
+
+  it('authorizeGithubRerequest() round-trips one metadata-only projection lookup', async () => {
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const pending = client.authorizeGithubRerequest(REREQUEST)
+    await flush()
+    const req = transport.lastReq('rc/github-rerequest')!
+    expect(req.payload).toEqual(REREQUEST)
+    const result = {
+      allowed: true as const,
+      hookId: COMMENT_AUTHZ.hookId,
+      pullNumber: 585,
+      configRevision: '3',
+      dispatchRevision: '5'
+    }
+    transport.inject(buildRelayCpFrame('rc/github-rerequest/ok', result, { corr: req.id }))
+
+    await expect(pending).resolves.toEqual(result)
+    expect(client.state).toBe('READY')
+  })
+
+  it('authorizeGithubComment() rides out a CP restart instead of failing closed', async () => {
+    const { client, transports, reconnect } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+    transports[0]!.simulateClose(1012)
+
+    // The delivery is already answered 202: waiting for the link is the difference
+    // between a review and a silently skipped one.
+    const pending = client.authorizeGithubComment(COMMENT_AUTHZ)
+    await flush()
+    expect(transports[0]!.sent.filter((f) => f.type === 'rc/github-comment-authz')).toHaveLength(0)
+
+    const next = await reconnect()
+    await flush()
+    const req = next.lastReq('rc/github-comment-authz')!
+    expect(req.payload).toEqual(COMMENT_AUTHZ)
+    next.inject(buildRelayCpFrame('rc/github-comment-authz/ok', { allowed: true }, { corr: req.id }))
+    await expect(pending).resolves.toBe(true)
+  })
+
+  it('authorizeGithubComment() re-issues a request the dying link swallowed, exactly once', async () => {
+    const { client, transports, reconnect } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+
+    const pending = client.authorizeGithubComment(COMMENT_AUTHZ)
+    await flush()
+    expect(transports[0]!.lastReq('rc/github-comment-authz')).toBeDefined()
+    transports[0]!.simulateClose(1012) // in-flight REQ rejects as retryable
+
+    const next = await reconnect()
+    await flush()
+    const req = next.lastReq('rc/github-comment-authz')!
+    next.inject(buildRelayCpFrame('rc/github-comment-authz/ok', { allowed: false }, { corr: req.id }))
+
+    await expect(pending).resolves.toBe(false)
+    expect(next.sent.filter((f) => f.type === 'rc/github-comment-authz')).toHaveLength(1)
+  })
+
+  it('authorizeGithubComment() does not re-ask over a link that never died', async () => {
+    // A retryable answer is not proof the connection dropped: the CP replies
+    // retryable for its own GitHub/DB blips, and an ack timeout is retryable
+    // too. Re-issuing on that same link would duplicate the upstream lookup.
+    const { client, transport } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const pending = client.authorizeGithubComment(COMMENT_AUTHZ)
+    await flush()
+    const req = transport.lastReq('rc/github-comment-authz')!
+    transport.inject(
+      buildRelayCpFrame('error', { code: 'INTERNAL', message: 'github blip', retryable: true }, { corr: req.id })
+    )
+
+    await expect(pending).rejects.toMatchObject({ retryable: true })
+    expect(transport.sent.filter((f) => f.type === 'rc/github-comment-authz')).toHaveLength(1)
+    expect(client.state).toBe('READY')
+  })
+
+  it('authorizeGithubComment() gives up when the ack never comes and the link stays up', async () => {
+    const { client, clock, transport } = makeClient()
+    await handshakeToReady(client, transport)
+
+    const settled = expect(client.authorizeGithubComment(COMMENT_AUTHZ)).rejects.toMatchObject({ retryable: true })
+    await flush()
+    clock.advance(5_000) // the single-shot ack budget — retryable, but the link never dropped
+    await flush()
+
+    await settled
+    expect(transport.sent.filter((f) => f.type === 'rc/github-comment-authz')).toHaveLength(1)
+  })
+
+  it('authorizeGithubComment() still fails closed when the link stays down', async () => {
+    const { client, clock, transports } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+    transports[0]!.simulateClose(1012)
+
+    const settled = expect(client.authorizeGithubComment(COMMENT_AUTHZ)).rejects.toMatchObject({ retryable: true })
+    clock.advance(30_000) // the wait window, with no CP answering the reconnect
+    await flush()
+
+    await settled
+    for (const transport of transports) {
+      expect(transport.sent.filter((f) => f.type === 'rc/github-comment-authz')).toHaveLength(0)
+    }
+  })
+
+  it('replays run reports queued while the link was down, oldest first', async () => {
+    const { client, transports, reconnect } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+    transports[0]!.simulateClose(1012)
+
+    // A delivery refused pre-dispatch never reaches a daemon, so this row is the
+    // only trace it ever gets — dropping it shows the console nothing at all.
+    client.emitRunReport({ ...RUN_REPORT, deliveryKey: 'delivery-1' })
+    client.emitRunReport({ ...RUN_REPORT, deliveryKey: 'delivery-2' })
+
+    const next = await reconnect()
+    const replayed = next.sent.filter((f) => f.type === 'rc/run-report')
+    expect(replayed.map((f) => (f.payload as { deliveryKey: string }).deliveryKey)).toEqual([
+      'delivery-1',
+      'delivery-2'
+    ])
+    expect((replayed[0]!.payload as { firedAt: string }).firedAt).toBe(RUN_REPORT.firedAt)
+  })
+
+  it('bounds the queued run reports, dropping the oldest', async () => {
+    const { client, transports, reconnect } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+    transports[0]!.simulateClose(1012)
+
+    for (let i = 0; i < 205; i++) client.emitRunReport({ ...RUN_REPORT, deliveryKey: `delivery-${i}` })
+
+    const next = await reconnect()
+    const replayed = next.sent.filter((f) => f.type === 'rc/run-report')
+    expect(replayed).toHaveLength(200)
+    expect((replayed[0]!.payload as { deliveryKey: string }).deliveryKey).toBe('delivery-5')
+  })
+})
+
+describe('RelayCpClient lookups across a CP handoff', () => {
+  it('lookupThread() re-asks a lookup the dying link swallowed, once, over the replaced link', async () => {
+    const { client, transports, reconnect } = makeReconnectingClient()
+    client.start()
+    await flush()
+    await completeHandshake(transports[0]!)
+    const lookup = { botId: DAEMON_ID, sessionKey: 'slack:C1:1.0' }
+    const pending = client.lookupThread(lookup)
+    await flush()
+    expect(transports[0]!.lastReq('rc/thread-lookup')).toBeDefined()
+    transports[0]!.simulateClose(1012)
+    const next = await reconnect()
+    await flush()
+    const req = next.lastReq('rc/thread-lookup')!
+    expect(req.payload).toEqual(lookup)
+    next.inject(
+      buildRelayCpFrame('rc/thread-lookup/ok', { ...lookup, target: null, participants: [] }, { corr: req.id })
+    )
+    await expect(pending).resolves.toMatchObject({ target: null })
+  })
+})
+
+describe('RelayCpClient redial after a planned CP restart', () => {
+  async function readyClient() {
+    const harness = makeReconnectingClient()
+    harness.client.start()
+    await flush()
+    await completeHandshake(harness.transports[0]!)
+    expect(harness.client.state).toBe('READY')
+    return harness
+  }
+
+  it('redials fast with a capped handshake and does not escalate while the handoff window lasts', async () => {
+    const { clock, transports, connect } = await readyClient()
+    expect(connect.mock.calls[0]).toEqual([undefined])
+    transports[0]!.simulateClose(1012)
+    clock.advance(249)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1)
+    clock.advance(1)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(2)
+    expect(connect.mock.calls[1]).toEqual([{ handshakeTimeoutMs: 1000 }])
+    // A redial that lands on the retiring pod fails; the next one still comes 250 ms later.
+    transports[1]!.simulateClose(1006)
+    await flush()
+    clock.advance(250)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps ordinary backoff for a drop that is not a planned restart', async () => {
+    const { clock, transports, connect } = await readyClient()
+    transports[0]!.simulateClose(1006)
+    clock.advance(999)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1)
+    clock.advance(1)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(2)
+    expect(connect.mock.calls[1]).toEqual([undefined])
+  })
+
+  it('resumes ordinary backoff once the handoff window has passed', async () => {
+    const { clock, transports, connect } = await readyClient()
+    transports[0]!.simulateClose(1012)
+    while (clock.now() < 10_000) {
+      clock.advance(250)
+      await flush()
+      transports.at(-1)!.simulateClose(1006)
+      await flush()
+    }
+    const caps = connect.mock.calls.flatMap(([opts]) => (opts?.handshakeTimeoutMs ? [opts.handshakeTimeoutMs] : []))
+    expect(Math.max(...caps)).toBe(1000)
+    expect(Math.min(...caps)).toBe(250) // the last redial inside the window gets only what is left of it
+    const dials = connect.mock.calls.length
+    clock.advance(999)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(dials)
+    clock.advance(1)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(dials + 1)
+    expect(connect.mock.calls.at(-1)).toEqual([undefined])
+  })
+})
+
+describe('RelayCpClient dedicated GitHub App webhooks', () => {
+  it('hands the assign and unassign frames to the table', async () => {
+    const onGithubAppAssign = vi.fn()
+    const onGithubAppUnassign = vi.fn()
+    const { client, transport } = makeClient({ onGithubAppAssign, onGithubAppUnassign })
+    await handshakeToReady(client, transport)
+    const assign = { githubAppId: DAEMON_ID, appId: '2000', webhookSecret: 'whsec-example' }
+    transport.inject(buildRelayCpFrame('rc/github-app-assign', assign))
+    transport.inject(buildRelayCpFrame('rc/github-app-unassign', { githubAppId: DAEMON_ID }))
+    await flush()
+    expect(onGithubAppAssign).toHaveBeenCalledWith(assign)
+    expect(onGithubAppUnassign).toHaveBeenCalledWith({ githubAppId: DAEMON_ID })
+  })
+})
+
+describe('RelayCpClient reconnect snapshots', () => {
+  it('advertises snapshot support and hands the frames to the tables', async () => {
+    const onSnapshotBegin = vi.fn()
+    const onSnapshotEnd = vi.fn()
+    const { client, transport } = makeClient({ onSnapshotBegin, onSnapshotEnd })
+    await handshakeToReady(client, transport)
+    expect((transport.lastReq('rc/register')!.payload as { features: string[] }).features).toContain(
+      RELAY_PROJECTION_SNAPSHOT_V1_FEATURE
+    )
+    const snapshotId = '33333333-3333-4333-8333-333333333333'
+    transport.inject(buildRelayCpFrame('rc/snapshot-begin', { kind: 'mcp', snapshotId }))
+    transport.inject(buildRelayCpFrame('rc/snapshot-end', { kind: 'mcp', snapshotId, withheld: [DAEMON_ID] }))
+    await flush()
+    expect(onSnapshotBegin).toHaveBeenCalledWith({ kind: 'mcp', snapshotId })
+    expect(onSnapshotEnd).toHaveBeenCalledWith({ kind: 'mcp', snapshotId, withheld: [DAEMON_ID] })
+  })
+})
+
+describe('RelayCpClient — frame fragments', () => {
+  it('reassembles a CP frame past the cap and dispatches it', async () => {
+    const onCollabRoutes = vi.fn()
+    const { client, transport } = makeClient({ onCollabRoutes })
+    await handshakeToReady(client, transport)
+    const channels = Array.from({ length: 2500 }, (_, i) => ({
+      orgId: 'org_default',
+      platform: 'slack' as const,
+      channelId: `C${String(i).padStart(10, '0')}`,
+      agents: [{ agentId: '33333333-3333-4333-8333-333333333333', daemonId: '44444444-4444-4444-8444-444444444444' }]
+    }))
+    const text = JSON.stringify(
+      buildRelayCpFrame('rc/collab-routes', { generation: 1, channels, agents: [], platformKinds: [] })
+    )
+    const parts = fragmentFrame(text, 'rc/fragment')!
+    expect(parts.length).toBeGreaterThan(1)
+    for (const part of parts) {
+      expect(Buffer.byteLength(part)).toBeLessThanOrEqual(MAX_FRAME_BYTES)
+      transport.injectText(part)
+    }
+    await flush()
+    expect(onCollabRoutes).toHaveBeenCalledOnce()
+    expect(onCollabRoutes.mock.calls[0]![0].channels).toHaveLength(2500)
+    expect(client.state).toBe('READY')
+  })
+})

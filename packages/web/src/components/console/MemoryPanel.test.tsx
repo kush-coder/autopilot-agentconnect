@@ -1,0 +1,829 @@
+// @vitest-environment happy-dom
+
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  updateAgent: vi.fn(),
+  // How many memory browsers have mounted: a home or migration change must remount it so it reads again.
+  entryMounts: 0,
+  isMobile: false,
+  // What the wake answers; the panel presses it once when a memory read refuses as a sleeping sandbox.
+  wake: 'starting' as 'running' | 'starting' | 'unsupported'
+}))
+
+vi.mock('@/components/console/UnifiedMemoryPanel', async () => {
+  const { useEffect } = await import('react')
+  return {
+    UnifiedMemoryPanel: (props: { channelKey?: string; sandboxed?: boolean; overview?: unknown }) => {
+      useEffect(() => {
+        mocks.entryMounts += 1
+      }, [])
+      return (
+        <div
+          data-testid="entries-memory-view"
+          data-sandboxed={String(props.sandboxed ?? '')}
+          data-channel={props.channelKey ?? ''}
+          data-overview={props.overview ? 'yes' : 'no'}
+        />
+      )
+    }
+  }
+})
+
+vi.mock('@/components/console/MemoryLayerBrowser', async () => {
+  const { useEffect } = await import('react')
+  return {
+    MemoryLayerBrowser: (props: { sandboxed?: boolean; header?: ReactNode }) => {
+      useEffect(() => {
+        mocks.entryMounts += 1
+      }, [])
+      return (
+        <>
+          {props.header}
+          <div data-testid="layer-memory-view" data-sandboxed={String(props.sandboxed ?? '')} />
+        </>
+      )
+    }
+  }
+})
+
+vi.mock('next/dynamic', () => ({ default: () => () => null }))
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({ updateAgent: mocks.updateAgent })
+}))
+
+vi.mock('@/lib/api', () => {
+  class ApiError extends Error {
+    constructor(
+      message: string,
+      public status = 500,
+      public code?: string
+    ) {
+      super(message)
+    }
+  }
+  return {
+    ApiError,
+    fetchAgentMemoryFull: vi.fn(),
+    listAgentMemory: vi.fn(),
+    updateAgentMemory: vi.fn(),
+    fetchAgentMemoryChannels: vi.fn(async () => ({ channels: [] })),
+    clearAgentMemoryChannel: vi.fn(async () => ({ cleared: true })),
+    wakeAgent: vi.fn(() => Promise.resolve({ state: mocks.wake })),
+    // Pulled in by the workspace read model the sandbox code constant lives beside; never called from here.
+    fetchWorkspaceFiles: vi.fn(),
+    fetchWorkspaceGitStatus: vi.fn()
+  }
+})
+
+vi.mock('@/components/console/ExternalMemoryBindingFields', () => ({
+  DEFAULT_EXTERNAL_MEMORY_BINDING: {
+    connectionId: '',
+    recall: { mode: 'auto', topK: 5, maxBytes: 8192, timeoutMs: 3000 },
+    captureMode: 'manual'
+  },
+  ExternalMemoryBindingFields: () => null
+}))
+
+vi.mock('@/lib/use-is-mobile', () => ({ useIsMobile: () => mocks.isMobile }))
+
+vi.mock('@/components/console/DreamPanel', () => ({
+  DreamPanel: () => <div data-testid="dream-memory-view" />
+}))
+
+import {
+  ApiError,
+  clearAgentMemoryChannel,
+  fetchAgentMemoryFull,
+  listAgentMemory,
+  updateAgentMemory,
+  fetchAgentMemoryChannels,
+  wakeAgent
+} from '@/lib/api'
+import type { ReactNode } from 'react'
+import { MemoryPanel } from './MemoryPanel'
+
+const CONNECTION_ID = '11111111-1111-4111-8111-111111111111'
+
+let root: Root | undefined
+let container: HTMLDivElement | undefined
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+
+beforeEach(() => {
+  mocks.updateAgent.mockReset().mockResolvedValue(undefined)
+  mocks.entryMounts = 0
+  mocks.isMobile = false
+  mocks.wake = 'starting'
+  vi.mocked(wakeAgent)
+    .mockReset()
+    .mockImplementation(() => Promise.resolve({ state: mocks.wake }))
+  vi.mocked(listAgentMemory)
+    .mockReset()
+    .mockResolvedValue({
+      exists: true,
+      files: [{ name: 'MEMORY.md', size: 9, mtime: '2026-07-27T09:00:00.000Z' }]
+    })
+  vi.mocked(fetchAgentMemoryFull)
+    .mockReset()
+    .mockResolvedValue({ exists: true, content: '# Memory', mtime: '2026-07-27T09:00:00.000Z' })
+  vi.mocked(updateAgentMemory)
+    .mockReset()
+    .mockResolvedValue({ path: 'MEMORY.md', size: 9, mtime: '2026-07-27T09:01:00.000Z' })
+  vi.mocked(fetchAgentMemoryChannels).mockReset().mockResolvedValue({ channels: [] })
+  vi.mocked(clearAgentMemoryChannel).mockReset().mockResolvedValue({ cleared: true })
+})
+
+afterEach(async () => {
+  if (root) await act(async () => root?.unmount())
+  container?.remove()
+  root = undefined
+  container = undefined
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
+
+const recallPolicy = () => ({
+  mode: 'auto' as const,
+  topK: 5,
+  maxBytes: 8192,
+  timeoutMs: 3000
+})
+
+/** The settings form opens from the summary line's Change link. */
+const openSettings = async (host: HTMLElement) => {
+  const changeButton = Array.from(host.querySelectorAll('button')).find((button) => button.textContent === 'Change')
+  expect(changeButton).toBeTruthy()
+  await act(async () => changeButton?.click())
+}
+
+const clickButton = async (host: HTMLElement, label: string) => {
+  const button = Array.from(host.querySelectorAll<HTMLButtonElement>('button')).find(
+    (candidate) => candidate.textContent?.trim() === label
+  )
+  expect(button, `${label} button`).toBeTruthy()
+  await act(async () => button?.click())
+}
+
+const changeValue = async (element: HTMLInputElement | HTMLTextAreaElement, value: string) => {
+  await act(async () => {
+    const prototype = element instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype
+    Object.getOwnPropertyDescriptor(prototype, 'value')?.set?.call(element, value)
+    element.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+describe('MemoryPanel settings draft', () => {
+  it('locks dreaming off when the runtime cannot dream', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+          canDream={false}
+        />
+      )
+    })
+
+    await openSettings(container)
+    const dreaming = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((box) =>
+      box.parentElement?.textContent?.includes('Enable dreaming')
+    )
+    expect(dreaming?.checked).toBe(false)
+    expect(dreaming?.disabled).toBe(true)
+    expect(container.textContent).not.toContain('Run on a schedule')
+  })
+
+  it('defaults managed memory to daily auto-adopting dreaming and lets users opt out', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    await openSettings(container)
+    const checkboxFor = (text: string) =>
+      [...container!.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((box) =>
+        box.parentElement?.textContent?.includes(text)
+      )
+
+    expect(checkboxFor('Enable dreaming')?.checked).toBe(true)
+    expect(checkboxFor('Run on a schedule')?.checked).toBe(true)
+    // Auto-adopt is on by default, so the accuracy caveat is shown up front.
+    expect(checkboxFor('Automatically adopt completed memory results')?.checked).toBe(true)
+    expect(container.textContent).toContain('Daily')
+    expect(container.textContent).toContain('Results can be inaccurate')
+
+    // Opt out of automatic acceptance.
+    await act(async () => checkboxFor('Automatically adopt completed memory results')?.click())
+    expect(container.textContent).not.toContain('Results can be inaccurate')
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent === 'Save memory settings'
+    )
+    await act(async () => save?.click())
+
+    expect(mocks.updateAgent).toHaveBeenCalledWith('22222222-2222-4222-8222-222222222222', {
+      memory: {
+        provider: 'managed',
+        autoDistill: false,
+        home: 'daemon',
+        dreaming: { enabled: true, schedule: '0 4 * * *', mineSkills: true, autoAdopt: false }
+      }
+    })
+  })
+
+  // Skill mining is on by default, and the daemon keys three separate things off
+  // that one flag (the extract-procedures phase, the tool rows in the prompt, and
+  // the grounding set). The control lets a user opt out; turning it off must be
+  // sent explicitly so the daemon does not fall back to the mine-by-default policy.
+  it('turns skill mining off and sends it with the memory binding', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    await openSettings(container)
+    const checkboxFor = (text: string) =>
+      [...container!.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((box) =>
+        box.parentElement?.textContent?.includes(text)
+      )
+
+    expect(checkboxFor('Also mine reusable skills')?.checked).toBe(true)
+    expect(container.textContent).toContain('Suggested skills always need your review')
+
+    // Opt out of skill mining.
+    await act(async () => checkboxFor('Also mine reusable skills')?.click())
+    expect(container.textContent).not.toContain('at least two sessions')
+
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent === 'Save memory settings'
+    )
+    await act(async () => save?.click())
+
+    expect(mocks.updateAgent).toHaveBeenCalledWith('22222222-2222-4222-8222-222222222222', {
+      memory: {
+        provider: 'managed',
+        autoDistill: false,
+        home: 'daemon',
+        dreaming: { enabled: true, schedule: '0 4 * * *', mineSkills: false, autoAdopt: true }
+      }
+    })
+  })
+
+  it('collapses the settings form behind a summary of the persisted backend', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    // Collapsed: no provider picker, but the summary names the active backend
+    // and scope; the persisted memory content is shown.
+    expect(container.querySelector('[data-memory-provider="managed"]')).toBeNull()
+    expect(container.textContent).toContain('Managed')
+    expect(container.textContent).toContain('Dreaming daily')
+    expect(container.textContent).toContain('Auto-accept on')
+    expect(container.textContent).toContain('Skill mining on')
+    expect(container.textContent).not.toContain('scope')
+    expect(container.querySelector('[data-testid="layer-memory-view"]')).not.toBeNull()
+
+    await openSettings(container)
+    expect(container.querySelector('[data-memory-provider="managed"]')).not.toBeNull()
+
+    // Closing without changes collapses it again.
+    const closeButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Close'
+    )
+    await act(async () => closeButton?.click())
+    expect(container.querySelector('[data-memory-provider="managed"]')).toBeNull()
+  })
+
+  it('offers no memory scope: dreaming applies to every managed agent and a save sends no scope', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    await openSettings(container)
+    expect(container.querySelector('[data-memory-scope]')).toBeNull()
+    expect(container.textContent).toContain("a person's DMs stay theirs")
+    expect(container.textContent).toContain('Enable dreaming')
+
+    const autoDistill = [...container.querySelectorAll<HTMLLabelElement>('label')].find((label) =>
+      label.textContent?.includes('distill')
+    )
+    await act(async () => autoDistill?.querySelector('input')?.click())
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (button) => button.textContent === 'Save memory settings'
+    )
+    await act(async () => save?.click())
+    expect(mocks.updateAgent).toHaveBeenCalledWith('22222222-2222-4222-8222-222222222222', {
+      memory: { provider: 'managed', autoDistill: true, home: 'daemon' }
+    })
+  })
+
+  it('hides the persisted memory session while a different backend is selected but unsaved', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    expect(container.querySelector('[data-testid="layer-memory-view"]')).not.toBeNull()
+    await openSettings(container)
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-memory-provider="external"]')?.click()
+    })
+
+    expect(container.querySelector('[data-testid="layer-memory-view"]')).toBeNull()
+    expect(container.querySelector('[data-testid="entries-memory-view"]')).toBeNull()
+    expect(container.querySelector('[data-testid="record-memory-view"]')).toBeNull()
+    expect(container.textContent).toContain('Save memory settings to switch to External and view its memory.')
+
+    const cancelButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Cancel'
+    )
+    await act(async () => cancelButton?.click())
+
+    expect(container.querySelector('[data-testid="layer-memory-view"]')).not.toBeNull()
+    // Cancelling also collapses the form back to the summary line.
+    expect(container.querySelector('[data-memory-provider="external"]')).toBeNull()
+  })
+
+  it('preserves unsaved edits when refreshed props contain an equivalent recall object', async () => {
+    const props = {
+      agentId: '22222222-2222-4222-8222-222222222222',
+      canEdit: true,
+      memoryProvider: 'external',
+      autoDistill: false,
+      memoryConnectionId: CONNECTION_ID,
+      memoryCaptureMode: 'manual' as const
+    }
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryRecall={recallPolicy()} />)
+    })
+
+    await openSettings(container)
+    const nativeButton = container.querySelector<HTMLButtonElement>('[data-memory-provider="native"]')
+    expect(nativeButton).not.toBeNull()
+    await act(async () => {
+      nativeButton?.click()
+    })
+    expect(nativeButton?.className).toContain('pill on')
+
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryRecall={recallPolicy()} />)
+    })
+
+    expect(nativeButton?.className).toContain('pill on')
+
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryRecall={{ ...recallPolicy(), topK: 6 }} />)
+    })
+
+    expect(nativeButton?.className).not.toContain('pill on')
+    expect(container.querySelector<HTMLButtonElement>('[data-memory-provider="external"]')?.className).toContain(
+      'pill on'
+    )
+  })
+
+  it('keeps a persisted dreaming policy across mount and equivalent prop refreshes', async () => {
+    // Regression: the prop-sync effect must carry `memoryDreaming` (otherwise an
+    // enabled policy renders as off right after mount and a later save erases
+    // it), and must compare the policy's semantic fields — polling hands us a new
+    // object every refresh, which must not clobber an in-progress draft.
+    const dreaming = () => ({ enabled: true, sessionWindow: 40, instructions: 'focus on prefs' })
+    const props = {
+      agentId: '33333333-3333-4333-8333-333333333333',
+      canEdit: true,
+      memoryProvider: 'managed',
+      autoDistill: false
+    }
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryDreaming={dreaming()} />)
+    })
+
+    await openSettings(container)
+    const dreamingBox = () =>
+      [...container!.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((box) =>
+        box.parentElement?.textContent?.includes('Enable dreaming')
+      )
+    // Survives the mount effect rather than resetting to "Dreaming off".
+    expect(dreamingBox()?.checked).toBe(true)
+
+    // An equivalent (re-created) policy object must not reset the toggle.
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryDreaming={dreaming()} />)
+    })
+    expect(dreamingBox()?.checked).toBe(true)
+
+    // A genuine change in a semantic field does re-sync.
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryDreaming={{ ...dreaming(), enabled: false }} />)
+    })
+    expect(dreamingBox()?.checked).toBe(false)
+  })
+
+  it('places dreaming below the live memory browser', async () => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="33333333-3333-4333-8333-333333333333"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+          memoryDreaming={{ enabled: true }}
+        />
+      )
+    })
+
+    const memory = container.querySelector('[data-testid="layer-memory-view"]')
+    const dreaming = container.querySelector('[data-testid="dream-memory-view"]')
+    expect(memory).not.toBeNull()
+    expect(dreaming).not.toBeNull()
+    if (!memory || !dreaming) throw new Error('Expected memory and dreaming panels')
+    expect(memory.compareDocumentPosition(dreaming) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('resyncs on a timezone-only refresh, so a later save cannot restore the stale zone', async () => {
+    // `timezone` is preserved through the wholesale memory PATCH but not edited
+    // in the UI. If it were missing from the prop-sync dependency list, a
+    // timezone-only poll would leave the draft on the old zone and the next
+    // unrelated edit would silently write it back.
+    const props = {
+      agentId: '44444444-4444-4444-8444-444444444444',
+      canEdit: true,
+      memoryProvider: 'managed',
+      autoDistill: false
+    }
+    const policy = (timezone: string) => ({ enabled: true, schedule: '0 4 * * *', timezone })
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryDreaming={policy('UTC')} />)
+    })
+    await openSettings(container)
+
+    // Only the timezone changes upstream.
+    await act(async () => {
+      root?.render(<MemoryPanel {...props} memoryDreaming={policy('America/New_York')} />)
+    })
+
+    // An unrelated edit (auto-distill) then saves the WHOLE binding.
+    const distillBox = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((box) =>
+      box.parentElement?.textContent?.includes('Automatically distill')
+    )
+    await act(async () => {
+      distillBox?.click()
+    })
+    const save = [...container.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent === 'Save memory settings'
+    )
+    await act(async () => {
+      save?.click()
+    })
+
+    const saved = mocks.updateAgent.mock.calls.at(-1)?.[1] as
+      { memory?: { dreaming?: { timezone?: string } } } | undefined
+    expect(saved?.memory?.dreaming?.timezone).toBe('America/New_York')
+  })
+
+  it('uses an app confirmation before persisting a backend switch', async () => {
+    const nativeConfirm = vi.fn(() => true)
+    vi.stubGlobal('confirm', nativeConfirm)
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId="22222222-2222-4222-8222-222222222222"
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+        />
+      )
+    })
+
+    await openSettings(container)
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>('[data-memory-provider="native"]')?.click()
+    })
+    const saveButton = Array.from(container.querySelectorAll('button')).find(
+      (button) => button.textContent === 'Save memory settings'
+    )
+    await act(async () => saveButton?.click())
+
+    expect(nativeConfirm).not.toHaveBeenCalled()
+    expect(mocks.updateAgent).not.toHaveBeenCalled()
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]')
+    expect(dialog?.textContent).toContain('Switch memory backend')
+
+    const confirmButton = Array.from(dialog?.querySelectorAll('button') ?? []).find(
+      (button) => button.textContent === 'Switch backend'
+    )
+    await act(async () => confirmButton?.click())
+
+    expect(mocks.updateAgent).toHaveBeenCalledWith('22222222-2222-4222-8222-222222222222', {
+      memory: { provider: 'native', autoDistill: false }
+    })
+    // A successful save collapses the form back to the summary bar.
+    expect(container.querySelector('[data-memory-provider="native"]')).toBeNull()
+  })
+})
+
+// A cluster agent's managed memory lives on its sandbox volume (#1078), so the memory reads refuse with the same
+// asleep code the workspace reads do — and the panel answers it the way the Files surfaces do: one wake, then a poll.
+describe('MemoryPanel memory views', () => {
+  const AGENT = '22222222-2222-4222-8222-222222222222'
+
+  const mount = async (props: Partial<Parameters<typeof MemoryPanel>[0]> = {}) => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(<MemoryPanel agentId={AGENT} canEdit memoryProvider="managed" autoDistill={false} {...props} />)
+      await Promise.resolve()
+    })
+    return container
+  }
+  const entries = (host: HTMLElement) => host.querySelector<HTMLElement>('[data-testid="entries-memory-view"]')
+  const layers = (host: HTMLElement) => host.querySelector<HTMLElement>('[data-testid="layer-memory-view"]')
+
+  it('lets the layer browser wake the sandbox only for a managed tree that lives on it', async () => {
+    let host = await mount({ sandboxed: true })
+    expect(layers(host)?.getAttribute('data-sandboxed')).toBe('true')
+    expect(entries(host)).toBeNull()
+    await act(async () => root?.unmount())
+    container?.remove()
+    // A `control-plane` home is read through the daemon's connection; the pod has nothing to do with it.
+    host = await mount({ sandboxed: true, memoryHome: 'control-plane' })
+    expect(layers(host)?.getAttribute('data-sandboxed')).toBe('false')
+  })
+
+  it('shows external memory through the entry browser alone', async () => {
+    const host = await mount({
+      sandboxed: true,
+      memoryProvider: 'external',
+      memoryConnectionId: CONNECTION_ID,
+      memoryRecall: recallPolicy(),
+      memoryCaptureMode: 'manual'
+    })
+    expect(entries(host)).not.toBeNull()
+    expect(layers(host)).toBeNull()
+    expect(entries(host)?.getAttribute('data-sandboxed')).toBe('')
+    expect(entries(host)?.getAttribute('data-overview')).toBe('no')
+  })
+
+  it('shows no memory contents for native memory, which the runtime keeps to itself', async () => {
+    const host = await mount({ memoryProvider: 'native', memoryDreaming: { enabled: true } })
+    expect(entries(host)).toBeNull()
+    expect(layers(host)).toBeNull()
+    expect(host.querySelector('[data-testid="dream-memory-view"]')).toBeNull()
+  })
+})
+
+// The managed home is chosen one way (memory-evolution.md §3.2.1): `daemon` → `control-plane` from the selector behind a
+// confirmation, the return only as a forced action behind its own dialog, and on the pool no choice at all.
+describe('MemoryPanel memory home', () => {
+  const AGENT_ID = '22222222-2222-4222-8222-222222222222'
+
+  const mount = async (props: Partial<Parameters<typeof MemoryPanel>[0]> = {}) => {
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => {
+      root?.render(<MemoryPanel agentId={AGENT_ID} canEdit memoryProvider="managed" autoDistill={false} {...props} />)
+    })
+    return container
+  }
+
+  const homePill = (host: HTMLElement, value: string) =>
+    host.querySelector<HTMLButtonElement>(`[data-memory-home="${value}"]`)
+  const dialog = (host: HTMLElement) => host.querySelector<HTMLElement>('[role="dialog"]')
+  const dialogButton = (host: HTMLElement, label: string) =>
+    Array.from(dialog(host)?.querySelectorAll('button') ?? []).find((button) => button.textContent === label)
+
+  it('reads the home from the binding and carries it through an unrelated save', async () => {
+    const host = await mount({ memoryHome: 'control-plane' })
+    expect(host.textContent).toContain('In the Control Plane')
+    await openSettings(host)
+    const autoDistill = host.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    await act(async () => autoDistill?.click())
+    await clickButton(host, 'Save memory settings')
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT_ID, {
+      memory: { provider: 'managed', autoDistill: true, home: 'control-plane' }
+    })
+  })
+
+  it('moves daemon → control-plane from the selector, but only after the confirmation', async () => {
+    const host = await mount()
+    await openSettings(host)
+    expect(homePill(host, 'daemon')?.getAttribute('aria-pressed')).toBe('true')
+    expect(homePill(host, 'daemon')?.disabled).toBe(false)
+    expect(homePill(host, 'control-plane')?.disabled).toBe(false)
+
+    await act(async () => homePill(host, 'control-plane')?.click())
+    await clickButton(host, 'Save memory settings')
+    expect(mocks.updateAgent).not.toHaveBeenCalled()
+    expect(dialog(host)?.textContent).toContain('Move memory to the Control Plane?')
+    expect(dialog(host)?.textContent).toContain('Memory is unavailable until the copy completes')
+
+    await act(async () => dialogButton(host, 'Move')?.click())
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT_ID, {
+      memory: { provider: 'managed', autoDistill: false, home: 'control-plane' }
+    })
+    expect(dialog(host)).toBeNull()
+  })
+
+  it('shows the quiet status and locks the control while the copy is pending', async () => {
+    const host = await mount({ memoryHome: 'control-plane', memoryHomeMigration: 'pending' })
+    expect(host.querySelector('[data-memory-home-status]')?.textContent).toContain(
+      'Moving memory to the Control Plane…'
+    )
+    await openSettings(host)
+    expect(homePill(host, 'daemon')).toBeNull()
+    expect(homePill(host, 'control-plane')?.disabled).toBe(true)
+    expect(host.textContent).not.toContain('Move memory back to the daemon')
+  })
+
+  it('offers no daemon in the selector once the home is control-plane; the return is a forced action', async () => {
+    const host = await mount({ memoryHome: 'control-plane' })
+    await openSettings(host)
+    expect(homePill(host, 'daemon')).toBeNull()
+    expect(homePill(host, 'control-plane')?.getAttribute('aria-pressed')).toBe('true')
+
+    await clickButton(host, 'Move memory back to the daemon')
+    expect(mocks.updateAgent).not.toHaveBeenCalled()
+    expect(dialog(host)?.textContent).toContain('Move memory back to the daemon?')
+    expect(dialog(host)?.textContent).toContain('Nothing is kept')
+
+    await act(async () => dialogButton(host, 'Move')?.click())
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT_ID, {
+      memory: { provider: 'managed', autoDistill: false, home: 'daemon' },
+      force: true
+    })
+    expect(dialog(host)).toBeNull()
+    expect(host.textContent).toContain('On the daemon')
+  })
+
+  it("surfaces the server's refusal inside the return dialog", async () => {
+    mocks.updateAgent.mockRejectedValueOnce(new ApiError('moving the memory home back requires force', 409))
+    const host = await mount({ memoryHome: 'control-plane' })
+    await openSettings(host)
+    await clickButton(host, 'Move memory back to the daemon')
+    await act(async () => dialogButton(host, 'Move')?.click())
+    expect(dialog(host)?.querySelector('[role="alert"]')?.textContent).toContain('requires force')
+  })
+
+  it('fixes the home to control-plane on a group or the pool, with a reason and no way back', async () => {
+    const host = await mount({ memberSetPlaced: true })
+    await openSettings(host)
+    expect(homePill(host, 'daemon')).toBeNull()
+    expect(homePill(host, 'control-plane')?.disabled).toBe(true)
+    expect(homePill(host, 'control-plane')?.getAttribute('aria-pressed')).toBe('true')
+    expect(host.querySelector('[data-memory-home-reason]')?.textContent).toContain('a group or the managed pool')
+    expect(host.textContent).not.toContain('Move memory back to the daemon')
+
+    // A set-placed agent's binding always carries the only home it may have, even when the DTO predates the field.
+    const autoDistill = host.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    await act(async () => autoDistill?.click())
+    await clickButton(host, 'Save memory settings')
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT_ID, {
+      memory: { provider: 'managed', autoDistill: true, home: 'control-plane' }
+    })
+  })
+
+  it('keeps memory managed in the Control Plane while assistant mode is on, with a reason and no way back', async () => {
+    // A binding older than the mode reads as daemon; the draft is still pinned to the only home it may carry.
+    const host = await mount({ assistantMode: true })
+    await openSettings(host)
+    expect(homePill(host, 'daemon')).toBeNull()
+    expect(homePill(host, 'control-plane')?.disabled).toBe(true)
+    expect(homePill(host, 'control-plane')?.getAttribute('aria-pressed')).toBe('true')
+    expect(host.querySelector('[data-memory-home-reason]')?.textContent).toContain('Turn assistant mode off')
+    expect(host.textContent).not.toContain('Move memory back to the daemon')
+    const providerPill = (value: string) => host.querySelector<HTMLButtonElement>(`[data-memory-provider="${value}"]`)
+    expect(providerPill('managed')?.disabled).toBe(false)
+    expect(['native', 'external', 'none'].map((value) => providerPill(value)?.disabled)).toEqual([true, true, true])
+
+    const autoDistill = host.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    await act(async () => autoDistill?.click())
+    await clickButton(host, 'Save memory settings')
+    expect(mocks.updateAgent).toHaveBeenCalledWith(AGENT_ID, {
+      memory: { provider: 'managed', autoDistill: true, home: 'control-plane' }
+    })
+  })
+
+  it('renders the field and the return action on mobile too', async () => {
+    mocks.isMobile = true
+    const host = await mount({ memoryHome: 'control-plane' })
+    await openSettings(host)
+    expect(homePill(host, 'control-plane')).toBeTruthy()
+    expect(host.textContent).toContain('Move memory back to the daemon')
+  })
+
+  it('drops the cached browser and reads again once the home has changed underneath it', async () => {
+    const host = await mount({ memoryHome: 'control-plane' })
+    const mounts = mocks.entryMounts
+    await openSettings(host)
+    await clickButton(host, 'Move memory back to the daemon')
+    await act(async () => dialogButton(host, 'Move')?.click())
+    // The agents poll delivers the returned binding; the tree the browser showed is gone with it.
+    await act(async () => {
+      root?.render(
+        <MemoryPanel agentId={AGENT_ID} canEdit memoryProvider="managed" autoDistill={false} memoryHome="daemon" />
+      )
+    })
+    expect(mocks.entryMounts).toBeGreaterThan(mounts)
+  })
+
+  it('retries the reads when the pending copy clears', async () => {
+    const host = await mount({ memoryHome: 'control-plane', memoryHomeMigration: 'pending' })
+    const mounts = mocks.entryMounts
+    await act(async () => {
+      root?.render(
+        <MemoryPanel
+          agentId={AGENT_ID}
+          canEdit
+          memoryProvider="managed"
+          autoDistill={false}
+          memoryHome="control-plane"
+        />
+      )
+    })
+    expect(host.querySelector('[data-memory-home-status]')).toBeNull()
+    expect(mocks.entryMounts).toBeGreaterThan(mounts)
+  })
+})

@@ -1,0 +1,344 @@
+// Explicit repository grants (agent-multi-repo-authorization.md): a write to a projected field — id, name, materialize, staleness — bumps the agent's configRevision in the same transaction, or the daemon refuses the spec.
+import type {
+  AgentRepoAuthorization,
+  PrismaClient,
+  RepoMaterialization as DbRepoMaterialization,
+  User
+} from '../../generated/prisma/client.js'
+import { Prisma } from '../../generated/prisma/client.js'
+import type { PrismaLike } from '../prisma.js'
+import type { CodeHostProvider } from '@agentconnect.md/protocol'
+import type {
+  AgentRepoAuthorizationRecord,
+  AgentRepoAuthorizationRepo,
+  RepoAccess,
+  RepoGrantAttestationSubject,
+  RepoGrantStaleReason,
+  RepoMaterialization
+} from '../ports.js'
+import { AgentId, OrgId } from '../../domain/ids.js'
+import { PgHookRepo } from './hook.repo.js'
+import { lockHookReviewAgentRepoScope } from '../review-projection-lock.js'
+import { AgentWorkspaceRepoConflict } from '../errors.js'
+import { joinGiteaBindingFence } from './gitea-binding-fence.js'
+import { joinAzureDevOpsBindingFence } from './azure-devops-binding-fence.js'
+import { bumpAgentConfigRevisions } from './organization-environment-fence.js'
+
+// An Azure DevOps grant's routing is read through the binding its connection column names (azure-devops-integration.md §4).
+const withCreator = {
+  createdBy: true,
+  azureDevOpsBinding: {
+    select: {
+      connection: { select: { organization: true } },
+      identity: { select: { projectId: true, repositoryId: true } }
+    }
+  }
+} as const
+
+type Row = AgentRepoAuthorization & {
+  createdBy: User | null
+  azureDevOpsBinding: {
+    connection: { organization: string }
+    identity: { projectId: string; repositoryId: string }
+  } | null
+}
+
+// The wire spells it `on-demand`; the Prisma enum member is `on_demand` (its `@map` keeps the DB value on the wire spelling).
+const toDbMaterialization = (m: RepoMaterialization): DbRepoMaterialization => (m === 'on-demand' ? 'on_demand' : m)
+const fromDbMaterialization = (m: DbRepoMaterialization): RepoMaterialization => (m === 'on_demand' ? 'on-demand' : m)
+
+/** The tiers a write may raise to each tier from; access never falls without revoke and authorize again. */
+export const RAISABLE_FROM: Record<RepoAccess, RepoAccess[]> = {
+  read: [],
+  comment: ['read'],
+  write: ['read', 'comment']
+}
+
+function toRecord(r: Row): AgentRepoAuthorizationRecord {
+  return {
+    id: r.id,
+    agentId: AgentId(r.agentId),
+    provider: r.provider as CodeHostProvider,
+    repoId: r.repoId,
+    repoFullName: r.repoFullName,
+    access: r.access as RepoAccess,
+    materialize: fromDbMaterialization(r.materialize),
+    createdAt: r.createdAt,
+    createdBy: r.createdBy
+      ? { userId: r.createdBy.id, displayName: r.createdBy.displayName, email: r.createdBy.email }
+      : null,
+    attestedByUserId: r.attestedByUserId,
+    stale:
+      r.staleSince && r.staleReason ? { since: r.staleSince, reason: r.staleReason as RepoGrantStaleReason } : null,
+    ...(r.connectionId !== null ? { connectionId: r.connectionId } : {}),
+    ...(r.azureDevOpsBinding
+      ? {
+          azureDevOps: {
+            organization: r.azureDevOpsBinding.connection.organization,
+            projectId: r.azureDevOpsBinding.identity.projectId,
+            repositoryId: r.azureDevOpsBinding.identity.repositoryId
+          }
+        }
+      : {})
+  }
+}
+
+export class PgAgentRepoAuthorizationRepo implements AgentRepoAuthorizationRepo {
+  constructor(private readonly db: PrismaLike) {}
+
+  private transaction<T>(fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    if ('$transaction' in this.db) return (this.db as PrismaClient).$transaction(fn)
+    return fn(this.db as Prisma.TransactionClient)
+  }
+
+  async create(input: {
+    agentId: AgentId
+    provider: CodeHostProvider
+    repoId: bigint
+    repoFullName: string
+    access: RepoAccess
+    materialize?: RepoMaterialization
+    createdByUserId?: string
+    attestedAt?: Date
+    connectionId?: string
+  }): Promise<AgentRepoAuthorizationRecord> {
+    return this.transaction(async (tx) => {
+      // Linearize with lazy workspace-id repair. If create wins first, repair
+      // deletes the now-redundant row; if repair wins, create observes the
+      // numeric workspace identity and refuses to recreate it.
+      await lockHookReviewAgentRepoScope(tx, input.agentId, input.repoId)
+      const agent = await tx.agent.findUnique({
+        where: { id: input.agentId },
+        select: { orgId: true, workspaceRepoId: true, gitCredentialProvider: true }
+      })
+      // The hosts number repositories independently, so the workspace collides only
+      // when the grant names ITS provider — `gitCredentialProvider` is that provider.
+      if (agent?.workspaceRepoId === input.repoId && agent.gitCredentialProvider === input.provider) {
+        throw new AgentWorkspaceRepoConflict(input.repoId)
+      }
+      // A gitea grant references a binding (gitea-integration.md §6): it commits only while that binding is live.
+      if (input.provider === 'gitea' && agent) await joinGiteaBindingFence(tx, agent.orgId, input.repoId)
+      // An Azure DevOps grant names its connection's binding (azure-devops-integration.md §5), under the same kind of fence.
+      if (input.provider === 'azure-devops' && agent) {
+        if (input.connectionId === undefined) throw new Error('an azure-devops grant names its connection')
+        await joinAzureDevOpsBindingFence(tx, agent.orgId, input.connectionId, input.repoId)
+      }
+      const row = await tx.agentRepoAuthorization.create({
+        data: {
+          agentId: input.agentId,
+          provider: input.provider,
+          repoId: input.repoId,
+          repoFullName: input.repoFullName,
+          access: input.access,
+          materialize: toDbMaterialization(input.materialize ?? 'always'),
+          ...(input.provider === 'azure-devops' ? { connectionId: input.connectionId ?? null } : {}),
+          ...(input.createdByUserId
+            ? { createdByUserId: input.createdByUserId, attestedByUserId: input.createdByUserId }
+            : {}),
+          ...(input.attestedAt ? { attestationCheckedAt: input.attestedAt } : {})
+        },
+        include: withCreator
+      })
+      await bumpAgentConfigRevisions(tx, [input.agentId])
+      return toRecord(row)
+    })
+  }
+
+  async get(id: string): Promise<AgentRepoAuthorizationRecord | null> {
+    const row = await this.db.agentRepoAuthorization.findUnique({ where: { id }, include: withCreator })
+    return row ? toRecord(row) : null
+  }
+
+  async listForAgent(agentId: AgentId): Promise<AgentRepoAuthorizationRecord[]> {
+    const rows = await this.db.agentRepoAuthorization.findMany({
+      where: { agentId },
+      include: withCreator,
+      orderBy: { createdAt: 'asc' }
+    })
+    return rows.map(toRecord)
+  }
+
+  async listForRepository(
+    orgId: OrgId,
+    provider: CodeHostProvider,
+    repoId: bigint
+  ): Promise<AgentRepoAuthorizationRecord[]> {
+    const rows = await this.db.agentRepoAuthorization.findMany({
+      where: { provider, repoId, agent: { orgId } },
+      include: withCreator,
+      orderBy: { createdAt: 'asc' }
+    })
+    return rows.map(toRecord)
+  }
+
+  // Raise-only at the write: the tier condition is re-read after a concurrent raise commits, so a stale request is a no-op.
+  async updateAccess(id: string, access: RepoAccess): Promise<AgentRepoAuthorizationRecord | null> {
+    await this.db.agentRepoAuthorization.updateMany({
+      where: { id, access: { in: RAISABLE_FROM[access] } },
+      data: { access }
+    })
+    return this.get(id)
+  }
+
+  async raiseAttested(
+    id: string,
+    access: RepoAccess,
+    attestation: { userId: string; at: Date }
+  ): Promise<{ row: AgentRepoAuthorizationRecord; restored: boolean } | null> {
+    return this.transaction(async (tx) => {
+      // Lock before reading the suspension, so a concurrent verdict either lands first and is seen, or waits for this write.
+      const [before] = await tx.$queryRaw<{ agentId: string; staleSince: Date | null }[]>(Prisma.sql`
+        SELECT "agentId", "staleSince" FROM "agent_repo_authorization" WHERE id = ${id}::uuid FOR UPDATE
+      `)
+      if (!before) return null
+      // The raiser vouched for the new tier, which covers every lower one, so a stale grant is honored again.
+      const raised = await tx.agentRepoAuthorization.updateMany({
+        where: { id, access: { in: RAISABLE_FROM[access] } },
+        data: {
+          access,
+          attestedByUserId: attestation.userId,
+          attestationCheckedAt: attestation.at,
+          staleSince: null,
+          staleReason: null
+        }
+      })
+      // Staleness is projected (a stale grant leaves the spec), so honoring it again advances the revision.
+      const restored = raised.count > 0 && before.staleSince !== null
+      if (restored) await bumpAgentConfigRevisions(tx, [before.agentId])
+      const row = await tx.agentRepoAuthorization.findUnique({ where: { id }, include: withCreator })
+      return row ? { row: toRecord(row), restored } : null
+    })
+  }
+
+  async claimDueForReattestation(
+    provider: CodeHostProvider,
+    checkedBefore: Date,
+    now: Date
+  ): Promise<(AgentRepoAuthorizationRecord & { orgId: OrgId }) | null> {
+    // SKIP LOCKED: concurrent sweeps take different rows; stamping first rotates a row back even when its check fails.
+    const claimed = await this.db.$queryRaw<{ id: string }[]>(Prisma.sql`
+      WITH picked AS (
+        SELECT id FROM "agent_repo_authorization"
+        WHERE "provider" = ${provider}
+          AND ("attestationCheckedAt" IS NULL OR "attestationCheckedAt" < ${checkedBefore})
+        ORDER BY "attestationCheckedAt" ASC NULLS FIRST, "createdAt" ASC, id ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE "agent_repo_authorization" g SET "attestationCheckedAt" = ${now}
+      FROM picked WHERE g.id = picked.id
+      RETURNING g.id
+    `)
+    const id = claimed[0]?.id
+    if (!id) return null
+    const row = await this.db.agentRepoAuthorization.findUnique({
+      where: { id },
+      include: { ...withCreator, agent: { select: { orgId: true } } }
+    })
+    return row ? { ...toRecord(row), orgId: OrgId(row.agent.orgId) } : null
+  }
+
+  async recordAttestation(
+    id: string,
+    subject: RepoGrantAttestationSubject,
+    verdict: RepoGrantStaleReason | null,
+    at: Date
+  ): Promise<boolean> {
+    return this.transaction(async (tx) => {
+      // A raise or a new attester since the check makes the verdict moot, so it lands only while both still hold.
+      const checked = { id, attestedByUserId: subject.attestedByUserId, access: subject.access }
+      let flipped
+      if (verdict === null) {
+        flipped = await tx.agentRepoAuthorization.updateMany({
+          where: { ...checked, staleSince: { not: null } },
+          data: { staleSince: null, staleReason: null }
+        })
+      } else {
+        flipped = await tx.agentRepoAuthorization.updateMany({
+          where: { ...checked, staleSince: null },
+          data: { staleSince: at, staleReason: verdict }
+        })
+        // Already stale: keep when it went stale, refresh only why.
+        if (flipped.count === 0) {
+          await tx.agentRepoAuthorization.updateMany({
+            where: { ...checked, staleReason: { not: verdict } },
+            data: { staleReason: verdict }
+          })
+        }
+      }
+      if (flipped.count === 0) return false
+      const row = await tx.agentRepoAuthorization.findUnique({ where: { id }, select: { agentId: true } })
+      if (row) await bumpAgentConfigRevisions(tx, [row.agentId])
+      return true
+    })
+  }
+
+  async updateMaterialize(id: string, materialize: RepoMaterialization): Promise<AgentRepoAuthorizationRecord | null> {
+    return this.transaction(async (tx) => {
+      const row = await tx.agentRepoAuthorization.findUnique({ where: { id }, include: withCreator })
+      if (!row) return null
+      const next = toDbMaterialization(materialize)
+      if (row.materialize === next) return toRecord(row)
+      const updated = await tx.agentRepoAuthorization.update({
+        where: { id },
+        data: { materialize: next },
+        include: withCreator
+      })
+      await bumpAgentConfigRevisions(tx, [row.agentId])
+      return toRecord(updated)
+    })
+  }
+
+  async updateFullName(id: string, repoFullName: string): Promise<void> {
+    await this.transaction(async (tx) => {
+      // updateMany (not update) so a concurrently-deleted row is a count of 0, not a throw.
+      const changed = await tx.agentRepoAuthorization.updateMany({
+        where: { id, repoFullName: { not: repoFullName } },
+        data: { repoFullName }
+      })
+      if (changed.count === 0) return
+      const row = await tx.agentRepoAuthorization.findUnique({ where: { id }, select: { agentId: true } })
+      if (row) await bumpAgentConfigRevisions(tx, [row.agentId])
+    })
+  }
+
+  async remove(id: string): Promise<void> {
+    await this.transaction(async (tx) => {
+      const row = await tx.agentRepoAuthorization.findUnique({ where: { id }, select: { agentId: true } })
+      const removed = await tx.agentRepoAuthorization.deleteMany({ where: { id } })
+      if (removed.count > 0 && row) await bumpAgentConfigRevisions(tx, [row.agentId])
+    })
+  }
+
+  async removeWithReviewProjectionCleanup(
+    id: string,
+    agentId: AgentId,
+    provider: CodeHostProvider,
+    repoId: bigint,
+    at: Date,
+    desiredState: string
+  ): Promise<void> {
+    await this.transaction(async (tx) => {
+      await lockHookReviewAgentRepoScope(tx, agentId, repoId)
+      const agent = await tx.agent.findUnique({
+        where: { id: agentId },
+        select: { workspaceRepoId: true, gitCredentialProvider: true }
+      })
+      const workspaceIsThisRepo = agent?.workspaceRepoId === repoId && agent.gitCredentialProvider === provider
+      // HookReviewProjection is the GitHub Checks ledger — GitLab publishes notes and
+      // has no durable projection to retire, so only a github grant reaches it.
+      //
+      // A lazy workspace repair may have classified this legacy grant while
+      // the delete request was in flight. Deleting the duplicate is harmless;
+      // tombstoning would incorrectly revoke still-valid workspace Checks.
+      if (provider === 'github' && !workspaceIsThisRepo) {
+        // PgHookRepo re-enters the same xact advisory lock before its candidate
+        // scan. PostgreSQL transaction advisory locks are re-entrant, keeping
+        // the shared lock order without opening a no-row race.
+        await new PgHookRepo(tx).tombstoneReviewProjectionsForAgentRepo(agentId, repoId, at, desiredState)
+      }
+      const removed = await tx.agentRepoAuthorization.deleteMany({ where: { id, agentId, provider, repoId } })
+      if (removed.count > 0) await bumpAgentConfigRevisions(tx, [agentId])
+    })
+  }
+}

@@ -1,0 +1,691 @@
+/**
+ * GitCredentialCache — daemon-side memory for CP-minted git credentials
+ * (docs/designs/github-app-git-credentials.md §Daemon Side;
+ * docs/designs/agent-multi-repo-authorization.md §Daemon for the
+ * per-repo keying, issue #457).
+ *
+ * Tokens live ONLY here (and transiently on helper stdout pipes): never disk,
+ * never argv, never a log line. Expiry is tracked on the MONOTONIC clock as
+ * `receivedAt + ttlSec` — a skewed wall clock must never resurrect a dead
+ * token (`expiresAt` in the grant is observability only).
+ *
+ * Keying: `(agentId, plane, repo?)` — the git plane ('contents' capability)
+ * and the gh plane (contents+issues+pull_requests, plus actions when the CP
+ * advertises support) are distinct tokens with
+ * separate lifecycles, and every non-workspace repo is its own token (single
+ * repo scope). `repo` absent ⇒ the agent's workspace repo, the pre-#457 keys.
+ *
+ * Threshold nesting: entries are handed out only while >10min remain (the CP
+ * serves grants with ≥15min, so a fresh grant always clears this). Per-key
+ * in-flight coalescing (the `cloneInFlight` pattern) keeps a cold cache from
+ * fanning N concurrent helper/pull/prefetch calls into N WS REQs.
+ *
+ * Denial semantics split (multi-repo design §Security Boundary): an AGENT-level
+ * SCOPE_DENIED (workspace request) is terminal — stop asking until the spec
+ * replicates. A REPO-level SCOPE_DENIED (request that named a repo) is a
+ * 60s NEGATIVE CACHE only: the operator authorizing the repo in the console
+ * must take effect on the next gh/git call within a minute, without a spec
+ * push or daemon restart.
+ *
+ * Degradation: outside READY the fetch fails fast (see CpClient.requestGitCred)
+ * and an UNEXPIRED cached token keeps serving — CP downtime only breaks remote
+ * git once the hour runs out.
+ */
+import {
+  GITEA_DEFAULT_BASE_URL,
+  GITLAB_DEFAULT_BASE_URL,
+  type CodeHostProvider,
+  type GitCredCapability,
+  type GitCredGrant,
+  type GitCredRequest
+} from '@agentconnect.md/protocol'
+import {
+  codeHostCredentials,
+  isLiveCredentialPurpose,
+  isProxyOnlyProvider,
+  type GitCredConsumer,
+  type QualifiedCodeHostProvider
+} from '../codehost/credentials.js'
+
+/** Hand out only while more than this remains (nests under the CP's 15min floor). */
+const HANDOUT_MIN_MS = 10 * 60 * 1000
+
+/** Repo-level denials are retried after this — the console-authorization lag. */
+const REPO_DENIAL_TTL_MS = 60 * 1000
+
+/** Pause before the single re-ask after a retryable INTERNAL mint failure. */
+const INTERNAL_RETRY_DELAY_MS = 250
+
+/** The baseline scope set behind `GH_TOKEN` (P2.5 write-back): git contents plus the
+ *  issue/PR scopes `gh issue comment` / `gh pr comment` need. The CP clamps
+ *  every capability — the workspace repo to the agent's gitAccess, an
+ *  additional repo to its authorization tier (comment ⇒ contents:read +
+ *  issues/PR:write). */
+const GH_TOKEN_CAPABILITIES: readonly GitCredCapability[] = ['contents', 'issues', 'pull_requests']
+
+/** The credential plane: 'git' = contents-only (the credential helper), 'gh' =
+ *  the widened GH_TOKEN set. Distinct capability sets are distinct tokens. */
+export type CredPlane = 'git' | 'gh' | 'glab'
+type CachePlane = CredPlane | 'gh-actions' | 'gh-research'
+
+/** Cache key — NUL-joined so no owner/repo string can collide across fields
+ *  (the GH_KEY precedent). GitHub is the EMPTY provider segment whether the request went out
+ *  v1-shaped or github-qualified: one logical credential must stay one entry across a CP up- or
+ *  downgrade, and the request shape is a wire negotiation, not part of the credential's identity. */
+const keyOf = (agentId: string, plane: CachePlane, repo?: string, provider?: QualifiedCodeHostProvider): string =>
+  `${plane}\u0000${agentId}\u0000${repo?.toLowerCase() ?? ''}\u0000${provider ?? ''}`
+
+/** Cache key for a repo-targeted COMMENT token (the GithubPoster's — issues/PR
+ *  only, no contents requested; its capability set differs from both planes so
+ *  it gets its own keyspace). One per (agent, repo). */
+const POST_KEY = (agentId: string, repo: string): string => `post\u0000${agentId}\u0000${repo.toLowerCase()}`
+
+/** Cache key for the gitlab note poster's effect token (§14.1) — its own keyspace. */
+const GITLAB_POST_KEY = (agentId: string, projectId: string): string => `postglab\u0000${agentId}\u0000${projectId}`
+
+/** Cache key for the structured broker's effect lease (§14.2) — a third keyspace, per (agent, project). */
+const GITLAB_EFFECT_KEY = (agentId: string, projectId: string): string => `fxglab\u0000${agentId}\u0000${projectId}`
+
+/** The Gitea twins (gitea-integration.md §10.1, §10.2): one token serves both, but each lease keeps its own keyspace per (agent, repository). */
+const GITEA_POST_KEY = (agentId: string, repoId: string): string => `postgitea\u0000${agentId}\u0000${repoId}`
+const GITEA_EFFECT_KEY = (agentId: string, repoId: string): string => `fxgitea\u0000${agentId}\u0000${repoId}`
+
+/** The Azure DevOps final poster's lease (azure-devops-integration.md §11.5), per (agent, repository). */
+const AZURE_DEVOPS_POST_KEY = (agentId: string, repoId: string): string => `postazure\u0000${agentId}\u0000${repoId}`
+
+/** The GitHub broker's token: the agent's own grant on the repository, in a keyspace of its own per (agent, repo). */
+const GITHUB_EFFECT_KEY = (agentId: string, repo: string): string =>
+  `fxgithub\u0000${agentId}\u0000${repo.toLowerCase()}`
+
+/** One credential-proxy lease of a proxy-only provider's repository: the access asked is part of the key, so a read lease never answers a push. */
+export interface ProxyLeaseAsk {
+  provider: QualifiedCodeHostProvider
+  externalRepoId: string
+  /** The repository's path for an additional repository; absent for the workspace's, which the lease names by the workspace alone. */
+  repoFullName?: string
+  requestedAccess?: 'read'
+}
+
+const PROXY_LEASE_KEY = (agentId: string, lease: ProxyLeaseAsk): string =>
+  `proxy\u0000${agentId}\u0000${lease.provider}\u0000${lease.externalRepoId}\u0000${lease.requestedAccess ?? ''}`
+
+/** Why a proxy-only provider's credential is refused to anyone but the proxy and the daemon's own Git. */
+export function proxyOnlyRefusal(provider: string | undefined): string {
+  const name = codeHostCredentials(provider)?.displayName ?? provider ?? 'this'
+  return `${name} credentials are presented only by the daemon's credential proxy; git and the CLI reach ${name} with the session's placeholder`
+}
+
+export class GitCredUnavailableError extends Error {
+  constructor(
+    message: string,
+    /** Terminal (agent-level SCOPE_DENIED): stop asking for this agent until config changes. */
+    readonly terminal: boolean,
+    /** Set when the control plane refused (SCOPE_DENIED), naming what it refused; absent for an outage. */
+    readonly denied?: 'repository' | 'agent'
+  ) {
+    super(message)
+    this.name = 'GitCredUnavailableError'
+  }
+}
+
+interface Entry {
+  username: string
+  token: string
+  repoFullName: string
+  /** §13.1 authorization level as the CP echoed it — 'comment' rides an effect lease only. */
+  access: GitCredGrant['access']
+  /** The purge fence the CP minted this grant under; absent when the CP echoed none. */
+  credentialEpoch?: string
+  /** The numeric repository identity the CP echoed, verified against the ask whenever it named one; GitHub's only source of it. */
+  externalRepoId?: string
+  /** Monotonic deadline (ms on the injected monotonic clock). */
+  expiresAtMono: number
+}
+
+export interface GitCredentialCacheDeps {
+  /** D→C `gitcred/request` — throws WireError-shaped errors (`code`, `retryable`). */
+  request: (payload: {
+    agentId: string
+    reason?: 'clone' | 'fetch' | 'pull' | 'push' | 'helper'
+    capabilities?: GitCredCapability[]
+    repoFullName?: string
+    purpose?: GitCredRequest['purpose']
+    hookId?: string
+    forceRefresh?: boolean
+    provider?: CodeHostProvider
+    externalRepoId?: string
+    requestedAccess?: 'read' | 'write'
+    consumer?: GitCredConsumer
+  }) => Promise<GitCredGrant>
+  log: { warn: (msg: string) => void }
+  /** Rolling-upgrade gate: old CPs reject the new enum value, so request Actions
+   *  only after register/ok advertises support. The cache key changes with this
+   *  value so reconnecting to an upgraded CP mints a fresh widened grant. */
+  actionsSupported?: () => boolean
+  /** §17.1 negotiation: a provider may be named only after register/ok carries
+   *  gitcred-provider-v2 — an older CP would strip the field and answer a
+   *  GitHub workspace grant for the wrong provider. */
+  providerV2Supported?: () => boolean
+  /** §17.3 negotiation: GitHub requests carry `provider: 'github'` only after the CP advertises
+   *  gitcred-github-v2 — an older CP strips the field and answers an unqualified grant, which the
+   *  echo check below would then have to refuse. Never part of the cache key (see keyOf). */
+  githubV2Supported?: () => boolean
+  /** §17.3 negotiation: `purpose: 'gitlab_effect'` is a NEW ENUM VALUE, so naming it to an
+   *  older CP is frame-fatal rather than silently stripped — ask only after gitlab-effect-v1. */
+  gitlabEffectSupported?: () => boolean
+  /** §24.4: the GitLab instance this agent's spec names, absent ⇒ GitLab.com. Every gitlab grant's
+   *  echoed host is verified against it exactly as provider and project id are — a mismatch means
+   *  the credential authenticates against a different instance and is never served. */
+  gitlabHostFor?: (agentId: string) => string | undefined
+  /** The Gitea twin (gitea-integration.md §9): `purpose: 'gitea_*'` is named only after the CP advertises
+   *  gitea-v1, and a gitea grant's echoed host is verified against the spec's instance, absent ⇒ gitea.com. */
+  giteaSupported?: () => boolean
+  giteaHostFor?: (agentId: string) => string | undefined
+  /** Monotonic ms; injectable for tests. */
+  monoNow?: () => number
+}
+
+/** The instance axis of each spec-hosted provider: which dep names the spec's host, and the value an absent one means. */
+interface InstanceAxis {
+  hostFor: 'gitlabHostFor' | 'giteaHostFor'
+  defaultHost: string
+}
+
+const INSTANCE_AXES: Partial<Record<string, InstanceAxis>> = {
+  gitlab: { hostFor: 'gitlabHostFor', defaultHost: GITLAB_DEFAULT_BASE_URL },
+  gitea: { hostFor: 'giteaHostFor', defaultHost: GITEA_DEFAULT_BASE_URL }
+}
+
+export class GitCredentialCache {
+  private readonly entries = new Map<string, Entry>()
+  private readonly inflight = new Map<string, Promise<Entry>>()
+  /** Poster keys whose next successful CP mint must bypass the CP token cache
+   *  after GitHub rejected the previous grant with 401/403. */
+  private readonly refreshPosts = new Set<string>()
+  /** Workspace keys the CP told us to stop asking for (agent-level
+   *  SCOPE_DENIED — moved/mode-off). Per KEY, so a gh-plane denial never
+   *  silences the git plane. */
+  private readonly denied = new Set<string>()
+  /** Repo-keyed denials → monotonic retry-after deadline (60s negative cache) and the CP's own reason. */
+  private readonly deniedRepos = new Map<string, { retryAfter: number; reason: string }>()
+  private readonly monoNow: () => number
+
+  constructor(private readonly deps: GitCredentialCacheDeps) {
+    this.monoNow = deps.monoNow ?? (() => performance.now())
+  }
+
+  /**
+   * A live credential for one of the agent's authorized repos — cached,
+   * coalesced, or freshly pulled. `repo` ("owner/repo") absent ⇒ the workspace
+   * repo (the pre-#457 behavior, byte-identical on the wire). `plane` picks the
+   * capability set: 'git' (contents, the credential helper) or 'gh' (the
+   * widened GH_TOKEN set for the gh wrapper).
+   */
+  async get(
+    agentId: string,
+    reason: 'clone' | 'fetch' | 'pull' | 'push' | 'helper',
+    opts: {
+      plane?: CredPlane
+      repo?: string
+      provider?: QualifiedCodeHostProvider
+      externalRepoId?: string
+      requestedAccess?: 'read' | 'write'
+      /** Who will present it; a proxy-only provider is served to the proxy and the daemon's own Git alone. */
+      consumer?: GitCredConsumer
+    } = {}
+  ): Promise<Entry> {
+    const plane = opts.plane ?? 'git'
+    // §17.1: any provider but the implicit one may be named only after the CP advertises the field.
+    if (opts.provider !== undefined && this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        `the control plane is too old for ${opts.provider} credentials (gitcred-provider-v2 not advertised)`,
+        false
+      )
+    }
+    // azure-devops-integration.md §6.1, refused here too: a cached grant would otherwise answer an ask the CP refuses.
+    if (isProxyOnlyProvider(opts.provider) && opts.consumer !== 'proxy' && opts.consumer !== 'daemon') {
+      throw new GitCredUnavailableError(proxyOnlyRefusal(opts.provider), false, 'agent')
+    }
+    const withActions = plane === 'gh' && this.deps.actionsSupported?.() === true
+    const cachePlane = withActions ? 'gh-actions' : plane
+    return this.getKeyed(keyOf(agentId, cachePlane, opts.repo, opts.provider), agentId, {
+      agentId,
+      reason,
+      ...(plane === 'gh' && opts.provider === undefined
+        ? { capabilities: [...GH_TOKEN_CAPABILITIES, ...(withActions ? (['actions'] as const) : [])] }
+        : {}),
+      ...(opts.repo !== undefined ? { repoFullName: opts.repo } : {}),
+      ...(opts.provider !== undefined ? { provider: opts.provider } : this.githubProvider()),
+      ...(opts.externalRepoId !== undefined ? { externalRepoId: opts.externalRepoId } : {}),
+      ...(opts.requestedAccess !== undefined ? { requestedAccess: opts.requestedAccess } : {}),
+      ...(opts.consumer !== undefined ? { consumer: opts.consumer } : {})
+    })
+  }
+
+  /** The credential proxy's lease of a proxy-only provider's repository (azure-devops-integration.md §6.1), in a keyspace of its own; after {@link invalidateProxyLease} the next one asks the CP to refresh. */
+  async getProxyLease(agentId: string, lease: ProxyLeaseAsk): Promise<Entry> {
+    if (!isProxyOnlyProvider(lease.provider)) {
+      throw new GitCredUnavailableError(`${lease.provider} credentials are not leased to the proxy alone`, false)
+    }
+    if (this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        `the control plane is too old for ${lease.provider} credentials (gitcred-provider-v2 not advertised)`,
+        false
+      )
+    }
+    const key = PROXY_LEASE_KEY(agentId, lease)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      provider: lease.provider,
+      externalRepoId: lease.externalRepoId,
+      consumer: 'proxy',
+      ...(lease.repoFullName !== undefined ? { repoFullName: lease.repoFullName } : {}),
+      ...(lease.requestedAccess !== undefined ? { requestedAccess: lease.requestedAccess } : {}),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop a proxy lease the upstream rejected with 401, so the next one asks the CP for a fresh token. */
+  invalidateProxyLease(agentId: string, lease: ProxyLeaseAsk, presentedToken?: string): void {
+    this.dropCached(PROXY_LEASE_KEY(agentId, lease), presentedToken)
+  }
+
+  /**
+   * The GithubPoster's comment token (P3 outbound): scoped to `repo`, requesting
+   * issues/pull_requests only (no contents — the token can talk on threads,
+   * not read code). `purpose` keeps this daemon-owned writer distinct from an
+   * agent's general git/gh credentials: the CP admits it only when this agent
+   * has an enabled GitHub hook for the repo. Same cache/coalesce/degradation
+   * discipline as {@link get}; the token never enters the agent environment.
+   */
+  /** Organization research's GitHub read (assistant-mode.md §5.15): one repository's contents and pull requests, read-only, in a keyspace of its own; the daemon serves it and the runtime never sees it. */
+  async getResearchReadToken(agentId: string, repo: string): Promise<Entry> {
+    return this.getKeyed(keyOf(agentId, 'gh-research', repo), agentId, {
+      agentId,
+      reason: 'helper',
+      capabilities: ['contents', 'pull_requests'],
+      repoFullName: repo,
+      requestedAccess: 'read',
+      ...this.githubProvider()
+    })
+  }
+
+  async getPostToken(agentId: string, repo: string, hookId: string): Promise<Entry> {
+    const key = POST_KEY(agentId, repo)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      capabilities: ['issues', 'pull_requests'],
+      repoFullName: repo,
+      purpose: 'github_hook_reply',
+      hookId,
+      ...this.githubProvider(),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** The GitlabPoster's note token (§14.1): the binding's effect PAT, gated CP-side by the enabled gitlab hook. */
+  async getGitlabPostToken(agentId: string, projectId: string, hookId: string): Promise<Entry> {
+    if (this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        'the control plane is too old for gitlab credentials (gitcred-provider-v2 not advertised)',
+        false
+      )
+    }
+    const key = GITLAB_POST_KEY(agentId, projectId)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      provider: 'gitlab',
+      externalRepoId: projectId,
+      purpose: 'gitlab_hook_reply',
+      hookId,
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** The structured broker's effect lease (§14.2): the never-agent-visible effect PAT, authorized by the
+   *  agent's GitLab workspace binding or the NAMED enabled hook, carrying the §13.1 clamp it enforces. */
+  async getGitlabEffectToken(agentId: string, projectId: string, hookId?: string): Promise<Entry> {
+    if (this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        'the control plane is too old for gitlab credentials (gitcred-provider-v2 not advertised)',
+        false
+      )
+    }
+    if (this.deps.gitlabEffectSupported?.() !== true) {
+      throw new GitCredUnavailableError('the control plane does not support GitLab effect leases yet', false)
+    }
+    const key = GITLAB_EFFECT_KEY(agentId, projectId)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      provider: 'gitlab',
+      externalRepoId: projectId,
+      purpose: 'gitlab_effect',
+      ...(hookId !== undefined ? { hookId } : {}),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop the cached gitlab note token after GitLab rejects it. */
+  invalidateGitlabPost(agentId: string, projectId: string, presentedToken?: string): void {
+    this.dropCached(GITLAB_POST_KEY(agentId, projectId), presentedToken)
+  }
+
+  /** Drop the cached broker effect lease after GitLab rejects it, so the single retry re-mints. */
+  invalidateGitlabEffect(agentId: string, projectId: string, presentedToken?: string): void {
+    this.dropCached(GITLAB_EFFECT_KEY(agentId, projectId), presentedToken)
+  }
+
+  /** The Gitea final poster's lease (gitea-integration.md §10.1): the connection token, gated CP-side by the enabled gitea hook. */
+  getGiteaPostToken(agentId: string, repoId: string, hookId: string): Promise<Entry> {
+    return this.getGiteaLease(GITEA_POST_KEY(agentId, repoId), agentId, repoId, 'gitea_hook_reply', hookId)
+  }
+
+  /** The Gitea broker's lease (§10.2): the same token, authorized by the workspace binding or the named enabled hook. */
+  getGiteaEffectToken(agentId: string, repoId: string, hookId?: string): Promise<Entry> {
+    return this.getGiteaLease(GITEA_EFFECT_KEY(agentId, repoId), agentId, repoId, 'gitea_effect', hookId)
+  }
+
+  private async getGiteaLease(
+    key: string,
+    agentId: string,
+    repoId: string,
+    purpose: 'gitea_hook_reply' | 'gitea_effect',
+    hookId: string | undefined
+  ): Promise<Entry> {
+    if (this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        'the control plane is too old for gitea credentials (gitcred-provider-v2 not advertised)',
+        false
+      )
+    }
+    // A gitea purpose is a new enum value, frame-fatal to an older CP: ask only after gitea-v1.
+    if (this.deps.giteaSupported?.() !== true) {
+      throw new GitCredUnavailableError('the control plane does not support Gitea leases yet', false)
+    }
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      provider: 'gitea',
+      externalRepoId: repoId,
+      purpose,
+      ...(hookId !== undefined ? { hookId } : {}),
+      consumer: 'daemon',
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop the cached Gitea poster lease after Gitea rejects it. */
+  invalidateGiteaPost(agentId: string, repoId: string, presentedToken?: string): void {
+    this.dropCached(GITEA_POST_KEY(agentId, repoId), presentedToken)
+  }
+
+  /** Drop the cached Gitea broker lease after Gitea rejects it, so the single retry re-mints. */
+  invalidateGiteaEffect(agentId: string, repoId: string, presentedToken?: string): void {
+    this.dropCached(GITEA_EFFECT_KEY(agentId, repoId), presentedToken)
+  }
+
+  /** The Azure DevOps final poster's lease (§11.5): `comment` on a repository with the named enabled hook, served to the daemon alone; asked only in a hook turn. */
+  async getAzureDevOpsPostLease(agentId: string, repoId: string, hookId: string): Promise<Entry> {
+    if (this.deps.providerV2Supported?.() !== true) {
+      throw new GitCredUnavailableError(
+        'the control plane is too old for azure-devops credentials (gitcred-provider-v2 not advertised)',
+        false
+      )
+    }
+    const key = AZURE_DEVOPS_POST_KEY(agentId, repoId)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      provider: 'azure-devops',
+      externalRepoId: repoId,
+      purpose: 'azure_devops_hook_reply',
+      hookId,
+      consumer: 'daemon',
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop the cached Azure DevOps poster lease after Azure DevOps rejects it. */
+  invalidateAzureDevOpsPost(agentId: string, repoId: string, presentedToken?: string): void {
+    this.dropCached(AZURE_DEVOPS_POST_KEY(agentId, repoId), presentedToken)
+  }
+
+  /** Evict one daemon-owned writer's cached token and force its next mint past the CP cache. */
+  private dropCached(key: string, presentedToken?: string): void {
+    const entry = this.entries.get(key)
+    if (!entry) return
+    if (presentedToken !== undefined && entry.token !== presentedToken) return
+    this.entries.delete(key)
+    this.refreshPosts.add(key)
+  }
+
+  /** The GitHub broker's lease at the tier the agent's own authorization on `repo` earns; the runtime never sees it. */
+  async getGithubEffectToken(agentId: string, repo: string): Promise<Entry> {
+    const key = GITHUB_EFFECT_KEY(agentId, repo)
+    const forceRefresh = this.refreshPosts.has(key)
+    const entry = await this.getKeyed(key, agentId, {
+      agentId,
+      reason: 'helper',
+      // The CP reports a grant's access from its contents level, so contents rides along to carry the repository's tier.
+      capabilities: ['contents', 'issues', 'pull_requests'],
+      repoFullName: repo,
+      ...this.githubProvider(),
+      ...(forceRefresh ? { forceRefresh: true } : {})
+    })
+    if (forceRefresh) this.refreshPosts.delete(key)
+    return entry
+  }
+
+  /** Drop the GitHub broker's cached token after GitHub rejects it, so the single retry re-mints. */
+  invalidateGithubEffect(agentId: string, repo: string, presentedToken?: string): void {
+    this.dropCached(GITHUB_EFFECT_KEY(agentId, repo), presentedToken)
+  }
+
+  /** Drop the cached GithubPoster token after GitHub rejects it. Matching the
+   *  presented token avoids deleting a newer grant that won a concurrent race. */
+  invalidatePost(agentId: string, repo: string, presentedToken?: string): void {
+    this.dropCached(POST_KEY(agentId, repo), presentedToken)
+  }
+
+  /** The provider field a GitHub request may name: present once the CP advertises it, absent before. */
+  private githubProvider(): { provider?: 'github' } {
+    return this.deps.githubV2Supported?.() === true ? { provider: 'github' } : {}
+  }
+
+  private async getKeyed(
+    key: string,
+    agentId: string,
+    payload: Parameters<GitCredentialCacheDeps['request']>[0]
+  ): Promise<Entry> {
+    if (this.denied.has(key)) {
+      throw new GitCredUnavailableError('control plane denied git credentials for this agent', true, 'agent')
+    }
+    const repoDenial = this.deniedRepos.get(key)
+    if (repoDenial !== undefined) {
+      if (repoDenial.retryAfter > this.monoNow()) {
+        throw new GitCredUnavailableError(repoDenial.reason, false, 'repository')
+      }
+      this.deniedRepos.delete(key)
+    }
+    const cached = this.entries.get(key)
+    if (cached && cached.expiresAtMono - this.monoNow() > HANDOUT_MIN_MS) return cached
+
+    let pending = this.inflight.get(key)
+    if (!pending) {
+      pending = this.fetch(key, payload).finally(() => this.inflight.delete(key))
+      this.inflight.set(key, pending)
+    }
+    try {
+      return await pending
+    } catch (e) {
+      // CP unreachable / transient: an UNEXPIRED cached token still serves.
+      // A DENIAL is authoritative, not transient — fetch() deletes the entry on
+      // SCOPE_DENIED, so the identity check (`=== cached`) fails and we do NOT
+      // resurrect the token the denial just purged (a revoked repo must break on
+      // the discovering call, not one call later).
+      if (cached && this.entries.get(key) === cached && cached.expiresAtMono > this.monoNow()) {
+        this.deps.log.warn(`gitcred: refresh failed for agent ${agentId} — serving cached token`)
+        return cached
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Invalidate on rejection. Git calls the helper's `erase` with the failing
+   * credential when the remote refuses it (GitHub revokes instantly on
+   * uninstall/suspend) — matching on the presented password keeps a racing
+   * fresh grant from being wiped by a stale erase. `repo` routes the erase to
+   * the same key the `get` used; absent ⇒ the workspace git-plane entry.
+   */
+  invalidate(
+    agentId: string,
+    presentedPassword?: string,
+    opts: { plane?: CredPlane; repo?: string; provider?: QualifiedCodeHostProvider } = {}
+  ): void {
+    const plane = opts.plane ?? 'git'
+    const cachePlane = plane === 'gh' && this.deps.actionsSupported?.() === true ? 'gh-actions' : plane
+    const key = keyOf(agentId, cachePlane, opts.repo, opts.provider)
+    const entry = this.entries.get(key)
+    if (!entry) return
+    if (presentedPassword !== undefined && entry.token !== presentedPassword) return
+    this.entries.delete(key)
+  }
+
+  /** agent/remove: drop the orphaned bearer tokens with the agent dir. */
+  remove(agentId: string): void {
+    const marker = `\u0000${agentId}\u0000`
+    for (const key of [...this.entries.keys()]) if (key.includes(marker)) this.entries.delete(key)
+    for (const key of [...this.deniedRepos.keys()]) if (key.includes(marker)) this.deniedRepos.delete(key)
+    for (const key of [...this.denied]) if (key.includes(marker)) this.denied.delete(key)
+    for (const key of [...this.refreshPosts]) if (key.includes(marker)) this.refreshPosts.delete(key)
+  }
+
+  /** A retryable INTERNAL answer is a CP-side transient (e.g. the installation changed mid-mint):
+   *  the CP replied promptly, so one more ask fits inside the helper's IPC timeout. */
+  private async requestWithRetry(payload: Parameters<GitCredentialCacheDeps['request']>[0]): Promise<GitCredGrant> {
+    try {
+      return await this.deps.request(payload)
+    } catch (e) {
+      const { code, retryable } = e as { code?: string; retryable?: boolean }
+      if (code !== 'INTERNAL' || retryable !== true) throw e
+      this.deps.log.warn(`gitcred: transient mint failure for agent ${payload.agentId} — retrying once`)
+      await new Promise((resolve) => setTimeout(resolve, INTERNAL_RETRY_DELAY_MS))
+      return await this.deps.request(payload)
+    }
+  }
+
+  private async fetch(key: string, payload: Parameters<GitCredentialCacheDeps['request']>[0]): Promise<Entry> {
+    let grant: GitCredGrant
+    try {
+      grant = await this.requestWithRetry(payload)
+    } catch (e) {
+      const code = (e as { code?: string }).code
+      if (code === 'SCOPE_DENIED') {
+        // §14.1/§14.2: a purpose its host re-resolves live — hook/binding lifecycle changes never
+        // replicate an agent spec, so a refusal is never durable and the next turn asks the CP again.
+        const denied = payload.repoFullName !== undefined ? 'repository' : 'agent'
+        if (isLiveCredentialPurpose(payload.purpose)) {
+          this.entries.delete(key)
+          throw new GitCredUnavailableError((e as Error).message, false, denied)
+        }
+        if (payload.repoFullName !== undefined) {
+          // Repo-keyed: negative-cache and retry in a minute — the operator may be authorizing it right now.
+          const reason = (e as Error).message
+          this.deniedRepos.set(key, { retryAfter: this.monoNow() + REPO_DENIAL_TTL_MS, reason })
+          this.entries.delete(key)
+          throw new GitCredUnavailableError(reason, false, 'repository')
+        }
+        // Workspace-keyed terminal: the agent moved daemons or left github-app
+        // mode. Stop asking on THIS key until the CP replicates a new spec
+        // (which clears it).
+        this.denied.add(key)
+        this.entries.delete(key)
+        throw new GitCredUnavailableError((e as Error).message, true, 'agent')
+      }
+      // 19.3: LEASE_DENIED is an authoritative refusal of new effects, not an outage — evict so no revoked token keeps serving.
+      if (code === 'LEASE_DENIED') this.entries.delete(key)
+      throw new GitCredUnavailableError((e as Error).message, false)
+    }
+    // Old-CP mismatch guard (multi-repo design §Protocol Changes): a CP that predates
+    // `repoFullName` strips the field and answers with the WORKSPACE grant —
+    // serving that under a repo key would hand the wrong repo's token to gh/git.
+    // A NEW CP ECHOES the requested name back verbatim (even after a GitHub
+    // canonical rename — it mints by numeric id but reports what we asked), so
+    // this only ever fires on the genuine old-CP case, never on a rename.
+    if (payload.repoFullName !== undefined && grant.repoFullName.toLowerCase() !== payload.repoFullName.toLowerCase()) {
+      throw new GitCredUnavailableError(
+        `control plane is too old for per-repo credentials (asked ${payload.repoFullName}, got ${grant.repoFullName})`,
+        false
+      )
+    }
+    // v2 echo verification (§17.1/§17.3): a stripped provider means the CP answered unqualified —
+    // an older peer, or one that never saw our provider. Never serve that for a request that named one.
+    if (payload.provider !== undefined && grant.provider !== payload.provider) {
+      throw new GitCredUnavailableError(
+        `control plane answered provider ${grant.provider ?? 'github (unqualified)'} for a ${payload.provider} request`,
+        false
+      )
+    }
+    // …and a mismatched numeric identity is a wrong-project credential: local
+    // replica and CP record disagree — fail, never serve.
+    if (payload.externalRepoId !== undefined && grant.externalRepoId !== payload.externalRepoId) {
+      throw new GitCredUnavailableError(
+        `control plane answered project ${grant.externalRepoId ?? 'unknown'} for project ${payload.externalRepoId}`,
+        false
+      )
+    }
+    // …and the instance it authenticates against (§24.4, gitea-integration.md §9); absent means the axis default on both sides.
+    const axis = payload.provider !== undefined ? INSTANCE_AXES[payload.provider] : undefined
+    if (axis) {
+      const expected = this.deps[axis.hostFor]?.(payload.agentId) ?? axis.defaultHost
+      const echoed = grant.host ?? axis.defaultHost
+      if (echoed !== expected) {
+        throw new GitCredUnavailableError(
+          `control plane answered a credential for ${payload.provider} instance ${echoed} for an agent bound to ${expected}`,
+          false
+        )
+      }
+    }
+    const entry: Entry = {
+      username: grant.username,
+      token: grant.token,
+      repoFullName: grant.repoFullName,
+      access: grant.access,
+      ...(grant.credentialEpoch !== undefined ? { credentialEpoch: grant.credentialEpoch } : {}),
+      ...(grant.externalRepoId !== undefined ? { externalRepoId: grant.externalRepoId } : {}),
+      expiresAtMono: this.monoNow() + grant.ttlSec * 1000
+    }
+    this.entries.set(key, entry)
+    return entry
+  }
+
+  /** A replicated spec change may re-enable a previously denied agent. */
+  clearDenied(agentId: string): void {
+    const marker = `\u0000${agentId}\u0000`
+    for (const key of [...this.denied]) if (key.includes(marker)) this.denied.delete(key)
+    for (const key of [...this.deniedRepos.keys()]) if (key.includes(marker)) this.deniedRepos.delete(key)
+  }
+}

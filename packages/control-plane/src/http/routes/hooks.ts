@@ -1,0 +1,1724 @@
+/**
+ * `http/routes/hooks.ts` — CRUD for inbound-webhook triggers
+ * (webhook-triggers-and-github-events.md). A hook fires ONE agent; the relay
+ * pool is the public ingress, so creation is gated on "a live relay exists and
+ * `PUBLIC_RELAY_URL` is configured" (409 otherwise — same shape as the shared-bot
+ * install chain). Every write re-converges the relay pool through the
+ * {@link HookService} (fire-and-forget; a fresh relay replays on register).
+ *
+ * Secret discipline: `urlToken` is a capability URL — surfaced (as the full
+ * ingress URL) only to callers with edit rights; the HMAC signing secret is
+ * echoed EXACTLY ONCE in the create response and never retrievable after.
+ */
+import { randomBytes, randomUUID } from 'node:crypto'
+import { gitRepoLabel, isCodeHostHookKind, type CodeHostProvider } from '@agentconnect.md/protocol'
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { z } from 'zod'
+import type { ZodTypeProvider } from '../plugins/zod.js'
+import type { HttpDeps } from '../deps.js'
+import {
+  isHonoredRepoGrant,
+  isSyntheticEmail,
+  type AgentRecord,
+  type GiteaBindingState,
+  type GithubInstallationRecord,
+  type RepoAccess,
+  type GitlabBindingState,
+  type HookRecord,
+  type UpsertHookInput
+} from '../../persistence/ports.js'
+import { GithubApiError } from '../../github/api.js'
+import { GiteaApiError } from '../../gitea/api.js'
+import { GiteaConnectDenied } from '../../gitea/connection.service.js'
+import { GITLAB_ACCESS_DEVELOPER } from '../../gitlab/api.js'
+import { gitlabAccountUnavailableMessage } from '../../gitlab/account.service.js'
+import { GitCredDeniedError, type ResolvedAgentRepoAuthorization } from '../../github/service.js'
+import { AgentId, HookId, IntegrationId, OrgId } from '../../domain/ids.js'
+import { NoConnection } from '../../orchestrator/outbound.js'
+import { orgOf, denyViewerWrite, ctxOf } from '../rbac.js'
+import { canView } from '../../authorization/policy.js'
+import { toDbPlatform, type DbPlatform } from '../../persistence/platform.js'
+import { AgentWorkspaceIntegrationConflict, GiteaBindingUnavailable } from '../../persistence/errors.js'
+import { isCanonicalGithubAddress } from '../../domain/git-host.js'
+import { hookFamilyShapeError, hookSiblingShapeError, type HookFamily } from '../../hooks/hook-family.js'
+import { codeHostsOf } from '../../codehost/registry.js'
+import { Tag } from '../plugins/openapi.js'
+import {
+  CreateHookBody,
+  UpdateHookBody,
+  HookDto,
+  HookListDto,
+  CreatedHookDto,
+  HookRunListDto,
+  ErrorDto,
+  IdParam,
+  type HookDtoT
+} from '../dto/index.js'
+
+/** The (agent, kind, repo, family) uniqueness lives in Postgres, so a duplicate
+ *  subscription arrives here as a constraint violation rather than a probe. */
+class DuplicateHookFamily extends Error {}
+const HOOK_FAMILY_INDEX = 'hook_def_agent_repo_family_key'
+
+function isHookFamilyCollision(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  if (Reflect.get(err, 'code') !== 'P2002') return false
+  // Prisma names the violated constraint differently per driver — a `target`
+  // field list, or the driver error's own index name — so read the whole meta.
+  const meta = JSON.stringify(Reflect.get(err, 'meta') ?? '')
+  return meta.includes(HOOK_FAMILY_INDEX) || meta.includes('family')
+}
+
+/** The full ingress URL for a hook's urlToken (pool-level origin + fixed path). */
+export function hookIngressUrl(publicRelayUrl: string, urlToken: string): string {
+  const relayHttpUrl = publicRelayUrl
+    .replace(/^wss:\/\//, 'https://')
+    .replace(/^ws:\/\//, 'http://')
+    .replace(/\/+$/, '')
+  return `${relayHttpUrl}/webhooks/in/${urlToken}`
+}
+
+// A hook has no visibility of its own — it is subordinate to its agent (like an
+// Integration). The `url` capability is surfaced whenever the caller reached this
+// hook at all, which already means they can VIEW (and thus edit) the owning agent.
+function toDto(h: HookRecord, publicRelayUrl?: string): HookDtoT {
+  return {
+    id: h.id,
+    orgId: h.orgId,
+    agentId: h.agentId,
+    kind: h.kind,
+    name: h.name,
+    sessionMode: h.sessionMode,
+    enabled: h.enabled,
+    instructions: h.instructions ?? null,
+    url: h.urlToken && publicRelayUrl ? hookIngressUrl(publicRelayUrl, h.urlToken) : null,
+    hmacConfigured: h.hmacConfigured,
+    repoId: h.repoId?.toString() ?? null,
+    repoFullName: h.repoFullName,
+    installationId: h.installationId?.toString() ?? null,
+    installationAccount: h.installationAccount ?? null,
+    family: h.family,
+    events: h.events,
+    commentFamilies: h.commentFamilies,
+    labelFilter: h.labelFilter,
+    skipDrafts: h.skipDrafts,
+    mentionOnly: h.mentionOnly,
+    configRevision: h.configRevision.toString(),
+    reviewPolicy: h.reviewPolicy,
+    reportingMode: h.reportingMode,
+    gateMode: h.gateMode,
+    targetPlatform: toDbPlatform(h.targetPlatform),
+    targetChannel: h.targetChannel,
+    targetIntegrationId: h.targetIntegrationId,
+    lastFiredAt: h.lastFiredAt ? h.lastFiredAt.toISOString() : null,
+    createdBy: h.createdBy && !isSyntheticEmail(h.createdBy.email) ? h.createdBy.userId : null,
+    createdAt: h.createdAt.toISOString(),
+    lastModifiedBy: h.lastModifiedBy && !isSyntheticEmail(h.lastModifiedBy.email) ? h.lastModifiedBy.userId : null,
+    lastModifiedAt: h.lastModifiedAt.toISOString()
+  }
+}
+
+export function hookRoutes(deps: HttpDeps) {
+  return async function hookRoutesPlugin(app: FastifyInstance): Promise<void> {
+    const r = app.withTypeProvider<ZodTypeProvider>()
+    const codeHosts = codeHostsOf(deps)
+
+    // A hook is reachable iff its OWNING AGENT is viewable (no per-hook visibility;
+    // the agent is the access boundary, like an Integration). Cross-org ids, an
+    // agent the caller can't see, and any legacy orphaned hook all read as absent
+    // (404, no existence oracle).
+    const getOrgHook = async (req: FastifyRequest, id: string): Promise<HookRecord | null> => {
+      const hook = await deps.repos.hook.get(orgOf(req), HookId(id))
+      if (!hook || !hook.agentId) return null
+      const agent = await deps.repos.agent.get(orgOf(req), hook.agentId)
+      if (!agent || !canView(agent, ctxOf(req))) return null
+      return hook
+    }
+
+    // The ingress lives on the relay pool: without a configured public origin
+    // AND at least one live relay, a hook could never fire — refuse creation
+    // up front (mirrors the shared-bot "no live relay" 409).
+    const ingressUnavailable = async (): Promise<string | null> => {
+      if (!deps.config.PUBLIC_RELAY_URL) return 'PUBLIC_RELAY_URL is not configured on this deployment'
+      const staleMs = deps.config.RELAY_STALE_MS ?? 45_000
+      const alive = await deps.repos.relay.listAlive(new Date(Date.now() - staleMs))
+      return alive.length === 0 ? 'no relay is registered — deploy the relay to accept webhooks' : null
+    }
+
+    // Re-converge the relay pool after a write. Fire-and-forget: a push failure
+    // never fails the CRUD (a relay converges via its register replay).
+    //
+    // `afterAssigned` runs once the rule has actually been assigned, for work that is only
+    // safe on the far side of it. It is deliberately skipped when the broadcast REJECTS: the
+    // old rule may still be live in the pool, and its callers use this to drop state that
+    // rule still depends on. Leaving that state stale is safe and the roster reconciles it.
+    const converge = (hook: HookRecord, afterAssigned?: () => Promise<void>, previous?: HookRecord): void => {
+      void deps.hooks
+        .broadcast(hook)
+        .then(() => afterAssigned?.())
+        // A routed scope's host and sibling rules follow its membership (code-host-decisions.md §3.2).
+        .then(() => deps.hooks.reconcileRouting([previous, hook]))
+        .catch((err) => app.log.warn({ hookId: hook.id, err }, 'hook broadcast failed'))
+    }
+
+    // §24.4: the hook's OWN agent is re-projected by `HookService.broadcast`, which is the
+    // only place that sees every rule assignment. This covers the two an assign cannot: the
+    // agent a retarget moved the hook OFF, and a delete, which leaves no row to broadcast.
+    // Best-effort, like the agents route's replicateUpsert: the register/ok roster backstops.
+    const replicateUpsert = async (orgId: OrgId, agentId: AgentId | null): Promise<void> => {
+      if (!agentId) return
+      // Re-read: the hook write advanced the agent's configRevision in its own transaction.
+      const fresh = await deps.repos.agent.get(orgId, agentId)
+      if (!fresh) return
+      await deps.agentDelivery.upsert(fresh, (err, daemonId) => {
+        if (err instanceof NoConnection) {
+          app.log.debug({ agentId, daemonId }, 'agent/upsert skipped: daemon offline')
+        } else {
+          app.log.warn({ err, agentId, daemonId }, 'hook write: agent spec reconcile failed')
+        }
+      })
+    }
+
+    // §7.2 identity bracket for a gitlab hook write: the hook agent's own account
+    // is provisioned FIRST — the compiled rule names it and its poster mints
+    // credentials from it — and the write commits while the binding lease is
+    // still held, so convergence never sees the membership without the hook row
+    // that authorizes it. A hook that will not be enabled needs no identity: it
+    // can never fire, and provisioning one would churn an account the next
+    // convergence retires, and would block disabling during an account outage.
+    const withGitlabHookIdentity = async <T>(
+      orgId: OrgId,
+      projectId: bigint,
+      agentId: string,
+      enabled: boolean,
+      commit: () => Promise<T>
+    ): Promise<{ ok: true; result: T } | { ok: false; status: 409; message: string }> => {
+      const gitlab = deps.gitlab
+      if (!gitlab || !enabled) return { ok: true, result: await commit() }
+      const done = await gitlab.provisioner.provisionAgentAccount(
+        orgId,
+        projectId,
+        // A hook consumer posts notes and may run the configured review policy.
+        { agentId, accessLevel: GITLAB_ACCESS_DEVELOPER },
+        commit
+      )
+      if (!done.ok) return { ok: false, status: 409, message: gitlabAccountUnavailableMessage(done.reason) }
+      return { ok: true, result: done.result }
+    }
+
+    // A code-host write also re-converges the managed ingress its host owns: what
+    // that means is the provider's (a no-op where the webhook is deployment-wide).
+    // Fire-and-forget; a host's own saga outwaits a peer's lease.
+    const convergeManagedRepository = (kind: HookRecord['kind'], orgId: OrgId, repoId: bigint | null): void => {
+      if (!isCodeHostHookKind(kind)) return
+      codeHosts[kind].hooks.convergeManagedRepository(deps, orgId, repoId, (err) =>
+        app.log.warn({ projectId: repoId?.toString(), err }, `${kind} webhook converge failed`)
+      )
+    }
+
+    // The repository repeats the workspace-access invariant under its shared
+    // transaction fence. Surface a concurrent loser as the same 409 as the
+    // route's fast preflight instead of leaking it as a generic 500.
+    type PersistOutcome = HookRecord | AgentWorkspaceIntegrationConflict | DuplicateHookFamily | GiteaBindingUnavailable
+    const persistHook = async (input: UpsertHookInput): Promise<PersistOutcome> => {
+      try {
+        // §24.1: every gitlab-kind write carries the instance its repoId names,
+        // enabled or not — the disabled path reaches this with no lease at all.
+        // The gitea kind joins its own axis the same way (gitea-integration.md §3).
+        const fenced =
+          input.kind === 'gitlab' && deps.gitlab
+            ? { ...input, axisBaseUrl: deps.gitlab.api.baseUrl }
+            : input.kind === 'gitea' && deps.gitea
+              ? { ...input, axisBaseUrl: deps.gitea.api.baseUrl }
+              : input
+        return await deps.repos.hook.upsert(fenced)
+      } catch (err) {
+        if (err instanceof AgentWorkspaceIntegrationConflict || err instanceof GiteaBindingUnavailable) return err
+        if (isHookFamilyCollision(err)) return new DuplicateHookFamily()
+        throw err
+      }
+    }
+
+    // The pure per-row shape gate: every stored pattern belongs to the row's own
+    // family, comments are scoped to it, and only a change-proposal family may
+    // carry the review/reporting axes. Runs before any upstream call.
+    const familyShapeError = (body: {
+      kind: CodeHostProvider
+      family: HookFamily
+      events: string[]
+      commentFamilies?: string[]
+      reviewPolicy?: string
+      reportingMode?: string
+      gateMode?: string
+      skipDrafts?: boolean
+    }): string | null =>
+      hookFamilyShapeError({
+        kind: body.kind,
+        family: body.family,
+        events: body.events,
+        commentFamilies: body.commentFamilies ?? [],
+        reviewPolicy: body.reviewPolicy ?? 'off',
+        reportingMode: body.reportingMode ?? 'off',
+        gateMode: body.gateMode ?? 'informational',
+        skipDrafts: body.skipDrafts ?? false
+      })
+
+    // Sibling rows of one (agent, repo) answer the same threads, so they must
+    // agree on where the turn posts. Excludes the row being written.
+    const siblingShapeError = async (
+      agentId: string,
+      kind: HookRecord['kind'],
+      repoId: bigint,
+      repoLabel: string,
+      selfId: string,
+      proposed: { targetPlatform: string; targetChannel: string | null; targetIntegrationId: string | null }
+    ): Promise<string | null> => {
+      const siblings = (await deps.repos.hook.listForAgent(AgentId(agentId))).filter(
+        (h) => h.id !== selfId && h.kind === kind && h.repoId === repoId
+      )
+      return hookSiblingShapeError(
+        siblings.map((h) => ({
+          targetPlatform: h.targetPlatform,
+          targetChannel: h.targetChannel,
+          targetIntegrationId: h.targetIntegrationId,
+          sessionMode: h.sessionMode
+        })),
+        { ...proposed, sessionMode: 'perThread' },
+        repoLabel
+      )
+    }
+
+    // github kind: resolve "owner/repo" to the NUMERIC repo id through the org's
+    // covering installation. The resolution IS the attribution proof (the repo is
+    // reachable through an installation this org owns — an installation only ever
+    // grants repos under its own account); the canonical casing comes back from
+    // GitHub. repoId is never client-supplied.
+    type RepoResolution =
+      { ok: true; repoId: bigint; repoFullName: string } | { ok: false; status: 400 | 409 | 429 | 502; message: string }
+    const notCovered = {
+      ok: false,
+      status: 400,
+      message: "repository is not covered by one of this organization's GitHub App installations"
+    } as const
+    // GitHub being unreachable is upstream trouble, not a policy verdict —
+    // same mapping as routes/github.ts githubUpstreamFailure (429 rate-limit,
+    // 502 for the rest); never let it surface as an unhandled 500.
+    const githubUpstream = (e: GithubApiError): { status: 429 | 502; message: string } => ({
+      status: e.code === 'RATE_LIMITED' ? 429 : 502,
+      message: `github: ${e.message}`
+    })
+    const resolveGithubRepo = async (
+      orgId: string,
+      repoFullName: string,
+      githubAppId: string | null
+    ): Promise<RepoResolution> => {
+      if (!deps.github) {
+        return {
+          ok: false,
+          status: 409,
+          message: 'GitHub App is not configured on this deployment (GITHUB_APP_*)'
+        }
+      }
+      const [owner, repo] = repoFullName.split('/')
+      if (!owner || !repo) return notCovered
+      const ins = await deps.repos.githubInstallation.liveByOrgAndAccount(OrgId(orgId), owner, githubAppId)
+      if (!ins || ins.suspendedAt) return notCovered
+      try {
+        const ref = await deps.github.repoRefFor(ins, owner, repo)
+        if (!ref) return notCovered
+        // Readers-first catalog convergence (gitlab-com-integration.md §8.1).
+        await deps.repos.codeHostRepository.upsert({
+          orgId,
+          provider: 'github',
+          externalId: ref.repoId,
+          displayPath: ref.fullName,
+          cloneUrl: `https://github.com/${ref.fullName}`,
+          defaultBranch: ref.defaultBranch
+        })
+        return { ok: true, repoId: ref.repoId, repoFullName: ref.fullName }
+      } catch (e) {
+        if (e instanceof GithubApiError) return { ok: false, ...githubUpstream(e) }
+        throw e
+      }
+    }
+    const ERROR_NAMES = {
+      400: 'Bad Request',
+      403: 'Forbidden',
+      404: 'Not Found',
+      409: 'Conflict',
+      429: 'Too Many Requests',
+      502: 'Bad Gateway'
+    } as const
+
+    // Triggers never outrun credentials (multi-repo decision 6): workspace, row, or installation grant, on create and binding-changing edits only.
+    type WatchRepoAuthz = { ok: true } | { ok: false; status: 409 | 429 | 502; message: string }
+    const watchRepoAuthorized = async (
+      agent: AgentRecord,
+      provider: CodeHostProvider,
+      repoId: bigint,
+      repoFullName: string
+    ): Promise<WatchRepoAuthz> => {
+      const subject = codeHosts[provider].repositorySubject
+      const denied = {
+        ok: false,
+        status: 409,
+        message: `${repoFullName} is not authorized for this agent — authorize the ${subject} for it, or make it the agent's workspace ${subject}, then create the trigger`
+      } as const
+      // A stale row authorizes no new trigger, as it mints no credential.
+      const explicitlyGranted = async () =>
+        (await deps.repos.agentRepoAuth.listForAgent(agent.id)).some(
+          (row) => row.provider === provider && row.repoId === repoId && isHonoredRepoGrant(row)
+        )
+      // After the rows (decision 10): the caller resolved `repoFullName` through its owner's live installation, the coverage proof.
+      const installationGranted = async (): Promise<boolean> => {
+        const owner = provider === 'github' ? repoFullName.split('/')[0] : undefined
+        const ins = owner
+          ? await deps.repos.githubInstallation.liveByOrgAndAccount(agent.orgId, owner, agent.githubAppId ?? null)
+          : null
+        if (!ins || ins.suspendedAt) return false
+        return (await deps.repos.agentInstallationAuth.listForAgent(agent.id)).some(
+          (grant) => grant.provider === 'github' && grant.installationId === ins.installationId
+        )
+      }
+      const granted = async () => (await explicitlyGranted()) || (await installationGranted())
+      // The workspace is this repository only when it is the SAME host's: the two
+      // number theirs independently, so the credential provider qualifies the id (§8.1).
+      const workspaceProvider = agent.workspace.mode === 'git' ? agent.workspace.credential?.provider : undefined
+      if (agent.workspaceRepoId === repoId && workspaceProvider === provider) return { ok: true }
+      // Workspace rows without a numeric id resolve it lazily. The stored name is
+      // only an endpoint hint: after a GitHub rename the requested canonical name
+      // differs, so always resolve and compare numeric identity. Gated on the
+      // ADDRESS's host, not on a credential: an anonymous github.com checkout still
+      // IS this repository, and a credentialed one already matched above.
+      const onGithubCom = agent.workspace.mode === 'git' && isCanonicalGithubAddress(agent.workspace.gitRepo)
+      if (provider === 'github' && agent.workspace.mode === 'git' && onGithubCom && deps.github) {
+        const workspaceLabel = gitRepoLabel(agent.workspace.gitRepo)
+        const [owner, repo] = workspaceLabel.split('/')
+        const ins = owner
+          ? await deps.repos.githubInstallation.liveByOrgAndAccount(agent.orgId, owner, agent.githubAppId ?? null)
+          : null
+        if (ins && repo) {
+          try {
+            const ref = await deps.github.repoRefFor(ins, owner!, repo)
+            if (ref?.repoId === repoId) {
+              if (await deps.repos.agent.setWorkspaceRepoId(agent.id, repoId)) return { ok: true }
+              return (await deps.repos.agent.get(agent.orgId, agent.id))?.workspaceRepoId === repoId
+                ? { ok: true }
+                : denied
+            }
+          } catch (e) {
+            if (!(e instanceof GithubApiError)) throw e
+            // GitHub down mid-check: a grant still authorizes; short of one, report the upstream failure, not a misleading denial.
+            return (await granted()) ? { ok: true } : { ok: false, ...githubUpstream(e) }
+          }
+        }
+      }
+      return (await granted()) ? { ok: true } : denied
+    }
+
+    // The two effect axes both code hosts carry; github adds its own gate axis on top.
+    type CodeHostEffectConfig = {
+      reviewPolicy: HookRecord['reviewPolicy']
+      reportingMode: HookRecord['reportingMode']
+    }
+
+    type GithubEffectConfig = CodeHostEffectConfig & { gateMode: HookRecord['gateMode'] }
+
+    type CodeHostEffectDenial = { status: 409 | 429 | 502; message: string }
+
+    /** R1/R2a action-time rules are also enforced at configuration time so the
+     * editor cannot save a mode that is guaranteed to fail. Runtime still
+     * re-resolves the same numeric authorization on every effect. */
+    const validateGithubEffects = async (
+      agent: AgentRecord,
+      repoId: bigint,
+      repoFullName: string,
+      cfg: GithubEffectConfig
+    ): Promise<CodeHostEffectDenial | null> => {
+      const misconfigured = (message: string): CodeHostEffectDenial => ({ status: 409, message })
+      if (cfg.gateMode === 'required') return misconfigured('required review gates are not available until R2b')
+      if (cfg.reportingMode === 'status') return misconfigured('commit status reporting is not available until R3')
+      if (cfg.reviewPolicy === 'off' && cfg.reportingMode === 'off') return null
+      if (!deps.github) return misconfigured('GitHub App is not configured on this deployment (GITHUB_APP_*)')
+
+      let resolved: ResolvedAgentRepoAuthorization
+      try {
+        resolved = await deps.github.resolveAgentRepoAuthorization(agent, repoId, repoFullName)
+      } catch (err) {
+        if (err instanceof GitCredDeniedError) return misconfigured(err.message)
+        // GitHub unreachable is not a configuration verdict — report it as
+        // retryable upstream trouble instead of a 409 policy denial.
+        if (err instanceof GithubApiError) return githubUpstream(err)
+        throw err
+      }
+
+      if (cfg.reviewPolicy !== 'off') {
+        const commentOnlyAdditional =
+          (resolved.kind === 'additional' || resolved.kind === 'installation') &&
+          resolved.access === 'comment' &&
+          cfg.reviewPolicy === 'comment'
+        if (resolved.access !== 'write' && !commentOnlyAdditional) {
+          return misconfigured(
+            cfg.reviewPolicy === 'comment'
+              ? 'formal review comments require workspace write or additional-repository comment access'
+              : 'request-changes and approve reviews require write repository access'
+          )
+        }
+        if (resolved.installation.permissions?.pull_requests !== 'write') {
+          return misconfigured('this GitHub App installation has not accepted the Pull requests write permission')
+        }
+      }
+      if (cfg.reportingMode === 'check') {
+        // Revoking a row retires its Checks; a grant has no per-repository cleanup, so it does not carry them.
+        if (resolved.kind === 'installation') {
+          return misconfigured(
+            'informational Checks need this repository authorized on its own; an installation grant does not carry them'
+          )
+        }
+        if (resolved.access !== 'write') return misconfigured('informational Checks require write repository access')
+        if (resolved.installation.permissions?.checks !== 'write') {
+          return misconfigured('this GitHub App installation has not accepted the Checks write permission')
+        }
+        const pullRequests = resolved.installation.permissions?.pull_requests
+        if (pullRequests !== 'read' && pullRequests !== 'write') {
+          return misconfigured('this GitHub App installation has not accepted the Pull requests read permission')
+        }
+      }
+      return null
+    }
+
+    // A github row names one repository or one installation account, never both.
+    const githubScopeError = (body: { repoFullName?: string; githubAccount?: string }): string | null =>
+      (body.repoFullName === undefined) === (body.githubAccount === undefined)
+        ? 'name one repository (repoFullName) or one installation account (githubAccount)'
+        : null
+
+    // An installation row's effects take the grant's tier and the installation's accepted permissions, Checks included.
+    const installationEffectsError = (
+      access: RepoAccess,
+      installation: GithubInstallationRecord,
+      cfg: GithubEffectConfig
+    ): string | null => {
+      if (cfg.gateMode === 'required') return 'required review gates are not available until R2b'
+      if (cfg.reportingMode === 'status') return 'commit status reporting is not available until R3'
+      if (cfg.reviewPolicy !== 'off') {
+        if (access !== 'write' && !(access === 'comment' && cfg.reviewPolicy === 'comment')) {
+          return cfg.reviewPolicy === 'comment'
+            ? 'formal review comments require the installation authorized at comment or write access'
+            : 'request-changes and approve reviews require the installation authorized at write access'
+        }
+        if (installation.permissions?.pull_requests !== 'write') {
+          return 'this GitHub App installation has not accepted the Pull requests write permission'
+        }
+      }
+      if (cfg.reportingMode === 'check') {
+        if (access !== 'write') return 'informational Checks require the installation authorized at write access'
+        if (installation.permissions?.checks !== 'write') {
+          return 'this GitHub App installation has not accepted the Checks write permission'
+        }
+        const pullRequests = installation.permissions?.pull_requests
+        if (pullRequests !== 'read' && pullRequests !== 'write') {
+          return 'this GitHub App installation has not accepted the Pull requests read permission'
+        }
+      }
+      return null
+    }
+
+    // An agent's installation rows of one installation answer the same threads, so they post to the same place.
+    const installationSiblingError = async (
+      agentId: string,
+      installationId: bigint,
+      label: string,
+      selfId: string,
+      proposed: { targetPlatform: string; targetChannel: string | null; targetIntegrationId: string | null }
+    ): Promise<string | null> => {
+      const siblings = (await deps.repos.hook.listForAgent(AgentId(agentId))).filter(
+        (h) => h.id !== selfId && h.kind === 'github' && h.installationId === installationId
+      )
+      return hookSiblingShapeError(
+        siblings.map((h) => ({
+          targetPlatform: h.targetPlatform,
+          targetChannel: h.targetChannel,
+          targetIntegrationId: h.targetIntegrationId,
+          sessionMode: h.sessionMode
+        })),
+        { ...proposed, sessionMode: 'perThread' },
+        label
+      )
+    }
+
+    type InstallationRowResolution =
+      | { ok: true; installationId: bigint; installationAccount: string }
+      | { ok: false; status: 400 | 409; message: string }
+
+    // Installation-Wide Rows: the account's live installation, the agent's grant for it, and the row's effects at the grant's tier.
+    const resolveInstallationRow = async (
+      agent: AgentRecord,
+      account: string,
+      selfId: string,
+      proposed: { targetPlatform: string; targetChannel: string | null; targetIntegrationId: string | null },
+      cfg: GithubEffectConfig
+    ): Promise<InstallationRowResolution> => {
+      if (!deps.github) {
+        return { ok: false, status: 409, message: 'GitHub App is not configured on this deployment (GITHUB_APP_*)' }
+      }
+      const installation = await deps.repos.githubInstallation.liveByOrgAndAccount(
+        agent.orgId,
+        account,
+        agent.githubAppId ?? null
+      )
+      if (!installation || installation.suspendedAt) {
+        return {
+          ok: false,
+          status: 400,
+          message: account + " is not one of this organization's GitHub App installations"
+        }
+      }
+      const label = 'all repositories in ' + installation.accountLogin
+      const grant = (await deps.repos.agentInstallationAuth.listForAgent(agent.id)).find(
+        (row) => row.provider === 'github' && row.installationId === installation.installationId
+      )
+      if (!grant) {
+        return {
+          ok: false,
+          status: 409,
+          message:
+            label + ' are not authorized for this agent — authorize the installation for it, then create the trigger'
+        }
+      }
+      const siblingError = await installationSiblingError(
+        agent.id,
+        installation.installationId,
+        label,
+        selfId,
+        proposed
+      )
+      if (siblingError) return { ok: false, status: 409, message: siblingError }
+      const effectError = installationEffectsError(grant.access, installation, cfg)
+      if (effectError) return { ok: false, status: 409, message: effectError }
+      return { ok: true, installationId: installation.installationId, installationAccount: installation.accountLogin }
+    }
+
+    // The GitLab counterpart. No repository-access clamp: the writer for BOTH effects is the
+    // hook agent's own service account under its provisioned role (§7.2), not the agent's git
+    // grant. That account is created by the convergence this very write kicks, so the only
+    // configuration-time fact to check is that the binding itself has converged once.
+    const validateGitlabEffects = (
+      binding: { state: GitlabBindingState; projectPath: string },
+      cfg: CodeHostEffectConfig
+    ): CodeHostEffectDenial | null => {
+      // §16.2: GitLab commit statuses are external CI jobs, deliberately not this transport.
+      if (cfg.reportingMode === 'status') {
+        return { status: 409, message: 'commit status reporting is not available for GitLab projects' }
+      }
+      if (cfg.reviewPolicy === 'off' && cfg.reportingMode === 'off') return null
+      if (binding.state === 'provisioning') {
+        return {
+          status: 409,
+          message: `${binding.projectPath} is still being set up — reviews and run reporting need its bot accounts`
+        }
+      }
+      return null
+    }
+
+    // The Gitea counterpart (gitea-integration.md §10.4): the run state is a commit status the
+    // Control Plane writes, so GitLab's run note has no Gitea meaning; every effect is authored by
+    // the one bot token, so the only configuration-time fact is that the binding has converged.
+    const validateGiteaEffects = (
+      binding: { state: GiteaBindingState; repoPath: string },
+      cfg: CodeHostEffectConfig
+    ): CodeHostEffectDenial | null => {
+      if (cfg.reportingMode === 'check') {
+        return { status: 409, message: 'run notes are not available for Gitea repositories — report a commit status' }
+      }
+      if (cfg.reviewPolicy === 'off' && cfg.reportingMode === 'off') return null
+      if (binding.state === 'provisioning') {
+        return { status: 409, message: `${binding.repoPath} is still being set up — reviews and run reporting need it` }
+      }
+      return null
+    }
+
+    // gitea (gitea-integration.md §6): the facts first, for the gates that need the path; the bind AFTER the agent gate, so a refused trigger binds nothing.
+    type GiteaRepositoryStep<T> =
+      ({ ok: true } & T) | { ok: false; status: 400 | 403 | 404 | 409 | 429 | 502; message: string }
+    const giteaRefusal = (e: unknown): { ok: false; status: 400 | 403 | 404 | 409 | 429 | 502; message: string } => {
+      if (e instanceof GiteaConnectDenied) return { ok: false, status: e.status, message: e.message }
+      if (e instanceof GiteaApiError) {
+        return { ok: false, status: e.code === 'RATE_LIMITED' ? 429 : 502, message: `gitea: ${e.message}` }
+      }
+      throw e
+    }
+    const giteaRepositoryFacts = async (
+      orgId: OrgId,
+      repoId: bigint
+    ): Promise<GiteaRepositoryStep<{ repoPath: string }>> => {
+      if (!deps.gitea) return { ok: false, status: 409, message: 'Gitea is not configured on this deployment' }
+      const binding = await deps.repos.giteaRepositoryBinding.byRepo(orgId, repoId)
+      if (binding && binding.state !== 'cleanup_pending') return { ok: true, repoPath: binding.repoPath }
+      try {
+        return { ok: true, repoPath: (await deps.gitea.bindings.administered(orgId, repoId)).repo.full_name }
+      } catch (e) {
+        return giteaRefusal(e)
+      }
+    }
+    const bindGiteaRepository = async (
+      orgId: OrgId,
+      repoId: bigint
+    ): Promise<GiteaRepositoryStep<{ binding: { state: GiteaBindingState; repoPath: string } }>> => {
+      if (!deps.gitea) return { ok: false, status: 409, message: 'Gitea is not configured on this deployment' }
+      try {
+        return { ok: true, binding: (await deps.gitea.bindings.ensureBound(orgId, repoId)).binding }
+      } catch (e) {
+        return giteaRefusal(e)
+      }
+    }
+
+    // azure-devops (azure-devops-integration.md §11.1): the repository is bound already, since a hook never creates a grant.
+    const azureDevOpsRepositoryFacts = async (
+      orgId: OrgId,
+      repoId: bigint
+    ): Promise<{ ok: true; repoPath: string } | { ok: false; status: 409; message: string }> => {
+      const hooks = deps.azureDevOps?.hooks
+      if (!hooks)
+        return { ok: false, status: 409, message: 'Azure DevOps triggers are not available on this deployment' }
+      const binding = await hooks.hookBinding(orgId, repoId)
+      if (!binding) {
+        return {
+          ok: false,
+          status: 409,
+          message: 'the repository is not bound through an Azure DevOps connection in this organization'
+        }
+      }
+      return { ok: true, repoPath: binding.repoPath }
+    }
+    // §11.6/§11.7: every review policy votes and threads; the run is reported as a pull-request status, never a run note.
+    const validateAzureDevOpsEffects = (cfg: CodeHostEffectConfig): CodeHostEffectDenial | null =>
+      cfg.reportingMode === 'check'
+        ? { status: 409, message: 'run notes are not available for Azure DevOps repositories — report a status' }
+        : null
+    // §11.1: an enabled trigger needs the application's View and Edit subscriptions on the repository's project.
+    const azureDevOpsTriggersAllowed = async (orgId: OrgId, repoId: bigint, enabled: boolean) => {
+      const hooks = deps.azureDevOps?.hooks
+      if (!enabled) return { ok: true as const }
+      if (!hooks)
+        return {
+          ok: false as const,
+          status: 409 as const,
+          message: 'Azure DevOps triggers are not available on this deployment'
+        }
+      return hooks.triggersAllowed(orgId, repoId)
+    }
+
+    // Validate the optional anchoring target against the hook's agent (the
+    // anchor posts through one of THAT agent's integrations — cron semantics).
+    const resolveTarget = async (
+      orgId: OrgId,
+      agentId: string,
+      // `DbPlatform` is the served set the anchor may target — the same registry
+      // declaration `Platform` (the request body's own enum) and `toDbPlatform`
+      // (the value returned below) read, instead of a third inline spelling.
+      body: {
+        targetPlatform: DbPlatform
+        targetChannel?: string
+        targetIntegrationId?: string
+      }
+    ): Promise<{ ok: true; targetPlatform: DbPlatform; targetIntegrationId?: IntegrationId } | { ok: false }> => {
+      if (!(body.targetIntegrationId && body.targetChannel)) return { ok: true, targetPlatform: body.targetPlatform }
+      const integ = await deps.repos.integration.get(orgId, IntegrationId(body.targetIntegrationId))
+      if (!integ || integ.agentId !== agentId) return { ok: false }
+      return { ok: true, targetPlatform: toDbPlatform(integ.platform), targetIntegrationId: integ.id }
+    }
+
+    r.post(
+      '/hooks',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'Create a hook',
+          description:
+            'Create a trigger for one agent. `kind:"webhook"` mints an ingress URL (the response carries it plus — when requested — the one-time HMAC signing secret, never retrievable again). `kind:"github"` subscribes a repository covered by one of the organization’s GitHub App installations to issue, pull-request, push, deployment or release events, or, with `githubAccount` in place of `repoFullName`, every repository of that account’s installation, which needs the agent’s installation grant. `kind:"azure-devops"` subscribes a bound Azure DevOps repository by its `repoId` to pull-request (`merge_request`) or push events through service hooks; an enabled one needs Allow triggers on the repository’s project, granted in Manage project access. A code-host trigger covers ONE subject `family`, so a repository watched for both pull requests and issues is two triggers, each with its own cadence and mention gate; a second trigger on the same family is a 409. A `deployment_status:<state>` pattern selects on the status state (`success`, `failure`, …).',
+          operationId: 'createHook',
+          body: CreateHookBody,
+          response: {
+            200: CreatedHookDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const orgId = orgOf(req)
+        const unavailable = await ingressUnavailable()
+        if (unavailable) {
+          return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: unavailable })
+        }
+        // The hook's agent must exist IN THIS ORG and be VISIBLE to the caller —
+        // same no-oracle rule as cron create (no binding a restricted agent).
+        const agent = await deps.repos.agent.get(orgOf(req), AgentId(req.body.agentId))
+        if (!agent || !canView(agent, ctxOf(req))) {
+          return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: 'unknown agentId' })
+        }
+        const target = await resolveTarget(orgId, agent.id, req.body)
+        if (!target.ok) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'targetIntegrationId is not an integration of this agent'
+          })
+        }
+        // Each host's own effect axes, with its inert default for an axis it has no
+        // surface for. Resolved up front: the per-kind arms below run inside closures,
+        // where the body's own narrowing no longer holds.
+        const effects = req.body.kind === 'webhook' ? null : codeHosts[req.body.kind].hooks.effects(req.body)
+        if (req.body.kind !== 'webhook') {
+          const shapeError = familyShapeError({
+            kind: req.body.kind,
+            family: req.body.family,
+            events: req.body.events,
+            commentFamilies: req.body.commentFamilies,
+            ...effects!,
+            ...(req.body.kind === 'github' ? { skipDrafts: req.body.skipDrafts } : {})
+          })
+          if (shapeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: shapeError })
+          }
+        }
+        // Server-minted identifiers: the row id and (webhook kind) the ≥128-bit
+        // capability token. Prefixes follow the Stripe-style shapes (whk_ / whsec_).
+        const hookId = HookId(randomUUID())
+        const kindFields =
+          req.body.kind === 'webhook'
+            ? {
+                sessionMode: req.body.sessionMode,
+                instructions: req.body.instructions || null,
+                urlToken: `whk_${randomBytes(16).toString('hex')}`,
+                hmacSecret: req.body.hmac ? `whsec_${randomBytes(32).toString('hex')}` : null
+              }
+            : req.body.kind === 'gitlab'
+              ? await (async () => {
+                  // The project must already be a managed binding (§8.3): a hook
+                  // never creates a grant or a binding, and the numeric id is
+                  // validated against the org's own row — never trusted for facts.
+                  const projectId = BigInt((req.body as { projectId: string }).projectId)
+                  const binding = deps.gitlab ? await deps.repos.gitlabProjectBinding.byProject(orgId, projectId) : null
+                  if (!binding || binding.state === 'cleanup_pending') {
+                    return {
+                      ok: false as const,
+                      status: 409 as const,
+                      message: 'the project is not a managed GitLab binding in this organization'
+                    }
+                  }
+                  // A duplicate family is the database's own rule; what only the
+                  // route can see is a sibling family anchored somewhere else.
+                  const siblingError = await siblingShapeError(
+                    agent.id,
+                    'gitlab',
+                    projectId,
+                    binding.projectPath,
+                    hookId,
+                    {
+                      targetPlatform: target.targetPlatform,
+                      targetChannel: req.body.targetChannel ?? null,
+                      targetIntegrationId: target.targetIntegrationId ?? null
+                    }
+                  )
+                  if (siblingError) {
+                    return { ok: false as const, status: 409 as const, message: siblingError }
+                  }
+                  // §8.3: creating a hook never creates a grant, so the project must
+                  // ALREADY be the workspace or an explicit additional authorization.
+                  const authz = await watchRepoAuthorized(agent, 'gitlab', projectId, binding.projectPath)
+                  if (!authz.ok) return authz
+                  const effectError = validateGitlabEffects(binding, effects!)
+                  if (effectError) return { ok: false as const, ...effectError }
+                  return {
+                    // gitlab is perThread by definition, like github (§12.3).
+                    sessionMode: 'perThread' as const,
+                    repoId: projectId,
+                    repoFullName: binding.projectPath,
+                    githubSessionKey: `gitlab:${projectId}`,
+                    hmacSecret: null
+                  }
+                })()
+              : req.body.kind === 'gitea'
+                ? await (async () => {
+                    // The repository the bot administers, re-read by numeric id (§6); bound below, AFTER the §8.3 gate — a hook never creates a grant.
+                    const repoId = BigInt((req.body as { repoId: string }).repoId)
+                    const facts = await giteaRepositoryFacts(orgId, repoId)
+                    if (!facts.ok) return facts
+                    const siblingError = await siblingShapeError(agent.id, 'gitea', repoId, facts.repoPath, hookId, {
+                      targetPlatform: target.targetPlatform,
+                      targetChannel: req.body.targetChannel ?? null,
+                      targetIntegrationId: target.targetIntegrationId ?? null
+                    })
+                    if (siblingError) return { ok: false as const, status: 409 as const, message: siblingError }
+                    const authz = await watchRepoAuthorized(agent, 'gitea', repoId, facts.repoPath)
+                    if (!authz.ok) return authz
+                    const bound = await bindGiteaRepository(orgId, repoId)
+                    if (!bound.ok) return bound
+                    const effectError = validateGiteaEffects(bound.binding, effects!)
+                    if (effectError) return { ok: false as const, ...effectError }
+                    return {
+                      sessionMode: 'perThread' as const,
+                      repoId,
+                      repoFullName: bound.binding.repoPath,
+                      githubSessionKey: `gitea:${repoId}`,
+                      hmacSecret: null
+                    }
+                  })()
+                : req.body.kind === 'azure-devops'
+                  ? await (async () => {
+                      const body = req.body as { repoId: string; enabled: boolean }
+                      const repoId = BigInt(body.repoId)
+                      const facts = await azureDevOpsRepositoryFacts(orgId, repoId)
+                      if (!facts.ok) return facts
+                      const siblingError = await siblingShapeError(
+                        agent.id,
+                        'azure-devops',
+                        repoId,
+                        facts.repoPath,
+                        hookId,
+                        {
+                          targetPlatform: target.targetPlatform,
+                          targetChannel: req.body.targetChannel ?? null,
+                          targetIntegrationId: target.targetIntegrationId ?? null
+                        }
+                      )
+                      if (siblingError) return { ok: false as const, status: 409 as const, message: siblingError }
+                      const authz = await watchRepoAuthorized(agent, 'azure-devops', repoId, facts.repoPath)
+                      if (!authz.ok) return authz
+                      const effectError = validateAzureDevOpsEffects(effects!)
+                      if (effectError) return { ok: false as const, ...effectError }
+                      const gate = await azureDevOpsTriggersAllowed(orgId, repoId, body.enabled)
+                      if (!gate.ok) return gate
+                      return {
+                        sessionMode: 'perThread' as const,
+                        repoId,
+                        repoFullName: facts.repoPath,
+                        githubSessionKey: `azure-devops:${repoId}`,
+                        hmacSecret: null
+                      }
+                    })()
+                  : await (async () => {
+                      const scope = req.body as { repoFullName?: string; githubAccount?: string }
+                      const scopeError = githubScopeError(scope)
+                      if (scopeError) return { ok: false as const, status: 400 as const, message: scopeError }
+                      if (scope.githubAccount !== undefined) {
+                        const row = await resolveInstallationRow(
+                          agent,
+                          scope.githubAccount,
+                          hookId,
+                          {
+                            targetPlatform: target.targetPlatform,
+                            targetChannel: req.body.targetChannel ?? null,
+                            targetIntegrationId: target.targetIntegrationId ?? null
+                          },
+                          effects!
+                        )
+                        if (!row.ok) return row
+                        return {
+                          sessionMode: 'perThread' as const,
+                          installationId: row.installationId,
+                          installationAccount: row.installationAccount,
+                          hmacSecret: null
+                        }
+                      }
+                      const repo = await resolveGithubRepo(orgId, scope.repoFullName!, agent.githubAppId ?? null)
+                      if (!repo.ok) return repo
+                      const siblingError = await siblingShapeError(
+                        agent.id,
+                        'github',
+                        repo.repoId,
+                        repo.repoFullName,
+                        hookId,
+                        {
+                          targetPlatform: target.targetPlatform,
+                          targetChannel: req.body.targetChannel ?? null,
+                          targetIntegrationId: target.targetIntegrationId ?? null
+                        }
+                      )
+                      if (siblingError) {
+                        return { ok: false as const, status: 409 as const, message: siblingError }
+                      }
+                      const authz = await watchRepoAuthorized(agent, 'github', repo.repoId, repo.repoFullName)
+                      if (!authz.ok) return authz
+                      const configError = await validateGithubEffects(agent, repo.repoId, repo.repoFullName, effects!)
+                      if (configError) {
+                        return { ok: false as const, ...configError }
+                      }
+                      return {
+                        // github is perThread by definition — the same issue/PR
+                        // continues one session (design decision 7).
+                        sessionMode: 'perThread' as const,
+                        repoId: repo.repoId,
+                        repoFullName: repo.repoFullName,
+                        hmacSecret: null
+                      }
+                    })()
+        if ('status' in kindFields) {
+          const { status, message } = kindFields
+          return reply.code(status).send({ error: ERROR_NAMES[status], statusCode: status, message })
+        }
+        const { hmacSecret, ...upsertFields } = kindFields
+        const writeHook = (): Promise<PersistOutcome> =>
+          persistHook({
+            hookId,
+            orgId,
+            agentId: agent.id,
+            kind: req.body.kind,
+            name: req.body.name,
+            enabled: req.body.enabled,
+            ...upsertFields,
+            ...(req.body.kind === 'github'
+              ? {
+                  family: req.body.family,
+                  events: req.body.events,
+                  commentFamilies: req.body.commentFamilies,
+                  labelFilter: req.body.labelFilter,
+                  skipDrafts: req.body.skipDrafts,
+                  mentionOnly: req.body.mentionOnly,
+                  reviewPolicy: req.body.reviewPolicy,
+                  reportingMode: req.body.reportingMode,
+                  gateMode: req.body.gateMode
+                }
+              : {}),
+            ...(req.body.kind === 'gitlab' || req.body.kind === 'gitea'
+              ? {
+                  family: req.body.family,
+                  events: req.body.events,
+                  commentFamilies: req.body.commentFamilies,
+                  labelFilter: req.body.labelFilter,
+                  mentionOnly: req.body.mentionOnly,
+                  reviewPolicy: req.body.reviewPolicy,
+                  reportingMode: req.body.reportingMode
+                  // No gateMode: neither host has a required-gate surface, so the row stays informational.
+                }
+              : {}),
+            ...(req.body.kind === 'azure-devops'
+              ? {
+                  family: req.body.family,
+                  events: req.body.events,
+                  commentFamilies: req.body.commentFamilies,
+                  // No label filter: no Azure DevOps event reports a label change (§11.4).
+                  mentionOnly: req.body.mentionOnly,
+                  reviewPolicy: req.body.reviewPolicy,
+                  reportingMode: req.body.reportingMode
+                }
+              : {}),
+            targetPlatform: target.targetPlatform,
+            ...(req.body.targetChannel ? { targetChannel: req.body.targetChannel } : {}),
+            ...(target.targetIntegrationId ? { targetIntegrationId: target.targetIntegrationId } : {}),
+            ...(req.principal
+              ? { createdByUserId: req.principal.userId, lastModifiedByUserId: req.principal.userId }
+              : {})
+          })
+        const written =
+          req.body.kind === 'gitlab'
+            ? await withGitlabHookIdentity(orgId, BigInt(req.body.projectId), agent.id, req.body.enabled, writeHook)
+            : { ok: true as const, result: await writeHook() }
+        if (!written.ok) {
+          return reply
+            .code(written.status)
+            .send({ error: ERROR_NAMES[written.status], statusCode: written.status, message: written.message })
+        }
+        const hook = written.result
+        if (hook instanceof AgentWorkspaceIntegrationConflict || hook instanceof GiteaBindingUnavailable) {
+          return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: hook.message })
+        }
+        if (hook instanceof DuplicateHookFamily) {
+          const label =
+            'installationAccount' in upsertFields
+              ? 'all repositories in ' + upsertFields.installationAccount
+              : 'repoFullName' in upsertFields
+                ? upsertFields.repoFullName
+                : null
+          const family = req.body.kind === 'webhook' ? null : req.body.family
+          return reply.code(409).send({
+            error: ERROR_NAMES[409],
+            statusCode: 409,
+            message: `this agent already watches ${label} (${family})`
+          })
+        }
+        if (hmacSecret) await deps.repos.hookSecret.put(orgOf(req), hookId, hmacSecret)
+        void deps.repos.audit
+          .append({
+            kind: 'hook_change',
+            orgId,
+            agentId: agent.id,
+            ...(req.principal ? { actorUserId: req.principal.userId } : {}),
+            frameType: 'rc/hook-assign',
+            message: `hook ${hook.id} created`,
+            details: {
+              hookId: hook.id,
+              kind: hook.kind,
+              enabled: hook.enabled,
+              ...(hook.repoFullName ? { repoFullName: hook.repoFullName } : {}),
+              ...(hook.installationAccount ? { installationAccount: hook.installationAccount } : {})
+            }
+          })
+          .catch(() => {})
+        // Re-read so hmacConfigured reflects the secret written above.
+        const fresh = (await deps.repos.hook.get(orgId, hookId)) ?? hook
+        converge(fresh)
+        convergeManagedRepository(fresh.kind, orgId, fresh.repoId)
+        return { ...toDto(fresh, deps.config.PUBLIC_RELAY_URL), hmacSecret }
+      }
+    )
+
+    // A hook is subordinate to its agent (like an Integration), so there is no
+    // org-wide hook list — you list an AGENT's hooks, gated by that agent's
+    // visibility. An agent you can't see (or that isn't in the org) reads 404.
+    r.get(
+      '/agents/:agentId/hooks',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'List an agent’s hooks',
+          description: 'Every hook firing this agent. Gated by the agent’s visibility.',
+          operationId: 'listAgentHooks',
+          params: z.object({ agentId: z.string() }),
+          response: { 200: HookListDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await deps.repos.agent.get(orgOf(req), AgentId(req.params.agentId))
+        if (!agent || !canView(agent, ctxOf(req))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        }
+        const rows = await deps.repos.hook.listForAgent(agent.id)
+        return rows.map((h) => toDto(h, deps.config.PUBLIC_RELAY_URL))
+      }
+    )
+
+    r.get(
+      '/hooks/:id',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'Get a hook',
+          description: 'A single hook definition by id, scoped to the caller’s active organization.',
+          operationId: 'getHook',
+          params: IdParam,
+          response: { 200: HookDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const hook = await getOrgHook(req, req.params.id)
+        if (!hook) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'hook not found' })
+        }
+        return toDto(hook, deps.config.PUBLIC_RELAY_URL)
+      }
+    )
+
+    r.put(
+      '/hooks/:id',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'Update a hook',
+          description:
+            'Update a hook definition. `kind` is immutable (it discriminates the body); so is a code-host trigger’s subject `family`, which is why the update body carries none — delete and re-create to change it. A webhook hook’s ingress URL and signing secret are immutable too — rotating either is a delete + re-create. A github hook’s repository may be re-targeted (re-validated against the organization’s installations).',
+          operationId: 'updateHook',
+          params: IdParam,
+          body: UpdateHookBody,
+          response: {
+            200: HookDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const orgId = orgOf(req)
+        // getOrgHook already gated on the owning agent's visibility, and
+        // denyViewerWrite blocked viewer-role callers — that IS edit authorization
+        // for an agent-subordinate resource (no separate per-hook canEdit).
+        const existing = await getOrgHook(req, req.params.id)
+        if (!existing) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'hook not found' })
+        }
+        if (req.body.kind !== existing.kind) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'kind is immutable — delete and re-create to change it'
+          })
+        }
+        const agent = await deps.repos.agent.get(orgOf(req), AgentId(req.body.agentId))
+        if (!agent || !canView(agent, ctxOf(req))) {
+          return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: 'unknown agentId' })
+        }
+        const target = await resolveTarget(orgId, agent.id, req.body)
+        if (!target.ok) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'targetIntegrationId is not an integration of this agent'
+          })
+        }
+        // github kind: re-resolve the repo on every update (re-target allowed —
+        // repoId is recomputed; a stale/foreign repo fails the same as on create).
+        let kindFields: { sessionMode: HookRecord['sessionMode'] } & Partial<{
+          instructions: string | null
+          repoId: bigint
+          repoFullName: string
+          installationId: bigint
+          installationAccount: string
+          events: string[]
+          commentFamilies: HookRecord['commentFamilies']
+          labelFilter: string[]
+          skipDrafts: boolean
+          mentionOnly: boolean
+          reviewPolicy: HookRecord['reviewPolicy']
+          reportingMode: HookRecord['reportingMode']
+          gateMode: HookRecord['gateMode']
+        }>
+        if (req.body.kind === 'github') {
+          const nextEnabled = req.body.enabled ?? existing.enabled
+          const effectConfig = {
+            reviewPolicy: req.body.reviewPolicy ?? existing.reviewPolicy,
+            reportingMode: req.body.reportingMode ?? existing.reportingMode,
+            gateMode: req.body.gateMode ?? existing.gateMode
+          }
+          const skipDrafts = req.body.skipDrafts ?? existing.skipDrafts
+          // The family is immutable, so the edit is re-shaped against the STORED
+          // one. A legacy row the split could not place has none and is grandfathered.
+          const shapeError = existing.family
+            ? familyShapeError({
+                kind: 'github',
+                family: existing.family as HookFamily,
+                events: req.body.events,
+                commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+                ...effectConfig,
+                skipDrafts
+              })
+            : null
+          if (shapeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: shapeError })
+          }
+          // Future modes remain fail-closed even on a disabled definition; a
+          // later re-enable must never activate a value R2a cannot execute.
+          if (effectConfig.gateMode === 'required' || effectConfig.reportingMode === 'status') {
+            const message =
+              effectConfig.gateMode === 'required'
+                ? 'required review gates are not available until R2b'
+                : 'commit status reporting is not available until R3'
+            return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message })
+          }
+          const policyRank = { off: 0, comment: 1, request_changes: 2, full: 3 } as const
+          const scope = req.body as { repoFullName?: string; githubAccount?: string }
+          const scopeError =
+            githubScopeError(scope) ??
+            ((existing.installationId != null) !== (scope.githubAccount !== undefined)
+              ? "a trigger's scope is fixed — delete it and create another to watch one repository or a whole installation"
+              : null)
+          if (scopeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: scopeError })
+          }
+          const proposedTarget = {
+            targetPlatform: target.targetPlatform,
+            targetChannel: req.body.targetChannel ?? null,
+            targetIntegrationId: target.targetIntegrationId ?? null
+          }
+          if (scope.githubAccount !== undefined && existing.installationId != null) {
+            // An installation row keeps its installation and its agent; an edit changes only how it fires.
+            if (
+              agent.id !== existing.agentId ||
+              scope.githubAccount.toLowerCase() !== existing.installationAccount?.toLowerCase()
+            ) {
+              return reply.code(409).send({
+                error: ERROR_NAMES[409],
+                statusCode: 409,
+                message: 'an installation-wide trigger keeps its installation and agent — delete it and create another'
+              })
+            }
+            // Disabling or narrowing reduces effects, so it needs no live installation or grant.
+            const narrowing =
+              !nextEnabled ||
+              (existing.reportingMode === 'check' &&
+                effectConfig.reportingMode === 'off' &&
+                policyRank[effectConfig.reviewPolicy] <= policyRank[existing.reviewPolicy])
+            const installationId = existing.installationId
+            const siblingOnly = narrowing
+              ? await installationSiblingError(
+                  agent.id,
+                  installationId,
+                  'all repositories in ' + existing.installationAccount,
+                  existing.id,
+                  proposedTarget
+                )
+              : null
+            const row: InstallationRowResolution = narrowing
+              ? siblingOnly === null
+                ? { ok: true, installationId, installationAccount: existing.installationAccount! }
+                : { ok: false, status: 409, message: siblingOnly }
+              : await resolveInstallationRow(agent, scope.githubAccount, existing.id, proposedTarget, effectConfig)
+            if (!row.ok) {
+              return reply
+                .code(row.status)
+                .send({ error: ERROR_NAMES[row.status], statusCode: row.status, message: row.message })
+            }
+            kindFields = {
+              sessionMode: 'perThread',
+              installationId: row.installationId,
+              installationAccount: row.installationAccount,
+              events: req.body.events,
+              commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+              labelFilter: req.body.labelFilter,
+              skipDrafts,
+              mentionOnly: req.body.mentionOnly ?? existing.mentionOnly,
+              ...effectConfig
+            }
+          } else {
+            const persistedBindingRequested =
+              existing.repoId !== null &&
+              existing.repoFullName !== null &&
+              agent.id === existing.agentId &&
+              scope.repoFullName!.toLowerCase() === existing.repoFullName.toLowerCase()
+            const safeLifecycleNarrowing =
+              persistedBindingRequested &&
+              (!nextEnabled ||
+                (existing.reportingMode === 'check' &&
+                  effectConfig.reportingMode === 'off' &&
+                  policyRank[effectConfig.reviewPolicy] <= policyRank[existing.reviewPolicy]))
+            // A pure disable or check-off reduces effects, so it reuses the persisted binding even with the grant or GitHub gone.
+            const repo = safeLifecycleNarrowing
+              ? { ok: true as const, repoId: existing.repoId!, repoFullName: existing.repoFullName! }
+              : await resolveGithubRepo(orgId, scope.repoFullName!, agent.githubAppId ?? null)
+            if (!repo.ok) {
+              const { status, message } = repo
+              return reply.code(status).send({ error: ERROR_NAMES[status], statusCode: status, message })
+            }
+            // The database owns duplicate families; the route checks that this repo's sibling families post to the same place.
+            const siblingError = await siblingShapeError(
+              agent.id,
+              'github',
+              repo.repoId,
+              repo.repoFullName,
+              existing.id,
+              {
+                targetPlatform: target.targetPlatform,
+                targetChannel: req.body.targetChannel ?? null,
+                targetIntegrationId: target.targetIntegrationId ?? null
+              }
+            )
+            if (siblingError) {
+              return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: siblingError })
+            }
+            // Only a binding change (another repo or agent) re-runs the authorization gate, so a tweak never bricks a grandfathered hook.
+            const bindingChanged = repo.repoId !== existing.repoId || agent.id !== existing.agentId
+            if (bindingChanged) {
+              const authz = await watchRepoAuthorized(agent, 'github', repo.repoId, repo.repoFullName)
+              if (!authz.ok) {
+                return reply.code(authz.status).send({
+                  error: ERROR_NAMES[authz.status],
+                  statusCode: authz.status,
+                  message: authz.message
+                })
+              }
+            }
+            const configError = safeLifecycleNarrowing
+              ? null
+              : await validateGithubEffects(agent, repo.repoId, repo.repoFullName, effectConfig)
+            if (configError) {
+              return reply.code(configError.status).send({
+                error: ERROR_NAMES[configError.status],
+                statusCode: configError.status,
+                message: configError.message
+              })
+            }
+            kindFields = {
+              sessionMode: 'perThread',
+              repoId: repo.repoId,
+              repoFullName: repo.repoFullName,
+              events: req.body.events,
+              // Optional on UPDATE so old clients preserve the stored scope.
+              commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+              labelFilter: req.body.labelFilter,
+              skipDrafts,
+              mentionOnly: req.body.mentionOnly ?? existing.mentionOnly,
+              ...effectConfig
+            }
+          }
+        } else if (req.body.kind === 'gitlab') {
+          const projectId = BigInt(req.body.projectId)
+          const binding = deps.gitlab ? await deps.repos.gitlabProjectBinding.byProject(orgId, projectId) : null
+          if (!binding || binding.state === 'cleanup_pending') {
+            return reply.code(409).send({
+              error: ERROR_NAMES[409],
+              statusCode: 409,
+              message: 'the project is not a managed GitLab binding in this organization'
+            })
+          }
+          const siblingError = await siblingShapeError(
+            agent.id,
+            'gitlab',
+            projectId,
+            binding.projectPath,
+            existing.id,
+            {
+              targetPlatform: target.targetPlatform,
+              targetChannel: req.body.targetChannel ?? null,
+              targetIntegrationId: target.targetIntegrationId ?? null
+            }
+          )
+          if (siblingError) {
+            return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: siblingError })
+          }
+          // Binding-CHANGING edits go through the §8.3 gate — a new project, or the
+          // same project moved onto a different agent. An edit that keeps the
+          // (grandfathered) pair must not brick an existing hook, exactly as github.
+          if (projectId !== existing.repoId || agent.id !== existing.agentId) {
+            const authz = await watchRepoAuthorized(agent, 'gitlab', projectId, binding.projectPath)
+            if (!authz.ok) {
+              return reply.code(authz.status).send({
+                error: ERROR_NAMES[authz.status],
+                statusCode: authz.status,
+                message: authz.message
+              })
+            }
+          }
+          const effectConfig = {
+            reviewPolicy: req.body.reviewPolicy ?? existing.reviewPolicy,
+            reportingMode: req.body.reportingMode ?? existing.reportingMode
+          }
+          const shapeError = existing.family
+            ? familyShapeError({
+                kind: 'gitlab',
+                family: existing.family as HookFamily,
+                events: req.body.events,
+                commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+                ...effectConfig
+              })
+            : null
+          if (shapeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: shapeError })
+          }
+          const effectError = validateGitlabEffects(binding, effectConfig)
+          if (effectError) {
+            return reply.code(effectError.status).send({
+              error: ERROR_NAMES[effectError.status],
+              statusCode: effectError.status,
+              message: effectError.message
+            })
+          }
+          kindFields = {
+            sessionMode: 'perThread',
+            repoId: projectId,
+            repoFullName: binding.projectPath,
+            events: req.body.events,
+            commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+            labelFilter: req.body.labelFilter ?? existing.labelFilter,
+            mentionOnly: req.body.mentionOnly ?? existing.mentionOnly,
+            ...effectConfig
+          }
+        } else if (req.body.kind === 'gitea') {
+          const repoId = BigInt(req.body.repoId)
+          const facts = await giteaRepositoryFacts(orgId, repoId)
+          if (!facts.ok) {
+            return reply.code(facts.status).send({
+              error: ERROR_NAMES[facts.status],
+              statusCode: facts.status,
+              message: facts.message
+            })
+          }
+          const siblingError = await siblingShapeError(agent.id, 'gitea', repoId, facts.repoPath, existing.id, {
+            targetPlatform: target.targetPlatform,
+            targetChannel: req.body.targetChannel ?? null,
+            targetIntegrationId: target.targetIntegrationId ?? null
+          })
+          if (siblingError) {
+            return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: siblingError })
+          }
+          // Binding-CHANGING edits go through the gate, exactly as the other two hosts.
+          if (repoId !== existing.repoId || agent.id !== existing.agentId) {
+            const authz = await watchRepoAuthorized(agent, 'gitea', repoId, facts.repoPath)
+            if (!authz.ok) {
+              return reply.code(authz.status).send({
+                error: ERROR_NAMES[authz.status],
+                statusCode: authz.status,
+                message: authz.message
+              })
+            }
+          }
+          // Bound on first use (§6), after the gate.
+          const bound = await bindGiteaRepository(orgId, repoId)
+          if (!bound.ok) {
+            return reply.code(bound.status).send({
+              error: ERROR_NAMES[bound.status],
+              statusCode: bound.status,
+              message: bound.message
+            })
+          }
+          const binding = bound.binding
+          const effectConfig = {
+            reviewPolicy: req.body.reviewPolicy ?? existing.reviewPolicy,
+            reportingMode: req.body.reportingMode ?? existing.reportingMode
+          }
+          const shapeError = existing.family
+            ? familyShapeError({
+                kind: 'gitea',
+                family: existing.family as HookFamily,
+                events: req.body.events,
+                commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+                ...effectConfig
+              })
+            : null
+          if (shapeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: shapeError })
+          }
+          const effectError = validateGiteaEffects(binding, effectConfig)
+          if (effectError) {
+            return reply.code(effectError.status).send({
+              error: ERROR_NAMES[effectError.status],
+              statusCode: effectError.status,
+              message: effectError.message
+            })
+          }
+          kindFields = {
+            sessionMode: 'perThread',
+            repoId,
+            repoFullName: binding.repoPath,
+            events: req.body.events,
+            commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+            labelFilter: req.body.labelFilter ?? existing.labelFilter,
+            mentionOnly: req.body.mentionOnly ?? existing.mentionOnly,
+            ...effectConfig
+          }
+        } else if (req.body.kind === 'azure-devops') {
+          const repoId = BigInt(req.body.repoId)
+          const facts = await azureDevOpsRepositoryFacts(orgId, repoId)
+          if (!facts.ok) {
+            return reply.code(facts.status).send({
+              error: ERROR_NAMES[facts.status],
+              statusCode: facts.status,
+              message: facts.message
+            })
+          }
+          const siblingError = await siblingShapeError(agent.id, 'azure-devops', repoId, facts.repoPath, existing.id, {
+            targetPlatform: target.targetPlatform,
+            targetChannel: req.body.targetChannel ?? null,
+            targetIntegrationId: target.targetIntegrationId ?? null
+          })
+          if (siblingError) {
+            return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: siblingError })
+          }
+          if (repoId !== existing.repoId || agent.id !== existing.agentId) {
+            const authz = await watchRepoAuthorized(agent, 'azure-devops', repoId, facts.repoPath)
+            if (!authz.ok) {
+              return reply.code(authz.status).send({
+                error: ERROR_NAMES[authz.status],
+                statusCode: authz.status,
+                message: authz.message
+              })
+            }
+          }
+          const effectConfig = {
+            reviewPolicy: req.body.reviewPolicy ?? existing.reviewPolicy,
+            reportingMode: req.body.reportingMode ?? existing.reportingMode
+          }
+          const shapeError = existing.family
+            ? familyShapeError({
+                kind: 'azure-devops',
+                family: existing.family as HookFamily,
+                events: req.body.events,
+                commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+                ...effectConfig
+              })
+            : null
+          if (shapeError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: shapeError })
+          }
+          const effectError = validateAzureDevOpsEffects(effectConfig)
+          if (effectError) {
+            return reply.code(effectError.status).send({
+              error: ERROR_NAMES[effectError.status],
+              statusCode: effectError.status,
+              message: effectError.message
+            })
+          }
+          const gate = await azureDevOpsTriggersAllowed(orgId, repoId, req.body.enabled ?? existing.enabled)
+          if (!gate.ok) {
+            return reply
+              .code(gate.status)
+              .send({ error: ERROR_NAMES[gate.status], statusCode: gate.status, message: gate.message })
+          }
+          kindFields = {
+            sessionMode: 'perThread',
+            repoId,
+            repoFullName: facts.repoPath,
+            events: req.body.events,
+            commentFamilies: req.body.commentFamilies ?? existing.commentFamilies,
+            mentionOnly: req.body.mentionOnly ?? existing.mentionOnly,
+            ...effectConfig
+          }
+        } else {
+          // Absent keeps the stored instructions (a client predating them echoes no key); empty or null clears them.
+          const instructions = req.body.instructions
+          kindFields = {
+            sessionMode: req.body.sessionMode,
+            ...(instructions !== undefined ? { instructions: instructions || null } : {})
+          }
+        }
+        // PgHookRepo owns the hook-level lifecycle transaction: binding/mode/
+        // enablement changes tombstone the old projection epoch before this
+        // definition advances to its new epoch.
+        const nowEnabled = req.body.enabled ?? existing.enabled
+        const writeHook = (): Promise<PersistOutcome> =>
+          persistHook({
+            hookId: existing.id,
+            expectedAgentId: existing.agentId!,
+            orgId,
+            agentId: agent.id,
+            kind: existing.kind,
+            name: req.body.name,
+            enabled: nowEnabled,
+            ...kindFields,
+            targetPlatform: target.targetPlatform,
+            ...(req.body.targetChannel ? { targetChannel: req.body.targetChannel } : {}),
+            ...(target.targetIntegrationId ? { targetIntegrationId: target.targetIntegrationId } : {}),
+            ...(req.principal ? { lastModifiedByUserId: req.principal.userId } : {})
+          })
+        const written =
+          req.body.kind === 'gitlab'
+            ? await withGitlabHookIdentity(orgId, BigInt(req.body.projectId), agent.id, nowEnabled, writeHook)
+            : { ok: true as const, result: await writeHook() }
+        if (!written.ok) {
+          return reply
+            .code(written.status)
+            .send({ error: ERROR_NAMES[written.status], statusCode: written.status, message: written.message })
+        }
+        const hook = written.result
+        if (hook instanceof AgentWorkspaceIntegrationConflict || hook instanceof GiteaBindingUnavailable) {
+          return reply.code(409).send({ error: ERROR_NAMES[409], statusCode: 409, message: hook.message })
+        }
+        // A retarget carries the row's own family onto the new repository, where
+        // another row of this agent may already own it.
+        if (hook instanceof DuplicateHookFamily) {
+          return reply.code(409).send({
+            error: ERROR_NAMES[409],
+            statusCode: 409,
+            message: `this agent already watches ${kindFields.repoFullName} (${existing.family})`
+          })
+        }
+        void deps.repos.audit
+          .append({
+            kind: 'hook_change',
+            orgId,
+            agentId: agent.id,
+            ...(req.principal ? { actorUserId: req.principal.userId } : {}),
+            frameType: 'rc/hook-assign',
+            message: `hook ${hook.id} updated`,
+            details: { hookId: hook.id, kind: hook.kind, enabled: hook.enabled }
+          })
+          .catch(() => {})
+        // A retarget moved the hook OFF this agent, which may have just lost its last GitLab
+        // consumer — so it is re-projected only once the rule has actually MOVED. Until
+        // `hookAssign` runs, the pool still holds the old rule targeting this very agent, and
+        // dropping its host first would have a delivery in that window refused.
+        const retargetedFrom = existing.agentId && existing.agentId !== agent.id ? existing.agentId : null
+        converge(hook, retargetedFrom ? () => replicateUpsert(orgOf(req), retargetedFrom) : undefined, existing)
+        convergeManagedRepository(hook.kind, orgOf(req), hook.repoId)
+        // A retarget moved this hook off `existing.repoId`: the source binding's
+        // union shrank too, so converge BOTH distinct repositories.
+        if (existing.repoId !== null && existing.repoId !== hook.repoId) {
+          convergeManagedRepository(hook.kind, orgOf(req), existing.repoId)
+        }
+        return toDto(hook, deps.config.PUBLIC_RELAY_URL)
+      }
+    )
+
+    r.delete(
+      '/hooks/:id',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'Delete a hook',
+          description: 'Remove a hook definition and drop its rule from the relay pool.',
+          operationId: 'deleteHook',
+          params: IdParam,
+          response: { 204: z.null(), 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgHook(req, req.params.id)
+        if (!existing) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'hook not found' })
+        }
+        // remove() atomically tombstones the current projection epoch under the
+        // same hook lifecycle lock before deleting the definition.
+        await deps.repos.hook.remove(orgOf(req), existing.id, existing.agentId!)
+        void deps.repos.audit
+          .append({
+            kind: 'hook_change',
+            orgId: orgOf(req),
+            ...(existing.agentId ? { agentId: existing.agentId } : {}),
+            ...(req.principal ? { actorUserId: req.principal.userId } : {}),
+            frameType: 'rc/hook-remove',
+            message: `hook ${existing.id} removed`,
+            details: { hookId: existing.id }
+          })
+          .catch(() => {})
+        deps.hooks.remove(existing.id)
+        void deps.hooks
+          .reconcileRouting([existing])
+          .catch((err) => app.log.warn({ hookId: existing.id, err }, 'hook routing reconcile failed'))
+        // Losing: no rule can fire any more, so dropping the host now cannot orphan a
+        // delivery that still quotes it.
+        await replicateUpsert(orgOf(req), existing.agentId)
+        convergeManagedRepository(existing.kind, orgOf(req), existing.repoId)
+        return reply.code(204).send(null)
+      }
+    )
+
+    // Run history (two-stage: relay rc/run-report opens, daemon hook/report
+    // closes), newest first — the console detail page's Runs card.
+    r.get(
+      '/hooks/:id/runs',
+      {
+        schema: {
+          tags: [Tag.Hooks],
+          summary: 'List hook runs',
+          description: 'Delivery/run history for a hook, newest first (metadata only — payloads never reach the CP).',
+          operationId: 'listHookRuns',
+          params: IdParam,
+          response: { 200: HookRunListDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const hook = await getOrgHook(req, req.params.id)
+        if (!hook) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'hook not found' })
+        }
+        const runs = await deps.repos.hook.listRuns(orgOf(req), hook.id)
+        return runs.map((run) => ({
+          id: run.id,
+          deliveryKey: run.deliveryKey,
+          event: run.event,
+          startedAt: run.startedAt.toISOString(),
+          status: run.status,
+          durationMs: run.durationMs,
+          sessionId: run.sessionId,
+          reason: run.reason,
+          redeliveryAttempts: run.redeliveryAttempts,
+          redeliveryLastRequestedAt: run.redeliveryLastRequestedAt?.toISOString() ?? null
+        }))
+      }
+    )
+
+    // No /hooks/:id/sharing: a hook has no visibility of its own — it inherits the
+    // owning agent's (share the agent instead). See CreateHookBody / the schema.
+  }
+}

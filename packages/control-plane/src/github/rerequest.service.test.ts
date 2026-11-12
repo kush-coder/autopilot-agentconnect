@@ -1,0 +1,389 @@
+import { describe, expect, it, vi } from 'vitest'
+import { HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED, type RcGithubRerequest } from '@agentconnect.md/protocol'
+import { AgentId, DaemonId, HookId, OrgId } from '../domain/ids.js'
+import type { HookRecord, HookRepo, HookReviewProjectionRecord, HookRunRecord } from '../persistence/ports.js'
+import { GithubRerequestService } from './rerequest.service.js'
+
+const HOOK_ID = HookId('88888888-8888-4888-8888-888888888888')
+const HOOK_ID_B = HookId('77777777-7777-4777-8777-777777777777')
+const AGENT_ID = AgentId('33333333-3333-4333-8333-333333333333')
+const DAEMON_ID = DaemonId('dddddddd-dddd-4ddd-8ddd-dddddddddddd')
+const HEAD_SHA = 'a'.repeat(40)
+const BASE_SHA = 'b'.repeat(40)
+const CHECK_RUN_ID = '86617583005'
+const REPO_ID = 987654321n
+const APP_ID = 4157507
+const INSTALLATION_ID = 1234567n
+const DEDICATED_APP_ID = 2000n
+const DEDICATED_INSTALLATION_ID = 7654321n
+
+const request: RcGithubRerequest = {
+  checkRunId: CHECK_RUN_ID,
+  repoId: REPO_ID.toString(),
+  headSha: HEAD_SHA,
+  deliveryKey: 'delivery-rerun-1',
+  includeBaseSha: true
+}
+const suiteRequest: RcGithubRerequest = {
+  scope: 'suite',
+  appId: String(APP_ID),
+  installationId: String(INSTALLATION_ID),
+  repoId: REPO_ID.toString(),
+  headSha: HEAD_SHA,
+  deliveryKey: 'delivery-suite-rerun-1'
+}
+const workflowRequest: RcGithubRerequest = {
+  scope: 'workflow',
+  installationId: String(INSTALLATION_ID),
+  repoId: REPO_ID.toString(),
+  headSha: HEAD_SHA,
+  deliveryKey: 'delivery-workflow-start-1'
+}
+
+function projection(overrides: Partial<HookReviewProjectionRecord> = {}): HookReviewProjectionRecord {
+  return {
+    id: '99999999-9999-4999-8999-999999999999',
+    hookId: HOOK_ID,
+    orgId: OrgId('org-a'),
+    agentId: AGENT_ID,
+    agentName: 'review-bot',
+    lastResolvedInstallationId: INSTALLATION_ID,
+    repoId: REPO_ID,
+    repoFullName: 'acme/infra',
+    headSha: HEAD_SHA,
+    reportSha: HEAD_SHA,
+    projectionEpoch: 2n,
+    generation: 3n,
+    currentHookRunId: 'run-1',
+    externalId: 'projection-external-id',
+    checkRunId: CHECK_RUN_ID,
+    mode: 'check',
+    gateMode: 'informational',
+    desiredState: 'failure',
+    observedState: 'failure',
+    sealedThrough: 3n,
+    subjectSyncGeneration: 3n,
+    subjectSyncErrorCode: null,
+    leaseOwner: null,
+    leaseUntil: null,
+    nextAttemptAt: null,
+    attempts: 0,
+    lastErrorCode: null,
+    pendingIntent: null,
+    writeMarker: null,
+    writePhase: null,
+    writeStartedAt: null,
+    tombstonedAt: null,
+    updatedAt: new Date(0),
+    ...overrides
+  }
+}
+
+function hook(overrides: Partial<HookRecord> = {}): HookRecord {
+  return {
+    id: HOOK_ID,
+    orgId: OrgId('org-a'),
+    agentId: AGENT_ID,
+    kind: 'github',
+    enabled: true,
+    repoId: REPO_ID,
+    reviewPolicy: 'full',
+    reportingMode: 'check',
+    gateMode: 'informational',
+    projectionEpoch: 2n,
+    configRevision: 7n,
+    dispatchRevision: 9n,
+    ...overrides
+  } as HookRecord
+}
+
+function run(overrides: Partial<HookRunRecord> = {}): HookRunRecord {
+  return {
+    id: 'run-1',
+    hookId: HOOK_ID,
+    deliveryKey: 'delivery-original',
+    event: 'pull_request:opened',
+    agentId: AGENT_ID,
+    configRevision: 6n,
+    dispatchRevision: 8n,
+    projectionEpoch: 2n,
+    dispatchDaemonId: DAEMON_ID,
+    reviewPolicySnapshot: 'full',
+    reportingModeSnapshot: 'check',
+    gateModeSnapshot: 'informational',
+    projectionIntent: 'revision_event',
+    repoId: REPO_ID,
+    repoFullName: 'acme/infra',
+    sourceInstallationId: INSTALLATION_ID,
+    subjectKind: 'pull_request',
+    pullNumber: 585,
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    reportSha: HEAD_SHA,
+    isDraft: false,
+    baseChanged: false,
+    projectionId: projection().id,
+    projectionGeneration: 3n,
+    startedAt: new Date(0),
+    turnStartedAt: null,
+    completedAt: new Date(1),
+    orphanedAt: null,
+    reviewAttemptId: null,
+    reviewAttemptState: null,
+    reviewErrorCode: null,
+    reviewId: null,
+    reviewEvent: null,
+    verdict: null,
+    sessionId: null,
+    status: 'failed',
+    reason: HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
+    ...overrides
+  } as HookRunRecord
+}
+
+function make(
+  opts: {
+    projection?: HookReviewProjectionRecord | null
+    hook?: HookRecord | null
+    run?: HookRunRecord | null
+    runs?: HookRunRecord[]
+    orgAppIdOf?: (installationId: bigint) => Promise<bigint | null>
+  } = {}
+) {
+  const findReviewProjectionByCheckRunId = vi.fn(async () =>
+    opts.projection === undefined ? projection() : opts.projection
+  )
+  const listReviewProjectionsForSuiteRerequest = vi.fn(async () => {
+    const candidate = opts.projection === undefined ? projection() : opts.projection
+    return candidate ? [candidate] : []
+  })
+  const listReviewRequestRequiredRuns = vi.fn(async () => {
+    if (opts.runs) return opts.runs
+    const candidate = opts.run === undefined ? run() : opts.run
+    return candidate ? [candidate] : []
+  })
+  const get = vi.fn(async () => (opts.hook === undefined ? hook() : opts.hook))
+  const getMany = vi.fn(async () => {
+    const candidate = opts.hook === undefined ? hook() : opts.hook
+    return candidate ? [candidate] : []
+  })
+  const getRunById = vi.fn(async () => (opts.run === undefined ? run() : opts.run))
+  const service = new GithubRerequestService({
+    hooks: {
+      findReviewProjectionByCheckRunId,
+      listReviewProjectionsForSuiteRerequest,
+      listReviewRequestRequiredRuns,
+      getUnscoped: get,
+      getManyUnscoped: getMany,
+      getRunById
+    } as Pick<
+      HookRepo,
+      | 'findReviewProjectionByCheckRunId'
+      | 'listReviewProjectionsForSuiteRerequest'
+      | 'listReviewRequestRequiredRuns'
+      | 'getUnscoped'
+      | 'getManyUnscoped'
+      | 'getRunById'
+    >,
+    appId: APP_ID,
+    ...(opts.orgAppIdOf ? { orgAppIdOf: opts.orgAppIdOf } : {})
+  })
+  return {
+    service,
+    findReviewProjectionByCheckRunId,
+    listReviewProjectionsForSuiteRerequest,
+    listReviewRequestRequiredRuns,
+    get,
+    getMany,
+    getRunById
+  }
+}
+
+describe('GithubRerequestService', () => {
+  it('resolves an App-owned terminal informational Check to the current hook and PR', async () => {
+    await expect(make().service.resolve(request)).resolves.toEqual({
+      allowed: true,
+      hookId: HOOK_ID,
+      pullNumber: 585,
+      baseSha: BASE_SHA,
+      configRevision: '7',
+      dispatchRevision: '9'
+    })
+  })
+
+  it("resolves an installation row's Check by the installation that signed its current run", async () => {
+    const row = hook({ repoId: null, repoFullName: null, installationId: INSTALLATION_ID, installationAccount: 'acme' })
+    await expect(make({ hook: row }).service.resolve(request)).resolves.toMatchObject({
+      allowed: true,
+      hookId: HOOK_ID
+    })
+    const other = hook({
+      repoId: null,
+      repoFullName: null,
+      installationId: INSTALLATION_ID + 1n,
+      installationAccount: 'acme'
+    })
+    await expect(make({ hook: other }).service.resolve(request)).resolves.toEqual({ allowed: false })
+  })
+
+  it('keeps replies compatible when an older relay does not request the stored base SHA', async () => {
+    const { includeBaseSha: _, ...legacyRequest } = request
+    await expect(make().service.resolve(legacyRequest)).resolves.toEqual({
+      allowed: true,
+      hookId: HOOK_ID,
+      pullNumber: 585,
+      configRevision: '7',
+      dispatchRevision: '9'
+    })
+  })
+
+  describe("an organization App's Check", () => {
+    const orgAppRequest: RcGithubRerequest = {
+      checkRunId: CHECK_RUN_ID,
+      repoId: REPO_ID.toString(),
+      headSha: HEAD_SHA,
+      deliveryKey: 'delivery-org-app-rerun-1',
+      appId: DEDICATED_APP_ID.toString()
+    }
+    const written = projection({ lastResolvedInstallationId: DEDICATED_INSTALLATION_ID })
+    const orgAppIdOf = async (installationId: bigint) =>
+      installationId === DEDICATED_INSTALLATION_ID ? DEDICATED_APP_ID : null
+
+    it('resolves when the delivering App wrote the Check', async () => {
+      await expect(make({ projection: written, orgAppIdOf }).service.resolve(orgAppRequest)).resolves.toEqual({
+        allowed: true,
+        hookId: HOOK_ID,
+        pullNumber: 585,
+        configRevision: '7',
+        dispatchRevision: '9'
+      })
+    })
+
+    it.each([
+      ['another App wrote the Check', { projection: projection(), orgAppIdOf }],
+      ['the delivering App is not the writer', { projection: written, orgAppIdOf: async () => 3000n }],
+      ['no App lookup is wired', { projection: written }]
+    ])('denies when %s', async (_name, opts) => {
+      await expect(make(opts).service.resolve(orgAppRequest)).resolves.toEqual({ allowed: false })
+    })
+  })
+
+  it('resolves an App-owned Check Suite to its current projection targets', async () => {
+    const h = make()
+    await expect(h.service.resolve(suiteRequest)).resolves.toEqual({
+      allowed: true,
+      targets: [
+        {
+          hookId: HOOK_ID,
+          pullNumber: 585,
+          baseSha: BASE_SHA,
+          configRevision: '7',
+          dispatchRevision: '9'
+        }
+      ]
+    })
+    expect(h.listReviewProjectionsForSuiteRerequest).toHaveBeenCalledWith(REPO_ID, HEAD_SHA, INSTALLATION_ID)
+    expect(h.findReviewProjectionByCheckRunId).not.toHaveBeenCalled()
+  })
+
+  it('denies a Check Suite from a different GitHub App before reading projections', async () => {
+    const h = make()
+    await expect(h.service.resolve({ ...suiteRequest, appId: String(APP_ID + 1) })).resolves.toEqual({ allowed: false })
+    expect(h.listReviewProjectionsForSuiteRerequest).not.toHaveBeenCalled()
+  })
+
+  it('resolves each current no-effect external-PR run when an approved workflow starts', async () => {
+    const h = make()
+    await expect(h.service.resolve(workflowRequest)).resolves.toEqual({
+      allowed: true,
+      targets: [
+        {
+          hookId: HOOK_ID,
+          pullNumber: 585,
+          baseSha: BASE_SHA,
+          configRevision: '7',
+          dispatchRevision: '9'
+        }
+      ]
+    })
+    expect(h.listReviewRequestRequiredRuns).toHaveBeenCalledWith(REPO_ID, HEAD_SHA, undefined)
+    expect(h.listReviewProjectionsForSuiteRerequest).not.toHaveBeenCalled()
+  })
+
+  it('preserves a signed workflow pull-request association when GitHub supplies one', async () => {
+    const h = make({ runs: [run({ pullNumber: 586 })] })
+    await expect(h.service.resolve({ ...workflowRequest, pullNumber: 586 })).resolves.toEqual({
+      allowed: true,
+      targets: [
+        expect.objectContaining({
+          hookId: HOOK_ID,
+          pullNumber: 586
+        })
+      ]
+    })
+    expect(h.listReviewRequestRequiredRuns).toHaveBeenCalledWith(REPO_ID, HEAD_SHA, 586)
+  })
+
+  it('fails closed when one hook has multiple waiting PRs on the same head SHA', async () => {
+    const h = make({
+      runs: [run({ id: 'run-1', pullNumber: 585 }), run({ id: 'run-2', pullNumber: 586 })]
+    })
+    await expect(h.service.resolve(workflowRequest)).resolves.toEqual({ allowed: false })
+    expect(h.getMany).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when shared-head candidates across hooks disagree on the PR', async () => {
+    const h = make({
+      runs: [run({ hookId: HOOK_ID, pullNumber: 585 }), run({ hookId: HOOK_ID_B, pullNumber: 586 })]
+    })
+    await expect(h.service.resolve(workflowRequest)).resolves.toEqual({ allowed: false })
+    expect(h.getMany).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['different installation', run({ sourceInstallationId: INSTALLATION_ID + 1n }), hook()],
+    ['run already started', run({ turnStartedAt: new Date(1) }), hook()],
+    ['wrong waiting reason', run({ reason: 'daemon_offline' }), hook()],
+    ['review disabled', run(), hook({ reviewPolicy: 'off' })],
+    ['changed projection epoch', run(), hook({ projectionEpoch: 3n })]
+  ])('denies a workflow approval for %s', async (_label, waitingRun, currentHook) => {
+    await expect(make({ run: waitingRun, hook: currentHook }).service.resolve(workflowRequest)).resolves.toEqual({
+      allowed: false
+    })
+  })
+
+  it.each([
+    ['unknown Check', null],
+    ['wrong repository', projection({ repoId: REPO_ID + 1n })],
+    ['wrong revision', projection({ headSha: 'c'.repeat(40), reportSha: 'c'.repeat(40) })],
+    ['required gate', projection({ gateMode: 'required' })],
+    ['nonterminal Check', projection({ observedState: 'in_progress' })],
+    ['write in flight', projection({ writePhase: 'update' })],
+    ['pending generation', projection({ pendingIntent: { desiredState: 'queued' } })],
+    ['tombstoned projection', projection({ tombstonedAt: new Date(0) })]
+  ])('denies %s before reading hook/run authority', async (_label, candidate) => {
+    const h = make({ projection: candidate })
+    await expect(h.service.resolve(request)).resolves.toEqual({ allowed: false })
+    expect(h.get).not.toHaveBeenCalled()
+    expect(h.getRunById).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['disabled hook', hook({ enabled: false }), run()],
+    ['retargeted hook', hook({ repoId: REPO_ID + 1n }), run()],
+    ['changed projection epoch', hook({ projectionEpoch: 3n }), run()],
+    ['missing current run', hook(), null],
+    ['different PR revision', hook(), run({ headSha: 'c'.repeat(40) })],
+    ['incomplete PR metadata', hook(), run({ baseSha: null })]
+  ])('denies %s', async (_label, currentHook, currentRun) => {
+    await expect(make({ hook: currentHook, run: currentRun }).service.resolve(request)).resolves.toEqual({
+      allowed: false
+    })
+  })
+
+  it('propagates persistence failures for the wire handler to return a retryable error', async () => {
+    const h = make()
+    h.findReviewProjectionByCheckRunId.mockRejectedValueOnce(new Error('db unavailable'))
+    await expect(h.service.resolve(request)).rejects.toThrow('db unavailable')
+  })
+})

@@ -1,0 +1,634 @@
+/**
+ * `AgentSpecAssembler` — the ONE place a wire {@link AgentSpec} is assembled
+ * from a C6 agent definition (docs/designs/secret-store-seams.md §5).
+ *
+ * Every CP→daemon spec emission goes through this class: the `register/ok`
+ * reconcile roster, the live `agent/upsert` REST emit, the icon-refresh
+ * replicate, and the agent-move `agent/activate` definition. Centralizing the
+ * assembly makes secret loading structural — a new emission path CANNOT ship a
+ * spec that silently omits the agent's write-only secrets, because the only
+ * ways to get a spec are `assemble` (which fetches them from the
+ * {@link AgentSecretStore} seam) and `project` (which demands them as an
+ * argument, for the move path's snapshot-pinned bundle).
+ *
+ * The instance also owns the icon URL bases, so the four call sites stop
+ * re-deriving `{cp, store}` from config independently.
+ */
+import {
+  GitCloneUrlError,
+  decisionChainIds,
+  decisionGateIssues,
+  normalizeGitCloneUrl,
+  normalizeGithubRepoUrl,
+  redactGitUrlSecrets,
+  type AgentAdditionalInstallation,
+  type AgentAdditionalRepo,
+  type AgentApiGateProjections,
+  type AgentApiProtocol,
+  type AgentSkillEntry,
+  type ChannelDecisionGate,
+  type HookRoutingProjection,
+  type ManagedSkillEntry,
+  type AgentSpec,
+  type GitCommitIdentity,
+  agentComputerUseOf
+} from '@agentconnect.md/protocol'
+import type {
+  AgentInstallationAuthorizationRepo,
+  AgentRecord,
+  AgentRepoAuthorizationRepo,
+  AgentSecretStore,
+  LiveSecret,
+  CodeHostDecisionRoutingRepo,
+  ComputerRepo,
+  DecisionRepo,
+  GithubAppRepo,
+  HookRepo,
+  OrganizationEnvironmentResolver,
+  OrganizationKnowledgeRepo,
+  SkillSourceRepo
+} from '../persistence/ports.js'
+import { isHonoredRepoGrant } from '../persistence/ports.js'
+import { AgentId, OrgId } from '../domain/ids.js'
+import { gitlabManagedProjectPath } from '../domain/git-host.js'
+import { derivedComputerIds } from '../domain/computer.js'
+import { codeHostProviders } from '../codehost/registry.js'
+import { githubAppBotIdentity } from '../github/config.js'
+import { resolveAgentIconUrl, type IconUrlBases } from '../agents/agent-icon.js'
+import { hookRoutingProjection, routingMembers } from '../hooks/hook-routing.js'
+import { resolveAgentSkillEntries, type InvalidSkillSourceProjection } from './skillSource.js'
+import {
+  emptyOrganizationEnvironmentValues,
+  resolveEffectiveEnvironment,
+  type OrganizationEnvironmentValues
+} from './organizationEnvironment.js'
+
+/** The wire spec plus the id it is keyed by on `agent/upsert` / the roster. */
+export type AssembledAgentSpec = AgentSpec & { agentId: string }
+
+/** Both authorization lists the workspace projects, read together so a move pins them at one revision. */
+export interface WorkspaceGrants {
+  additionalRepos: AgentAdditionalRepo[]
+  additionalInstallations: AgentAdditionalInstallation[]
+}
+
+/** Byte-order string compare — deliberately not `localeCompare`, whose order is host-dependent. */
+const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)
+
+export class AgentSpecAssembler {
+  constructor(
+    private readonly secrets: AgentSecretStore,
+    private readonly iconBases: IconUrlBases = {},
+    // Optional: resolves the agent's skill enable-list into self-contained
+    // AgentSpec.skills entries. Absent (some tests / minimal graphs) ⇒ no skills.
+    private readonly skillSources?: SkillSourceRepo,
+    // Optional for older/minimal test graphs. Production resolves explicitly
+    // enabled centrally-managed skill ids into immutable revision metadata.
+    private readonly organizationKnowledge?: OrganizationKnowledgeRepo,
+    private readonly onInvalidSkillSource?: (agentId: string, invalid: InvalidSkillSourceProjection) => void,
+    // Optional for minimal test graphs: resolves the organization entries assigned
+    // to the agent (organization-secrets-and-variables.md §7). Absent ⇒ the agent's
+    // own env/secrets only, exactly the pre-feature behavior.
+    private readonly organizationEnvironment?: OrganizationEnvironmentResolver,
+    // Reports a key that resolved to nothing — an organization variable colliding
+    // with an agent secret, or an organization secret with no stored material (§9).
+    // ID/key only: never a value.
+    private readonly onTombstonedEnvironmentKeys?: (agentId: string, keys: readonly string[]) => void,
+    // Optional for minimal test graphs: the agent's additional-repository allowlist,
+    // projected onto the workspace (multi-repository-workspaces.md decision 2).
+    // Absent ⇒ [], exactly the pre-feature projection.
+    private readonly agentRepoAuth?: AgentRepoAuthorizationRepo,
+    // The deployment's normalized GitLab instance base URL (§24.1). Absent ⇒ GitLab is
+    // not configured, so no consumer can exist and no spec carries a host.
+    private readonly gitlabHost?: string,
+    // Optional: the third GitLab consumer (§24.4). A hook can reach an already-running
+    // session whose environment cannot be retroactively edited, so an enabled gitlab hook
+    // has to put the host on the spec even when neither workspace nor grant does.
+    private readonly hooks?: Pick<HookRepo, 'listForAgent'>,
+    // The deployment's Gitea instance base URL (gitea-integration.md §11): the same carriage as
+    // GitLab's, set whenever ANY Gitea consumer rides the spec. Absent ⇒ Gitea is not wired.
+    private readonly giteaHost?: string,
+    // The routings this agent hosts and the hooks that are their members (code-host-decisions.md §3.2); absent ⇒ no hookRoutings.
+    private readonly routingSources?: {
+      routings: Pick<CodeHostDecisionRoutingRepo, 'listForHost'>
+      hooks: Pick<HookRepo, 'listForOrgKind'>
+    },
+    // Optional for minimal test graphs: the agent's installation grants (decision 10); absent ⇒ [].
+    private readonly agentInstallationAuth?: Pick<AgentInstallationAuthorizationRepo, 'listForAgent'>,
+    // The Decisions an API gate names, shipped with it so admission never reads the CP; absent ⇒ no gates.
+    private readonly decisions?: Pick<DecisionRepo, 'getForAgent'>,
+    // The Computers whose agent access grants an agent (computer-use.md §4.1); absent ⇒ none.
+    private readonly computerGrants?: Pick<ComputerRepo, 'listAgentGrants'>,
+    // The organization GitHub Apps, for an agent's own commit identity; absent ⇒ every agent commits as the built-in App.
+    private readonly githubApps?: Pick<GithubAppRepo, 'get'>
+  ) {}
+
+  /** The bot of the agent's organization GitHub App; absent on the built-in App or an App whose bot id is unknown. */
+  async gitCommitIdentityOf(a: Pick<AgentRecord, 'orgId' | 'githubAppId'>): Promise<GitCommitIdentity | undefined> {
+    if (!this.githubApps || !a.githubAppId) return undefined
+    const app = await this.githubApps.get(OrgId(a.orgId), a.githubAppId)
+    return app?.botUserId != null ? githubAppBotIdentity(app.slug, Number(app.botUserId)) : undefined
+  }
+
+  /** The Computers an agent may use, derived from each Computer's agent access; pinned by the move bundle like grants. */
+  async computersOf(a: Pick<AgentRecord, 'id' | 'orgId'>): Promise<string[]> {
+    if (!this.computerGrants) return []
+    return derivedComputerIds(await this.computerGrants.listAgentGrants(OrgId(a.orgId)), a.id)
+  }
+
+  /** Each chat API gate with its Decisions; a gate whose condition no longer fits its Decision is left out, so it fails open. */
+  async apiGatesOf(a: Pick<AgentRecord, 'orgId' | 'apiGates'>): Promise<AgentApiGateProjections> {
+    const decisions = this.decisions
+    if (!decisions) return {}
+    const projected: AgentApiGateProjections = {}
+    for (const [protocol, gate] of Object.entries(a.apiGates ?? {}) as Array<[AgentApiProtocol, ChannelDecisionGate]>) {
+      const definitions = await Promise.all(
+        decisionChainIds(gate).map((id) => decisions.getForAgent(OrgId(a.orgId), id))
+      )
+      if (definitions.some((d) => !d)) continue
+      const byId = new Map(definitions.map((d) => [d!.id, d!]))
+      const questions = new Map([...byId].map(([id, d]) => [id, d.question]))
+      if (decisionGateIssues(byId.get(gate.decisionId)!.question, gate, questions).length > 0) continue
+      projected[protocol] = { gate, definitions: [...byId.values()] }
+    }
+    return projected
+  }
+
+  /** Fetch the agent's secret values + resolve its skills, then project the spec. */
+  async assemble(a: AgentRecord): Promise<AssembledAgentSpec> {
+    const [
+      secrets,
+      liveSecrets,
+      skillEntries,
+      managedSkillEntries,
+      organization,
+      additionalRepos,
+      gitlabHook,
+      giteaHook,
+      hookRoutings,
+      additionalInstallations,
+      apiGates,
+      computers,
+      gitCommitIdentity
+    ] = await Promise.all([
+      this.secrets.get(a.orgId, a.id),
+      this.secrets.live(a.orgId, a.id),
+      resolveAgentSkillEntries(a, this.skillSources, (invalid) => this.onInvalidSkillSource?.(a.id, invalid)),
+      this.managedSkillsOf(a),
+      this.organizationEnvironmentOf(a),
+      this.additionalReposOf(a),
+      this.gitlabHookOf(a),
+      this.giteaHookOf(a),
+      this.hookRoutingsOf(a),
+      this.additionalInstallationsOf(a),
+      this.apiGatesOf(a),
+      this.computersOf(a),
+      this.gitCommitIdentityOf(a)
+    ])
+    // Live secrets ride beside the environment, never in it (capability-requests.md §4.9.2); always a full list, `[]` included, so a removal replicates.
+    return {
+      ...this.project(
+        a,
+        secrets,
+        skillEntries,
+        managedSkillEntries,
+        organization,
+        additionalRepos,
+        gitlabHook,
+        giteaHook,
+        hookRoutings,
+        additionalInstallations,
+        apiGates,
+        computers,
+        gitCommitIdentity
+      ),
+      liveSecrets
+    }
+  }
+
+  /** The routings this agent hosts, always shipped so losing the last one replicates; the daemon digests [] as absent. */
+  async hookRoutingsOf(a: Pick<AgentRecord, 'id' | 'orgId'>): Promise<HookRoutingProjection[] | undefined> {
+    if (this.routingSources === undefined) return undefined
+    const hosted = await this.routingSources.routings.listForHost(AgentId(a.id))
+    if (hosted.length === 0) return []
+    const providers = [...new Set(hosted.map((record) => record.provider))]
+    const hooks = (
+      await Promise.all(providers.map((provider) => this.routingSources!.hooks.listForOrgKind(a.orgId, provider)))
+    ).flat()
+    return hosted.flatMap((record) => hookRoutingProjection(record, routingMembers(hooks, record)) ?? [])
+  }
+
+  /** Whether an enabled gitlab hook rides this agent — the one GitLab consumer no other
+   *  projected field reveals. Skipped entirely when GitLab is unconfigured. */
+  async gitlabHookOf(a: Pick<AgentRecord, 'id'>): Promise<boolean> {
+    if (this.gitlabHost === undefined || this.hooks === undefined) return false
+    const rows = await this.hooks.listForAgent(AgentId(a.id))
+    return rows.some((hook) => hook.kind === 'gitlab' && hook.enabled)
+  }
+
+  /** The Gitea twin: an enabled gitea hook is the consumer neither the workspace nor a grant reveals. */
+  async giteaHookOf(a: Pick<AgentRecord, 'id'>): Promise<boolean> {
+    if (this.giteaHost === undefined || this.hooks === undefined) return false
+    const rows = await this.hooks.listForAgent(AgentId(a.id))
+    return rows.some((hook) => hook.kind === 'gitea' && hook.enabled)
+  }
+
+  /** The organization contribution to one agent's effective environment. */
+  organizationEnvironmentOf(a: Pick<AgentRecord, 'id' | 'orgId'>): Promise<OrganizationEnvironmentValues> {
+    return (
+      this.organizationEnvironment?.forAgent(a.orgId, a.id) ?? Promise.resolve(emptyOrganizationEnvironmentValues())
+    )
+  }
+
+  /** Batch form for the reconcile roster (one store read per owned agent).
+   * Historical unsafe clone targets are quarantined individually; every other
+   * failure still rejects the roster so infrastructure errors remain visible. */
+  async assembleAll(
+    agents: readonly AgentRecord[],
+    onUnsafeAgent?: (agent: AgentRecord, error: GitCloneUrlError) => void
+  ): Promise<AssembledAgentSpec[]> {
+    const settled = await Promise.allSettled(agents.map((a) => this.assemble(a)))
+    const assembled: AssembledAgentSpec[] = []
+    for (const [index, result] of settled.entries()) {
+      if (result.status === 'fulfilled') {
+        assembled.push(result.value)
+      } else if (result.reason instanceof GitCloneUrlError) {
+        onUnsafeAgent?.(agents[index]!, result.reason)
+      } else {
+        throw result.reason
+      }
+    }
+    return assembled
+  }
+
+  /** The store read the agent-move snapshot pins into its {@link MoveBundle} —
+   *  exposed here so move code needs no separate secrets dependency. */
+  secretsOf(a: Pick<AgentRecord, 'id' | 'orgId'>): Promise<Record<string, string>> {
+    return this.secrets.get(a.orgId, a.id)
+  }
+
+  /** The live secrets the agent-move snapshot pins beside `secretsOf`. */
+  liveSecretsOf(a: Pick<AgentRecord, 'id' | 'orgId'>): Promise<LiveSecret[]> {
+    return this.secrets.live(a.orgId, a.id)
+  }
+
+  /** The agent's authorized additional repositories, sorted by provider then full name
+   *  so the projection is stable (a reordered read must not change the spec digest) —
+   *  two hosts can display the same path, so the name alone is not a total order.
+   *  Pinned into the move {@link MoveBundle} for the same reason as skills. */
+  async additionalReposOf(a: Pick<AgentRecord, 'id'>): Promise<AgentAdditionalRepo[]> {
+    const rows = (await this.agentRepoAuth?.listForAgent(a.id)) ?? []
+    // A stale grant is neither cloned nor offered to the selector until it is honored again.
+    // A host that routes by more than the numeric id carries it beside the entry (azure-devops-integration.md §4).
+    return rows
+      .filter(isHonoredRepoGrant)
+      .map((row) => ({
+        repoFullName: row.repoFullName,
+        repoId: row.repoId.toString(),
+        provider: row.provider,
+        materialize: row.materialize,
+        ...(row.azureDevOps ? { azureDevOps: row.azureDevOps } : {})
+      }))
+      .sort((x, y) => cmp(x.provider, y.provider) || cmp(x.repoFullName, y.repoFullName))
+  }
+
+  /** The agent's installation grants, never expanded into rows; sorted over every projected field so the digest is stable. */
+  async additionalInstallationsOf(a: Pick<AgentRecord, 'id'>): Promise<AgentAdditionalInstallation[]> {
+    const grants = (await this.agentInstallationAuth?.listForAgent(a.id)) ?? []
+    return grants
+      .map((grant) => ({
+        provider: grant.provider,
+        accountLogin: grant.accountLogin,
+        access: grant.access,
+        materialize: grant.materialize
+      }))
+      .sort(
+        (x, y) =>
+          cmp(x.provider, y.provider) ||
+          cmp(x.accountLogin, y.accountLogin) ||
+          cmp(x.access, y.access) ||
+          cmp(x.materialize, y.materialize)
+      )
+  }
+
+  /** Both lists at once — the move path re-reads them together after every revision-advancing write it makes. */
+  async workspaceGrantsOf(a: Pick<AgentRecord, 'id'>): Promise<WorkspaceGrants> {
+    const [additionalRepos, additionalInstallations] = await Promise.all([
+      this.additionalReposOf(a),
+      this.additionalInstallationsOf(a)
+    ])
+    return { additionalRepos, additionalInstallations }
+  }
+
+  /** Resolve the agent's skill entries — pinned into the move {@link MoveBundle} so
+   *  the authoritative `agent/activate` path ships them (a bare `project` would
+   *  default to [], which `writeAgentSpec` reads as "clear", wiping skills on move). */
+  skillsOf(a: Pick<AgentRecord, 'id' | 'orgId' | 'skills'>): Promise<AgentSkillEntry[]> {
+    return resolveAgentSkillEntries(a, this.skillSources, (invalid) => this.onInvalidSkillSource?.(a.id, invalid))
+  }
+
+  /** Resolve enabled managed-skill ids into the exact immutable revisions the
+   * daemon must fetch. Missing/archived/foreign ids are omitted defensively; the
+   * HTTP write path rejects them, while this keeps legacy rows from breaking a
+   * daemon's entire reconcile roster. */
+  async managedSkillsOf(a: Pick<AgentRecord, 'orgId' | 'managedSkills'>): Promise<ManagedSkillEntry[]> {
+    if (!this.organizationKnowledge || a.managedSkills.length === 0) return []
+    // The read is org-fenced on the agent's own org, so a foreign id resolves
+    // to null and is dropped by the same defensive filter below.
+    const rows = await Promise.all(
+      a.managedSkills.map((id) => this.organizationKnowledge!.getManagedSkill(a.orgId, id))
+    )
+    return rows.flatMap((row) =>
+      row !== null && row.orgId === a.orgId && row.archivedAt === null
+        ? [
+            {
+              id: row.id,
+              name: row.name,
+              revision: row.currentRevision,
+              digest: row.digest
+            }
+          ]
+        : []
+    )
+  }
+
+  /**
+   * Pure projection over ALREADY-FETCHED secrets. The agent-move path calls this
+   * with its snapshotted `MoveBundle.secrets` so the activation fingerprint
+   * compares stable inputs; everything else should prefer {@link assemble}.
+   *
+   * `skillEntries` is REQUIRED (not defaulted): the move/activation path is
+   * authoritative and `writeAgentSpec` reads an omitted skills list as "clear", so
+   * a silent default would wipe skills on every move/workspace edit. The move bundle
+   * snapshots the resolved entries and passes them here; callers with none pass [].
+   */
+  project(
+    a: AgentRecord,
+    secrets: Record<string, string>,
+    skillEntries: AgentSkillEntry[],
+    managedSkillEntries: ManagedSkillEntry[] = [],
+    organization: OrganizationEnvironmentValues = emptyOrganizationEnvironmentValues(),
+    additionalRepos: AgentAdditionalRepo[] = [],
+    gitlabHook = false,
+    giteaHook = false,
+    hookRoutings?: HookRoutingProjection[],
+    additionalInstallations: AgentAdditionalInstallation[] = [],
+    apiGates: AgentApiGateProjections = {},
+    computers: readonly string[] = [],
+    gitCommitIdentity?: GitCommitIdentity
+  ): AssembledAgentSpec {
+    // Resolve by key across both sources BEFORE splitting into the two wire maps
+    // (organization-secrets-and-variables.md §3.2), so the winner of a collision
+    // is deterministic and a write-only key can never be declassified into `env`.
+    const effective = resolveEffectiveEnvironment(a.env, secrets, organization)
+    if (effective.tombstoned.length > 0) this.onTombstonedEnvironmentKeys?.(a.id, effective.tombstoned)
+    return agentRecordToSpec(
+      a,
+      effective.secrets,
+      this.iconBases,
+      skillEntries,
+      managedSkillEntries,
+      effective.env,
+      additionalRepos,
+      gitlabHost(this.gitlabHost, a.workspace, additionalRepos, gitlabHook, skillEntries),
+      giteaHost(this.giteaHost, a.workspace, additionalRepos, giteaHook),
+      hookRoutings,
+      additionalInstallations,
+      apiGates,
+      computers,
+      gitCommitIdentity
+    )
+  }
+}
+
+/** The Gitea twin of {@link gitlabHost} (gitea-integration.md §11): one axis, carried whenever any Gitea consumer rides the spec. */
+export function giteaHost(
+  configured: string | undefined,
+  workspace: AgentRecord['workspace'],
+  additionalRepos: readonly AgentAdditionalRepo[],
+  enabledGiteaHook: boolean
+): string | undefined {
+  if (configured === undefined) return undefined
+  const consumer =
+    (workspace.mode === 'git' &&
+      (workspace.credential?.provider === 'gitea' ||
+        // An anonymous public repository on the deployment's own instance still needs the host.
+        gitlabManagedProjectPath(workspace.gitRepo, configured) !== null)) ||
+    enabledGiteaHook ||
+    additionalRepos.some((repo) => repo.provider === 'gitea')
+  return consumer ? configured : undefined
+}
+
+/**
+ * The §24.4 host carriage rule, in one place: the configured instance rides the spec
+ * whenever ANY GitLab consumer does — a gitlab-vouched workspace, an additional-
+ * repository authorization, or an enabled hook. It never branches on "is this
+ * GitLab.com" (§24.1): the value is the axis, and an absent one means GitLab is
+ * unconfigured. A daemon reading an absent field means GitLab.com, so an older
+ * Control Plane needs no negotiation.
+ */
+export function gitlabHost(
+  configured: string | undefined,
+  workspace: AgentRecord['workspace'],
+  additionalRepos: readonly AgentAdditionalRepo[],
+  enabledGitlabHook: boolean,
+  skillEntries: readonly Pick<AgentSkillEntry, 'credential'>[] = []
+): string | undefined {
+  if (configured === undefined) return undefined
+  const consumer =
+    (workspace.mode === 'git' &&
+      (workspace.credential?.provider === 'gitlab' ||
+        // An anonymous public project on the deployment's own instance still needs
+        // the host: the daemon widens its clone-origin allowlist from this field.
+        gitlabManagedProjectPath(workspace.gitRepo, configured) !== null)) ||
+    enabledGitlabHook ||
+    additionalRepos.some((repo) => repo.provider === 'gitlab') ||
+    // A credentialed GitLab skill Source is read on this instance, path prefix included (source-cache.md §11).
+    skillEntries.some((entry) => entry.credential?.provider === 'gitlab')
+  return consumer ? configured : undefined
+}
+
+/**
+ * Map a C6 agent definition to the wire {@link AgentSpec} (+ `agentId`) the daemon
+ * replicates locally. `description` IS the system-prompt seed; `model` is flattened
+ * out of `runtimeOverrides`. Exported for unit tests — production code reaches it
+ * only through {@link AgentSpecAssembler}, which owns secret loading. `secrets`
+ * comes from the AgentSecretStore seam (the record deliberately never carries
+ * values) and rides the spec like env.
+ */
+export function agentRecordToSpec(
+  a: AgentRecord,
+  secrets: Record<string, string>,
+  iconBases?: IconUrlBases,
+  skillEntries: AgentSkillEntry[] = [],
+  managedSkillEntries: ManagedSkillEntry[] = [],
+  // The RESOLVED variable map (agent-local merged with assigned organization
+  // entries). Defaults to the agent's own env so a caller with no organization
+  // context — hand-authored tests, minimal graphs — behaves exactly as before.
+  env: Record<string, string> = a.env,
+  // The agent's `AgentRepoAuthorization` rows, already sorted by full name.
+  // Defaults to [] so a caller with no allowlist context projects as before.
+  additionalRepos: AgentAdditionalRepo[] = [],
+  // The §24.4 host carriage, already decided by {@link gitlabHost}.
+  host?: string,
+  // The Gitea instance carriage, already decided by {@link giteaHost}.
+  giteaInstance?: string,
+  hookRoutings?: HookRoutingProjection[],
+  // The agent's installation grants, already sorted; always shipped beside `additionalRepos` and never merged into it.
+  additionalInstallations: AgentAdditionalInstallation[] = [],
+  // The chat API gates with their Decisions, already resolved by {@link AgentSpecAssembler.apiGatesOf}.
+  apiGates: AgentApiGateProjections = {},
+  // The Computers whose agent access grants the agent, already derived by {@link AgentSpecAssembler.computersOf}.
+  computers: readonly string[] = [],
+  // The agent's own App bot, already resolved by {@link AgentSpecAssembler.gitCommitIdentityOf}.
+  gitCommitIdentity?: GitCommitIdentity
+): AssembledAgentSpec {
+  // Domain AgentWorkspace uses `gitBranch`; the wire AgentWorkspace uses `branch`.
+  // The assembled spec always carries the host-neutral `git` arm; the per-peer
+  // dual encoding to the legacy arms (git-workspace-model.md §8) happens at the
+  // transmit sites through encodeSpecWorkspaceForPeer. Credential derivation and
+  // the allowlist both stay CP-side.
+  const specCredential =
+    a.workspace.mode === 'git' && a.workspace.credential
+      ? codeHostProviders[a.workspace.credential.provider].workspace.toSpec(a.workspace.credential, a.workspaceRepoId)
+      : null
+  const workspace: AgentSpec['workspace'] =
+    a.workspace.mode === 'git'
+      ? {
+          mode: 'git',
+          isolation: a.workspace.isolation ?? 'shared',
+          // Defense in depth for historical/non-Prisma records: never send
+          // credentials or an unsupported transport to any daemon version.
+          gitRepo:
+            a.workspace.credential?.provider === 'github'
+              ? normalizeGithubRepoUrl(a.workspace.gitRepo)
+              : normalizeGitCloneUrl(redactGitUrlSecrets(a.workspace.gitRepo)),
+          branch: a.workspace.gitBranch ?? 'main',
+          ...(a.workspace.agentDir !== undefined ? { agentDir: a.workspace.agentDir } : {}),
+          // The vouching host owns its own wire shape; absent ⇒ anonymous clone.
+          ...(specCredential ? { credential: specCredential } : {}),
+          additionalRepos,
+          additionalInstallations
+        }
+      : {
+          mode: 'scratch',
+          isolation: a.workspace.isolation ?? 'shared',
+          gitCredential: 'github-app',
+          additionalRepos,
+          additionalInstallations
+        }
+  return {
+    agentId: a.id,
+    orgId: a.orgId,
+    name: a.name,
+    // Always ship value or null: explicit null clears a previously replicated
+    // daemon-local display name, while an absent wire key means "leave unchanged".
+    displayName: a.displayName,
+    // Public avatar URL for the Slack per-message icon (sibling of displayName→
+    // username). Always ship value or null so clearing/switching the icon (or a
+    // deploy with no PUBLIC_CP_URL) replicates as a cleared override. Cache-busted
+    // by lastModified so a re-picked glyph/color refetches on Slack's side.
+    iconUrl: resolveAgentIconUrl(a.id, a.icon, iconBases ?? {}, a.lastModifiedAt.getTime()),
+    // Specs are only assembled for PLACED agents, and placement requires a runtime
+    // (preset-agents.md §3.2) — the null→undefined map is a type-level formality.
+    runtime: a.runtime ?? undefined,
+    // Always ship a string: a cleared description (null in the DB) replicates as ""
+    // so the daemon overwrites a stale value rather than seeing an absent key ("leave
+    // unchanged"). Uses "" not null as the empty sentinel because older daemons parse
+    // description as a non-nullable string and would reject a null register/ok entry,
+    // failing the whole handshake. An empty prompt seed == "no description", lossless.
+    description: a.description ?? '',
+    // Always shipped (value or null): these are per-runtime override vocabularies, so
+    // a runtime switch resets them to default. The daemon merge treats an absent key as
+    // "leave alone", so a cleared override (null) must replicate as an explicit null —
+    // otherwise the stale value from the previous runtime survives in agent.json. Same
+    // rationale as env/mcpServers below.
+    model: a.model,
+    modelProvider: a.modelProvider ?? null,
+    reasoningEffort: a.reasoningEffort,
+    permissionMode: a.permissionMode,
+    showFooter: a.showFooter,
+    showStatusBar: a.showStatusBar,
+    chatActions: a.chatActions,
+    // Guarded (not just non-null): the wire field is an enum, and outputMode is a
+    // plain string in the runtimeOverrides JSON — never let a stray value kill the frame.
+    ...(a.outputMode === 'none' ||
+    a.outputMode === 'minimal' ||
+    a.outputMode === 'low' ||
+    a.outputMode === 'medium' ||
+    a.outputMode === 'high'
+      ? { outputMode: a.outputMode }
+      : {}),
+    ...(a.fastMode !== null ? { fastMode: a.fastMode } : {}),
+    ...(a.pause !== null ? { pause: a.pause } : {}),
+    // Always ship env (even {}): the daemon merge treats an absent key as
+    // "leave alone", so removing the last variable must still replicate. This is
+    // the RESOLVED map — agent-local variables with assigned organization
+    // variables layered over them — so unassigning an entry clears its value from
+    // the daemon through the same full-snapshot semantics.
+    env,
+    // Write-only secrets ride the same wire as env (values are plaintext on the TLS WS,
+    // never in a DTO response). Always shipped (even {}) so a removed secret replicates.
+    secrets,
+    // The revision the daemon fences on (organization-secrets-and-variables.md §7).
+    // Decimal string, because the column is a bigint and a JSON number would lose
+    // precision. Always shipped by a current CP so the ordering guarantee holds on
+    // agent/upsert, the register/ok roster, and agent/activate alike.
+    configRevision: a.configRevision.toString(),
+    // Likewise always shipped (even []) so disabling the last MCP server replicates.
+    mcpServers: a.mcpServers,
+    // Self-contained skill sources (shared-skills.md), resolved from the agent's
+    // enable-list against the org SkillSource registry. Always shipped (even []) so
+    // disabling the last skill replicates.
+    skills: skillEntries,
+    decisionIds: a.decisionIds ?? [],
+    modelSelection: a.modelSelection ?? null,
+    // Value or null, so a return to Default replicates.
+    coordinatorModel: a.coordinatorModel ?? null,
+    // Always shipped, so turning the coordinator back on replicates.
+    coordinatorDisabled: a.coordinatorDisabled === true,
+    // Value or null, so removing the filter replicates.
+    coordinatorFilter: a.coordinatorFilter ?? null,
+    // Always shipped, so removing the last gate replicates.
+    apiGates,
+    // Value or null, so clearing the evaluator replicates; the daemon digests null as the absent field.
+    repositorySelector: a.repositorySelector ?? null,
+    ...(hookRoutings !== undefined ? { hookRoutings } : {}),
+    // Immutable centrally-managed bundle metadata. Content is fetched separately
+    // in bounded chunks, keeping reconcile/upsert frames small.
+    managedSkills: managedSkillEntries,
+    // Agent→agent call authorization (§2.5), replicated so the owning daemon enforces
+    // it locally on same-daemon `messageAgent` delivery. Always ship both (allowedCallerAgentIds
+    // even []) so a policy loosen/tighten or an emptied allow-list replicates.
+    callPolicy: a.callPolicy,
+    allowedCallerAgentIds: a.allowedCallerAgentIds,
+    // Caller-side half of the same authorization edge. Same-daemon delivery can
+    // enforce it without a CP hop; [] must replicate when the final target is removed.
+    outboundPolicy: a.outboundPolicy,
+    allowedTargetAgentIds: a.allowedTargetAgentIds,
+    // #536: self-introduce-on-join. A definite column value, always shipped so a
+    // toggle replicates to the owning daemon (which applies it to agent.json).
+    introduceOnJoin: a.introduceOnJoin,
+    // Derived (computer-use.md §4.1): the granting Computers and the managed mode, or null so losing the last one replicates.
+    computerUse: agentComputerUseOf(a.computerUse, computers),
+    // The strategy sessions run in (session-executors.md §5), always shipped.
+    execution: a.execution,
+    // Preset marker (preset-agents.md §3.1). Always shipped (definite record field)
+    // so the daemon can gate preset-only behavior locally.
+    builtin: a.builtin,
+    // Ship the memory backend only when set (like pause) — a switch isn't a
+    // per-runtime-vocabulary reset, so absent ⇒ the daemon leaves agent.json alone.
+    ...(a.memory !== null ? { memory: a.memory } : {}),
+    // Value or null, so clearing replicates; stored routing keys ride unchanged, so a daemon that still requires one validates it.
+    assistantMode: a.assistantMode ?? null,
+    // Only once set (assistant-mode.md §5.15): write-once, so a spec never starts carrying it at an unchanged revision.
+    ...(a.assistantOnboarding ? { assistantOnboarding: a.assistantOnboarding } : {}),
+    // §24.4: pre-spawn host carriage. Present only when a GitLab consumer is, so a spec
+    // with none stays byte-identical to what a pre-§24 control plane projected.
+    ...(host !== undefined ? { gitlabHost: host } : {}),
+    ...(giteaInstance !== undefined ? { giteaHost: giteaInstance } : {}),
+    // Present only on an organization App, so a built-in agent's spec stays byte-identical; absent clears it daemon-side.
+    ...(gitCommitIdentity ? { gitCommitIdentity } : {}),
+    workspace
+  }
+}

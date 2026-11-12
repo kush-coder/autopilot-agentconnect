@@ -1,0 +1,86 @@
+/**
+ * Pairwise a2a transcript privacy (#967).
+ *
+ * Every postless `toAgent` child of ONE caller session is keyed on the same
+ * synthetic channel (`a2a:<caller>`) and the caller's thread, so all pairwise
+ * sessions share one PHYSICAL transcript thread. The sessions are pairwise;
+ * the reads must be too: the §8.5 catch-up and the turn-context refresh scope
+ * a2a threads to rows the session's agent sent or received, so a sibling can
+ * never see another child's private delivery or report through ordinary
+ * context refresh.
+ *
+ * Measured before the fix (webchat Werewolf real run, #941/#967): a player's
+ * night prompt carried the referee's ROLE deliveries to its siblings — private
+ * canaries included — as `(thread context you may have missed)` rows.
+ */
+import { describe, expect, it, vi } from 'vitest'
+import { Daemon } from '../src/daemon.js'
+import type { MessageAgentReq } from '../src/mcp/ops.js'
+import { fakeCpClient, scaffold, scriptedHosts, seedCallPolicy, settle } from './webchat-continuation-fixture.js'
+import { WAIT } from './wait-support.js'
+
+const CALLER = 'bot-caller'
+const CHILD_A = 'child-a'
+const CHILD_B = 'child-b'
+
+const ALPHA = 'ALPHA-CANARY-a2a-privacy'
+const BRAVO = 'BRAVO-CANARY-a2a-privacy'
+
+function callReq(toAgentId: string, text: string): MessageAgentReq {
+  return {
+    callerAgentId: CALLER,
+    platform: 'webchat',
+    callerChannel: 'wc-conversation-1',
+    callerThread: '100.1',
+    toAgentId,
+    text,
+    channel: 'wc-conversation-1',
+    thread: '100.1',
+    postless: true
+  }
+}
+
+describe('a2a transcript privacy (#967)', () => {
+  it('siblings of one caller never see each other’s private deliveries or replies in any prompt', async () => {
+    const { factory, prompts } = scriptedHosts({
+      [CALLER]: () => 'never prompted here',
+      [CHILD_A]: () => `ack from ${CHILD_A}`,
+      [CHILD_B]: () => `ack from ${CHILD_B}`
+    })
+    const daemon = new Daemon({ root: scaffold([CALLER, CHILD_A, CHILD_B]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [CALLER, CHILD_A, CHILD_B])
+    try {
+      const call = (req: MessageAgentReq) => (daemon as any).collab.messageAgent(req) as Promise<{ delivered: boolean }>
+
+      // Two private deliveries from ONE caller to two different children —
+      // they share the physical a2a thread by construction.
+      expect((await call(callReq(CHILD_A, `for A only: ${ALPHA}`))).delivered).toBe(true)
+      await vi.waitFor(() => expect(prompts.get(CHILD_A)).toHaveLength(1), WAIT)
+      expect((await call(callReq(CHILD_B, `for B only: ${BRAVO}`))).delivered).toBe(true)
+      await vi.waitFor(() => expect(prompts.get(CHILD_B)).toHaveLength(1), WAIT)
+
+      // Second round: later turns of the SAME pairwise sessions are where the
+      // shared-thread catch-up used to replay sibling rows.
+      expect((await call(callReq(CHILD_A, 'second ping for A'))).delivered).toBe(true)
+      await vi.waitFor(() => expect(prompts.get(CHILD_A)).toHaveLength(2), WAIT)
+      expect((await call(callReq(CHILD_B, 'second ping for B'))).delivered).toBe(true)
+      await vi.waitFor(() => expect(prompts.get(CHILD_B)).toHaveLength(2), WAIT)
+      await settle()
+
+      const textOf = (agentId: string) => (prompts.get(agentId) ?? []).join('\n\u0000\n')
+      // Each child saw its OWN delivery…
+      expect(textOf(CHILD_A)).toContain(ALPHA)
+      expect(textOf(CHILD_B)).toContain(BRAVO)
+      // …and NEVER the sibling's delivery, in any prompt of any turn.
+      expect(textOf(CHILD_A)).not.toContain(BRAVO)
+      expect(textOf(CHILD_B)).not.toContain(ALPHA)
+      // A sibling's REPLY is private too.
+      expect(textOf(CHILD_A)).not.toContain(`ack from ${CHILD_B}`)
+      expect(textOf(CHILD_B)).not.toContain(`ack from ${CHILD_A}`)
+    } finally {
+      await daemon.stop()
+    }
+  }, 60_000)
+})

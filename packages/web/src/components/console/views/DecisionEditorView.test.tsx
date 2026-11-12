@@ -1,0 +1,472 @@
+// @vitest-environment happy-dom
+
+// The editor validates writes and preserves sharing that the user did not change.
+
+import { act } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { SWRConfig } from 'swr'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import * as decisionProvider from '@/lib/decisions/provider'
+import * as decisionMock from '@/lib/decisions/mock-api'
+import { createDecisionMockSeed } from '@/lib/decisions/fixtures'
+import { decisionExample } from '@/lib/decisions/examples'
+import type { MemberSetRow } from '@/lib/data'
+import { ApiError } from '@/lib/api'
+
+const { DecisionsPrototypeProvider, useDecisionsPrototype } = decisionProvider
+const push = vi.fn()
+/** Per-test query string, so the `returnTo` guard can be exercised. */
+let searchParams = new URLSearchParams()
+let params: { id?: string } = {}
+let store: ReturnType<typeof useDecisionsPrototype>
+let memberSets: MemberSetRow[] = []
+function StoreProbe() {
+  store = useDecisionsPrototype()
+  return null
+}
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    members: [],
+    memberSets,
+    integrations: [{ id: 'int-1', agentId: 'agent-1', platform: 'slack', channels: [] }],
+    bots: [],
+    agents: []
+  })
+}))
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push, replace: vi.fn() }),
+  useParams: () => params,
+  usePathname: () => '/decisions/new',
+  useSearchParams: () => searchParams
+}))
+vi.mock('@/lib/data', async (original) => ({ ...(await original<object>()), MOCK_MODE: true }))
+vi.mock('@/lib/feature-flags', () => ({
+  featureFlagEnabled: (id: string) => id === 'daemon-pool' || id === 'managed'
+}))
+vi.mock('@/lib/org-context', () => ({
+  useOrgs: () => ({ activeOrg: { id: 'org-test' }, myRole: 'owner', orgPath: (path: string) => path })
+}))
+
+import DecisionEditorView from './DecisionEditorView'
+
+let root: Root | undefined
+let container: HTMLDivElement | undefined
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+
+afterEach(async () => {
+  if (root) await act(async () => root?.unmount())
+  container?.remove()
+  root = undefined
+  container = undefined
+  push.mockClear()
+  searchParams = new URLSearchParams()
+  params = {}
+  memberSets = []
+  vi.restoreAllMocks()
+})
+
+async function render() {
+  container = document.createElement('div')
+  document.body.append(container)
+  root = createRoot(container)
+  await act(async () => {
+    root?.render(
+      <SWRConfig value={{ provider: () => new Map(), dedupingInterval: 0 }}>
+        <DecisionsPrototypeProvider>
+          <StoreProbe />
+          <DecisionEditorView />
+        </DecisionsPrototypeProvider>
+      </SWRConfig>
+    )
+  })
+  await act(async () => {})
+}
+
+const click = async (node: Element | undefined | null) => {
+  if (!node) throw new Error('nothing to click')
+  await act(async () => {
+    node.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  })
+}
+
+const byText = (text: string) =>
+  [...document.body.querySelectorAll('button, span, div, a, p')].find((node) => node.textContent?.trim() === text)
+
+/** React tracks a controlled field's value, so a bare assignment is swallowed; set it natively. */
+async function type(selector: string, index: number, value: string) {
+  const nodes = [...document.body.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>(selector)]
+  const node = nodes[index]
+  if (!node) throw new Error(`no field for ${selector}[${index}]`)
+  const prototype = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+  await act(async () => {
+    setter?.call(node, value)
+    node.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
+/** A complete, saveable choice decision — the two keys and both descriptions a save needs. */
+async function fillValidChoice() {
+  await type('input[placeholder="Request type"]', 0, 'Request type')
+  await type('textarea[placeholder="Ask one question about the latest message."]', 0, 'Which request is this?')
+  await type('input[placeholder="key"]', 0, 'deploy')
+  await type('input[placeholder="key"]', 1, 'review')
+  await type('input[placeholder="What this answer means"]', 0, 'Shipping and rollbacks')
+  await type('input[placeholder="What this answer means"]', 1, 'Code review')
+}
+
+describe('DecisionEditorView', () => {
+  it('offers Cloud, named groups, and machines and submits the selected scope', async () => {
+    params = { id: 'support-category' }
+    const seed = createDecisionMockSeed()
+    const provider = seed.providers[0]!
+    const providers = [
+      { ...provider, daemonName: 'Example machine' },
+      {
+        ...provider,
+        daemonId: 'pool-member-a',
+        daemonName: 'Example pool node A',
+        pool: true,
+        readiness: { status: 'pending_sync' as const }
+      },
+      { ...provider, daemonId: 'pool-member-b', daemonName: 'Example pool node B', pool: true },
+      { ...provider, daemonId: 'group-member', daemonName: 'Build machine', memberSetId: 'example-group' }
+    ]
+    const api = decisionMock.createDecisionMockApi({ seed: { ...seed, providers } })
+    vi.spyOn(decisionMock, 'createDecisionMockApi').mockReturnValue(api)
+    memberSets = [
+      {
+        setId: 'example-group',
+        name: 'Build group',
+        memberDaemonIds: ['group-member'],
+        agentCount: 1,
+        spreadSessions: false
+      },
+      { setId: 'empty-group', name: 'Empty group', memberDaemonIds: [], agentCount: 0, spreadSessions: false }
+    ]
+    const catalog = vi.spyOn(decisionProvider, 'useDecisionProviders').mockReturnValue({
+      providers,
+      daemonId: provider.daemonId,
+      error: null
+    })
+    await render()
+    const picker = () => document.body.querySelector('button[aria-label="Runs on"]')
+    const run = () => [...document.body.querySelectorAll('button')].find((node) => node.textContent?.trim() === 'Run')!
+    const preview = vi.spyOn(store.api, 'preview')
+    expect(picker()?.textContent).toContain('AgentConnect Cloud')
+    await click(run())
+    expect(preview.mock.lastCall?.[0].target).toEqual({ kind: 'pool' })
+    expect(preview.mock.lastCall?.[0]).not.toHaveProperty('daemonId')
+
+    await click(picker())
+    await click(document.body.querySelector('.fscrim'))
+    expect(picker()?.getAttribute('aria-expanded')).toBe('false')
+    await click(picker())
+    const options = [...document.body.querySelectorAll<HTMLButtonElement>('[role="option"]')]
+    expect(options.filter((option) => option.dataset.pool)).toHaveLength(1)
+    expect(document.body.textContent).not.toContain('Example pool node')
+    expect(options.find((option) => option.textContent?.includes('Empty group'))?.disabled).toBe(true)
+    expect(options.find((option) => option.textContent?.includes('Example machine'))).toBeTruthy()
+    await click(options.find((option) => option.textContent?.includes('Build group')))
+    await click(run())
+    expect(preview.mock.lastCall?.[0].target).toEqual({ kind: 'set', setId: 'example-group' })
+
+    catalog.mockReturnValue({
+      providers: providers.filter((entry) => entry.daemonId !== 'group-member'),
+      daemonId: provider.daemonId,
+      error: null
+    })
+    await type('input[placeholder="Request type"]', 0, 'Updated category')
+    expect(picker()?.textContent).toContain('Build group')
+    expect(run().disabled).toBe(true)
+
+    await click(picker())
+    await click(
+      [...document.body.querySelectorAll('[role="option"]')].find((option) =>
+        option.textContent?.includes('Example machine')
+      )
+    )
+    await click(run())
+    expect(preview.mock.lastCall?.[0].target).toEqual({ kind: 'daemon', daemonId: provider.daemonId })
+  })
+
+  it('starts a new decision on a choice question with two empty answers', async () => {
+    await render()
+    expect(byText('New decision')).toBeTruthy()
+    expect(document.body.querySelectorAll('input[placeholder="key"]')).toHaveLength(2)
+    expect(document.body.querySelectorAll('input[placeholder="What this answer means"]')).toHaveLength(2)
+    expect(byText('Create')).toBeTruthy()
+  })
+
+  it('refuses to save without a question to ask', async () => {
+    await render()
+    await click(byText('Create'))
+    expect(byText('Give the decision a name before saving.')).toBeTruthy()
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  // A preview parses the draft: an unfinished question must not offer to run at all.
+  it('only offers to run once the question can be evaluated', async () => {
+    await render()
+    const run = () => [...document.body.querySelectorAll('button')].find((node) => node.textContent?.includes('Run'))
+    expect(run()?.disabled).toBe(true)
+
+    await type('textarea[placeholder="Ask one question about the latest message."]', 0, 'Which request is this?')
+    await type('input[placeholder="key"]', 0, 'deploy')
+    await type('input[placeholder="key"]', 1, 'review')
+    await type('input[placeholder="What this answer means"]', 0, 'Shipping')
+    await type('input[placeholder="What this answer means"]', 1, 'Review')
+    expect(run()?.disabled).toBe(false)
+
+    // Back to an unfinished question: the control returns to inert rather than rejecting.
+    await type('input[placeholder="key"]', 1, '')
+    expect(run()?.disabled).toBe(true)
+  })
+
+  it('saves the combined provider and model selection with a valid choice decision', async () => {
+    const seed = createDecisionMockSeed()
+    seed.providers[0]!.models.push({ id: 'jev-latest', label: 'Jev latest', questionTypes: ['choice'] })
+    vi.spyOn(decisionMock, 'createDecisionMockApi').mockReturnValue(decisionMock.createDecisionMockApi({ seed }))
+    await render()
+    await fillValidChoice()
+    const create = vi.spyOn(store.api, 'createDecision')
+    const picker = document.body.querySelector('button[aria-label="Provider · model"]')!
+    await click(picker)
+    await click(byText('Jev latest'))
+    expect(picker.textContent).toContain('TypeSafe · Jev latest')
+    await click(byText('Create'))
+    await act(async () => {})
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ providerId: 'typesafe', model: 'jev-latest' }))
+    expect(push).toHaveBeenCalledWith('/decisions')
+  })
+
+  it('prefills a new decision from an example and saves it unchanged', async () => {
+    searchParams = new URLSearchParams('example=prAuthor')
+    const example = decisionExample('prAuthor')!
+    await render()
+    expect(document.body.querySelector<HTMLInputElement>('input[placeholder="Request type"]')?.value).toBe('PR author')
+    const currentMessage = () =>
+      document.body.querySelector<HTMLTextAreaElement>('textarea[placeholder="The message being evaluated"]')?.value
+    expect(currentMessage()).toBe(example.sample.current)
+    // Load example restores this example's own sample, not the generic Choice one.
+    await type('textarea[placeholder="The message being evaluated"]', 0, 'edited')
+    await click(byText('Load example'))
+    expect(currentMessage()).toBe(example.sample.current)
+    const create = vi.spyOn(store.api, 'createDecision')
+    await click(byText('Create'))
+    await act(async () => {})
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ name: 'PR author', question: example.question }))
+  })
+
+  it('refuses to delete a decision a consumer still uses from the editor', async () => {
+    params = { id: 'support-category' }
+    await render()
+    await click(byText('Delete'))
+    const dialog = document.body.querySelector('[role="dialog"]')!
+    expect(dialog.textContent).toContain('Delete Support category')
+    // The dialog already lists the usage the detail read returned.
+    expect(dialog.textContent).toContain('This decision is still used. Remove it from these places before deleting it:')
+    expect(dialog.textContent).toContain('Support bot')
+    await click([...dialog.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Delete'))
+    expect(dialog.textContent).toContain('This decision is still used. Remove its bindings before deleting it.')
+    expect(dialog.textContent).toContain('Support bot')
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  // The live refusal lists the visible usages, linked to their consoles, and counts the rest.
+  it('renders a 409 delete refusal with its linked usages and the hidden count', async () => {
+    params = { id: 'needs-response' }
+    await render()
+    vi.spyOn(store.api, 'getDecision').mockResolvedValue({
+      decision: store.decisions.find((entry) => entry.id === 'needs-response')!,
+      usages: []
+    })
+    vi.spyOn(store.api, 'deleteDecision').mockRejectedValue(
+      new ApiError('in use', 409, undefined, {
+        usages: [
+          { kind: 'gate', id: 'int-1:C1', label: '#general · Support', integrationId: 'int-1', channelId: 'C1' },
+          { kind: 'agent_tool', id: 'agent-2', label: 'Reviewer' }
+        ],
+        hiddenUsageCount: 2
+      })
+    )
+    await click(byText('Delete'))
+    const dialog = document.body.querySelector('[role="dialog"]')!
+    expect(dialog.textContent).toContain('This decision is not used anywhere. This can’t be undone.')
+    await click([...dialog.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Delete'))
+    const link = (label: string) => [...dialog.querySelectorAll('a')].find((node) => node.textContent?.trim() === label)
+    expect(link('#general · Support')?.getAttribute('href')).toBe('/agents/agent-1')
+    expect(link('Reviewer')?.getAttribute('href')).toBe('/agents/agent-2?tab=tools')
+    expect(dialog.textContent).toContain('2 more you cannot see')
+    expect(dialog.textContent).toContain('This decision is still used. Remove its bindings before deleting it.')
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  // A refusal whose only references are hidden must never fall back to the unused copy.
+  it.each([
+    { hiddenUsageCount: 2, line: '2 more you cannot see' },
+    { hiddenUsageCount: 0, line: 'Used by items you cannot see' }
+  ])('keeps a 409 with no visible usages in use (hidden $hiddenUsageCount)', async ({ hiddenUsageCount, line }) => {
+    params = { id: 'needs-response' }
+    await render()
+    vi.spyOn(store.api, 'getDecision').mockResolvedValue({
+      decision: store.decisions.find((entry) => entry.id === 'needs-response')!,
+      usages: []
+    })
+    vi.spyOn(store.api, 'deleteDecision').mockRejectedValue(
+      new ApiError('in use', 409, undefined, { usages: [], hiddenUsageCount })
+    )
+    await click(byText('Delete'))
+    const dialog = document.body.querySelector('[role="dialog"]')!
+    await click([...dialog.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Delete'))
+    expect(dialog.textContent).not.toContain('This decision is not used anywhere.')
+    expect(dialog.textContent).toContain('This decision is still used. Remove it from these places before deleting it:')
+    expect(dialog.textContent).toContain(line)
+    expect(document.body.textContent).not.toContain('Not used anywhere yet.')
+    expect(push).not.toHaveBeenCalled()
+  })
+
+  it('duplicates the saved decision and opens the copy', async () => {
+    params = { id: 'support-category' }
+    await render()
+    await click(byText('Duplicate'))
+    const copy = store.decisions.find((entry) => entry.name === 'Support category copy')!
+    expect(copy.question).toEqual(store.decisions.find((entry) => entry.id === params.id)!.question)
+    expect(push).toHaveBeenCalledWith(`/decisions/${copy.id}`)
+  })
+
+  it('preserves sharing changed elsewhere while the user edits only the question', async () => {
+    params = { id: 'support-category' }
+    await render()
+    const { name, providerId, model, question } = store.decisions.find((entry) => entry.id === params.id)!
+    await act(async () => {
+      await store.api.updateDecision(params.id!, {
+        name,
+        providerId,
+        model,
+        question,
+        visibility: 'restricted',
+        sharedWith: ['example-user']
+      })
+      await store.reload()
+    })
+    const update = vi.spyOn(store.api, 'updateDecision')
+    await type('input[placeholder="Request type"]', 0, 'Edited category')
+    await click(byText('Save'))
+    expect(update.mock.calls[0]?.[1]).not.toHaveProperty('visibility')
+    expect(update.mock.calls[0]?.[1]).not.toHaveProperty('sharedWith')
+    expect((await store.api.getDecision(params.id!)).decision).toMatchObject({
+      name: 'Edited category',
+      visibility: 'restricted',
+      sharedWith: ['example-user']
+    })
+  })
+
+  it('warns before saving changed answers used by agents', async () => {
+    params = { id: 'support-category' }
+    await render()
+    const getDecision = store.api.getDecision.bind(store.api)
+    vi.spyOn(store.api, 'getDecision').mockImplementation(async (id) => {
+      const detail = await getDecision(id)
+      return {
+        ...detail,
+        usages: [...detail.usages, { kind: 'agent_tool', id: 'example-agent', label: 'Example agent' }]
+      }
+    })
+    const update = vi.spyOn(store.api, 'updateDecision')
+    await type('input[placeholder="What this answer means"]', 0, 'Updated answer')
+    await click(byText('Save'))
+    expect(byText('Review agents using this decision')).toBeTruthy()
+    expect(update).not.toHaveBeenCalled()
+    await click(byText('Save changes'))
+    expect(update).toHaveBeenCalledOnce()
+  })
+
+  // A gated conversation is named before a criteria edit can leave its condition Needs review.
+  it('names the gated conversations before saving changed answers', async () => {
+    params = { id: 'support-category' }
+    await render()
+    const getDecision = store.api.getDecision.bind(store.api)
+    vi.spyOn(store.api, 'getDecision').mockImplementation(async (id) => ({
+      ...(await getDecision(id)),
+      usages: [{ kind: 'gate', id: 'int-1:C1', label: '#general · Support', integrationId: 'int-1', channelId: 'C1' }]
+    }))
+    const update = vi.spyOn(store.api, 'updateDecision')
+    await type('input[placeholder="What this answer means"]', 0, 'Updated answer')
+    await click(byText('Save'))
+    expect(byText('Review where this decision is used')).toBeTruthy()
+    expect(
+      byText(
+        'Conversations whose conditions no longer fit the new answers are marked Needs review and stay off until repaired: #general · Support'
+      )
+    ).toBeTruthy()
+    expect(update).not.toHaveBeenCalled()
+  })
+
+  it('links each visible place to where the console edits it', async () => {
+    params = { id: 'support-category' }
+    const api = decisionMock.createDecisionMockApi()
+    const getDecision = api.getDecision.bind(api)
+    api.getDecision = async (id) => ({
+      ...(await getDecision(id)),
+      usages: [
+        { kind: 'gate', id: 'int-1:C1', label: '#general · Support', integrationId: 'int-1', channelId: 'C1' },
+        { kind: 'agent_tool', id: 'agent-2', label: 'Reviewer' },
+        { kind: 'shared_bot_routing', id: 'support-bot', label: 'Support bot' }
+      ]
+    })
+    vi.spyOn(decisionMock, 'createDecisionMockApi').mockReturnValue(api)
+    await render()
+    await act(async () => {})
+    // Each place's row carries its own Edit link.
+    const settingsOf = (label: string) =>
+      document.body.querySelector(`a[aria-label="Edit ${label}"]`)?.getAttribute('href')
+    expect(settingsOf('#general · Support')).toBe('/agents/agent-1')
+    expect(settingsOf('Reviewer')).toBe('/agents/agent-2?tab=tools')
+    // A shared bot's rules open in place instead of on its settings page.
+    expect(settingsOf('Support bot')).toBeUndefined()
+    await click(document.body.querySelector('button[aria-label="Edit Support bot"]'))
+    expect(document.body.querySelector('[role="dialog"]')?.getAttribute('aria-label')).toBe(
+      'Support bot · By decision rules'
+    )
+  })
+
+  it('replaces the criteria wholesale when the question type changes', async () => {
+    await render()
+    await click(byText('Score'))
+    // Four ordered levels, re-keyed from position, and no free-text answer key field.
+    expect(document.body.querySelectorAll('input[placeholder="What this level means"]')).toHaveLength(4)
+    expect(document.body.querySelectorAll('input[placeholder="key"]')).toHaveLength(0)
+    await click(byText('Boolean'))
+    expect(document.body.querySelectorAll('input[placeholder="When this answer applies"]')).toHaveLength(2)
+  })
+
+  // Created from a binding strip, the new Decision is handed back to the draft that asked for it.
+  it('seeds the pending binding draft with an inline-created decision', async () => {
+    searchParams = new URLSearchParams('returnTo=/agents/a1')
+    await render()
+    await act(async () => store.beginInlineCreate('org-test|bot|C1'))
+    await fillValidChoice()
+    await click(byText('Create'))
+    await act(async () => {})
+    expect(push).toHaveBeenCalledWith('/agents/a1')
+    const draft = store.bindingDrafts['org-test|bot|C1']
+    expect(draft).toMatchObject({
+      phase: 'editing',
+      when: { type: 'choice', thresholds: { deploy: 0.5, review: 0.5 } }
+    })
+    expect(store.decisions.find((entry) => entry.id === draft?.decisionId)?.name).toBe('Request type')
+  })
+
+  // `returnTo` is attacker-controllable, so only a console-relative target is honoured.
+  it('never follows an absolute returnTo', async () => {
+    searchParams = new URLSearchParams('returnTo=https://example.test/phish')
+    await render()
+    await fillValidChoice()
+    await click(byText('Create'))
+    await act(async () => {})
+    expect(push).toHaveBeenCalledWith('/decisions')
+  })
+})

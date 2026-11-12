@@ -1,0 +1,185 @@
+import { DatabaseSync } from 'node:sqlite'
+import { describe, expect, it, vi } from 'vitest'
+import type { EventSession } from '@agentconnect.md/protocol'
+import { SessionMetadataOutbox, type SessionMetadataHost } from '../src/store/session-metadata-outbox.js'
+import { LocalStore, sessionKey } from '../src/store/local-store.js'
+import { SqliteAsyncDatabase } from '../src/store/sqlite-async-database.js'
+
+const AGENT = 'a0a0a0a0-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const DAEMON = 'd1'
+
+/** git-workspace-model §11: one host per session, so two sessions of one agent can share a runtime-local ACP id. */
+async function world() {
+  const database = new DatabaseSync(':memory:')
+  const store = await LocalStore.open({ database: SqliteAsyncDatabase.adopt(database) })
+  const now = 1_000_000
+  const sync = vi.fn<(event: EventSession) => Promise<'acknowledged' | 'unsupported'>>(async () => 'acknowledged')
+  const cp = { state: 'READY', supportsServerFeature: () => true, syncEventSession: sync }
+  const agent = { id: AGENT, reasoningEffort: 'high', permissionMode: 'agent', fastMode: true }
+  const host: SessionMetadataHost = {
+    store: () => store,
+    warn: vi.fn(),
+    debug: vi.fn(),
+    clock: () => ({ now: () => now, setTimeout, clearTimeout }) as never,
+    daemonId: () => DAEMON,
+    controlPlaneConfigured: () => true,
+    draining: () => false,
+    cpClient: () => cp as never,
+    agents: () => new Map([[AGENT, agent as never]]),
+    servesAgent: () => true,
+    sessionLink: (id) => `https://console.example.test/sessions/${id}`,
+    sessionThreadUrl: () => undefined
+  }
+  const outbox = new SessionMetadataOutbox(host)
+  const row = async (channel: string, thread: string) => {
+    const key = sessionKey('slack', channel, thread, AGENT)
+    await store.upsertSession({
+      key,
+      agentId: AGENT,
+      platform: 'slack',
+      channel,
+      thread,
+      acpSessionId: 'acp-1',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: now,
+      triggeredBy: 'U1'
+    })
+    return { key, channel, outward: await store.ensureOutwardSessionId(key, AGENT, now) }
+  }
+  // A private DM and a public channel session, both minted `acp-1` by their own hosts.
+  const dm = await row('D1', 'T1')
+  const channel = await row('C1', 'T2')
+  const classify = async () => {
+    await store.setSessionClassification(dm.key, { conversationKind: 'dm', directDestination: true })
+    await store.setSessionClassification(channel.key, { conversationKind: 'channel' })
+  }
+  const start = async () => {
+    for (const s of [dm, channel]) {
+      await outbox.emitSessionMetadataSnapshot({
+        sessionId: 'acp-1',
+        sessionKey: s.key,
+        agentId: AGENT,
+        phase: 'start',
+        platform: 'slack',
+        channel: s.channel
+      })
+    }
+  }
+  const events = async (): Promise<Map<string, EventSession>> => {
+    await outbox.drainSessionMetadataSnapshots()
+    return new Map(sync.mock.calls.map(([event]) => [event.sessionId, event]))
+  }
+  return { database, agent, store, outbox, sync, cp, dm, channel, classify, start, events }
+}
+
+describe('session metadata names its classification by the logical session', () => {
+  it('publishes each session runtime, model, and run settings independently', async () => {
+    const w = await world()
+    const dmTarget = { runtime: 'runtime-a', model: 'model-a', effort: '', permissionMode: 'auto', fastMode: false }
+    const channelTarget = {
+      runtime: 'runtime-b',
+      model: 'model-b',
+      effort: 'low',
+      permissionMode: 'plan',
+      fastMode: true
+    }
+    await w.store.pinDecisionModel(w.dm.key, dmTarget)
+    await w.store.pinDecisionModel(w.channel.key, channelTarget)
+    await w.start()
+    const seen = await w.events()
+    expect(seen.get(w.dm.outward)).toMatchObject(dmTarget)
+    expect(seen.get(w.channel.outward)).toMatchObject(channelTarget)
+    w.outbox.dispose()
+    await w.store.close()
+  })
+
+  it('names no model for an observation recorded without its runtime, once the next runtime is known', async () => {
+    const w = await world()
+    w.database
+      .prepare('UPDATE sessions SET observedModel = ?, observedModelSet = 1 WHERE key = ?')
+      .run('model-a', w.dm.key)
+    Object.assign(w.agent, { runtime: 'runtime-a' })
+    await w.start()
+    const seen = await w.events()
+    expect(seen.get(w.dm.outward)).toMatchObject({ runtime: 'runtime-a', observedModel: null })
+    expect(seen.get(w.dm.outward)).not.toHaveProperty('model')
+    w.outbox.dispose()
+    await w.store.close()
+  })
+
+  it("a snapshot carrying the session key publishes that session's own facts, not a sibling's sharing the ACP id", async () => {
+    const w = await world()
+    await w.classify()
+    await w.start()
+    const seen = await w.events()
+    expect([...seen.keys()].sort()).toEqual([w.dm.outward, w.channel.outward].sort())
+    expect(seen.get(w.dm.outward)).toMatchObject({ conversationKind: 'dm', directDestination: true })
+    expect(seen.get(w.channel.outward)?.conversationKind).toBe('channel')
+    expect(seen.get(w.channel.outward)?.directDestination).toBeUndefined()
+    w.outbox.dispose()
+    await w.store.close()
+  })
+
+  it("the display-name re-emit carries each row's key, so both siblings are re-emitted as themselves", async () => {
+    const w = await world()
+    // A `plan` re-emit updates a pending obligation, so the CP is held away until the re-emit has landed;
+    // the facts are classified only after the start milestones, so what each event carries came through it.
+    w.cp.state = 'CONNECTING'
+    await w.start()
+    await w.classify()
+    await w.outbox.emitSessionMetadataSnapshotsForDisplayName('U1')
+    w.cp.state = 'READY'
+    const seen = await w.events()
+    expect(seen.size).toBe(2)
+    expect([...seen.keys()].sort()).toEqual([w.dm.outward, w.channel.outward].sort())
+    expect(seen.get(w.dm.outward)).toMatchObject({ conversationKind: 'dm', directDestination: true })
+    expect(seen.get(w.channel.outward)?.conversationKind).toBe('channel')
+    w.outbox.dispose()
+    await w.store.close()
+  })
+})
+
+describe('session metadata names the session owning a task', () => {
+  it('sends the owner of a threaded task, and null for a session no task row holds (auto-session-mode.md §6.2)', async () => {
+    const w = await world()
+    await w.store.assistantSubsessions.open({
+      agentId: AGENT,
+      childSessionKey: w.channel.key,
+      parentSessionId: 'sid-coordinator',
+      parentSessionKey: sessionKey('slack', 'C1', 'append:coordinator-1', AGENT),
+      title: 'Task'
+    })
+    await w.start()
+    const seen = await w.events()
+    expect(seen.get(w.channel.outward)?.taskParentSessionId).toBe('sid-coordinator')
+    expect(seen.get(w.dm.outward)?.taskParentSessionId).toBeNull()
+    w.outbox.dispose()
+    await w.store.close()
+  })
+})
+
+describe('a task owner change while the Control Plane is away', () => {
+  it('is queued durably as an ordered update and sent once it is back', async () => {
+    const w = await world()
+    await w.start()
+    await w.events()
+    w.sync.mockClear()
+    // The last milestone was acknowledged; the release happens while the Control Plane is away.
+    w.cp.state = 'CONNECTING'
+    await w.outbox.emitSessionMetadataSnapshot({
+      sessionId: 'acp-1',
+      sessionKey: w.channel.key,
+      agentId: AGENT,
+      phase: 'plan',
+      ordered: true,
+      platform: 'slack',
+      channel: w.channel.channel
+    })
+    w.cp.state = 'READY'
+    const seen = await w.events()
+    expect(seen.get(w.channel.outward)?.taskParentSessionId).toBeNull()
+    w.outbox.dispose()
+    await w.store.close()
+  })
+})

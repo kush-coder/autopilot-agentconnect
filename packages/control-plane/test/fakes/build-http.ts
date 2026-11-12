@@ -1,0 +1,1082 @@
+/**
+ * `buildHttpApp` — the C2 BFF composition root for tests (design §5.3, §6 Phase 4).
+ *
+ * Wires the real C6 repos (over the shared Testcontainers `PrismaClient`) to the
+ * `DaemonRegistryService`, the `DaemonAuthService`, and an
+ * `InMemorySessionEventSink`, then assembles the Fastify instance via the SAME
+ * `buildHttpServer(deps)` production uses. The `humanAuth` plane runs the devAuth
+ * stub (no `OIDC_ISSUER`). Tests drive it with `app.inject` — DB-backed, NO socket.
+ */
+import { PgDecisionRepo } from '../../src/persistence/repositories/decision.repo.js'
+import { PgDaemonAdmissionRepo } from '../../src/persistence/repositories/daemon-admission.repo.js'
+import { PgGithubAppRepo } from '../../src/persistence/repositories/github-app.repo.js'
+import { PgBotDecisionRoutingRepo } from '../../src/persistence/repositories/bot-decision-routing.repo.js'
+import type { FastifyInstance } from 'fastify'
+import type { PrismaClient } from '../../src/generated/prisma/client.js'
+import {
+  PgAgentRepo,
+  PgAssignmentRepo,
+  PgCronRepo,
+  PgHookRepo,
+  PgHookSecretStore,
+  PgRelayRepo,
+  PgSessionRepo,
+  PgSessionUsageRepo,
+  PgWebchatConversationRepo,
+  PgAgentApiEntryRepo,
+  PgWebchatMcpDelegationRepo,
+  PgWebchatMcpAccessGrantRepo,
+  PgWebchatMcpOperationRepo,
+  PgDaemonRepo,
+  PgDaemonLifecycleOpRepo,
+  PgApiKeyRepo,
+  PgOAuthRepo,
+  PgAuditRepo,
+  PgRuntimeProfileRepo,
+  PgLaunchRepo,
+  PgUserRepo,
+  PgGithubInstallationRepo,
+  PgAgentRepoAuthorizationRepo,
+  PgAgentInstallationAuthorizationRepo,
+  PgCodeHostRepositoryRepo,
+  PgCodeHostTrustedActorRepo,
+  PgGitlabConnectionRepo,
+  PgGitlabAgentAccountRepo,
+  PgGitlabInstanceStateStore,
+  PgGitlabProjectBindingRepo,
+  PgGitlabWebhookSecretStore,
+  PgGiteaConnectionRepo,
+  PgGiteaRepositoryBindingRepo,
+  PgGiteaWebhookSecretStore,
+  PgAzureDevOpsConnectionRepo,
+  PgAzureDevOpsHookRepo,
+  PgAzureDevOpsRepositoryBindingRepo,
+  PgOrgRepo,
+  PgOrgInviteLinkRepo,
+  PgWaitlistRepo,
+  PgIntegrationRepo,
+  PgBotRepo,
+  PgBotSecretStore,
+  PgBotCredentialWriter,
+  PgAgentSecretStore,
+  PgProviderKeyStore,
+  PgAgentConfigWriter,
+  PgMemoryConnectionWriter,
+  PgMcpProviderRepo,
+  PgMcpProviderSecretStore,
+  PgMcpGrantRepo,
+  PgMcpProviderOauthRepo,
+  PgMcpProviderOauthSecretStore,
+  PgMcpProviderOauthStateStore,
+  PgSkillSourceRepo,
+  PgComputerRepo,
+  PgComputerAuditRepo,
+  PgAgentSkillSourceStatusRepo,
+  PgOrganizationKnowledgeRepo,
+  PgOrganizationRecordRepo,
+  PgOrganizationEnvironmentRepo,
+  PgOrganizationEnvironmentResolver,
+  PgOrganizationEnvironmentSecretStore,
+  PgMemoryPluginInstallationRepo,
+  PgExternalMemoryConnectionRepo,
+  PgExternalMemoryConnectionSecretStore,
+  PgExternalMemoryGrantRepo,
+  PgSlackInstallStore,
+  PgSlackPlatformInstallStore,
+  PgSlackWorkspaceInstallStore,
+  PgFeishuAppRegistrationStore,
+  PgWechatPendingLoginStore,
+  PgMsTeamsAgentBotRequestStore,
+  PgThreadAffinityStore,
+  PgSlackUserConfigStore,
+  PgLinearTokenStore,
+  PgLinearInstallStateStore,
+  PgPresetAgentStore,
+  PgIntegrationChannelRepo,
+  PgDutyGroupRepo
+} from '../../src/persistence/index.js'
+import { CodeHostTrustedActorService } from '../../src/codehost/trusted-actor.service.js'
+import { PgMemberSetRepo } from '../../src/persistence/repositories/member-set.repo.js'
+import {
+  PgAgentMemoryFileRepo,
+  PgAgentMemoryHistoryRepo
+} from '../../src/persistence/repositories/agent-memory.repo.js'
+import { PlaintextSecretCipher } from '../../src/secrets/cipher.js'
+import { runWithSharedTx, withSharedTxRouting } from '../../src/persistence/ambient-tx.js'
+import { AgentSpecAssembler } from '../../src/orchestrator/agentSpecAssembler.js'
+import { DaemonRegistryService } from '../../src/registry/registryService.js'
+import { DaemonAuthService } from '../../src/registry/authService.js'
+import { ApiKeyCodec } from '../../src/registry/apiKey.js'
+import { ApiKeyService } from '../../src/registry/apiKeyService.js'
+import { ComputerService } from '../../src/registry/computerService.js'
+import { computerAccessFanOut } from '../../src/orchestrator/computerAccessFanOut.js'
+import type { ComputerScreenshots } from '../../src/registry/computerScreenshots.js'
+import { ComputerAuditLog } from '../../src/registry/computerAuditLog.js'
+import { ComputerChannelGrants } from '../../src/registry/computerChannelGrants.js'
+import { ComputerChannelKeys } from '../../src/registry/computerChannelKeys.js'
+import { OAuthService } from '../../src/registry/oauthService.js'
+import { WebchatTokenService } from '../../src/registry/webchatToken.js'
+import { WebchatMcpGrantTokenCodec } from '../../src/registry/webchatMcpGrantToken.js'
+import { OrgInviteLinkCodec } from '../../src/registry/orgInviteLink.js'
+import { OrgInviteLinkService } from '../../src/registry/orgInviteLinkService.js'
+import { WaitlistService } from '../../src/registry/waitlistService.js'
+import { EpochService } from '../../src/orchestrator/epoch.js'
+import { DUTY_LEASE_DEFAULTS } from '../../src/orchestrator/dutyLease.js'
+import { ControlSender } from '../../src/orchestrator/outbound.js'
+import { AgentDelivery } from '../../src/orchestrator/agentDelivery.js'
+import { PlacementResolver } from '../../src/orchestrator/placementResolver.js'
+import { RelayRoster } from '../../src/orchestrator/relayRoster.js'
+import { RelayControlSender } from '../../src/orchestrator/relayControl.js'
+import { HttpBotOrchestrator } from '../../src/orchestrator/httpBot.js'
+import { CollabRoutesService } from '../../src/orchestrator/collabRoutes.service.js'
+import { AgentMutationGate } from '../../src/orchestrator/agentMutationGate.js'
+import { ConnectionRegistry } from '../../src/ws/registry.js'
+import { RelayRegistry } from '../../src/ws/relay-registry.js'
+import { InMemorySessionEventSink } from '../../src/events/sink.js'
+import { SessionUsageWriter } from '../../src/usage/writer.js'
+import { HookService } from '../../src/hooks/hook.service.js'
+import { HookRoutingService } from '../../src/hooks/hook-routing.service.js'
+import { PgCodeHostDecisionRoutingRepo } from '../../src/persistence/repositories/code-host-decision-routing.repo.js'
+import { buildHttpServer } from '../../src/http/server.js'
+import type { HttpDeps } from '../../src/http/deps.js'
+import { buildCpPlatformRegistry } from '../../src/platforms/registry.js'
+import { botIdentityProjector } from '../../src/platforms/bot-identity.js'
+import type { CpPlatformRegistry } from '../../src/platforms/provider.js'
+import { createTelegramCpProvider } from '../../src/platforms/telegram/provider.js'
+import { createDiscordCpProvider } from '../../src/platforms/discord/provider.js'
+import { createSlackCpProvider, createSlackToolingCredentials } from '../../src/platforms/slack/provider.js'
+import { createFeishuCpProvider } from '../../src/platforms/feishu/provider.js'
+import { createLinearCpProvider } from '../../src/platforms/linear/provider.js'
+import { createDingTalkCpProvider } from '../../src/platforms/dingtalk/provider.js'
+import { dingTalkCredentialRoutes } from '../../src/platforms/dingtalk/routes.js'
+import { createMsTeamsCpProvider } from '../../src/platforms/msteams/provider.js'
+import { createWeChatCpProvider } from '../../src/platforms/wechat/provider.js'
+import { createWeComCpProvider, type WeComDial } from '../../src/platforms/wecom/provider.js'
+import { weComCredentialRoutes } from '../../src/platforms/wecom/routes.js'
+import { TENANTLESS_SENTINEL } from '../../src/persistence/ports.js'
+import { weChatLoginRoutes } from '../../src/platforms/wechat/routes.js'
+import { WeChatLoginService } from '../../src/platforms/wechat/login.js'
+import { WECHAT_DEFAULT_API_URL, type WeChatLoginClient } from '../../src/platforms/wechat/ilink.js'
+
+const unreachableWeChat: WeChatLoginClient = {
+  newQrCode: async () => {
+    throw new Error('iLink is not stubbed')
+  },
+  status: async () => {
+    throw new Error('iLink is not stubbed')
+  }
+}
+import { msTeamsRoutes } from '../../src/platforms/msteams/routes.js'
+import { MsTeamsRecoveryOAuth } from '../../src/platforms/msteams/recovery.js'
+import { msTeamsRecoveryRoutes } from '../../src/platforms/msteams/recovery-routes.js'
+import { msTeamsConnectRoutes, type MsTeamsConnectSeams } from '../../src/platforms/msteams/connect-routes.js'
+import { msTeamsConnectKeys } from '../../src/platforms/msteams/connect.js'
+import { PgMsTeamsBindingMutations } from '../../src/persistence/repositories/msteams-binding-mutations.js'
+import type { MsTeamsPlatformApp } from '../../src/platforms/msteams/deployment-app.js'
+import { relayHttpBase } from '../../src/http/relay-ingress.js'
+import { LinearCredentialReconciler } from '../../src/platforms/linear/credential-reconciler.js'
+import { LinearApiClient } from '../../src/platforms/linear/api.js'
+import { LinearTokenService } from '../../src/platforms/linear/token-service.js'
+import { LinearOrphanTokenSweeper } from '../../src/platforms/linear/orphan-token-sweeper.js'
+import { linearConnectRoutes, linearOauthCallbackRoutes } from '../../src/platforms/linear/routes.js'
+import { createGoogleChatCpProvider } from '../../src/platforms/googlechat/provider.js'
+import { googleChatAppRoutes, googleChatKeyRoutes } from '../../src/platforms/googlechat/routes.js'
+import { googleChatClaimRoutes } from '../../src/platforms/googlechat/claim.js'
+import { googleChatRecoveryRoutes } from '../../src/platforms/googlechat/recovery-routes.js'
+import { GoogleChatRecoveryOAuth, type GoogleChatRecoveryApplication } from '../../src/platforms/googlechat/recovery.js'
+import { PgGoogleChatBindingMutations } from '../../src/persistence/repositories/googlechat-binding-mutations.js'
+import { slackInstallRoutes, slackConfigRoutes, slackOauthCallbackRoutes } from '../../src/http/routes/slack-install.js'
+import {
+  slackPlatformInstallRoutes,
+  slackPlatformCallbackRoutes
+} from '../../src/http/routes/slack-platform-install.js'
+import { feishuRegistrationRoutes } from '../../src/http/routes/feishu-registration.js'
+import { slackBotRefreshRoutes } from '../../src/http/routes/slack-bot-refresh.js'
+import { slackBotTokenRoutes } from '../../src/http/routes/slack-bot-token.js'
+import { slackWorkspaceClaimRoutes, slackWorkspacePublicRoutes } from '../../src/http/routes/slack-workspace-install.js'
+import { slackWorkspaceIngress } from '../../src/platforms/slack/workspace-install.js'
+import { resolveWebAppUrl } from '../../src/config/env.js'
+import { telegramCheckRoutes } from '../../src/http/routes/telegram-check.js'
+import type {
+  FeishuRouteSeams,
+  GoogleChatRouteSeams,
+  LinearRouteSeams,
+  SlackRouteSeams,
+  TelegramRouteSeams
+} from '../../src/http/platform-route-seams.js'
+import type { SlackConfigApi } from '../../src/http/slack-config-api.js'
+import type { SlackBotVerifier, SlackAppTokenVerifier } from '../../src/http/slack-identity.js'
+import type { SlackPlatformAppConfig } from '../../src/config/slack-platform.js'
+import type { LinearPlatformAppConfig } from '../../src/config/linear-platform.js'
+import type { GoogleChatPlatformAppConfig } from '../../src/config/google-chat-platform.js'
+import type { FetchLike } from '../../src/github/api.js'
+import type { TelegramBotVerifier } from '../../src/http/telegram-identity.js'
+import type { TelegramBotIconSyncer } from '../../src/http/telegram-bot-profile.js'
+import type { DiscordBotVerifier, DiscordMessageContentIntentEnsurer } from '../../src/http/discord-identity.js'
+import type { DiscordBotProfileSyncer } from '../../src/http/discord-bot-profile.js'
+import type { FeishuAppTenantGuard, FeishuBotVerifier } from '../../src/http/feishu-identity.js'
+import type { FeishuHttpAppConfigurator } from '../../src/http/feishu-app-config.js'
+import type { FeishuAppIconSyncer } from '../../src/http/feishu-app-icon.js'
+import { createReadiness } from '../../src/http/readiness.js'
+import { McpRateLimiter } from '../../src/http/mcp/rate-limit.js'
+import { RemoteGrantAuthenticator } from '../../src/http/mcp/remote-grant-authenticator.js'
+import { InternalInvocationAuth } from '../../src/http/mcp/internal-invocation-auth.js'
+import { findTool } from '../../src/http/mcp/tools.js'
+import { pingDb } from '../../src/persistence/prisma.js'
+import type { DaemonLiveness } from '../../src/ports.js'
+import { systemClock } from '../../src/domain/clock.js'
+import { DEFAULT_OWNER_ID } from '../../prisma/seed.js'
+import { FeishuAppRegistrationService } from '../../src/http/feishu-registration.js'
+
+export const TEST_API_KEY_PEPPER = 'test-api-key-pepper-0123456789abcdef'
+
+/**
+ * The per-platform provider seams a suite may stub — the offline injectability
+ * that used to live as twelve platform-named fields on `HttpDeps` before the §9
+ * DI collapse. It is a TEST-COMPOSITION bag, not a production type: prod builds
+ * the same values in `container.ts` and hands them straight to the route
+ * factories and the providers.
+ *
+ * MUTABLE AND READ THROUGH, deliberately. Suites swap members AFTER `buildApp`
+ * (`app.platformStubs.verifySlackBot = …`), so every provider/route seam below
+ * closes over THIS OBJECT and dereferences the member per call — never captures
+ * the function. That is the same late-binding discipline the `platforms`
+ * registry façade uses, and it is what the DI collapse had to preserve.
+ */
+export interface PlatformStubs {
+  verifySlackBot?: SlackBotVerifier
+  verifySlackAppToken?: SlackAppTokenVerifier
+  slackConfigApi?: SlackConfigApi
+  slackPlatformApp?: SlackPlatformAppConfig
+  verifyTelegramBot: TelegramBotVerifier
+  syncTelegramBotIcon?: TelegramBotIconSyncer
+  verifyDiscordBot?: DiscordBotVerifier
+  ensureDiscordMessageContentIntent: DiscordMessageContentIntentEnsurer
+  syncDiscordBotProfile?: DiscordBotProfileSyncer
+  verifyFeishuBot?: FeishuBotVerifier
+  feishuAppTenantGuard: FeishuAppTenantGuard
+  configureFeishuHttpApp: FeishuHttpAppConfigurator
+  syncFeishuAppIcon?: FeishuAppIconSyncer
+  feishuAppRegistration: FeishuAppRegistrationService
+  linearPlatformApp?: LinearPlatformAppConfig
+  /** Linear's OAuth/GraphQL edge, stubbed: the whole connect lifecycle runs offline. */
+  linearFetch?: FetchLike
+  /** The deployment-owned Google Chat app; set before the first request, since its install route registers on it. */
+  googleChatPlatformApp?: GoogleChatPlatformAppConfig
+  /** Google's token endpoint and Chat API, stubbed; absent ⇒ every credential probe is a connectivity failure. */
+  googleChatFetch?: typeof fetch
+  googleChatRecoveryApplication?: GoogleChatRecoveryApplication
+  /** DingTalk's token endpoint, stubbed; absent ⇒ every credential check is a connectivity failure. */
+  dingTalkFetch?: typeof fetch
+  /** Entra's token endpoint, stubbed; absent ⇒ every credential check is a connectivity failure. */
+  msTeamsFetch?: typeof fetch
+  msTeamsPlatformApp?: MsTeamsPlatformApp
+  /** iLink's QR login, stubbed; absent ⇒ WeChat is unreachable. */
+  weChatLoginClient?: WeChatLoginClient
+  /** WeCom's long connection, stubbed; absent ⇒ every credential check is a connectivity failure. */
+  weComDial?: WeComDial
+}
+
+/** The keys `buildHttpApp` peels out of its overrides bag into
+ *  {@link PlatformStubs} — everything else stays a core dep override. */
+const PLATFORM_STUB_KEYS = [
+  'verifySlackBot',
+  'verifySlackAppToken',
+  'slackConfigApi',
+  'slackPlatformApp',
+  'verifyTelegramBot',
+  'syncTelegramBotIcon',
+  'verifyDiscordBot',
+  'ensureDiscordMessageContentIntent',
+  'syncDiscordBotProfile',
+  'verifyFeishuBot',
+  'feishuAppTenantGuard',
+  'configureFeishuHttpApp',
+  'syncFeishuAppIcon',
+  'feishuAppRegistration',
+  'linearPlatformApp',
+  'linearFetch',
+  'googleChatPlatformApp',
+  'googleChatFetch',
+  'googleChatRecoveryApplication',
+  'dingTalkFetch',
+  'msTeamsFetch',
+  'msTeamsPlatformApp',
+  'weChatLoginClient',
+  'weComDial'
+] as const satisfies readonly (keyof PlatformStubs)[]
+
+export interface HttpApp {
+  app: FastifyInstance
+  deps: HttpDeps
+  /** Swap a platform seam here — before or AFTER the app is built. */
+  platformStubs: PlatformStubs
+  events: InMemorySessionEventSink
+  /** The relay registry — a test can `add` a fake {@link RelayChannel} so
+   *  `hasConnectedRelay()` is true (e.g. to exercise the http-transport paths). */
+  relayReg: RelayRegistry
+  /** The Linear re-stamp loop, UNARMED: a suite drives `tick()` instead of a timer. */
+  linearCredentialReconciler: LinearCredentialReconciler
+  close(): Promise<void>
+}
+
+/** Empty liveness: no daemon is "connected right now" unless a test overrides it. */
+const NO_LIVENESS: DaemonLiveness = { get: () => undefined }
+
+/** Stable per-name repo id for the offline GitHub stand-in — distinct names get
+ *  distinct ids, and one name keeps its id across calls and across apps. */
+function fakeRepoId(fullName: string): bigint {
+  let h = 2166136261n
+  for (const ch of fullName) h = ((h ^ BigInt(ch.codePointAt(0)!)) * 16777619n) & 0xffffffffn
+  return h + 1n
+}
+
+export function buildHttpApp(
+  prisma: PrismaClient,
+  configOverrides?: Partial<HttpDeps['config']>,
+  liveness: DaemonLiveness = NO_LIVENESS,
+  control?: ControlSender,
+  // TOP-LEVEL deps and/or platform stubs (e.g. slackConfigApi, verifySlack*) —
+  // the platform keys are peeled into `platformStubs` and the rest merged last, so
+  // a test can register funnel routes that gate on these at plugin-registration
+  // time. Nested config goes through `configOverrides`, not here.
+  depsOverrides?: Partial<HttpDeps> & Partial<PlatformStubs>
+): HttpApp {
+  // The gitea seam a suite wires: the hook compile sources and the spec host follow it exactly as
+  // the gitlab ones follow theirs, so a suite without one never compiles a gitea rule.
+  const giteaSeam = depsOverrides?.gitea
+  const clock = systemClock
+
+  // Mirror the composition root's shared-transaction seam (§8): repos see the
+  // router; transaction OPENING stays on the root client.
+  const rootPrisma = prisma
+  prisma = withSharedTxRouting(prisma)
+
+  const daemonRepo = new PgDaemonRepo(prisma)
+  const botDecisionRoutingRepo = new PgBotDecisionRoutingRepo(prisma)
+  const codeHostDecisionRoutingRepo = new PgCodeHostDecisionRoutingRepo(prisma)
+  const daemonLifecycleOpRepo = new PgDaemonLifecycleOpRepo(prisma)
+  const apiKeyRepo = new PgApiKeyRepo(prisma)
+  const oauthRepo = new PgOAuthRepo(prisma)
+  const auditRepo = new PgAuditRepo(prisma)
+  const codec = new ApiKeyCodec({ API_KEY_PEPPER: TEST_API_KEY_PEPPER })
+  const epoch = new EpochService(daemonRepo, clock)
+  const apiKeyService = new ApiKeyService(codec, apiKeyRepo, daemonRepo, auditRepo, clock)
+  const computerRepo = new PgComputerRepo(prisma)
+  const agentRepoForComputers = new PgAgentRepo(prisma)
+  // A whole ComputerScreenshots also shortens retention on a policy change, as the container wires it.
+  const screenshots = depsOverrides?.computerScreenshots
+  const computerService = new ComputerService(codec, computerRepo, apiKeyRepo, auditRepo, clock, {
+    ...(screenshots && 'applyRetention' in screenshots
+      ? { screenshots: screenshots as Pick<ComputerScreenshots, 'applyRetention'> }
+      : {}),
+    // Late-bound like the container: the delivery fan-out is assembled below.
+    onAgentAccessChanged: computerAccessFanOut({ agents: agentRepoForComputers, delivery: () => agentDelivery })
+  })
+  const computerAudit = new ComputerAuditLog(new PgComputerAuditRepo(prisma), clock)
+  const inviteLinks = new OrgInviteLinkService(
+    new OrgInviteLinkCodec(TEST_API_KEY_PEPPER),
+    new PgOrgInviteLinkRepo(prisma),
+    clock
+  )
+  const waitlistRepo = new PgWaitlistRepo(prisma)
+  const waitlist = new WaitlistService(TEST_API_KEY_PEPPER, waitlistRepo, clock)
+
+  const events = new InMemorySessionEventSink()
+
+  // Default: an empty connection registry ⇒ every agent/upsert|remove throws
+  // NoConnection (swallowed by the route). Tests that assert the emit inject a
+  // spy `control` instead.
+  const connReg = new ConnectionRegistry()
+  const sender = control ?? new ControlSender(connReg, new PgLaunchRepo(prisma))
+
+  const dutyGroupRepo = new PgDutyGroupRepo(prisma)
+  const memberSets = new PgMemberSetRepo(prisma)
+
+  const cipher = new PlaintextSecretCipher()
+  const agentSecretStore = new PgAgentSecretStore(prisma, cipher)
+  const integrationRepo = new PgIntegrationRepo(prisma)
+  // The D6 identity projection reads the registry at bot-row WRITE time; the
+  // façade it reads through is bound further down (see the LATE-BOUND note), so
+  // the extra arrow defers the `platforms` reference past its declaration.
+  const botRepo = new PgBotRepo(prisma, (input) => botIdentityProjector(platforms)(input))
+  const botSecretStore = new PgBotSecretStore(prisma, cipher)
+  const botCredentialWriter = new PgBotCredentialWriter(prisma, cipher)
+  const feishuAppRegistrationStore = new PgFeishuAppRegistrationStore(prisma, cipher)
+  const slackUserConfigStore = new PgSlackUserConfigStore(prisma, cipher)
+  const linearTokenStore = new PgLinearTokenStore(prisma, cipher)
+  const linearInstallStateStore = new PgLinearInstallStateStore(prisma)
+  const integrationChannelRepo = new PgIntegrationChannelRepo(prisma)
+  const agentRepo = new PgAgentRepo(prisma)
+  const orgRepo = new PgOrgRepo(prisma)
+  const webchatConversationRepo = new PgWebchatConversationRepo(prisma)
+  const agentApiEntryRepo = new PgAgentApiEntryRepo(prisma)
+  const webchatMcpDelegationRepo = new PgWebchatMcpDelegationRepo(prisma)
+  const webchatMcpAccessGrantRepo = new PgWebchatMcpAccessGrantRepo(prisma)
+  const webchatMcpOperationRepo = new PgWebchatMcpOperationRepo(prisma)
+  const sessionRepo = new PgSessionRepo(prisma)
+  const sessionUsageRepo = new PgSessionUsageRepo(prisma)
+  const skillSourceRepo = new PgSkillSourceRepo(prisma)
+  const organizationKnowledgeRepo = new PgOrganizationKnowledgeRepo(prisma)
+  // The organization environment registry + its ONE cipher seam, shared by the
+  // resolver and the spec assembler exactly as the production graph wires them.
+  const organizationEnvironmentSecretStore = new PgOrganizationEnvironmentSecretStore(prisma, cipher)
+  const organizationEnvironmentRepo = new PgOrganizationEnvironmentRepo(prisma)
+  const organizationEnvironmentResolver = new PgOrganizationEnvironmentResolver(
+    prisma,
+    organizationEnvironmentSecretStore
+  )
+  const presetAgentRepo = new PgPresetAgentStore(prisma)
+  const hookRepo = new PgHookRepo(prisma)
+  const registryService = new DaemonRegistryService(
+    daemonRepo,
+    new PgRuntimeProfileRepo(prisma),
+    daemonLifecycleOpRepo,
+    clock
+  )
+  const hookSecretStore = new PgHookSecretStore(prisma, cipher)
+  const githubInstallationRepo = new PgGithubInstallationRepo(prisma)
+  const agentRepoAuthRepo = new PgAgentRepoAuthorizationRepo(prisma)
+  const agentInstallationAuthRepo = new PgAgentInstallationAuthorizationRepo(prisma)
+  // An empty relay registry ⇒ multi-agent installs 409 (no relay) and hook broadcasts are
+  // no-ops — exactly the prod graph with no relay dialed in, unless a test wires one up.
+  const relayReg = new RelayRegistry()
+  const relayControl = new RelayControlSender(relayReg)
+  // Same graph as prod: every replicate site resolves its targets here, so the
+  // duty ledger is a real repo and a holder actually receives the pushes.
+  const placementResolver = new PlacementResolver({
+    approved: (ids) => new PgDaemonAdmissionRepo(prisma).allowed(ids),
+    duties: dutyGroupRepo,
+    liveMembers: async (setId) => {
+      const members = new Set(await memberSets.memberIdsOf(setId))
+      return connReg
+        .reachableDaemons()
+        .filter((d) => d.state === 'READY' && members.has(d.daemonId))
+        .map((d) => d.daemonId)
+    },
+    clock
+  })
+  const remoteGrantAuth =
+    depsOverrides?.remoteGrantAuth ??
+    new RemoteGrantAuthenticator({
+      clock,
+      tokenCodec: new WebchatMcpGrantTokenCodec(TEST_API_KEY_PEPPER),
+      conversations: webchatConversationRepo,
+      orgs: orgRepo,
+      agents: agentRepo,
+      daemons: liveness,
+      placement: placementResolver,
+      grants: webchatMcpAccessGrantRepo,
+      authorities: webchatMcpDelegationRepo,
+      isCuratedTool: (toolName) => findTool(toolName) !== undefined
+    })
+  const internalInvocationAuth = depsOverrides?.internalInvocationAuth ?? new InternalInvocationAuth()
+
+  const agentSpecs = new AgentSpecAssembler(
+    agentSecretStore,
+    {},
+    skillSourceRepo,
+    organizationKnowledgeRepo,
+    undefined,
+    organizationEnvironmentResolver,
+    undefined,
+    agentRepoAuthRepo,
+    depsOverrides?.gitlab?.api.baseUrl,
+    hookRepo,
+    giteaSeam?.api.baseUrl,
+    { routings: codeHostDecisionRoutingRepo, hooks: hookRepo },
+    agentInstallationAuthRepo,
+    new PgDecisionRepo(prisma),
+    computerRepo,
+    new PgGithubAppRepo(prisma)
+  )
+  const agentDelivery = new AgentDelivery({ control: sender, specs: agentSpecs, placement: placementResolver })
+
+  // LATE-BOUND exactly as `buildContainer` binds it (§9): the providers below are
+  // constructed WITH this dep bundle, because their funnel plugins are route
+  // factories pre-bound to it, so the registry cannot exist before the object
+  // does. `platforms` is the same stable façade the container hands to the
+  // orchestrators, which take the registry BY VALUE at construction — every read
+  // through it runs at request / reconcile time, long after assignment. The
+  // providers' verify seams READ THROUGH to `platformStubs` on every call instead
+  // of capturing it: suites routinely swap `app.platformStubs.verifySlackBot` (and
+  // friends) AFTER the app is built, and an absent stub is passed through as the
+  // provider-unreachable outcome — which every provider treats exactly as the
+  // old route treated "no verifier injected" (inconclusive: no 400, no derived
+  // identity).
+  let platformRegistry: CpPlatformRegistry | undefined = undefined
+  const requirePlatforms = (): CpPlatformRegistry => {
+    if (!platformRegistry) throw new Error('platform registry read before composition')
+    return platformRegistry
+  }
+  const platforms: CpPlatformRegistry = {
+    get: (platformId) => requirePlatforms().get(platformId),
+    all: () => requirePlatforms().all(),
+    ids: () => requirePlatforms().ids()
+  }
+
+  // Peel the platform seams out of the overrides bag: they are no longer core
+  // deps (§9 DI collapse), but suites still hand them in at build time so the
+  // funnel plugins that gate on them register.
+  const coreOverrides: Partial<HttpDeps> = { ...depsOverrides } as Partial<HttpDeps>
+  for (const key of PLATFORM_STUB_KEYS) delete (coreOverrides as Record<string, unknown>)[key]
+  const platformStubs: PlatformStubs = {
+    verifyTelegramBot: async () => ({ status: 'ok', name: null, privacyModeDisabled: true }),
+    ensureDiscordMessageContentIntent: async () => 'ready',
+    configureFeishuHttpApp: async () => {},
+    feishuAppTenantGuard: {
+      loginAppStatus: async () => 'ok',
+      checkApp: async () => 'ok'
+    },
+    feishuAppRegistration: new FeishuAppRegistrationService(feishuAppRegistrationStore),
+    ...Object.fromEntries(
+      PLATFORM_STUB_KEYS.filter((key) => depsOverrides && key in depsOverrides).map((key) => [
+        key,
+        (depsOverrides as Record<string, unknown>)[key]
+      ])
+    )
+  }
+
+  const hookService = new HookService(
+    hookRepo,
+    hookSecretStore,
+    agentRepo,
+    relayControl,
+    placementResolver,
+    githubInstallationRepo,
+    'example-deployment',
+    undefined,
+    depsOverrides?.gitlab ? new PgGitlabProjectBindingRepo(prisma) : undefined,
+    depsOverrides?.gitlab ? new PgGitlabWebhookSecretStore(prisma, cipher) : undefined,
+    depsOverrides?.gitlab ? new PgGitlabAgentAccountRepo(prisma) : undefined,
+    // §24.4: the axis the fake GitLab edge serves rides every compiled gitlab rule, and the
+    // hook agent's spec is re-projected in the same ordered sequence production uses.
+    depsOverrides?.gitlab?.api.baseUrl,
+    async (orgId, agentId) => {
+      const agent = await agentRepo.get(orgId, agentId)
+      if (!agent) return
+      await (depsOverrides?.agentDelivery ?? agentDelivery).upsert(agent, () => {})
+    },
+    giteaSeam
+      ? {
+          bindings: new PgGiteaRepositoryBindingRepo(prisma),
+          connections: new PgGiteaConnectionRepo(prisma),
+          webhookSecrets: new PgGiteaWebhookSecretStore(prisma, cipher),
+          host: giteaSeam.api.baseUrl
+        }
+      : undefined,
+    codeHostDecisionRoutingRepo,
+    undefined,
+    // A suite that brings Azure DevOps service hooks compiles their rules from the same tables production reads.
+    depsOverrides?.azureDevOps?.hooks
+      ? {
+          bindings: new PgAzureDevOpsRepositoryBindingRepo(prisma),
+          connections: new PgAzureDevOpsConnectionRepo(prisma),
+          hooks: new PgAzureDevOpsHookRepo(prisma, cipher)
+        }
+      : undefined
+  )
+  // Same scope reconciler as production; host choice reads the live connection's features.
+  const hookRouting = new HookRoutingService({
+    routings: codeHostDecisionRoutingRepo,
+    hooks: hookRepo,
+    agents: agentRepo,
+    daemons: daemonRepo,
+    placement: placementResolver,
+    // The liveness fake doubles as the capability read, as daemonConns does below.
+    daemonFeatures: (daemonId) => (liveness as HttpDeps['daemonConns']).get(daemonId)?.capabilities?.features,
+    hookService,
+    projectAgentSpec: async (orgId, agentId) => {
+      const agent = await agentRepo.get(orgId, agentId)
+      if (!agent) return
+      await (depsOverrides?.agentDelivery ?? agentDelivery).upsert(agent, () => {})
+    }
+  })
+  hookService.attachRouting(hookRouting)
+
+  const deps: HttpDeps = {
+    runtimeConfig: {},
+    maxOrgsPerNonAdminUser: 1,
+    // The Gitea arm rides the seam when a test brings one, so the route can resolve a login end to end.
+    trustedActors: new CodeHostTrustedActorService({
+      trustedActors: new PgCodeHostTrustedActorRepo(prisma),
+      ...(giteaSeam
+        ? {
+            gitea: {
+              bindings: new PgGiteaRepositoryBindingRepo(prisma),
+              connections: new PgGiteaConnectionRepo(prisma),
+              tokens: giteaSeam.connections,
+              api: giteaSeam.api
+            }
+          }
+        : {})
+    }),
+    clock,
+    repos: {
+      daemonAdmission: new PgDaemonAdmissionRepo(prisma),
+      agent: agentRepo,
+      assignment: new PgAssignmentRepo(prisma),
+      memberSet: memberSets,
+      dutyGroup: dutyGroupRepo,
+      daemonLifecycleOp: daemonLifecycleOpRepo,
+      cron: new PgCronRepo(prisma),
+      hook: hookRepo,
+      hookSecret: hookSecretStore,
+      relay: new PgRelayRepo(prisma),
+      session: sessionRepo,
+      sessionUsage: sessionUsageRepo,
+      webchatConversation: webchatConversationRepo,
+      agentApiEntry: agentApiEntryRepo,
+      user: new PgUserRepo(prisma),
+      org: orgRepo,
+      waitlist: waitlistRepo,
+      githubInstallation: githubInstallationRepo,
+      githubApp: new PgGithubAppRepo(prisma),
+      agentRepoAuth: agentRepoAuthRepo,
+      agentInstallationAuth: agentInstallationAuthRepo,
+      codeHostRepository: new PgCodeHostRepositoryRepo(prisma),
+      codeHostTrustedActor: new PgCodeHostTrustedActorRepo(prisma),
+      gitlabConnection: new PgGitlabConnectionRepo(prisma),
+      gitlabProjectBinding: new PgGitlabProjectBindingRepo(prisma),
+      gitlabAgentAccount: new PgGitlabAgentAccountRepo(prisma),
+      gitlabInstanceState: new PgGitlabInstanceStateStore(prisma),
+      giteaConnection: new PgGiteaConnectionRepo(prisma),
+      giteaRepositoryBinding: new PgGiteaRepositoryBindingRepo(prisma),
+      azureDevOpsConnection: new PgAzureDevOpsConnectionRepo(prisma),
+      azureDevOpsRepositoryBinding: new PgAzureDevOpsRepositoryBindingRepo(prisma),
+      integration: integrationRepo,
+      bot: botRepo,
+      botSecret: botSecretStore,
+      botCredential: botCredentialWriter,
+      decision: new PgDecisionRepo(prisma),
+      botDecisionRouting: botDecisionRoutingRepo,
+      codeHostDecisionRouting: codeHostDecisionRoutingRepo,
+      providerKey: new PgProviderKeyStore(prisma, cipher),
+      agentSecret: agentSecretStore,
+      agentConfig: new PgAgentConfigWriter(prisma, cipher),
+      mcpProvider: new PgMcpProviderRepo(prisma),
+      mcpProviderSecret: new PgMcpProviderSecretStore(prisma, cipher),
+      mcpGrant: new PgMcpGrantRepo(prisma, cipher),
+      mcpProviderOauth: new PgMcpProviderOauthRepo(prisma),
+      mcpProviderOauthSecret: new PgMcpProviderOauthSecretStore(prisma, cipher),
+      mcpProviderOauthState: new PgMcpProviderOauthStateStore(prisma),
+      skillSource: skillSourceRepo,
+      computer: computerRepo,
+      agentSkillSourceStatus: new PgAgentSkillSourceStatusRepo(prisma),
+      organizationKnowledge: organizationKnowledgeRepo,
+      organizationRecord: new PgOrganizationRecordRepo(prisma),
+      organizationEnvironment: organizationEnvironmentRepo,
+      organizationEnvironmentSecret: organizationEnvironmentSecretStore,
+      organizationEnvironmentResolver,
+      memoryPluginInstallation: new PgMemoryPluginInstallationRepo(prisma),
+      externalMemoryConnection: new PgExternalMemoryConnectionRepo(prisma),
+      externalMemoryConnectionSecret: new PgExternalMemoryConnectionSecretStore(prisma, cipher),
+      externalMemoryGrant: new PgExternalMemoryGrantRepo(prisma, cipher),
+      memoryConnectionWriter: new PgMemoryConnectionWriter(prisma, cipher),
+      agentMemoryHistory: new PgAgentMemoryHistoryRepo(prisma),
+      agentMemoryFile: new PgAgentMemoryFileRepo(prisma),
+      slackInstall: new PgSlackInstallStore(prisma, cipher),
+      slackPlatformInstall: new PgSlackPlatformInstallStore(prisma),
+      slackWorkspaceInstall: new PgSlackWorkspaceInstallStore(prisma, cipher),
+      feishuAppRegistration: feishuAppRegistrationStore,
+      wechatPendingLogin: new PgWechatPendingLoginStore(prisma, cipher),
+      msTeamsAgentBotRequest: new PgMsTeamsAgentBotRequestStore(prisma, cipher),
+      slackUserConfig: slackUserConfigStore,
+      linearToken: linearTokenStore,
+      linearInstallState: linearInstallStateStore,
+      presetAgent: presetAgentRepo,
+      integrationChannel: integrationChannelRepo,
+      audit: auditRepo,
+      webchatMcpOperation: webchatMcpOperationRepo,
+      oauth: oauthRepo
+    },
+    registry: registryService,
+    platforms,
+    agentSpecs,
+    liveness,
+    // Capability reads share the liveness fake: a test that needs a capable
+    // daemon overrides `liveness` with one whose entries carry `capabilities`.
+    daemonConns: liveness as HttpDeps['daemonConns'],
+    control: sender,
+    agentDelivery,
+    placementResolver,
+    relayControl,
+    relayRoster: new RelayRoster(new PgRelayRepo(prisma), sender, clock, configOverrides?.RELAY_STALE_MS ?? 0),
+    httpBot: new HttpBotOrchestrator(
+      botRepo,
+      botSecretStore,
+      botCredentialWriter,
+      integrationRepo,
+      integrationChannelRepo,
+      agentRepo,
+      relayReg,
+      sender,
+      new PgThreadAffinityStore(prisma),
+      new PgSessionRepo(prisma),
+      { info() {}, warn() {}, debug() {} },
+      platforms,
+      agentDelivery,
+      placementResolver,
+      undefined,
+      { routings: botDecisionRoutingRepo, daemons: daemonRepo }
+    ),
+    collabRoutes: new CollabRoutesService(
+      daemonRepo,
+      integrationRepo,
+      agentRepo,
+      relayControl,
+      sender,
+      placementResolver,
+      dutyGroupRepo
+    ),
+    agentMutations: new AgentMutationGate(),
+    sessionOwners: connReg,
+    // The installations repo feeds the github-kind compile — same graph as prod.
+    // gitlab-kind compile sources appear exactly when the test wires a gitlab seam.
+    hooks: hookService,
+    hookRouting,
+    auth: new DaemonAuthService(
+      codec,
+      apiKeyRepo,
+      epoch,
+      clock,
+      { HEARTBEAT_SEC: 15, DUTY_LEASE_MS: DUTY_LEASE_DEFAULTS.leaseMs },
+      new PgOrgRepo(prisma),
+      memberSets
+    ),
+    apiKeys: apiKeyService,
+    computers: computerService,
+    computerAudit,
+    // The relay-free default refuses viewers with `no_relay`; suites that open one override this dep.
+    computerViewer: new ComputerChannelGrants(computerRepo, new ComputerChannelKeys(TEST_API_KEY_PEPPER, 300), clock, {
+      staleAfterMs: 45_000,
+      relays: async () => []
+    }),
+    oauth: new OAuthService(oauthRepo, apiKeyService, codec, clock),
+    webchatTokens: new WebchatTokenService(TEST_API_KEY_PEPPER),
+    inviteLinks,
+    waitlist,
+    usageWriter: new SessionUsageWriter(sessionUsageRepo),
+    events,
+    mcpRateLimit: new McpRateLimiter(clock),
+    sharedTx: <T>(fn: () => Promise<T>) => rootPrisma.$transaction((tx) => runWithSharedTx(tx, fn)),
+    readiness: createReadiness(() => pingDb(prisma)),
+    // Offline stand-in for the anonymous GitHub read that binds a skill source's
+    // numeric identity: every repo resolves, to a deterministic id per owner/repo.
+    // Suites that care about the unbindable paths override this dep.
+    resolvePublicRepo: async (owner: string, repo: string) => ({
+      repoId: fakeRepoId(`${owner}/${repo}`),
+      fullName: `${owner}/${repo}`,
+      private: false,
+      defaultBranch: 'main'
+    }),
+    config: { DEFAULT_OWNER_ID, ...configOverrides },
+    sessionAccessPlugins: [
+      { provider: 'slack', available: false, resolve: async () => ({ allowedScopes: [], degraded: false }) },
+      { provider: 'github', available: false, resolve: async () => ({ allowedScopes: [], degraded: false }) },
+      { provider: 'gitlab', available: false, resolve: async () => ({ allowedScopes: [], degraded: false }) },
+      {
+        provider: 'feishu',
+        available: false,
+        resolve: async () => ({ allowedScopes: [], degraded: false })
+      }
+    ],
+    ...coreOverrides,
+    remoteGrantAuth,
+    internalInvocationAuth
+  }
+
+  // The per-platform route seams, mirroring `buildContainer`'s — but every member
+  // reads THROUGH the mutable `platformStubs` bag rather than capturing its value,
+  // so a suite that swaps a stub after `buildApp` is still observed. `configApi`
+  // and `platformApp` are getters for exactly that reason: the funnel plugins read
+  // them once at plugin-registration time to decide whether to register at all
+  // (that IS the feature flag, so they must be set before the app is built), while
+  // the manifest-refresh handler reads `configApi` per REQUEST — which is what it
+  // did when it was core code reading `deps.slackConfigApi`.
+  //
+  // ANTI-DRIFT (learned the hard way in review): this harness once handed the
+  // tooling facet an API client the container had stopped passing, so every suite
+  // was green against a composition production did not have. Both roots now call
+  // {@link createSlackToolingCredentials} with the SAME two named arguments, and
+  // the API client here comes from ONE source shared with `slackSeams.configApi`
+  // — the harness cannot give the facet a client the routes do not see. The
+  // container graph itself is exercised in
+  // `test/integration/slack-tooling-credentials.route.test.ts`.
+  const slackConfigApiSeam = () => platformStubs.slackConfigApi
+  const slackSeams: SlackRouteSeams = {
+    get configApi() {
+      return slackConfigApiSeam()
+    },
+    get platformApp() {
+      return platformStubs.slackPlatformApp
+    },
+    verifyBot: async (token) =>
+      platformStubs.verifySlackBot ? platformStubs.verifySlackBot(token) : { status: 'unreachable' },
+    verifyAppToken: async (token) =>
+      platformStubs.verifySlackAppToken ? platformStubs.verifySlackAppToken(token) : ('unreachable' as const),
+    toolingCredentials: createSlackToolingCredentials({
+      get configApi() {
+        return slackConfigApiSeam()
+      },
+      store: slackUserConfigStore
+    })
+  }
+  const telegramSeams: TelegramRouteSeams = { verifyBot: (token) => platformStubs.verifyTelegramBot(token) }
+  // ONE api client + ONE token service, shared by the funnel routes, the provider's disconnect edge
+  // and the sweeper, exactly as `buildContainer` shares them. `fetchImpl` and `app` read THROUGH the
+  // stub bag per call so a suite can install its fake Linear after the app is built.
+  const linearApi = new LinearApiClient({
+    clock,
+    fetchImpl: (url, init) =>
+      platformStubs.linearFetch
+        ? platformStubs.linearFetch(url, init)
+        : Promise.reject(new Error('no linear fetch stub installed'))
+  })
+  const linearTokenService = new LinearTokenService({
+    get app() {
+      return platformStubs.linearPlatformApp
+    },
+    tokens: linearTokenStore,
+    api: linearApi,
+    clock
+  })
+  const linearSeams: LinearRouteSeams = {
+    get app() {
+      return platformStubs.linearPlatformApp
+    },
+    api: linearApi,
+    tokens: linearTokenService
+  }
+
+  // The §10.6 deployment-credential re-stamp plus the §15 team pass, wired exactly as
+  // `buildContainer` wires it — after the token service, which the team pass reads. Its app is a
+  // getter over the stub bag so a suite can rotate the deployment credentials mid-test, which is
+  // what the rotation actually looks like from this process: a different value on the next read.
+  const linearCredentialReconciler = new LinearCredentialReconciler({
+    bots: botRepo,
+    secrets: botSecretStore,
+    credentials: botCredentialWriter,
+    resync: (botId) => deps.httpBot.syncBot(botId),
+    get app() {
+      return platformStubs.linearPlatformApp
+    },
+    teams: {
+      integrations: integrationRepo,
+      agents: agentRepo,
+      channels: integrationChannelRepo,
+      tokens: linearTokenService,
+      routableDaemon: (agent) => placementResolver.routableDaemon(agent)
+    },
+    clock,
+    intervalMs: 15 * 60 * 1000
+  })
+  const linearOrphanTokenSweeper = new LinearOrphanTokenSweeper({
+    get app() {
+      return platformStubs.linearPlatformApp
+    },
+    tokens: linearTokenStore,
+    service: linearTokenService,
+    clock
+  })
+  const googleChatSeams: GoogleChatRouteSeams = {
+    bindingMutations: new PgGoogleChatBindingMutations(prisma, (input) => botIdentityProjector(platforms)(input)),
+    ...(platformStubs.googleChatRecoveryApplication && platformStubs.googleChatFetch
+      ? {
+          recovery: new GoogleChatRecoveryOAuth(
+            platformStubs.googleChatRecoveryApplication,
+            TEST_API_KEY_PEPPER,
+            clock,
+            platformStubs.googleChatFetch
+          )
+        }
+      : {}),
+    get app() {
+      return platformStubs.googleChatPlatformApp
+    },
+    fetch: (input, init) =>
+      platformStubs.googleChatFetch
+        ? platformStubs.googleChatFetch(input, init)
+        : Promise.reject(new TypeError('no google chat fetch stub installed'))
+  }
+  const dingTalkFetch: typeof fetch = (input, init) =>
+    platformStubs.dingTalkFetch
+      ? platformStubs.dingTalkFetch(input, init)
+      : Promise.reject(new TypeError('no dingtalk fetch stub installed'))
+  const msTeamsFetch: typeof fetch = (input, init) =>
+    platformStubs.msTeamsFetch
+      ? platformStubs.msTeamsFetch(input, init)
+      : Promise.reject(new TypeError('no msteams fetch stub installed'))
+  const msTeamsSeams: MsTeamsConnectSeams = {
+    keys: msTeamsConnectKeys(TEST_API_KEY_PEPPER),
+    bindingMutations: new PgMsTeamsBindingMutations(prisma, (input) => botIdentityProjector(platforms)(input)),
+    webAppUrl: 'https://console.example.test',
+    fetch: msTeamsFetch,
+    get app() {
+      return platformStubs.msTeamsPlatformApp
+    },
+    ...(platformStubs.msTeamsPlatformApp
+      ? {
+          recovery: new MsTeamsRecoveryOAuth(
+            platformStubs.msTeamsPlatformApp,
+            'https://console.example.test',
+            TEST_API_KEY_PEPPER,
+            clock,
+            msTeamsFetch
+          )
+        }
+      : {})
+  }
+  const weComDial: WeComDial = (url, handlers) => {
+    if (!platformStubs.weComDial) throw new TypeError('no wecom dial stub installed')
+    return platformStubs.weComDial(url, handlers)
+  }
+  const msTeamsRelayBase = relayHttpBase(configOverrides?.PUBLIC_RELAY_URL) ?? undefined
+  const feishuSeams: FeishuRouteSeams = {
+    verifyBot: async (appId, appSecret, region) =>
+      platformStubs.verifyFeishuBot
+        ? platformStubs.verifyFeishuBot(appId, appSecret, region)
+        : { status: 'unreachable' },
+    tenantGuard: platformStubs.feishuAppTenantGuard,
+    configureHttpApp: (input) => platformStubs.configureFeishuHttpApp(input),
+    registrations: platformStubs.feishuAppRegistration
+  }
+
+  // The same four providers `buildContainer` registers, so the create route
+  // parses/validates exactly the deployed shapes and `server.ts` mounts exactly
+  // the deployed funnel routes. Two deliberate test-composition traits:
+  //
+  //  - the verify/sync seams READ THROUGH to `platformStubs` on every call
+  //    instead of capturing it — tests routinely swap
+  //    `app.platformStubs.verifySlackBot` (and friends) AFTER the app is built.
+  //    An absent stub is passed through as the provider-unreachable outcome,
+  //    which every provider treats exactly as today's route treated "no verifier
+  //    injected" (inconclusive: no 400, no derived identity);
+  //  - the route plugins are pre-bound to `deps` + the seams above, mirroring
+  //    prod. Each still self-disables on absent config (no `slackConfigApi` /
+  //    `PUBLIC_CP_URL` ⇒ those routes 404), so a suite that wants them injects
+  //    the config.
+  platformRegistry = buildCpPlatformRegistry([
+    createTelegramCpProvider({
+      verifyBot: (token) => platformStubs.verifyTelegramBot(token),
+      syncBotIcon: async (token, agent) => platformStubs.syncTelegramBotIcon?.(token, agent),
+      funnelRoutes: { org: [telegramCheckRoutes(deps, telegramSeams)], publicCallback: [] }
+    }),
+    createDiscordCpProvider({
+      verifyBot: async (token) =>
+        platformStubs.verifyDiscordBot ? platformStubs.verifyDiscordBot(token) : { status: 'unreachable' },
+      ensureMessageContentIntent: (token) => platformStubs.ensureDiscordMessageContentIntent(token),
+      syncBotProfile: async (token, agent) => platformStubs.syncDiscordBotProfile?.(token, agent)
+    }),
+    createSlackCpProvider({
+      verifyBot: slackSeams.verifyBot!,
+      verifyAppToken: slackSeams.verifyAppToken!,
+      unclaimedIngress: slackWorkspaceIngress(
+        deps.repos.slackWorkspaceInstall,
+        slackSeams.platformApp,
+        resolveWebAppUrl(deps.config)
+      ),
+      funnelRoutes: {
+        org: [
+          slackInstallRoutes(deps, slackSeams),
+          slackPlatformInstallRoutes(deps, slackSeams),
+          slackWorkspaceClaimRoutes(deps, slackSeams),
+          slackConfigRoutes(deps, slackSeams),
+          slackBotRefreshRoutes(deps, slackSeams),
+          slackBotTokenRoutes(deps, slackSeams)
+        ],
+        publicCallback: [
+          slackOauthCallbackRoutes(deps, slackSeams),
+          slackPlatformCallbackRoutes(deps, slackSeams),
+          slackWorkspacePublicRoutes(deps, slackSeams)
+        ]
+      },
+      toolingCredentials: slackSeams.toolingCredentials!
+    }),
+    createFeishuCpProvider({
+      verifyBot: feishuSeams.verifyBot!,
+      tenantGuard: feishuSeams.tenantGuard,
+      funnelRoutes: { org: [feishuRegistrationRoutes(deps, feishuSeams)], publicCallback: [] },
+      syncAppIcon: async (appId, appSecret, region, agent) =>
+        platformStubs.syncFeishuAppIcon?.(appId, appSecret, region, agent)
+    }),
+    // The deployment app and the Linear edge are read THROUGH the stub bag per call, so a suite can
+    // enable Linear after the app is built — the same late-binding discipline every seam above uses.
+    createLinearCpProvider({
+      get app() {
+        return platformStubs.linearPlatformApp
+      },
+      tokens: linearTokenStore,
+      credentialReconciler: linearCredentialReconciler,
+      tokenService: linearTokenService,
+      funnelRoutes: {
+        org: [linearConnectRoutes(deps, linearSeams)],
+        publicCallback: [linearOauthCallbackRoutes(deps, linearSeams)]
+      },
+      pendingInstalls: { installStates: linearInstallStateStore, intervalMs: 60_000 },
+      orphanTokenSweeper: linearOrphanTokenSweeper
+    }),
+    createGoogleChatCpProvider({
+      fetch: googleChatSeams.fetch,
+      installRoutes: {
+        org: [
+          googleChatAppRoutes(googleChatSeams),
+          googleChatKeyRoutes(deps, googleChatSeams),
+          googleChatClaimRoutes(deps, googleChatSeams),
+          googleChatRecoveryRoutes(deps, googleChatSeams)
+        ],
+        publicCallback: []
+      },
+      get app() {
+        return platformStubs.googleChatPlatformApp
+      }
+    }),
+    createDingTalkCpProvider({ fetch: dingTalkFetch, installRoutes: [dingTalkCredentialRoutes(deps, dingTalkFetch)] }),
+    createMsTeamsCpProvider({
+      fetch: msTeamsFetch,
+      installRoutes: [
+        msTeamsRoutes(deps, msTeamsFetch),
+        msTeamsConnectRoutes(deps, msTeamsSeams),
+        msTeamsRecoveryRoutes(deps, msTeamsSeams)
+      ],
+      ...(msTeamsRelayBase ? { publicRelayUrl: msTeamsRelayBase } : {})
+    }),
+    createWeChatCpProvider({
+      routes: [
+        weChatLoginRoutes(
+          deps,
+          new WeChatLoginService(
+            deps.repos.wechatPendingLogin,
+            {
+              newQrCode: () => (platformStubs.weChatLoginClient ?? unreachableWeChat).newQrCode(),
+              status: (host, qrcode, code) =>
+                (platformStubs.weChatLoginClient ?? unreachableWeChat).status(host, qrcode, code)
+            },
+            WECHAT_DEFAULT_API_URL,
+            () => deps.clock.now()
+          )
+        )
+      ]
+    }),
+    createWeComCpProvider({
+      dial: weComDial,
+      installRoutes: [weComCredentialRoutes(deps)],
+      isInstalled: async (botId) =>
+        (await deps.repos.bot.getByExternalIdentity('wecom', botId, TENANTLESS_SENTINEL)) !== null
+    })
+  ])
+
+  const app = buildHttpServer(deps)
+
+  return {
+    app,
+    deps,
+    platformStubs,
+    events,
+    relayReg,
+    linearCredentialReconciler,
+    close: async () => {
+      await app.close()
+    }
+  }
+}

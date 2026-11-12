@@ -1,0 +1,724 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  conversationOwners,
+  groupBySpace,
+  IntegrationChannelList,
+  placePopover,
+  roomGlyph,
+  roomPlural,
+  rowLabel,
+  rowLabelParts,
+  rowMenuAction,
+  rowName,
+  rowUrl
+} from './IntegrationChannelList'
+import { conversationGate, type ConversationGate, type IntegrationChannelRow, type IntegrationRow } from '@/lib/data'
+
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    setChannelTrigger: vi.fn(),
+    setChannelAgent: vi.fn(),
+    forgetChannel: vi.fn(),
+    leaveConversation: vi.fn(),
+    bots: [
+      { id: 'bot_shared', agentIds: ['alice', 'bob'] },
+      { id: 'bot_solo', agentIds: ['alice'] }
+    ],
+    agents: [
+      { id: 'alice', name: 'alice', displayName: 'Alice', runtime: 'claude' },
+      { id: 'bob', name: 'bob', displayName: 'Bob', runtime: 'codex' }
+    ],
+    integrations: [
+      {
+        id: 'int_bob',
+        botId: 'bot_shared',
+        channels: [{ channelId: 'D1', name: '@Alice', kind: 'im', trigger: 'any', agentId: 'bob' }]
+      }
+    ]
+  })
+}))
+
+// A shared bot fans its membership snapshot out to one integration per member
+// agent, but persists the per-conversation owner on a single canonical row. Every
+// member's page must therefore read ownership bot-wide, not off its own row.
+describe('conversationOwners', () => {
+  const install = (id: string, agentId: string, channels: IntegrationChannelRow[]): IntegrationRow => ({
+    id,
+    agentId,
+    botId: 'bot_shared',
+    shareable: true,
+    name: 'acme-bridge',
+    platform: 'slack',
+    kind: 'Shared bot',
+    workspace: 'acme.example.test',
+    daemon: 'edge-1',
+    status: 'online',
+    revoked: false,
+    channels
+  })
+  const chan = (channelId: string, agentId?: string | null): IntegrationChannelRow => ({
+    channelId,
+    name: channelId,
+    kind: 'channel',
+    trigger: 'mention',
+    ...(agentId !== undefined ? { agentId } : {})
+  })
+
+  it('finds an owner persisted on a different member installation', () => {
+    const owners = conversationOwners('bot_shared', [
+      install('int_alice', 'alice', [chan('C-deploys', null)]),
+      install('int_bob', 'bob', [chan('C-deploys', 'bob')])
+    ])
+    // Alice's page renders int_alice's row, whose agentId is null — the owner is bob.
+    expect(owners.get('C-deploys')).toBe('bob')
+  })
+
+  it('ignores installs of other bots but includes direct-conversation rows', () => {
+    const other = { ...install('int_other', 'zoe', [chan('C-deploys', 'zoe')]), botId: 'bot_other' }
+    // DM and group DM owners use the same bot-wide projection as channels.
+    const dm = install('int_dm', 'bob', [
+      { ...chan('D-bob', 'bob'), kind: 'im' as const },
+      { ...chan('G-team', 'bob'), kind: 'mpim' as const }
+    ])
+    const owners = conversationOwners('bot_shared', [other, dm, install('int_bob', 'bob', [chan('C-deploys', 'bob')])])
+    expect([...owners]).toEqual([
+      ['D-bob', 'bob'],
+      ['G-team', 'bob'],
+      ['C-deploys', 'bob']
+    ])
+  })
+
+  it('keeps the first explicit owner when installs disagree', () => {
+    // Legacy state can leave two rows claiming a channel; the console must be
+    // deterministic rather than depending on install iteration luck.
+    const owners = conversationOwners('bot_shared', [
+      install('int_bob', 'bob', [chan('C-deploys', 'bob')]),
+      install('int_alice', 'alice', [chan('C-deploys', 'alice')])
+    ])
+    expect(owners.get('C-deploys')).toBe('bob')
+  })
+
+  it('reports nothing for a channel no install has claimed', () => {
+    const owners = conversationOwners('bot_shared', [install('int_alice', 'alice', [chan('C-deploys', null)])])
+    expect(owners.has('C-deploys')).toBe(false)
+  })
+})
+
+// The default-dispatch popover is portalled to the body at fixed coordinates
+// (its host cards clip), so nothing else keeps it inside the viewport — these
+// four corners are that guarantee.
+describe('placePopover', () => {
+  const btn = (left: number, top: number) => ({ left, right: left + 44, top, bottom: top + 28 })
+
+  it('anchors below-left of the button when there is room', () => {
+    expect(placePopover(btn(300, 200), 1280, 720).style).toEqual({ left: 300, top: 234 })
+  })
+
+  it('right-aligns when the menu would run past the right edge', () => {
+    // 1100 + 240 > 1280 - 8 ⇒ pin the menu's right edge to the button's.
+    expect(placePopover(btn(1100, 200), 1280, 720).style).toEqual({ right: 1280 - 1144, top: 234 })
+  })
+
+  it('flips above the button when the bottom edge is too close', () => {
+    expect(placePopover(btn(300, 600), 1280, 720).style).toEqual({ left: 300, bottom: 720 - 600 + 6 })
+  })
+
+  it('stays below when flipping up would clip the top instead', () => {
+    // A short viewport with the button near the top: neither side fits, and
+    // below is the one that keeps the button visible.
+    expect(placePopover(btn(300, 40), 1280, 200).style).toEqual({ left: 300, top: 74 })
+  })
+})
+
+// One Discord bot commonly spans several servers, each with a "#general" of its own —
+// and Discord lets two of those servers carry the same NAME.
+describe('groupBySpace', () => {
+  const chan = (channelId: string, spaceId?: string, space?: string): IntegrationChannelRow => ({
+    channelId,
+    name: 'general',
+    kind: 'channel',
+    trigger: 'mention',
+    ...(spaceId ? { spaceId } : {}),
+    ...(space ? { space } : {})
+  })
+
+  it('bands the rows under their server, alphabetically', () => {
+    expect(groupBySpace([chan('C2', 'G2', 'Side Project'), chan('C1', 'G1', 'Acme HQ')])).toEqual([
+      { key: 'G1', label: 'Acme HQ', rows: [chan('C1', 'G1', 'Acme HQ')] },
+      { key: 'G2', label: 'Side Project', rows: [chan('C2', 'G2', 'Side Project')] }
+    ])
+  })
+
+  it('keeps two SAME-NAMED servers apart and makes the duplication visible', () => {
+    // Grouping on the label would merge these, hiding the very ambiguity the server
+    // band exists to resolve — both channels are called "general" too.
+    const groups = groupBySpace([chan('C1', '90000001111', 'Acme'), chan('C2', '90000002222', 'Acme')])
+    expect(groups.map((g) => g.key)).toEqual(['90000001111', '90000002222'])
+    expect(groups.map((g) => g.label)).toEqual(['Acme · 1111', 'Acme · 2222'])
+  })
+
+  it('treats labels that READ alike as a clash — the header is uppercased', () => {
+    const groups = groupBySpace([chan('C1', '90000001111', 'acme'), chan('C2', '90000002222', 'ACME')])
+    expect(groups.map((g) => g.label)).toEqual(['acme · 1111', 'ACME · 2222'])
+  })
+
+  it('widens the id tail until the suffixes themselves differ', () => {
+    // Snowflakes of one shard share their low bits, so a fixed 4-char tail can collide —
+    // which would hand two distinct servers the same visible header.
+    const groups = groupBySpace([chan('C1', '11110000', 'Acme'), chan('C2', '22220000', 'Acme')])
+    // The 4-char tails are both "0000"; widening by one is enough here.
+    expect(groups.map((g) => g.label)).toEqual(['Acme · 10000', 'Acme · 20000'])
+  })
+
+  it('breaks a tie between a real name and a synthesized one', () => {
+    // A server can be NAMED like the header an unresolved one gets; only the real label
+    // can take a suffix, so that is the one that moves.
+    const groups = groupBySpace([chan('C1', '90000009999', 'server 2222'), chan('C2', '90000002222')])
+    expect(groups.map((g) => g.label)).toEqual(['server 2222', 'server 2222 · 9999'].sort())
+  })
+
+  it('keeps a space-less platform one flat, unheaded list', () => {
+    expect(groupBySpace([chan('C1'), chan('C2')])).toEqual([{ key: '', rows: [chan('C1'), chan('C2')] }])
+  })
+
+  it('heads a server whose name has not resolved yet by its id, not the flat group', () => {
+    const groups = groupBySpace([chan('C1', 'G1', 'Acme HQ'), chan('C2', '90000002222'), chan('C3')])
+    expect(groups).toEqual([
+      { key: '', rows: [chan('C3')] },
+      { key: 'G1', label: 'Acme HQ', rows: [chan('C1', 'G1', 'Acme HQ')] },
+      { key: '90000002222', label: 'server 2222', rows: [chan('C2', '90000002222')] }
+    ])
+  })
+
+  it('takes the label from whichever row of the server carries one', () => {
+    const rows = [chan('C1', 'G1'), chan('C2', 'G1', 'Acme HQ')]
+    expect(groupBySpace(rows)).toEqual([{ key: 'G1', label: 'Acme HQ', rows }])
+  })
+})
+
+// A row offers exactly ONE way out, and the copy has to carry whatever that one action
+// leaves undone — which differs by platform AND by what kind of place the row is.
+describe('rowMenuAction', () => {
+  const row = (kind: IntegrationChannelRow['kind'], name = 'acme docs'): IntegrationChannelRow => ({
+    channelId: 'C1',
+    name,
+    kind,
+    trigger: 'mention'
+  })
+
+  it('offers leaving, and only leaving, where the platform can leave one conversation', () => {
+    const action = rowMenuAction(row('channel'), 'telegram')
+    expect(action).toMatchObject({ leave: true, label: 'Leave group' })
+    expect(action.hint).toContain('leaves this group in Telegram')
+  })
+
+  it('offers removing the row, and says where to remove the bot, where it cannot', () => {
+    const action = rowMenuAction(row('channel'), 'slack')
+    expect(action).toMatchObject({ leave: false, label: 'Remove from this list' })
+    expect(action.hint).toContain('remove it in Slack')
+    expect(action.confirm).toContain('the row will come back')
+  })
+
+  // A Discord bot joins a SERVER, so naming Discord would send the operator hunting for
+  // a per-channel control that does not exist; the way out is the band above the row.
+  it('points a Discord row at its server, not at Discord', () => {
+    const action = rowMenuAction(row('channel'), 'discord')
+    expect(action.leave).toBe(false)
+    expect(action.hint).toContain('Leave on the server heading above')
+    expect(action.hint).not.toContain('remove it in Discord')
+  })
+
+  // Nobody is ADDED to a direct conversation, so telling the operator to remove the bot
+  // there describes something that cannot be done — on Discord it would also point at a
+  // server heading a DM row does not sit under.
+  it.each(['telegram', 'slack', 'discord'])('describes a %s direct conversation as a listing only', (platform) => {
+    for (const kind of ['im', 'mpim'] as const) {
+      const action = rowMenuAction(row(kind), platform)
+      expect(action.leave).toBe(false)
+      expect(action.hint).toContain('Nobody adds or removes a bot')
+      expect(action.hint).toContain('the row comes back on the next message')
+      expect(action.hint).not.toContain('server heading')
+      expect(action.hint).not.toMatch(/remove it in/)
+    }
+  })
+
+  // Lark declares `leave: 'none'` with no hint of its own, so it takes the
+  // generic sentence — with the platform NAMED, which is the whole point of the
+  // shared label table (the id is 'feishu', the word is "Lark").
+  it('falls back to the generic sentence, platform named, for a module with no hint', () => {
+    const action = rowMenuAction(row('channel'), 'feishu')
+    expect(action).toMatchObject({ leave: false, label: 'Remove from this list' })
+    expect(action.hint).toContain('The bot stays in the group')
+    expect(action.hint).toContain('remove it in Lark')
+  })
+
+  // An id no module claims must still produce a sentence — the prop is an open
+  // string, and an integration row carries whatever the CP sent.
+  it('degrades to the channel defaults and "the chat app" for an unknown platform', () => {
+    const action = rowMenuAction(row('channel'), 'teams-x')
+    expect(action.leave).toBe(false)
+    expect(action.hint).toContain('The bot stays in the channel')
+    expect(action.hint).toContain('remove it in the chat app')
+  })
+
+  // The stored DM label already carries the "@" the glyph column renders.
+  it('names a DM in a confirm without doubling its @', () => {
+    expect(rowMenuAction(row('im', '@Alice'), 'slack').confirm).toContain('Remove Alice from this list?')
+  })
+})
+
+// The list sigil is the module's `roomGlyph`; the DM markers are kind-driven and
+// platform-free. AgentDetailView's mobile card header renders this same value one
+// line above the row, so the two must not disagree.
+describe('roomGlyph', () => {
+  it('marks a room with the platform convention, and a DM by kind', () => {
+    expect(roomGlyph('channel', 'slack')).toBe('#')
+    expect(roomGlyph('channel', 'discord')).toBe('#')
+    expect(roomGlyph('channel', 'telegram')).toBe('')
+    expect(roomGlyph('channel', 'feishu')).toBe('')
+    // Unknown and absent ids take the host default.
+    expect(roomGlyph('channel', 'teams-x')).toBe('#')
+    expect(roomGlyph('channel', undefined)).toBe('#')
+    for (const platform of ['slack', 'telegram', 'feishu', undefined]) {
+      expect(roomGlyph('im', platform)).toBe('@')
+      expect(roomGlyph('mpim', platform)).toBe('@@')
+    }
+  })
+})
+
+// channel-session-mode.md §8: the session mode shares the trigger's button, offered only where the choice means something.
+describe('IntegrationChannelList session mode', () => {
+  const render = (channels: IntegrationChannelRow[], platform = 'slack', extra: { assistantMode?: boolean } = {}) =>
+    renderToStaticMarkup(createElement(IntegrationChannelList, { platform, channels, ...extra }))
+
+  it('reads the session mode first, then what it answers, defaulting to a session per thread', () => {
+    const html = render([{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }])
+    expect(html).toContain('aria-label="Settings for deploys: Per thread, @-mentions"')
+    expect(html).toContain('title="Session mode · Respond to"')
+  })
+
+  it('shows the conversation is on one session when it is', () => {
+    const html = render([
+      { channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention', sessionMode: 'append' }
+    ])
+    expect(html).toContain('<span>Single session</span>')
+  })
+
+  it('leaves the mode unsaid while the row is Off', () => {
+    const html = render([{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'off' }])
+    expect(html).toContain('aria-label="Settings for deploys: Off"')
+    expect(html).not.toContain('Per thread')
+  })
+
+  // Most platforms' DMs are one continuous exchange already, and a group DM is not a place this is configured either.
+  it('offers it on no direct conversation where the platform keeps DMs continuous', () => {
+    for (const platform of ['telegram', 'discord', 'feishu'])
+      for (const kind of ['im', 'mpim'] as const) {
+        const html = render([{ channelId: 'D1', name: '@alice', kind, trigger: 'any' }], platform)
+        expect(html, `${platform} ${kind}`).not.toContain('Session mode')
+        expect(html, `${platform} ${kind}`).not.toContain('Per thread')
+      }
+  })
+
+  // A Slack DM opens a session per top-level message, so its row may pick one session instead.
+  // auto-session-mode.md §3.2: a Slack group DM is a small room, with a room's modes.
+  it('offers it on a Slack DM and on a Slack group DM', () => {
+    // A DM's only reply choice is On, so it reads its session mode alone.
+    const dm = render([{ channelId: 'D1', name: '@alice', kind: 'im', trigger: 'any', sessionMode: 'append' }])
+    expect(dm).toContain('aria-label="Settings for alice: Single session"')
+    expect(dm).toContain('<span>Single session</span>')
+    const group = render([
+      { channelId: 'G1', name: '@alice, bob', kind: 'mpim', trigger: 'any', sessionMode: 'append' }
+    ])
+    expect(group).toContain('title="Session mode · Respond to"')
+    expect(group).toContain('<span>Single session</span>')
+  })
+
+  it('offers it nowhere the platform allows only one mode', () => {
+    const html = render(
+      [{ channelId: 'T1', name: 'Acme / Engineering', kind: 'channel', trigger: 'mention' }],
+      'linear'
+    )
+    expect(html).toContain('aria-label="Settings for Acme / Engineering: @-mentions"')
+    expect(html).not.toContain('Session mode')
+  })
+
+  // assistant-mode.md §5.2: every place that can hold one session does, whatever its row stores, while the mode is on.
+  it('fixes a room, a Slack DM and a Slack group DM on one session in assistant mode', () => {
+    const html = render(
+      [
+        { channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention', sessionMode: 'createNew' },
+        { channelId: 'D1', name: '@alice', kind: 'im', trigger: 'any' },
+        { channelId: 'G1', name: '@alice, bob', kind: 'mpim', trigger: 'mention' }
+      ],
+      'slack',
+      { assistantMode: true }
+    )
+    expect(html).toContain('aria-label="Settings for deploys: Single session, @-mentions"')
+    expect(html).toContain('aria-label="Settings for alice: Single session"')
+    expect(html.match(/: Single session[,"]/g)).toHaveLength(3)
+    expect(html).not.toContain('Per thread')
+  })
+
+  it('leaves a continuous DM and a team without the choice in assistant mode', () => {
+    const dm = render([{ channelId: 'D1', name: '@alice', kind: 'im', trigger: 'any' }], 'telegram', {
+      assistantMode: true
+    })
+    expect(dm).not.toContain('Session mode')
+    const team = render(
+      [{ channelId: 'T1', name: 'Acme / Engineering', kind: 'channel', trigger: 'mention' }],
+      'linear',
+      { assistantMode: true }
+    )
+    expect(team).not.toContain('Session mode')
+  })
+
+  it("returns a row's own mode when assistant mode is off", () => {
+    const html = render([{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }], 'slack', {
+      assistantMode: false
+    })
+    expect(html).toContain('aria-label="Settings for deploys: Per thread, @-mentions"')
+  })
+})
+
+describe('IntegrationChannelList footer', () => {
+  it('renders no explanatory footer under the rows', () => {
+    // The rows speak for themselves; the how-this-list-fills prose was removed on purpose.
+    for (const platform of ['slack', 'discord', 'telegram', 'linear', 'not-a-platform', undefined]) {
+      const html = renderToStaticMarkup(
+        createElement(IntegrationChannelList, {
+          platform,
+          channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }]
+        })
+      )
+      expect(html, String(platform)).not.toContain('appears here once the bot is added')
+      expect(html, String(platform)).not.toContain('do it in Slack')
+      expect(html, String(platform)).not.toContain('Default dispatch is the agent')
+    }
+  })
+})
+
+describe('IntegrationChannelList gated-agent banner', () => {
+  const banner = (platform?: string, gate: ConversationGate | null = 'private') =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform,
+        gate,
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }]
+      })
+    )
+
+  it('states the gate in one clause', () => {
+    expect(banner('slack')).toContain('Private agent — answers only where enabled below.')
+    expect(banner('telegram')).toContain('Private agent — answers only where enabled below.')
+  })
+
+  it('lets a platform whose gate is more than the row say so itself', () => {
+    // §4.3: a gated Linear member acts in a team only as its default, so the host's
+    // "enable it below" would promise a per-member switch the model does not have.
+    const html = banner('linear')
+    expect(html).toContain('Private agent — answers only in teams where it is the default.')
+    expect(html).not.toContain('enabled below')
+  })
+
+  // #2979 B7: assistant mode gates nothing, so an Everyone agent in it shows no banner.
+  it('shows nothing for an Everyone agent, in assistant mode or not', () => {
+    const everyone = { visibility: 'org' as const }
+    const assistant = { visibility: 'org' as const, assistantMode: { enabled: true } }
+    const privateAssistant = { visibility: 'restricted' as const, assistantMode: { enabled: true } }
+    for (const agent of [everyone, assistant])
+      for (const platform of ['slack', 'linear']) {
+        const html = banner(platform, conversationGate(agent))
+        expect(html, platform).not.toContain('role="note"')
+        expect(html, platform).not.toContain('answers only')
+      }
+    expect(conversationGate(privateAssistant)).toBe('private')
+  })
+})
+
+describe('IntegrationChannelList trigger control', () => {
+  it('leads with ⚡ on every platform — the console’s one trigger glyph', () => {
+    const html = renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform: 'slack',
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }]
+      })
+    )
+    expect(html).toContain('lucide-zap')
+    expect(html).not.toContain('lucide-bell')
+  })
+})
+
+describe('rowLabel', () => {
+  it('strips the stored @ from a direct conversation and leaves a channel alone', () => {
+    expect(rowLabel({ kind: 'im', name: '@Alice' })).toBe('Alice')
+    expect(rowLabel({ kind: 'mpim', name: '@Alice, Bob' })).toBe('Alice, Bob')
+    expect(rowLabel({ kind: 'channel', name: 'deploys' })).toBe('deploys')
+  })
+})
+
+describe('rowLabelParts', () => {
+  it('keeps the whole label as the name where the platform declares no split', () => {
+    expect(rowLabelParts({ kind: 'channel', name: 'deploys' }, 'slack')).toEqual({ name: 'deploys' })
+  })
+
+  it('drops the workspace a Linear team row already sits under, and never shows a team key', () => {
+    expect(rowLabelParts({ kind: 'channel', name: 'Acme / Engineering' }, 'linear')).toEqual({
+      name: 'Engineering'
+    })
+    // The team KEY is an identifier: it is not in the stored label and never reaches a row.
+    expect(rowLabelParts({ kind: 'channel', name: 'Acme / Engineering' }, 'linear').name).not.toContain('ENG')
+    // Only the FIRST separator is the workspace's, so a team named with a slash survives whole.
+    expect(rowLabelParts({ kind: 'channel', name: 'Acme / Design / Brand' }, 'linear')).toEqual({
+      name: 'Design / Brand'
+    })
+    // A team the daemon could only label by id, or one whose workspace went unnamed, stands alone.
+    expect(rowLabelParts({ kind: 'channel', name: 'team-9f2' }, 'linear')).toEqual({ name: 'team-9f2' })
+    expect(rowLabelParts({ kind: 'channel', name: 'Engineering' }, 'linear')).toEqual({ name: 'Engineering' })
+  })
+
+  it('never splits a direct row — that label is a person', () => {
+    expect(rowLabelParts({ kind: 'im', name: '@A · B' }, 'linear')).toEqual({ name: 'A · B' })
+  })
+})
+
+describe('rowName', () => {
+  it('is the platform’s own, and only where the platform declares one', () => {
+    // Linear prints a team's key after its name and links the name; nobody else has either.
+    expect(rowName('channel', 'linear')).toBeDefined()
+    for (const platform of ['slack', 'discord', 'telegram', 'feishu', undefined]) {
+      expect(rowName('channel', platform)).toBeUndefined()
+    }
+  })
+
+  it('never renames a direct row — its label is a person, with no handle and no page', () => {
+    expect(rowName('im', 'linear')).toBeUndefined()
+    expect(rowName('mpim', 'linear')).toBeUndefined()
+  })
+})
+
+describe('rowUrl', () => {
+  const row = (over: Partial<IntegrationChannelRow>): IntegrationChannelRow => ({
+    channelId: 'C0EXAMPLE',
+    name: 'general',
+    trigger: 'mention',
+    ...over
+  })
+
+  it('opens a Slack conversation of any kind under the bot workspace, and nowhere without one', () => {
+    const bot = { workspaceId: 'T0EXAMPLE' }
+    expect(rowUrl(row({}), 'slack', bot)).toBe('https://app.slack.com/client/T0EXAMPLE/C0EXAMPLE')
+    expect(rowUrl(row({ channelId: 'D0EXAMPLE', kind: 'im' }), 'slack', bot)).toBe(
+      'https://app.slack.com/client/T0EXAMPLE/D0EXAMPLE'
+    )
+    expect(rowUrl(row({}), 'slack', undefined)).toBeUndefined()
+  })
+
+  it('opens a Discord channel under its server and a DM under @me', () => {
+    const channel = row({ channelId: '200000000000000002', spaceId: '100000000000000001' })
+    expect(rowUrl(channel, 'discord', undefined)).toBe(
+      'https://discord.com/channels/100000000000000001/200000000000000002'
+    )
+    expect(rowUrl(row({ channelId: '300000000000000003', kind: 'im' }), 'discord', undefined)).toBe(
+      'https://discord.com/channels/@me/300000000000000003'
+    )
+    // A channel whose server has not resolved yet has no page to open.
+    expect(rowUrl(row({ channelId: '200000000000000002' }), 'discord', undefined)).toBeUndefined()
+  })
+
+  it('opens a Google Chat space by room and a DM by dm', () => {
+    expect(rowUrl(row({ channelId: 'spaces/AAAAexample' }), 'googlechat', undefined)).toBe(
+      'https://chat.google.com/room/AAAAexample'
+    )
+    expect(rowUrl(row({ channelId: 'spaces/BBBBexample', kind: 'im' }), 'googlechat', undefined)).toBe(
+      'https://chat.google.com/dm/BBBBexample'
+    )
+  })
+
+  it('opens a Lark group on the bot cloud, Feishu when the bot predates the region axis', () => {
+    const group = row({ channelId: 'oc_example' })
+    expect(rowUrl(group, 'feishu', { feishuRegion: 'lark' })).toBe(
+      'https://applink.larksuite.com/client/chat/open?openChatId=oc_example'
+    )
+    expect(rowUrl(group, 'feishu', { feishuRegion: null })).toBe(
+      'https://applink.feishu.cn/client/chat/open?openChatId=oc_example'
+    )
+    expect(rowUrl(row({ channelId: 'oc_example', kind: 'im' }), 'feishu', undefined)).toBeUndefined()
+  })
+
+  it('prefers the page the daemon reported, and links nothing on a platform without pages', () => {
+    const team = row({ channelId: 'team-1', url: 'https://linear.example.test/acme/team/ENG' })
+    expect(rowUrl(team, 'linear', undefined)).toBe('https://linear.example.test/acme/team/ENG')
+    expect(rowUrl(row({ channelId: '-100123' }), 'telegram', undefined)).toBeUndefined()
+  })
+})
+
+describe('roomPlural', () => {
+  it('heads a list of rows with the platform’s own noun, pluralised', () => {
+    // The three nouns the modules declare today.
+    expect(roomPlural('team')).toBe('teams')
+    expect(roomPlural('channel')).toBe('channels')
+    expect(roomPlural('chat')).toBe('chats')
+  })
+
+  it('keeps the sibilant arm honest for a noun no module declares yet', () => {
+    expect(roomPlural('inbox')).toBe('inboxes')
+    expect(roomPlural('branch')).toBe('branches')
+    // The host capitalises before pluralising, so the header reads "Teams", not "teamS".
+    expect(roomPlural('Team')).toBe('Teams')
+  })
+})
+
+// One member is no choice: the picker would name that agent and offer nothing to pick.
+describe('IntegrationChannelList default dispatch on a one-member bot', () => {
+  const render = (botId: string) =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        integrationId: 'int_alice',
+        botId,
+        agentId: 'alice',
+        platform: 'slack',
+        shareable: true,
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention', agentId: 'alice' }]
+      })
+    )
+
+  it('drops the picker', () => {
+    const html = render('bot_solo')
+    expect(html).not.toContain('Default dispatch')
+  })
+
+  it('keeps it once a second agent shares the bot', () => {
+    const html = render('bot_shared')
+    expect(html).toContain('Default dispatch — Alice')
+  })
+})
+
+// The dispatch control shows the current agent's avatar and a chevron on every conversation row.
+describe('IntegrationChannelList default dispatch control', () => {
+  const render = (agentId: string) =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        integrationId: 'int_alice',
+        botId: 'bot_shared',
+        agentId: 'alice',
+        platform: 'slack',
+        shareable: true,
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention', agentId }]
+      })
+    )
+
+  it('leads with the current default’s avatar and a chevron, the way every platform’s does', () => {
+    for (const html of [render('alice'), render('bob')]) {
+      expect(html).not.toContain('lucide-corner-down-right')
+      expect(html).toContain('lucide-chevron-down')
+    }
+  })
+
+  it('names the default accessibly without displaying its name on a chat row', () => {
+    const html = render('alice')
+    expect(html).toContain('aria-label="Default dispatch — Alice"')
+    expect(html).not.toContain('>Alice</span>')
+  })
+})
+
+describe('IntegrationChannelList direct rows', () => {
+  it('renders an Everyone DM with its On/Off trigger', () => {
+    const html = renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform: 'discord',
+        channels: [{ channelId: 'D1', name: '@Alice', kind: 'im', trigger: 'any' }]
+      })
+    )
+    expect(html).toContain('Direct messages')
+    // The closed control READS the current choice; Off is one menu item away.
+    expect(html).toContain('aria-label="Settings for Alice: On"')
+    expect(html).toContain('<span>On</span>')
+  })
+
+  it('renders shared-bot default dispatch for a DM', () => {
+    const html = renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        integrationId: 'int_alice',
+        botId: 'bot_shared',
+        agentId: 'alice',
+        platform: 'slack',
+        shareable: true,
+        channels: [{ channelId: 'D1', name: '@Alice', kind: 'im', trigger: 'any', agentId: 'bob' }]
+      })
+    )
+    expect(html).toContain('Default dispatch — Bob')
+    expect(html).not.toContain('>Bob</span>')
+  })
+})
+
+// A platform may give a conversation more than a label: a Linear team has a KEY and a page.
+// Both ride the row as their own fields — neither is ever read back out of the stored label.
+describe('IntegrationChannelList row name, where the platform gives one', () => {
+  const render = (row: Partial<IntegrationChannelRow> = {}) =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform: 'linear',
+        channels: [
+          {
+            channelId: 'team-eng',
+            name: 'Acme / Engineering',
+            kind: 'channel',
+            trigger: 'mention',
+            key: 'ENG',
+            url: 'https://linear.app/example-workspace/team/ENG',
+            ...row
+          }
+        ]
+      })
+    )
+
+  it('prints the team’s key after its name and links the NAME to the team in Linear', () => {
+    const html = render()
+    expect(html).toContain('href="https://linear.app/example-workspace/team/ENG"')
+    expect(html).toContain('>Engineering</a>')
+    expect(html).toContain('>ENG<')
+    // The stored label still carries the workspace and never the key (§4.5).
+    expect(html).not.toContain('Acme / Engineering</span>')
+  })
+
+  it('leaves every other platform’s row exactly as it was', () => {
+    const slack = renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        platform: 'slack',
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }]
+      })
+    )
+    expect(slack).not.toContain('<a ')
+    expect(slack).toContain('>deploys</span>')
+  })
+})
+
+// A row offers exactly one way out, so it spends it directly — the same × the repository
+// rows carry — rather than hiding a single item behind an overflow menu.
+describe('IntegrationChannelList row action', () => {
+  const render = (platform: string) =>
+    renderToStaticMarkup(
+      createElement(IntegrationChannelList, {
+        integrationId: 'int_alice',
+        platform,
+        channels: [{ channelId: 'C1', name: 'deploys', kind: 'channel', trigger: 'mention' }]
+      })
+    )
+
+  it('delists with an × where the bot cannot leave', () => {
+    const html = render('slack')
+    expect(html).toContain('aria-label="Remove from this list: deploys"')
+    expect(html).toContain('lucide-x')
+    expect(html).not.toContain('lucide-ellipsis')
+  })
+
+  it('leaves, and says so, where the platform can leave one conversation', () => {
+    const html = render('telegram')
+    expect(html).toContain('aria-label="Leave group: deploys"')
+    expect(html).toContain('lucide-log-out')
+    expect(html).not.toContain('lucide-ellipsis')
+  })
+})

@@ -1,0 +1,1194 @@
+/**
+ * `integrationToSpec` — the per-channel trigger → wire bindRules fold (unit, no I/O).
+ *
+ * The delivered rule set is the defaults (@-mention anywhere + DMs) plus one scoped
+ * `auto` rule per room switched to "any message". A room left on '@-mention' adds no
+ * extra rule; a 1:1 DM's On state uses the unscoped DM default.
+ */
+import { describe, it, expect } from 'vitest'
+import { z } from 'zod'
+import { cronToUpsert, httpIntegrationToSpec, integrationToSpec, isGatedAgent, type SpecOwner } from './placement.js'
+import { agentRecordToSpec } from './agentSpecAssembler.js'
+import type {
+  AgentRecord,
+  BotRecord,
+  CronRecord,
+  IntegrationChannelRecord,
+  IntegrationRecord
+} from '../persistence/ports.js'
+import { AgentId, BotId, IntegrationId, OrgId } from '../domain/ids.js'
+import { buildCpPlatformRegistry } from '../platforms/registry.js'
+import { createSlackCpProvider } from '../platforms/slack/provider.js'
+import { createTelegramCpProvider } from '../platforms/telegram/provider.js'
+import { createDiscordCpProvider } from '../platforms/discord/provider.js'
+import { createFeishuCpProvider } from '../platforms/feishu/provider.js'
+import {
+  IntegrationSlackConfig,
+  IntegrationTelegramConfig,
+  IntegrationDiscordConfig,
+  IntegrationFeishuConfig
+} from '@agentconnect.md/protocol'
+import { NO_SESSION_SYNC } from '../../test/fakes/no-session-sync.js'
+
+// The §9 projector seam: spec assembly now awaits the platform provider for the
+// opaque `config` payload, so every call needs the registry + the bot row. The
+// four providers are constructed with offline stubs — the projectors reach none
+// of them (they are pure functions of the row + the decrypted secret).
+const PLATFORMS = buildCpPlatformRegistry([
+  createSlackCpProvider({}),
+  createTelegramCpProvider({ verifyBot: async () => ({ status: 'unreachable' }) }),
+  createDiscordCpProvider({ ensureMessageContentIntent: async () => 'ready' }),
+  createFeishuCpProvider({})
+])
+
+// §6.4 emission flip: the spec carries envelope (`core`) + opaque `config` only.
+// Tests validate the payload through the SAME wire schema the daemon reader uses.
+const slackCfg = (spec: { config?: unknown }) => IntegrationSlackConfig.parse(spec.config)
+const telegramCfg = (spec: { config?: unknown }) => IntegrationTelegramConfig.parse(spec.config)
+const discordCfg = (spec: { config?: unknown }) => IntegrationDiscordConfig.parse(spec.config)
+const feishuCfg = (spec: { config?: unknown }) => IntegrationFeishuConfig.parse(spec.config)
+
+const INTEGRATION: IntegrationRecord = {
+  id: IntegrationId('66666666-6666-4666-8666-666666666666'),
+  orgId: OrgId('org'),
+  agentId: AgentId('77777777-7777-4777-8777-777777777777'),
+  botId: BotId('88888888-8888-4888-8888-888888888888'),
+  platform: 'slack',
+  name: 'acme-bot',
+  status: 'active',
+  createdAt: new Date('2026-01-01T00:00:00Z')
+}
+const SECRET = { botToken: 'xoxb-abc', appToken: 'xapp-def', signingSecret: null }
+
+/** A socket-transport bot row — the direct-mode fork the projector applies. Only
+ *  the fields the four projectors read are meaningful. */
+const bot = (over: Partial<BotRecord> = {}): BotRecord =>
+  ({
+    id: BotId('88888888-8888-4888-8888-888888888888'),
+    orgId: OrgId('org'),
+    platform: 'slack',
+    name: 'acme-bot',
+    transport: 'socket',
+    shareable: false,
+    slackAppId: null,
+    teamId: null,
+    botUserId: null,
+    ...over
+  }) as BotRecord
+
+/** The owning agents the projection reads: restricted, and Everyone in assistant mode. */
+const RESTRICTED: SpecOwner = { visibility: 'restricted' }
+const ASSISTANT: SpecOwner = { visibility: 'org', assistantMode: { enabled: true } }
+const RESTRICTED_ASSISTANT: SpecOwner = { visibility: 'restricted', assistantMode: { enabled: true } }
+
+/** `integrationToSpec` with the registry + the matching bot row pre-bound, so the
+ *  cases below keep reading as the trigger→bindRules fold they are testing. */
+const specOf = async (
+  i: IntegrationRecord,
+  secret: Parameters<typeof integrationToSpec>[4],
+  channels: IntegrationChannelRecord[] = [],
+  owner?: SpecOwner
+) => {
+  // Every platform exercised here always has a deliverable payload; `null` is the
+  // withheld-integration answer, pinned in its own suite below.
+  const spec = await integrationToSpec(
+    PLATFORMS,
+    NO_SESSION_SYNC,
+    i,
+    bot({ platform: i.platform }),
+    secret,
+    channels,
+    owner
+  )
+  if (!spec) throw new Error('expected a deliverable spec')
+  return spec
+}
+
+const channel = (
+  channelId: string,
+  trigger: 'off' | 'mention' | 'any',
+  kind: 'channel' | 'im' | 'mpim' = 'channel',
+  sessionMode: IntegrationChannelRecord['sessionMode'] = 'createNew'
+): IntegrationChannelRecord => ({
+  integrationId: INTEGRATION.id,
+  channelId,
+  name: channelId.toLowerCase(),
+  spaceId: null,
+  space: null,
+  icon: null,
+  color: null,
+  key: null,
+  url: null,
+  isPrivate: false,
+  kind,
+  trigger,
+  dmUserId: null,
+  sessionMode,
+  triggerChosen: false,
+  decisionBinding: null,
+  decisionNeedsReview: false,
+  decisionDefinition: null,
+  agentId: null
+})
+
+describe('integrationToSpec sessionModes', () => {
+  it('omits conversations left on the default', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'mention'), channel('C2', 'any')])
+    expect(spec.core.sessionModes).toEqual([])
+  })
+
+  it('lists only the conversations that depart from createNew', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [
+      channel('C1', 'mention'),
+      channel('C2', 'mention', 'channel', 'append'),
+      channel('C3', 'any', 'channel', 'append')
+    ])
+    expect(spec.core.sessionModes).toEqual([
+      { channel: 'C2', mode: 'append' },
+      { channel: 'C3', mode: 'append' }
+    ])
+  })
+
+  // auto-session-mode.md §3.1: the projection passes auto through; the per-peer encoder decides who may read it.
+  it('passes auto through like any other departure', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'mention'), channel('C2', 'any', 'channel', 'auto')])
+    expect(spec.core.sessionModes).toEqual([{ channel: 'C2', mode: 'auto' }])
+  })
+
+  // Unlike bindRules, this ships for a gated agent too: session keying is the daemon's
+  // in every mode, so withholding it would silently downgrade a restricted agent to
+  // createNew while the console shows append.
+  it('ships for a gated agent, whose bindRules carry no unscoped defaults', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'mention', 'channel', 'append')], RESTRICTED)
+    expect(spec.core.gated).toBe(true)
+    expect(spec.core.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+  })
+
+  // The relay arbitrates activation for a shared bot, so its bindRules are empty — but
+  // the daemon still owns session keying, which is why this rides its own field.
+  it('ships for a relay-managed bot whose bindRules are empty', async () => {
+    const spec = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      [channel('C1', 'mention', 'channel', 'append')]
+    )
+    expect(spec?.core.bindRules).toEqual([])
+    expect(spec?.core.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+  })
+})
+
+// assistant-mode.md §5.1, §5.2: assistant mode gives each place one session, at projection only, and gates nothing.
+describe('assistant-mode places', () => {
+  const decided = (channelId: string, sessionMode: 'createNew' | 'append' = 'createNew'): IntegrationChannelRecord => ({
+    ...channel(channelId, 'mention', 'channel', sessionMode),
+    trigger: 'decision',
+    decisionBinding: {
+      type: 'gate',
+      decisionId: '99999999-9999-4999-8999-999999999999',
+      when: { type: 'boolean', values: [true] }
+    }
+  })
+  const rows = () => [
+    channel('C1', 'mention'),
+    channel('C2', 'off'),
+    channel('C3', 'any', 'channel', 'append'),
+    channel('D1', 'any', 'im'),
+    channel('G1', 'mention', 'mpim'),
+    decided('C4'),
+    decided('C5', 'append')
+  ]
+  const OFF: SpecOwner = { visibility: 'org', assistantMode: { enabled: false } }
+
+  // #2979 B7: an Everyone agent in assistant mode takes the open defaults; an Off row it already has stays Off.
+  it('leaves an Everyone agent in assistant mode ungated, like any Everyone agent', async () => {
+    expect(isGatedAgent({ visibility: 'org' })).toBe(false)
+    expect(isGatedAgent(OFF)).toBe(false)
+    expect(isGatedAgent(ASSISTANT)).toBe(false)
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'mention'), channel('C2', 'off')], ASSISTANT)
+    expect(spec.core.gated).toBe(false)
+    expect(spec.core.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+    expect(spec.core.mutedChannels).toEqual(['C2'])
+  })
+
+  it('keeps a restricted agent gated whatever its mode', async () => {
+    expect(isGatedAgent(RESTRICTED)).toBe(true)
+    expect(isGatedAgent(RESTRICTED_ASSISTANT)).toBe(true)
+    const spec = await specOf(
+      INTEGRATION,
+      SECRET,
+      [channel('C1', 'mention'), channel('C2', 'off')],
+      RESTRICTED_ASSISTANT
+    )
+    expect(spec.core.gated).toBe(true)
+    expect(spec.core.bindRules).toEqual([{ channel: 'C1', match: { kind: 'mention' } }])
+    expect(spec.core.mutedChannels).toEqual([])
+  })
+
+  // The list is complete in assistant mode, so the daemon's append default for an unseen place never overrides a known row.
+  it('keys rooms, Slack DMs and Slack group DMs on one session, listing Decision rows on their own mode', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, rows(), ASSISTANT)
+    // Marked for the coordinator where the daemon reads `auto` (auto-session-mode.md §3.4).
+    expect(spec.core.sessionModes).toEqual([
+      { channel: 'C1', mode: 'append', assistantPlace: true },
+      { channel: 'C2', mode: 'append', assistantPlace: true },
+      { channel: 'C3', mode: 'append', assistantPlace: true },
+      { channel: 'D1', mode: 'append', assistantPlace: true },
+      { channel: 'G1', mode: 'append', assistantPlace: true },
+      { channel: 'C4', mode: 'createNew' },
+      { channel: 'C5', mode: 'append' }
+    ])
+  })
+
+  // auto-session-mode.md §3.6: with the coordinator off an assistant-mode place stays one session and never becomes Auto.
+  it('keeps assistant-mode places unmarked with the coordinator off', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, rows(), { ...ASSISTANT, coordinatorDisabled: true })
+    expect(spec.core.sessionModes.filter((m) => m.mode === 'append')).toEqual([
+      { channel: 'C1', mode: 'append' },
+      { channel: 'C2', mode: 'append' },
+      { channel: 'C3', mode: 'append' },
+      { channel: 'D1', mode: 'append' },
+      { channel: 'G1', mode: 'append' },
+      { channel: 'C5', mode: 'append' }
+    ])
+  })
+
+  it('sends an Auto row as Single session while the coordinator is off, and as Auto once it is back on', async () => {
+    const auto = [channel('C1', 'mention', 'channel', 'auto'), channel('C2', 'any', 'channel', 'createNew')]
+    const off = await specOf(INTEGRATION, SECRET, auto, { ...OFF, coordinatorDisabled: true })
+    expect(off.core.sessionModes).toEqual([{ channel: 'C1', mode: 'append' }])
+    const on = await specOf(INTEGRATION, SECRET, auto, OFF)
+    expect(on.core.sessionModes).toEqual([{ channel: 'C1', mode: 'auto' }])
+  })
+
+  it("restores every row's own mode once assistant mode is off", async () => {
+    for (const owner of [undefined, OFF, RESTRICTED]) {
+      const spec = await specOf(INTEGRATION, SECRET, rows(), owner)
+      expect(spec.core.sessionModes).toEqual([
+        { channel: 'C3', mode: 'append' },
+        { channel: 'C5', mode: 'append' }
+      ])
+    }
+  })
+
+  it('forces the same on a relay-managed member spec', async () => {
+    const spec = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      rows(),
+      ASSISTANT
+    )
+    expect(spec?.core.gated).toBe(false)
+    expect(spec?.core.sessionModes.filter((m) => m.mode === 'append').map((m) => m.channel)).toEqual([
+      'C1',
+      'C2',
+      'C3',
+      'D1',
+      'G1',
+      'C5'
+    ])
+  })
+
+  it('leaves a DM that is one continuous session already on its platform keying', async () => {
+    const spec = await specOf(
+      { ...INTEGRATION, platform: 'telegram' },
+      { botToken: '1:a', appToken: null, signingSecret: null },
+      [channel('-100', 'mention'), channel('42', 'any', 'im')],
+      ASSISTANT
+    )
+    expect(spec.core.sessionModes).toEqual([
+      { channel: '-100', mode: 'append', assistantPlace: true },
+      { channel: '42', mode: 'createNew' }
+    ])
+  })
+
+  it('skips a platform whose rows never append', async () => {
+    const linear = buildCpPlatformRegistry([
+      {
+        platformId: 'linear',
+        installRoutes: () => [],
+        credentialBodySchema: z.object({}),
+        validateConfig: () => Promise.resolve({ ok: true as const, identity: {} }),
+        buildNewBotInstall: () => ({ secrets: { botToken: '', appToken: null, signingSecret: null } }),
+        secretShape: { slots: {}, httpAssignRequires: [] },
+        projectIntegrationConfig: () => Promise.resolve({})
+      }
+    ])
+    const spec = await httpIntegrationToSpec(
+      linear,
+      NO_SESSION_SYNC,
+      { ...INTEGRATION, platform: 'linear' },
+      bot({ platform: 'linear', transport: 'http' }),
+      SECRET,
+      [channel('team_eng', 'mention')],
+      ASSISTANT
+    )
+    expect(spec?.core.sessionModes).toEqual([])
+  })
+})
+
+// assistant-mode.md §5.3: the detected external conversations; the daemon reads every other enabled one as internal.
+describe('integrationToSpec externalChannels', () => {
+  const shared = (channelId: string): IntegrationChannelRecord => ({
+    ...channel(channelId, 'mention'),
+    externalReason: 'externallyShared'
+  })
+
+  it('lists only the conversations the platform detected as external', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [shared('C1'), channel('C2', 'mention'), shared('C3')])
+    expect(spec.core.externalChannels).toEqual(['C1', 'C3'])
+  })
+
+  it('ships for a relay-managed bot too', async () => {
+    const spec = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      [shared('C1')]
+    )
+    expect(spec?.core.externalChannels).toEqual(['C1'])
+  })
+})
+
+describe('integrationToSpec chatAuthority', () => {
+  /** An organization whose session access sync is on (in any of its states) for exactly `synced` platforms. */
+  const policies = (synced: Record<string, 'enabling' | 'enabled' | 'degraded' | 'disabled'>) => ({
+    getExternalAccessPolicy: async (orgId: OrgId, provider: string) => {
+      const state = synced[provider]
+      return state ? { orgId, provider, state, currentRev: 1n, readFenceRev: null } : null
+    }
+  })
+
+  it.each(['enabling', 'enabled', 'degraded'] as const)(
+    'names the agent’s editors while the platform’s sync is %s',
+    async (state) => {
+      const spec = await integrationToSpec(PLATFORMS, policies({ slack: state }), INTEGRATION, bot(), SECRET)
+      expect(spec?.core.chatAuthority).toBe('editors')
+      const http = await httpIntegrationToSpec(
+        PLATFORMS,
+        policies({ slack: state }),
+        INTEGRATION,
+        bot({ transport: 'http' }),
+        SECRET
+      )
+      expect(http?.core.chatAuthority).toBe('editors')
+    }
+  )
+
+  it('names the agent’s editors on synced Feishu/Lark, whose members are matched by union_id', async () => {
+    const feishu = { ...INTEGRATION, platform: 'feishu' as const }
+    const spec = await integrationToSpec(
+      PLATFORMS,
+      policies({ feishu: 'enabled' }),
+      feishu,
+      bot({ platform: 'feishu' }),
+      { botToken: 'secret', appToken: 'cli_a', signingSecret: null }
+    )
+    expect(spec?.core.chatAuthority).toBe('editors')
+  })
+
+  it.each(['telegram', 'discord'] as const)(
+    'names linked editors on synced %s and participants otherwise',
+    async (platform) => {
+      for (const state of ['enabled', 'disabled'] as const) {
+        const spec = await integrationToSpec(
+          PLATFORMS,
+          policies({ [platform]: state }),
+          { ...INTEGRATION, platform },
+          bot({ platform }),
+          { botToken: '123:abc', appToken: null, signingSecret: null }
+        )
+        expect(spec?.core.chatAuthority).toBe(state === 'enabled' ? 'editors' : 'participants')
+      }
+    }
+  )
+
+  it('names anyone in the conversation where the sync is off, never set, or on for another platform only', async () => {
+    const cases: Array<Parameters<typeof policies>[0]> = [{ slack: 'disabled' }, {}, { feishu: 'enabled' }]
+    for (const synced of cases) {
+      const spec = await integrationToSpec(PLATFORMS, policies(synced), INTEGRATION, bot(), SECRET)
+      expect(spec?.core.chatAuthority).toBe('participants')
+    }
+    expect((await specOf(INTEGRATION, SECRET)).core.chatAuthority).toBe('participants')
+  })
+})
+
+describe('integrationToSpec bindRules', () => {
+  it('defaults to mention + dm with no channels', async () => {
+    const spec = await specOf(INTEGRATION, SECRET)
+    expect(spec.core.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+    expect(slackCfg(spec).botToken).toBe(SECRET.botToken)
+  })
+
+  it("adds one channel-scoped 'auto' rule per 'any message' channel; 'mention' channels add none", async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [
+      channel('C1', 'mention'),
+      channel('C2', 'any'),
+      channel('C3', 'any')
+    ])
+    expect(spec.core.bindRules).toEqual([
+      { match: { kind: 'mention' } },
+      { match: { kind: 'dm' } },
+      { channel: 'C2', match: { kind: 'auto' } },
+      { channel: 'C3', match: { kind: 'auto' } }
+    ])
+  })
+
+  it('uses the DM default for a 1:1 row and scopes a group DM set to "any"', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [
+      channel('C1', 'any'),
+      channel('D1', 'any', 'im'),
+      channel('G1', 'any', 'mpim')
+    ])
+    expect(spec.core.bindRules).toEqual([
+      { match: { kind: 'mention' } },
+      { match: { kind: 'dm' } },
+      { channel: 'C1', match: { kind: 'auto' } },
+      { channel: 'G1', match: { kind: 'auto' } }
+    ])
+  })
+
+  it('emits a telegram-shaped spec (single botToken, no appToken) for a telegram integration', async () => {
+    const spec = await specOf(
+      { ...INTEGRATION, platform: 'telegram' },
+      { botToken: '123:abc', appToken: null, signingSecret: null },
+      [channel('-100', 'any')]
+    )
+    if (spec.platform !== 'telegram') throw new Error('expected telegram spec')
+    expect(telegramCfg(spec).botToken).toBe('123:abc')
+    expect(spec).not.toHaveProperty('slack')
+    expect(spec.core.bindRules).toEqual([
+      { match: { kind: 'mention' } },
+      { match: { kind: 'dm' } },
+      { channel: '-100', match: { kind: 'auto' } }
+    ])
+  })
+})
+
+describe('integrationToSpec conversation gating (§14)', () => {
+  it('gated: emits ONLY conversation-scoped rules — no unscoped defaults', async () => {
+    const spec = await specOf(
+      INTEGRATION,
+      SECRET,
+      [channel('C1', 'mention'), channel('C2', 'any'), channel('C3', 'off'), channel('D1', 'any', 'im')],
+      RESTRICTED
+    )
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core.gated).toBe(true)
+    expect(spec.core.bindRules).toEqual([
+      { channel: 'C1', match: { kind: 'mention' } },
+      { channel: 'C2', match: { kind: 'auto' } },
+      { channel: 'D1', match: { kind: 'dm' } }
+    ])
+  })
+
+  it('gated with no enabled conversations ships an EMPTY rule set (fail-closed)', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'off'), channel('D1', 'off', 'im')], RESTRICTED)
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core.bindRules).toEqual([])
+    expect(spec.core.gated).toBe(true)
+  })
+
+  it("non-gated: an 'off' channel keeps the defaults but is muted; gated is false", async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'off'), channel('D1', 'any', 'im')])
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core.gated).toBe(false)
+    // The defaults are unscoped, so Off cannot be expressed by withholding a rule —
+    // the fence is what silences C1. The im row adds no auto rule either; DMs are
+    // covered by the unscoped dm default.
+    expect(spec.core.bindRules).toEqual([{ match: { kind: 'mention' } }, { match: { kind: 'dm' } }])
+    expect(spec.core.mutedChannels).toEqual(['C1'])
+  })
+})
+
+describe('integrationToSpec mutedChannels', () => {
+  it('mutes every Off channel and nothing else', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [
+      channel('C1', 'off'),
+      channel('C2', 'mention'),
+      channel('C3', 'any'),
+      channel('C4', 'off')
+    ])
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core?.mutedChannels).toEqual(['C1', 'C4'])
+  })
+
+  it('mutes direct rows on a non-gated integration', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('D1', 'off', 'im'), channel('G1', 'off', 'mpim')])
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core?.mutedChannels).toEqual(['D1', 'G1'])
+  })
+
+  // A gated integration says Off by having no rule for the conversation; stating it
+  // twice would let the two representations drift apart.
+  it('stays empty for a gated integration, whose Off is the missing rule', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'off'), channel('C2', 'mention')], RESTRICTED)
+    if (spec.platform !== 'slack') throw new Error('expected slack spec')
+    expect(spec.core?.mutedChannels).toEqual([])
+    expect(spec.core?.bindRules).toEqual([{ channel: 'C2', match: { kind: 'mention' } }])
+  })
+
+  it('rides every platform variant', async () => {
+    const tg = await specOf(
+      { ...INTEGRATION, platform: 'telegram' },
+      { botToken: '1:a', appToken: null, signingSecret: null },
+      [channel('-100', 'off')]
+    )
+    if (tg.platform !== 'telegram') throw new Error('expected telegram spec')
+    expect(tg.core?.mutedChannels).toEqual(['-100'])
+    const dc = await specOf(
+      { ...INTEGRATION, platform: 'discord' },
+      { botToken: 'bot', appToken: null, signingSecret: null },
+      [channel('999', 'off')]
+    )
+    if (dc.platform !== 'discord') throw new Error('expected discord spec')
+    expect(dc.core?.mutedChannels).toEqual(['999'])
+    const fs = await specOf(
+      { ...INTEGRATION, platform: 'feishu' },
+      { botToken: 'sec', appToken: 'cli_x', signingSecret: null },
+      [channel('oc_1', 'off')]
+    )
+    if (fs.platform !== 'feishu') throw new Error('expected feishu spec')
+    expect(fs.core?.mutedChannels).toEqual(['oc_1'])
+  })
+})
+
+/**
+ * §9 projector seam: core owns the envelope and ONE fail-closed fence — a
+ * registered provider is required; the opaque `config` is the provider's. The
+ * fence is unreachable in production — every persistence write already passes
+ * `toDbPlatform` and the create route admits only registered platform ids —
+ * but the pre-S3 code's unrecognized-platform arm silently FELL THROUGH to the
+ * slack branch, so pin that it does not any more. (The wire-side `toDbPlatform`
+ * narrowing died with the union flatten: `IntegrationSpec.platform` is open, so
+ * the session-identity and unknown ids below now hit the same provider refusal
+ * instead of the persistence fence's two messages. `toDbPlatform` itself lives
+ * on unchanged at every persistence write.)
+ */
+describe('By decision projection (decisions.md §7.1)', () => {
+  const DECISION = '99999999-9999-4999-8999-999999999999'
+  const definition = {
+    id: DECISION,
+    orgId: 'org',
+    name: 'Needs help',
+    providerId: 'typesafe',
+    model: 'jev-1.13.0',
+    question: {
+      type: 'boolean' as const,
+      instructions: 'Is help needed?',
+      criteria: { true: 'Yes', false: 'No' }
+    }
+  }
+  const gate = { type: 'gate' as const, decisionId: DECISION, when: { type: 'boolean' as const, values: [true] } }
+  const decisionRow = (channelId: string, over: Partial<IntegrationChannelRecord> = {}): IntegrationChannelRecord => ({
+    ...channel(channelId, 'mention'),
+    trigger: 'decision',
+    decisionBinding: gate,
+    decisionDefinition: definition,
+    ...over
+  })
+  const rows = () => [decisionRow('C1'), decisionRow('C2', { decisionNeedsReview: true }), channel('C3', 'any')]
+
+  it('emits the bundle and a scoped decision rule per enabled gate, muting held ones', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, rows())
+    expect(spec.core.bindRules).toContainEqual({ channel: 'C1', match: { kind: 'decision' } })
+    expect(spec.core.bindRules).not.toContainEqual({ channel: 'C2', match: { kind: 'decision' } })
+    expect(spec.core.mutedChannels).toEqual(['C2'])
+    expect(spec.core.decisions).toEqual({
+      bindings: [
+        { channel: 'C1', consumer: gate, enabled: true },
+        { channel: 'C2', consumer: gate, enabled: false, disabledReason: 'needs_review' }
+      ],
+      definitions: [definition]
+    })
+  })
+
+  it('never turns a gated By decision conversation into a mention rule', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, rows(), RESTRICTED)
+    expect(spec.core.bindRules).toEqual([
+      { channel: 'C1', match: { kind: 'decision' } },
+      { channel: 'C3', match: { kind: 'auto' } }
+    ])
+    expect(spec.core.mutedChannels).toEqual([])
+    expect(spec.core.decisions.bindings).toHaveLength(2)
+  })
+
+  it('emits an empty bundle when nothing is bound', async () => {
+    const spec = await specOf(INTEGRATION, SECRET, [channel('C1', 'mention')])
+    expect(spec.core.decisions).toEqual({ bindings: [], definitions: [] })
+  })
+
+  it('ships the bundle on a relay-managed spec without bind rules, muting held conversations', async () => {
+    const shared = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      rows()
+    )
+    expect(shared?.core.bindRules).toEqual([])
+    expect(shared?.core.mutedChannels).toEqual(['C2'])
+    expect(shared?.core.decisions.bindings.map((b) => [b.channel, b.enabled])).toEqual([
+      ['C1', true],
+      ['C2', false]
+    ])
+    const gated = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      rows(),
+      RESTRICTED
+    )
+    expect(gated?.core.bindRules).toContainEqual({ channel: 'C1', match: { kind: 'decision' } })
+    expect(gated?.core.decisions.definitions).toEqual([definition])
+  })
+})
+
+describe('shared-bot router projection on member specs (decisions.md §7.1)', () => {
+  const router = { type: 'shared_bot_routing' as const }
+  const routing = { decisionId: 'd1', enabled: true, needsReview: false, botShared: true }
+  const routedRow = (channelId: string, over: Partial<IntegrationChannelRecord> = {}): IntegrationChannelRecord => ({
+    ...channel(channelId, 'mention'),
+    trigger: 'decision',
+    decisionBinding: router,
+    decisionRouting: routing,
+    ...over
+  })
+  const rows = () => [routedRow('R1'), routedRow('R2', { decisionRouting: { ...routing, enabled: false } })]
+
+  it('binds every member as a held candidate without the router config', async () => {
+    const shared = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      rows()
+    )
+    expect(shared?.core.bindRules).toEqual([])
+    expect(shared?.core.mutedChannels).toEqual(['R2'])
+    expect(shared?.core.decisions).toEqual({
+      bindings: [
+        { channel: 'R1', consumer: router, enabled: true },
+        { channel: 'R2', consumer: router, enabled: false, disabledReason: 'paused' }
+      ],
+      definitions: []
+    })
+  })
+
+  it('gives a gated member a decision rule for an enabled routed channel only', async () => {
+    const gated = await httpIntegrationToSpec(
+      PLATFORMS,
+      NO_SESSION_SYNC,
+      INTEGRATION,
+      bot({ transport: 'http' }),
+      SECRET,
+      rows(),
+      RESTRICTED
+    )
+    expect(gated?.core.bindRules).toEqual([{ channel: 'R1', match: { kind: 'decision' } }])
+  })
+})
+
+describe('integrationToSpec platform fences (§9)', () => {
+  const foreign = { ...INTEGRATION, platform: 'mastodon' }
+
+  it('refuses an id no provider is registered for instead of falling through to slack', async () => {
+    const withoutSlack = buildCpPlatformRegistry([
+      createTelegramCpProvider({ verifyBot: async () => ({ status: 'unreachable' }) })
+    ])
+    // A SERVED id (slack) whose provider is simply not composed — the case that
+    // reaches the provider fence rather than `toDbPlatform`'s served-set check.
+    await expect(integrationToSpec(withoutSlack, NO_SESSION_SYNC, INTEGRATION, bot(), SECRET, [])).rejects.toThrow(
+      /no control-plane platform provider registered for slack/
+    )
+  })
+
+  it('refuses an id outside the served set at the provider fence', async () => {
+    await expect(
+      integrationToSpec(PLATFORMS, NO_SESSION_SYNC, foreign, bot({ platform: 'mastodon' }), SECRET, [])
+    ).rejects.toThrow(/no control-plane platform provider registered for mastodon/)
+  })
+
+  it('refuses a session-identity id, which has no persisted integration at all', async () => {
+    const webchat = { ...INTEGRATION, platform: 'webchat' }
+    await expect(
+      integrationToSpec(PLATFORMS, NO_SESSION_SYNC, webchat, bot({ platform: 'webchat' }), SECRET, [])
+    ).rejects.toThrow(/no control-plane platform provider registered for webchat/)
+  })
+})
+
+/**
+ * A provider whose own credential store has nothing for this row answers
+ * `undefined`, and core must turn that into ABSENCE, not into a spec with an
+ * empty payload.
+ *
+ * The distinction is the whole point: the daemon's reader refuses a config-less
+ * spec and KEEPS the entry it already holds (`CpIntegrationRegistry.converge`
+ * only ever sets), so a config-less spec would leave a revoked credential
+ * running. `null` instead keeps the row out of the deliverable roster, which is
+ * exactly what `drop.integrations` prunes — the same exit a missing secret row
+ * already takes.
+ */
+describe('a provider with no deliverable payload withholds the integration', () => {
+  const withheld = buildCpPlatformRegistry([
+    {
+      platformId: 'slack',
+      installRoutes: () => [],
+      credentialBodySchema: z.object({}),
+      validateConfig: () => Promise.resolve({ ok: true as const, identity: {} }),
+      buildNewBotInstall: () => ({ secrets: { botToken: '', appToken: null, signingSecret: null } }),
+      secretShape: { slots: {}, httpAssignRequires: [] },
+      projectIntegrationConfig: () => Promise.resolve(undefined)
+    }
+  ])
+
+  it('answers null from the direct (socket) assembler', async () => {
+    expect(await integrationToSpec(withheld, NO_SESSION_SYNC, INTEGRATION, bot(), SECRET, [])).toBeNull()
+  })
+
+  it('answers null from the shared (http) assembler', async () => {
+    expect(
+      await httpIntegrationToSpec(withheld, NO_SESSION_SYNC, INTEGRATION, bot({ transport: 'http' }), SECRET, [])
+    ).toBeNull()
+  })
+
+  it('still emits a spec when the provider returns a payload, including a falsy one', async () => {
+    // `undefined` is the ONLY withholding answer — an empty-object payload is a
+    // legitimate config and must not be mistaken for an absent credential.
+    const empty = buildCpPlatformRegistry([
+      {
+        platformId: 'slack',
+        installRoutes: () => [],
+        credentialBodySchema: z.object({}),
+        validateConfig: () => Promise.resolve({ ok: true as const, identity: {} }),
+        buildNewBotInstall: () => ({ secrets: { botToken: '', appToken: null, signingSecret: null } }),
+        secretShape: { slots: {}, httpAssignRequires: [] },
+        projectIntegrationConfig: () => Promise.resolve({})
+      }
+    ])
+    expect(await integrationToSpec(empty, NO_SESSION_SYNC, INTEGRATION, bot(), SECRET, [])).toMatchObject({
+      integrationId: INTEGRATION.id,
+      config: {}
+    })
+  })
+})
+
+describe('a provider that needs a daemon feature', () => {
+  it('stamps the spec with it, so core can keep the integration off a daemon without it', async () => {
+    const needy = buildCpPlatformRegistry([
+      {
+        platformId: 'slack',
+        installRoutes: () => [],
+        credentialBodySchema: z.object({}),
+        validateConfig: () => Promise.resolve({ ok: true as const, identity: {} }),
+        buildNewBotInstall: () => ({ secrets: { botToken: '', appToken: null, signingSecret: null } }),
+        secretShape: { slots: {}, httpAssignRequires: [] },
+        projectIntegrationConfig: () => Promise.resolve({ relay: true }),
+        requiredDaemonFeatures: (config) => ((config as { relay?: boolean }).relay ? ['example-feature-v1'] : [])
+      }
+    ])
+    expect(await integrationToSpec(needy, NO_SESSION_SYNC, INTEGRATION, bot(), SECRET, [])).toMatchObject({
+      requires: ['example-feature-v1']
+    })
+    expect(await integrationToSpec(PLATFORMS, NO_SESSION_SYNC, INTEGRATION, bot(), SECRET, [])).not.toHaveProperty(
+      'requires'
+    )
+  })
+})
+
+describe('agentRecordToSpec runtime overrides', () => {
+  it('ships displayName as either its value or explicit null so clearing it replicates', () => {
+    const agent: AgentRecord = {
+      id: AgentId('77777777-7777-4777-8777-777777777777'),
+      orgId: OrgId('org'),
+      name: 'deploy-bot',
+      displayName: 'Deploy Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: null,
+      chatActions: 'talk',
+      pause: null,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: null,
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    expect(agentRecordToSpec(agent, {})).toHaveProperty('displayName', 'Deploy Bot')
+    expect(agentRecordToSpec({ ...agent, displayName: null }, {})).toHaveProperty('displayName', null)
+    expect(agentRecordToSpec(agent, {}).workspace).toEqual({
+      mode: 'scratch',
+      isolation: 'shared',
+      gitCredential: 'github-app',
+      additionalRepos: [],
+      additionalInstallations: []
+    })
+    // The preset marker always ships (definite record field) so the daemon can
+    // gate preset-only behavior such as `agentconnect-admin` attachment.
+    expect(agentRecordToSpec(agent, {})).toHaveProperty('builtin', false)
+    expect(agentRecordToSpec({ ...agent, builtin: true }, {})).toHaveProperty('builtin', true)
+  })
+
+  it('carries permissionMode to the daemon spec', () => {
+    const agent: AgentRecord = {
+      id: AgentId('77777777-7777-4777-8777-777777777777'),
+      orgId: OrgId('org'),
+      name: 'deploy-bot',
+      displayName: 'Deploy Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: 'plan',
+      chatActions: 'talk',
+      pause: null,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: null,
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    expect(agentRecordToSpec(agent, {})).toMatchObject({ permissionMode: 'plan' })
+  })
+
+  it('carries pause to the daemon spec, and omits it when null (#288)', () => {
+    const base: AgentRecord = {
+      id: AgentId('77777777-7777-4777-8777-777777777777'),
+      orgId: OrgId('org'),
+      name: 'deploy-bot',
+      displayName: 'Deploy Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: null,
+      chatActions: 'talk',
+      pause: true,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: null,
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    expect(agentRecordToSpec(base, {})).toMatchObject({ pause: true })
+    // null ⇒ the key is omitted, so the daemon merge leaves the on-disk value alone.
+    expect(agentRecordToSpec({ ...base, pause: null }, {})).not.toHaveProperty('pause')
+    // #536: introduceOnJoin is a definite column value, always shipped so a toggle replicates.
+    expect(agentRecordToSpec({ ...base, introduceOnJoin: true }, {})).toMatchObject({ introduceOnJoin: true })
+    expect(agentRecordToSpec({ ...base, introduceOnJoin: false }, {})).toMatchObject({ introduceOnJoin: false })
+    // Computer use is derived from the granting Computers and the managed mode, or null so losing the last one replicates.
+    const C1 = '00000000-0000-4000-8000-000000000001'
+    const withComputers = (a: AgentRecord, computers: string[]) =>
+      agentRecordToSpec(a, {}, undefined, [], [], a.env, [], undefined, undefined, undefined, [], {}, computers)
+    expect(withComputers(base, [C1])).toMatchObject({ computerUse: { enabled: true, computers: [C1] } })
+    expect(withComputers({ ...base, computerUse: { managed: { mode: 'per-agent' } } }, [])).toMatchObject({
+      computerUse: { enabled: true, computers: [], managed: { mode: 'per-agent' } }
+    })
+    expect(agentRecordToSpec(base, {})).toMatchObject({ computerUse: null })
+  })
+
+  it('carries the memory backend to the daemon spec, and omits it when null', () => {
+    const base: AgentRecord = {
+      id: AgentId('88888888-8888-4888-8888-888888888888'),
+      orgId: OrgId('org'),
+      name: 'mem-bot',
+      displayName: 'Mem Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: null,
+      chatActions: 'talk',
+      pause: null,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: { provider: 'native' },
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    expect(agentRecordToSpec(base, {})).toMatchObject({ memory: { provider: 'native' } })
+    // null ⇒ omitted, so switching-then-clearing leaves the on-disk value alone.
+    expect(agentRecordToSpec({ ...base, memory: null }, {})).not.toHaveProperty('memory')
+  })
+
+  it('ships a cleared model/effort/permissionMode as explicit null so a runtime switch replicates the clear', () => {
+    const base: AgentRecord = {
+      id: AgentId('77777777-7777-4777-8777-777777777777'),
+      orgId: OrgId('org'),
+      name: 'deploy-bot',
+      displayName: 'Deploy Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: null,
+      chatActions: 'talk',
+      pause: null,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: null,
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    // The bug: these were omitted when null, conflating "cleared to default" with
+    // "leave alone", so the previous runtime's model survived in agent.json. They must
+    // be present-and-null (like env/mcpServers) so the daemon merge deletes them.
+    const spec = agentRecordToSpec(base, {})
+    expect(spec).toHaveProperty('model', null)
+    expect(spec).toHaveProperty('reasoningEffort', null)
+    expect(spec).toHaveProperty('permissionMode', null)
+
+    // A set value still rides through unchanged.
+    expect(agentRecordToSpec({ ...base, model: 'opus' }, {})).toMatchObject({ model: 'opus' })
+  })
+
+  it('ships the caller-fetched secrets (AgentSecretStore) on the spec — even {} so a removed secret replicates', () => {
+    const base: AgentRecord = {
+      id: AgentId('77777777-7777-4777-8777-777777777777'),
+      orgId: OrgId('org'),
+      name: 'deploy-bot',
+      displayName: 'Deploy Bot',
+      builtin: false,
+      icon: null,
+      description: null,
+      runtime: 'claude-acp',
+      model: null,
+      reasoningEffort: null,
+      outputMode: null,
+      showFooter: true,
+      showStatusBar: false,
+      fastMode: null,
+      permissionMode: null,
+      chatActions: 'talk',
+      pause: null,
+      env: {},
+      mcpServers: [],
+      skills: [],
+      managedSkills: [],
+      memory: null,
+      status: 'active',
+      placementKind: 'daemon',
+      placementChangedAt: new Date(0),
+      daemonId: null,
+      setId: null,
+      workspace: { mode: 'scratch' },
+      capabilities: [],
+      createdAt: new Date('2026-01-01T00:00:00Z'),
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      callPolicy: 'all',
+      allowedCallerAgentIds: [],
+      outboundPolicy: 'all',
+      allowedTargetAgentIds: [],
+      introduceOnJoin: false,
+      newConversationMode: null,
+      execution: 'host',
+      lastModifiedAt: new Date('2026-01-01T00:00:00Z'),
+      lastModifiedBy: null,
+      configRevision: 0n
+    }
+
+    expect(agentRecordToSpec(base, { API_KEY: 'sk-1' })).toMatchObject({ secrets: { API_KEY: 'sk-1' } })
+    expect(agentRecordToSpec(base, {})).toMatchObject({ secrets: {} })
+  })
+})
+
+describe('cronToUpsert asker (assistant-mode.md §5.5)', () => {
+  const cron = (over: Partial<CronRecord>): CronRecord =>
+    ({
+      id: '55555555-5555-4555-8555-555555555555',
+      orgId: OrgId('org-1'),
+      agentId: AgentId('66666666-6666-4666-8666-666666666666'),
+      name: null,
+      schedule: '0 9 * * 1-5',
+      timezone: 'UTC',
+      targetPlatform: 'slack',
+      targetChannel: null,
+      targetIntegrationId: null,
+      trigger: 'report',
+      enabled: true,
+      lastRunAt: null,
+      createdBy: null,
+      createdByUserId: null,
+      visibility: 'org',
+      sharedWith: [],
+      createdAt: new Date(0),
+      lastModifiedAt: new Date(0),
+      lastModifiedBy: null,
+      ...over
+    }) as CronRecord
+
+  it('reads as the last human editor, else the creator, and as nobody when neither is recorded', () => {
+    const editor = { userId: 'user-editor', displayName: null, email: 'e@example.test' }
+    expect(cronToUpsert(cron({ createdByUserId: 'user-creator', lastModifiedBy: editor }))?.askerUserId).toBe(
+      'user-editor'
+    )
+    expect(cronToUpsert(cron({ createdByUserId: 'user-creator' }))?.askerUserId).toBe('user-creator')
+    expect(cronToUpsert(cron({}))).not.toHaveProperty('askerUserId')
+  })
+
+  it('carries the display name the anchor shows in place of the prompt, and none for an unnamed row', () => {
+    expect(cronToUpsert(cron({ name: 'weekly-deploy-report' }))?.name).toBe('weekly-deploy-report')
+    expect(cronToUpsert(cron({}))).not.toHaveProperty('name')
+  })
+})

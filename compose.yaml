@@ -1,0 +1,316 @@
+name: agentconnect
+
+x-control-plane-image: &control-plane-image
+  image: ${AGENTCONNECT_IMAGE_REGISTRY:-ghcr.io/agentconnect-md}/control-plane:${AGENTCONNECT_VERSION:-latest}
+  platform: linux/amd64
+  pull_policy: missing
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: agentconnect
+      POSTGRES_PASSWORD: ${AGENTCONNECT_POSTGRES_PASSWORD:-agentconnect-local-only}
+      POSTGRES_USER: agentconnect
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U agentconnect -d agentconnect']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:${AGENTCONNECT_POSTGRES_PORT:-5432}:5432
+    volumes:
+      # PostgreSQL 18+ keeps PGDATA in a versioned child directory.
+      - postgres-data:/var/lib/postgresql
+    networks:
+      - default
+      - admin
+
+  migration-files:
+    <<: *control-plane-image
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rm -rf /migration/prisma
+        mkdir -p /migration/prisma
+        cp /app/packages/control-plane/prisma/schema.prisma /migration/prisma/schema.prisma
+        cp -R /app/packages/control-plane/prisma/migrations /migration/prisma/migrations
+    restart: 'no'
+    volumes:
+      - migration-files:/migration
+
+  migrate:
+    image: ${AGENTCONNECT_IMAGE_REGISTRY:-ghcr.io/agentconnect-md}/prisma-cli:${AGENTCONNECT_PRISMA_CLI_VERSION:-7.8.0-node24-r2}
+    platform: linux/amd64
+    pull_policy: missing
+    build:
+      context: .
+      dockerfile: docker/prisma-cli.Dockerfile
+    command: ['prisma', 'migrate', 'deploy']
+    depends_on:
+      migration-files:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://agentconnect:${AGENTCONNECT_POSTGRES_PASSWORD:-agentconnect-local-only}@postgres:5432/agentconnect?schema=public
+    restart: 'no'
+    volumes:
+      - migration-files:/migration:ro
+
+  # Loopback-only deployment administration surface. It reuses the Control
+  # Plane image but runs the self-contained @agentconnect.md/setup bundle
+  # instead of the Control Plane process. It is never published beyond the
+  # Docker host's loopback interface.
+  setup-server:
+    <<: *control-plane-image
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: control-plane
+    command: ['node', '/app/packages/setup/dist/index.js']
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      - NODE_ENV=production
+      - HOST=0.0.0.0
+      - PORT=8091
+      - DATABASE_URL=postgresql://agentconnect:${AGENTCONNECT_POSTGRES_PASSWORD:-agentconnect-local-only}@postgres:5432/agentconnect?schema=public
+      - SECRET_CIPHER
+      - VAULT_ADDR
+      - VAULT_TRANSIT_KEY
+      - VAULT_TRANSIT_MOUNT
+      - VAULT_NAMESPACE
+      - VAULT_TOKEN
+      - VAULT_JWT_ROLE
+      - VAULT_JWT_PATH
+      - VAULT_AUTH_MOUNT
+      - SETUP_SERVER_URL=http://localhost:8091
+      - SETUP_SERVER_ALLOW_CONTAINER_PROXY=true
+      - LOGTO_ADMIN_ENDPOINT=${LOGTO_ADMIN_ENDPOINT:-http://localhost:3002}
+      - AGENTCONNECT_PUBLIC_CP_URL
+      - AGENTCONNECT_PUBLIC_WEB_URL
+      - AGENTCONNECT_PUBLIC_RELAY_URL
+      - AGENTCONNECT_CP_PORT
+      - AGENTCONNECT_WEB_PORT
+      - AGENTCONNECT_RELAY_PORT
+      - OIDC_ISSUER
+      - LOGTO_ENDPOINT
+      - LOGTO_MGMT_ENDPOINT
+    init: true
+    ports:
+      - 127.0.0.1:8091:8091
+    networks:
+      - admin
+    restart: unless-stopped
+
+  control-plane:
+    <<: *control-plane-image
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: control-plane
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - HOST=0.0.0.0
+      - DATABASE_URL=postgresql://agentconnect:${AGENTCONNECT_POSTGRES_PASSWORD:-agentconnect-local-only}@postgres:5432/agentconnect?schema=public
+      - API_KEY_PEPPER=${AGENTCONNECT_API_KEY_PEPPER:-local-only-api-key-pepper-0000000000000000}
+      - RELAY_TOKEN=${AGENTCONNECT_RELAY_TOKEN:-local-only-relay-token-0000000000000000}
+      # Opt-in batch usage ingress. Passed through unset, never defaulted: a stock default would expose an authenticated write endpoint on every stack.
+      - USAGE_INGEST_TOKEN
+      # Opt-in console file transfer: a JSON bucket document the Control Plane signs URLs for (docs/designs/source-cache-file-transfer.md §7).
+      - AC_FILE_TRANSFER
+      # Opt-in Computer screenshot storage: a JSON bucket document like AC_FILE_TRANSFER plus retention (docs/designs/computer-use.md §9).
+      - AC_COMPUTER_SCREENSHOTS
+      # Opt-in TURN for the Computer viewer (docs/designs/computer-use.md §7.2); compose.turn.yaml runs coturn and sets the first two.
+      - COMPUTER_TURN_URLS
+      - COMPUTER_TURN_SECRET
+      - COMPUTER_TURN_TTL_SEC
+      # Or Cloudflare Realtime TURN instead of a coturn: a TURN key's ID and API token.
+      - COMPUTER_TURN_CLOUDFLARE_KEY_ID
+      - COMPUTER_TURN_CLOUDFLARE_API_TOKEN
+      # Bootstrap root for DB-backed deployment secrets. These values cannot be
+      # stored beside the ciphertext they unlock and therefore remain startup env.
+      - SECRET_CIPHER
+      - VAULT_ADDR
+      - VAULT_TRANSIT_KEY
+      - VAULT_TRANSIT_MOUNT
+      - VAULT_NAMESPACE
+      - VAULT_TOKEN
+      - VAULT_JWT_ROLE
+      - VAULT_JWT_PATH
+      - VAULT_AUTH_MOUNT
+      - PUBLIC_CP_URL=${AGENTCONNECT_PUBLIC_CP_URL:-http://localhost:${AGENTCONNECT_CP_PORT:-8080}}
+      - PUBLIC_WEB_URL=${AGENTCONNECT_PUBLIC_WEB_URL:-http://localhost:${AGENTCONNECT_WEB_PORT:-3000}}
+      - PUBLIC_RELAY_URL=${AGENTCONNECT_PUBLIC_RELAY_URL:-http://localhost:${AGENTCONNECT_RELAY_PORT:-8090}}
+      - CORS_ORIGIN=${AGENTCONNECT_PUBLIC_WEB_URL:-http://localhost:${AGENTCONNECT_WEB_PORT:-3000}}
+      - PRESET_AGENTS_ENABLED
+      - CAPABILITY_REQUESTS_ENABLED
+      - WECHAT_API_URL
+      - OIDC_ISSUER
+      - OIDC_AUDIENCE
+      - SLACK_PLATFORM_APP_ID
+      - SLACK_PLATFORM_CLIENT_ID
+      - SLACK_PLATFORM_CLIENT_SECRET
+      - SLACK_PLATFORM_SIGNING_SECRET
+      - LINEAR_PLATFORM_CLIENT_ID
+      - LINEAR_PLATFORM_CLIENT_SECRET
+      - LINEAR_PLATFORM_SIGNING_SECRET
+      - GITHUB_APP_ID
+      - GITHUB_APP_PRIVATE_KEY_B64
+      - GITHUB_APP_SLUG
+      - GITHUB_APP_CLIENT_ID
+      - LOGTO_MGMT_ENDPOINT
+      - LOGTO_MGMT_APP_ID
+      - LOGTO_MGMT_APP_SECRET
+      - LOGTO_MGMT_RESOURCE
+      # Brokers connector browsing and connection provisioning; the origin stays server-side.
+      - OPEN_CONNECTOR_URL=http://open-connector:3000
+      - OPEN_CONNECTOR_PROVIDER_WHITELIST
+      - OPEN_CONNECTOR_PROVIDER_BLOCKLIST
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    init: true
+    ports:
+      - ${AGENTCONNECT_BIND_ADDRESS:-127.0.0.1}:${AGENTCONNECT_CP_PORT:-8080}:8080
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  relay:
+    image: ${AGENTCONNECT_IMAGE_REGISTRY:-ghcr.io/agentconnect-md}/relay:${AGENTCONNECT_VERSION:-latest}
+    platform: linux/amd64
+    pull_policy: missing
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: relay
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    environment:
+      - NODE_ENV=production
+      - PORT=8080
+      - HOST=0.0.0.0
+      - CP_URL=http://control-plane:8080
+      - RELAY_NAME=local-relay
+      - DAEMON_DIAL_URL=${AGENTCONNECT_RELAY_DAEMON_URL:-ws://localhost:${AGENTCONNECT_RELAY_PORT:-8090}}
+      - RELAY_TOKEN=${AGENTCONNECT_RELAY_TOKEN:-local-only-relay-token-0000000000000000}
+      - GITHUB_APP_WEBHOOK_SECRET
+      # Egress for open_connector bindings — the relay calls its runtime action API.
+      - OPEN_CONNECTOR_URL=http://open-connector:3000
+      # One host variable drives both ends so runtime auth is never half-configured; the
+      # relay sends no bearer when it resolves empty, matching a gateway with auth off.
+      - OPEN_CONNECTOR_RUNTIME_TOKEN=${OOMOL_CONNECT_RUNTIME_TOKEN:-}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    init: true
+    ports:
+      - ${AGENTCONNECT_BIND_ADDRESS:-127.0.0.1}:${AGENTCONNECT_RELAY_PORT:-8090}:8080
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  web:
+    image: ${AGENTCONNECT_IMAGE_REGISTRY:-ghcr.io/agentconnect-md}/web:${AGENTCONNECT_VERSION:-latest}
+    platform: linux/amd64
+    pull_policy: missing
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: web
+    depends_on:
+      control-plane:
+        condition: service_healthy
+      relay:
+        condition: service_healthy
+    environment:
+      - PORT=8080
+      - HOSTNAME=0.0.0.0
+      # Topology-only bootstrap for the DB-backed browser auth snapshot. Public
+      # service routes remain owned by this Web container's startup environment.
+      - CP_INTERNAL_URL=http://control-plane:8080/api/v1
+      - PUBLIC_WEB_URL=${AGENTCONNECT_PUBLIC_WEB_URL:-http://localhost:${AGENTCONNECT_WEB_PORT:-3000}}
+      - CP_URL=${AGENTCONNECT_PUBLIC_CP_URL:-http://localhost:${AGENTCONNECT_CP_PORT:-8080}}/api/v1
+      - RELAY_URL=${AGENTCONNECT_PUBLIC_RELAY_URL:-http://localhost:${AGENTCONNECT_RELAY_PORT:-8090}}
+      - LOGTO_ENDPOINT
+      - LOGTO_APP_ID
+      - LOGTO_API_RESOURCE
+      # Which social sign-in methods to offer (comma-separated Logto connector
+      # targets; unset => all of them). The console owns this decision; the
+      # control plane gates on whether the tenant has that connector.
+      - SOCIAL_PROVIDERS
+      # Console feature flags this deployment turns on (comma-separated ids; unset =>
+      # none). Forwarded from the host so one image serves every deployment.
+      - FEATURE_FLAGS
+      # Address of the billing service, when the `billing` feature flag is on.
+      - BILLING_URL
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    init: true
+    ports:
+      - ${AGENTCONNECT_BIND_ADDRESS:-127.0.0.1}:${AGENTCONNECT_WEB_PORT:-3000}:8080
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  # Connector gateway backing the console's "Add connectors" catalog. Its admin API and
+  # web console are unauthenticated, so it stays on loopback like Setup Server and Postgres.
+  # Leave OOMOL_CONNECT_ADMIN_TOKEN unset: the Control Plane client sends no bearer token.
+  open-connector:
+    image: ghcr.io/oomol-lab/open-connector:${AGENTCONNECT_OPEN_CONNECTOR_VERSION:-latest}
+    pull_policy: missing
+    environment:
+      - PORT=3000
+      - OOMOL_CONNECT_DATA_DIR=/app/data
+      # Unset => provider credentials and OAuth client secrets are plaintext in this
+      # service's SQLite. That store is outside SECRET_CIPHER; set a key before real use.
+      - OOMOL_CONNECT_ENCRYPTION_KEY
+      # Browser-reachable origin the provider redirects to at <origin>/oauth/callback.
+      - OOMOL_CONNECT_ORIGIN=${AGENTCONNECT_PUBLIC_OPEN_CONNECTOR_URL:-http://localhost:${AGENTCONNECT_OPEN_CONNECTOR_PORT:-3100}}
+      # Bare pass-through so an unset value stays unset here rather than arriving empty.
+      - OOMOL_CONNECT_RUNTIME_TOKEN
+    init: true
+    ports:
+      - 127.0.0.1:${AGENTCONNECT_OPEN_CONNECTOR_PORT:-3100}:3000
+    volumes:
+      - open-connector-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  migration-files:
+  open-connector-data:
+  postgres-data:
+
+networks:
+  admin:

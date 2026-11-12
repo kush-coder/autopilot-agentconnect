@@ -1,0 +1,44 @@
+description: AgentConnect add-on paired effects and harness neutrality
+
+prompts:
+  - '{{case}}'
+
+providers:
+  - id: file://providers/agentconnect.ts
+    label: raw-acp
+    config:
+      mode: raw-acp
+      name: raw-acp
+
+  # Every daemon cell runs the production tool surface and messaging mechanism —
+  # collaboration has no off switch. Memory is the only capability treatment axis.
+  - id: file://providers/agentconnect.ts
+    label: daemon-core
+    config:
+      mode: daemon
+      treatment:
+        name: daemon-core
+        memory: off
+
+  - id: file://providers/agentconnect.ts
+    label: memory-only
+    config:
+      mode: daemon
+      treatment:
+        name: memory-only
+        memory: configured
+
+tests: file://cases/addons.yaml
+
+extensions:
+  - file://extensions/paired-summary.ts:afterAll
+
+evaluateOptions:
+  cache: false
+  maxConcurrency: 1
+
+outputPath:
+  - .artifacts/evaluation/promptfoo/results.json
+  - .artifacts/evaluation/promptfoo/results.junit.xml
+
+sharing: false

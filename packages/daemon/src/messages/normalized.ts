@@ -1,0 +1,206 @@
+import {
+  isAppendCoordinate,
+  type NormalizedPlatformMessage,
+  type PlatformAttachment,
+  type SessionImageAttachment,
+  type TaskInitiator,
+  type UserTurnBody
+} from '@agentconnect.md/protocol'
+import type { ChannelIntake } from '../decisions/evidence.js'
+import type { ReadAsker } from '../assistant/place-access.js'
+
+/**
+ * A file shared alongside a message. Platform ingresses carry metadata + a
+ * fetch URL and download the bytes daemon-locally with the provider token.
+ * Webchat may instead arrive with bounded inline bytes from the relay content
+ * plane. Both forms become ACP image/resource blocks at prompt assembly; the
+ * daemon also retains bounded webchat images for authorized transcript replay.
+ */
+export interface Attachment extends Omit<PlatformAttachment, 'sourceUrl'> {
+  /** Stable source id (Slack file.id). */
+  id: string
+  /** Display name / title. */
+  name: string
+  /** e.g. 'image/png', 'application/pdf'. */
+  mimeType: string
+  /** Bytes, when the platform reports it. */
+  size?: number
+  /** Auth-gated provider URL/key, absent for an inline webchat upload. */
+  sourceUrl?: string
+  /** Platform-owned read tool for provider URLs the agent cannot fetch directly. */
+  readerToolName?: string
+  /** Already-bounded bytes from webchat, absent for provider-backed attachments. */
+  inlineData?: Buffer
+  // Provider-owned fallback when the image cannot be downloaded or displayed by the runtime.
+  unavailableText?: string
+  /** Bytes fetched from `thumbnailUrl` for transcript preview only, set when the
+   *  full download (`inlineData`) doesn't fit the console history budget. Kept
+   *  apart from `inlineData` so the ACP prompt block never receives it. */
+  transcriptThumbnail?: { data: Buffer; mimeType: SessionImageAttachment['mimeType'] }
+  /** A console upload held in the Source Cache bucket; the prompt hands the agent a presigned GET for it. */
+  transfer?: { uploadId: string; sha256: string }
+}
+
+export interface NormalizedMessage extends Omit<
+  NormalizedPlatformMessage,
+  'source' | 'platform' | 'attachments' | 'trigger'
+> {
+  /**
+   * A displayable, ordering-safe transcript timestamp when `msgId` itself is not
+   * time-based (hook deliveries use `<hookId>:<deliveryKey>`). A suffix after
+   * the timestamp keeps same-millisecond deliveries distinct; consumers parse
+   * only the timestamp before the separator.
+   */
+  transcriptTs?: string
+  /** The canonical webchat post id minted beside `transcriptTs` (same origin,
+   *  merged-conversation-view.md §6) — persisted on the transcript row so
+   *  cross-daemon copies share an explicit identity. */
+  transcriptPostId?: string
+  source: 'user' | 'cron' | 'agent' | 'hook' | 'system'
+  /** CP-owned schedule run identity, retained with an interrupted inbox delivery. */
+  cronRun?: { cronId: string; firedAt: string }
+  // S1a open reader (integration-plugin-architecture.md §6.2): the wire reads
+  // platform as an open string, so the runtime model matches. Writers still
+  // produce only the legacy ids; unknown ids are handled fail-closed where the
+  // value is consumed (coordsDecision, persistence narrowing), never by type.
+  platform: string
+  /**
+   * Opaque identity of the physical platform bot/connection that received this
+   * message. Platform channel ids are only unique within one bot installation
+   * (Telegram DMs in particular reuse the user's numeric id across bots), so the
+   * daemon uses this scope for private transcript and session lookup boundaries.
+   * It is internal metadata: user-facing channel/thread coordinates stay unchanged.
+   */
+  transportScope?: string
+  // Per-target session coordinate, resolved after routing; delivery uses replyThread when present, otherwise thread.
+  sessionThread?: string
+  /** Per-target session channel where it is not `channel`: a room a task holds keys on the task's session (auto-session-mode.md §6.8). */
+  sessionChannel?: string
+  /** Ingress-derived title applied only when this message creates a logical
+   *  session. A later runtime title remains authoritative and replaces it. */
+  initialSessionTitle?: string
+  /** Trusted code-host repository behind a hook delivery, linked separately from its target session. */
+  sourceRepository?: { label: string; url: string }
+  /** Platform-resolved standing context for the session this message opens or resumes: session-stable
+   *  coordinates and working conventions the model reads once on the system-prompt channel (or the
+   *  first prompt block), never a transcript row. Ignored on a follow-up into an open session. */
+  standingContext?: string
+  /**
+   * The model text and platform facts behind this turn when they differ from `text`
+   * (`UserTurnBody`): the strategy that assembles a prompt out of a delivery puts the assembled
+   * prompt and the facts it read here, the transcript row persists it as `body`, replay reads
+   * `prompt` back, and the console formats the facts. Absent on an ordinary chat message.
+   */
+  turnBody?: UserTurnBody
+  /** Stable automation/source identity recorded as the session trigger when it
+   *  differs from the message author. GitHub hook messages, for example, are
+   *  authored by the event actor while still being triggered by `hook:<id>`. */
+  sessionTriggerId?: string
+  /** Daemon-authored initiator snapshot inherited across task delegation; never a tool argument. */
+  initiator?: TaskInitiator
+  attachments?: Attachment[]
+  /** Trusted activation cause when known. In particular, `mention` means the router
+   *  matched a raw platform token against this integration's own bound bot identity. */
+  trigger?: 'mention' | 'dm' | 'keyword' | 'auto' | 'cron' | 'hook'
+  /**
+   * This delivery is a child session's REPORT into its parent (`sendMessage
+   * {sessionId}` — replyToSession's local branch, the relay's lineage-reply
+   * branch, and the #800 inferred reply). Set only by the daemon at those
+   * construction sites, never from ingress. A report resumes the parent
+   * SESSION-ONLY (#966): it is injected into the parent's transcript and
+   * turn, but is never committed as a live conversation post — the #926
+   * agent-wake inbound rendering skips it, so a webchat conversation's roster
+   * does not see private night/task reports as room posts.
+   */
+  parentReport?: boolean
+  /** A settled capability request's reminder (capability-requests.md §4.7.2): the people its origin's turn spoke for, persisted with the message so a replay still knows them. Set only by the daemon. */
+  capabilityWake?: {
+    requestId: string
+    generation: number
+    askers: { people: ReadAsker[]; nobody: boolean }
+  }
+  /**
+   * This delivery CONTINUES a session the control plane authorized, synthesized on that
+   * session's own stored coordinates (webchat-cross-integration-continuation.md §9). Set only
+   * by the daemon's continuation construction site, never from ingress. The source gate reads
+   * it as "not a new audience": a hook session's audience cannot be re-derived without the
+   * webhook delivery's trusted metadata, so the row keeps the binding it already carries.
+   */
+  adoptedSession?: boolean
+  /** A continuation author's own member id on this session's platform and tenant, from their CP-verified linked identity; set only by the continuation construction site. */
+  senderMemberId?: string
+  /** The sender's time zone as their own client reported it (a console browser), read for every agent's local time; never identity. */
+  senderTimeZone?: string
+  /** A scheduled run's own configured zone, which its local time reads before any place's (product-conventions.md "Local time"). */
+  scheduleTimeZone?: string
+  /** By decision admission context (decisions.md §8.4): daemon-local, persisted with the inbox row, never a trigger. */
+  channelIntake?: ChannelIntake
+  /** This independent store may lack observations that the relay did not forward. */
+  forwardedHistory?: boolean
+}
+
+/**
+ * Promote the pure cross-transport message into the daemon's richer runtime
+ * model. Keeping this assignment type-checked makes a shared schema change fail
+ * here instead of relying on a relay payload assertion at the dispatch site.
+ */
+export function fromPlatformMessage(message: NormalizedPlatformMessage, transportScope?: string): NormalizedMessage {
+  return {
+    ...message,
+    ...(transportScope !== undefined ? { transportScope } : {})
+  }
+}
+
+/**
+ * The SESSION coordinate a message keys on (channel-session-mode.md §3.1) — the resolved
+ * one where the conversation appends, else the thread it arrived in.
+ *
+ * Every site that builds a session key, an inbox lane, a gate entry or a transcript
+ * coordinate goes through this. Deriving it independently is what makes the dispatch gate
+ * and the session manager disagree about which session a message belongs to, and the
+ * delivery sites (`postMessage`, chrome) deliberately do NOT use it — they want `thread`.
+ */
+export function sessionThreadOf(msg: Pick<NormalizedMessage, 'sessionThread' | 'thread' | 'msgId'>): string {
+  return msg.sessionThread ?? msg.thread ?? msg.msgId
+}
+
+/** The channel a message's session lives in, which every site pairing it with {@link sessionThreadOf} reads; delivery keeps `channel`. */
+export function sessionChannelOf(msg: Pick<NormalizedMessage, 'sessionChannel' | 'channel'>): string {
+  return msg.sessionChannel ?? msg.channel
+}
+
+/** A daemon-made message's threads: it replies in `replyThread` with the session's coordinate as `sessionThread` where the two differ, else where the session is. */
+export function wakeThreadFields(
+  sessionCoordinate: string,
+  replyThread?: string
+): Pick<NormalizedMessage, 'thread' | 'sessionThread'> {
+  if (replyThread !== undefined && replyThread !== sessionCoordinate)
+    return { thread: replyThread, sessionThread: sessionCoordinate }
+  if (isAppendCoordinate(sessionCoordinate)) return { sessionThread: sessionCoordinate }
+  return sessionCoordinate ? { thread: sessionCoordinate } : {}
+}
+
+type MessageIdentityFields = Pick<NormalizedMessage, 'msgId' | 'platform' | 'traceId' | 'transportScope'>
+
+/** Stable daemon-local delivery identity. Platform ids are only unique within
+ * one physical bot; webchat instead needs its per-turn trace id. */
+export function stableMessageId(msg: MessageIdentityFields): string {
+  const sourceId = msg.platform === 'webchat' ? msg.traceId : msg.msgId
+  return msg.transportScope ? `${msg.transportScope}\u001f${sourceId}` : sourceId
+}
+
+/** Stable operation fence shared by evaluation and memory lifecycle events. */
+export function stableTurnId(agentId: string, msg: MessageIdentityFields): string {
+  return `${agentId}:${stableMessageId(msg)}`
+}
+
+/** The outbound thread-key strategy moved to `platforms/thread-keys.ts` (§7.4) —
+ * one registered arm per platform, beside the inbound canonicalization it must
+ * agree with. */
+
+/** Append a per-turn block to what the model reads: the assembled prompt when the turn carries one, else `text`.
+ *  A turn with a prompt seat keeps its `text` as the console's short form, so the block never lands there. */
+export function appendTurnPrompt(msg: Pick<NormalizedMessage, 'text' | 'turnBody'>, block: string): void {
+  if (msg.turnBody?.prompt !== undefined) msg.turnBody.prompt += block
+  else msg.text += block
+}

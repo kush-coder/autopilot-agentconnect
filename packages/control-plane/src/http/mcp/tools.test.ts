@@ -1,0 +1,903 @@
+/**
+ * Unit tests for the AgentConnect MCP tool registry (agent-assistant.md §6.2).
+ *
+ * The contract under test: read tools issue ONLY GETs, write tools are flagged
+ * `write: true` (the scope/rate gates key off it), destructive tools carry the
+ * §6.4 required-`confirm` gate compared at the execution layer, every org
+ * resource path stays inside the caller's org subtree, path parameters cannot
+ * traverse into sibling routes, and the published JSON Schemas + behavior
+ * annotations are well-formed tool contracts.
+ */
+import { describe, it, expect } from 'vitest'
+import { KNOWN_PLATFORMS } from '@agentconnect.md/protocol'
+import { MCP_TOOLS, findTool, toolDescriptor, type McpToolCtx, type RestResult } from './tools.js'
+
+const ORG_ID = 'org-123'
+const HOST_AGENT_UUID = '9b7a1c64-6f2e-4c1b-8f0a-2a5d7e3b1c90'
+const CONVERSATION_ID = 'conv-1'
+
+interface RecordedCall {
+  method: string
+  path: string
+  query?: Record<string, unknown>
+  body?: Record<string, unknown>
+}
+
+/** A recording ctx: every request succeeds. GETs answer with a resource whose
+ *  name matches the confirm fixtures (list paths answer with an array of one). */
+function recordingCtx(): { ctx: McpToolCtx; calls: RecordedCall[] } {
+  const calls: RecordedCall[] = []
+  const ctx: McpToolCtx = {
+    orgId: ORG_ID,
+    delegatedAgentId: HOST_AGENT_UUID,
+    delegatedConversationId: CONVERSATION_ID,
+    get: async (path, query): Promise<RestResult> => {
+      calls.push({ method: 'GET', path, ...(query ? { query } : {}) })
+      const resource = {
+        id: 'integ-1',
+        name: 'my-agent',
+        repoFullName: 'my-agent',
+        decision: { id: DECISION_ID, name: 'my-agent', providerId: 'typesafe', model: 'jev-latest', question: QUESTION }
+      }
+      return {
+        statusCode: 200,
+        body: path.endsWith('/integrations') ? JSON.stringify([resource]) : JSON.stringify(resource)
+      }
+    },
+    send: async (method, path, body): Promise<RestResult> => {
+      calls.push({ method, path, ...(body ? { body } : {}) })
+      return { statusCode: 200, body: '{}' }
+    }
+  }
+  return { ctx, calls }
+}
+
+const CRON_ID = '7b1f9df2-9f63-4a2e-a2d4-3a1a55f5f001'
+const AGENT_UUID = '5e0f8a25-31c8-4a1a-bb0e-9a8f6a2b1c22'
+const DECISION_ID = '3c2b1a09-8f7e-4d6c-9b5a-4e3d2c1b0a99'
+const BOT_ID = '6a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+const INTEGRATION_ID = '1f2e3d4c-5b6a-4978-8a9b-0c1d2e3f4a5b'
+const QUESTION = {
+  type: 'boolean',
+  instructions: 'Does the message ask for help?',
+  criteria: { true: 'It asks for help', false: 'It does not' }
+}
+const DECISION = { name: 'Needs help', providerId: 'typesafe', model: 'jev-latest', question: QUESTION }
+const ROUTING = {
+  decisionId: DECISION_ID,
+  rules: [{ id: 'r1', when: { type: 'boolean', values: [true] }, action: { type: 'agent', agentId: AGENT_UUID } }],
+  enabled: true,
+  otherwise: { type: 'skip' }
+}
+const GATE = { type: 'gate', decisionId: DECISION_ID, when: { type: 'boolean', values: [true] } }
+const SAMPLE = { history: [{ sender: 'U1', text: 'hello' }], currentMessage: { text: 'can someone help?' } }
+const REPO_SCOPE = { provider: 'github', repoId: '42', family: 'pull_request' }
+
+/** Minimal happy-path args per tool (tools with no args pass {}). */
+const ARGS: Record<string, Record<string, unknown>> = {
+  configureIntegration: { mode: 'create' },
+  configureAgent: { agentId: AGENT_UUID },
+  manageAgentTools: { agentId: AGENT_UUID },
+  getAgent: { agentId: 'agent-1' },
+  getDaemon: { daemonId: 'daemon-1' },
+  listWorkspaceFiles: { agentId: 'agent-1', path: 'scripts' },
+  readWorkspaceFile: { agentId: 'agent-1', path: 'scripts/build.sh' },
+  getCron: { cronId: 'cron-1' },
+  listCronRuns: { cronId: 'cron-1' },
+  getSession: { sessionId: 'sess-1' },
+  listAgentHooks: { agentId: 'agent-1' },
+  listHookRuns: { hookId: 'hook-1' },
+  getOperation: { operationId: '0a5f4b3c-2d1e-4f6a-9b8c-7d6e5f4a3b2c' },
+  getGithubRepositoryAccess: { installationId: 'ins-1', owner: 'acme', repo: 'api' },
+  createAgent: { name: 'my-agent', runtime: 'claude' },
+  updateAgent: { agentId: AGENT_UUID, model: 'opus' },
+  setAgentWorkspace: { agentId: AGENT_UUID, confirm: 'my-agent', mode: 'git', gitRepo: 'acme/api', access: 'write' },
+  listGithubRepositories: { installationId: 'ins-1' },
+  createGithubTrigger: {
+    agentId: AGENT_UUID,
+    name: 'Reviews on acme/api',
+    repoFullName: 'acme/api',
+    family: 'pull_request',
+    events: ['pull_request:*', 'issue_comment:created'],
+    commentFamilies: ['pull_request'],
+    reviewPolicy: 'full',
+    reportingMode: 'check'
+  },
+  deleteAgent: { agentId: AGENT_UUID, confirm: 'my-agent' },
+  renameDaemon: { daemonId: 'daemon-1', name: 'edge-1' },
+  upsertCron: { agentId: AGENT_UUID, schedule: '0 9 * * *', trigger: 'do the thing', timezone: 'Asia/Shanghai' },
+  runCron: { cronId: 'cron-1' },
+  deleteCron: { cronId: 'cron-1', confirm: 'my-agent' },
+  setChannelTrigger: { integrationId: 'integ-1', channelId: 'C123', trigger: 'any' },
+  removeIntegration: { integrationId: 'integ-1', confirm: 'my-agent' },
+  getDecision: { decisionId: DECISION_ID },
+  getBotDecisionRouting: { botId: BOT_ID },
+  getCodeHostDecisionRouting: REPO_SCOPE,
+  listDecisionEvaluations: { source: 'model_selection', agentId: AGENT_UUID },
+  createDecision: DECISION,
+  updateDecision: { decisionId: DECISION_ID, ...DECISION },
+  deleteDecision: { decisionId: DECISION_ID, confirm: 'my-agent' },
+  saveBotDecisionRouting: { botId: BOT_ID, config: ROUTING, channelIds: ['C1'], removals: [] },
+  saveCodeHostDecisionRouting: { ...REPO_SCOPE, config: ROUTING },
+  deleteCodeHostDecisionRouting: { ...REPO_SCOPE, confirm: 'my-agent' },
+  previewDecision: { decisionId: DECISION_ID, target: { kind: 'pool' }, state: SAMPLE },
+  previewIntegrationChannelDecision: {
+    integrationId: INTEGRATION_ID,
+    channelId: 'C1',
+    decisionBinding: GATE,
+    state: SAMPLE
+  },
+  previewBotDecisionRouting: {
+    botId: BOT_ID,
+    config: ROUTING,
+    channelIds: ['C1'],
+    channelId: 'C1',
+    targets: { type: 'new' },
+    state: SAMPLE
+  }
+}
+
+async function run(toolName: string, args?: Record<string, unknown>) {
+  const { ctx, calls } = recordingCtx()
+  const tool = findTool(toolName)!
+  const parsed = tool.schema.safeParse(args ?? ARGS[toolName] ?? {})
+  expect(parsed.success, `${toolName}: fixture args must validate`).toBe(true)
+  const result = await tool.call(ctx, parsed.success ? parsed.data : {})
+  return { calls, result }
+}
+
+describe('MCP tool registry — §6.2 invariants', () => {
+  it('opens configuration without a write and rejects credential or organization arguments', async () => {
+    const tool = findTool('configureIntegration')!
+    const { ctx, calls } = recordingCtx()
+    const result = await tool.call(ctx, { mode: 'create', provider: 'github', agentId: AGENT_UUID })
+    expect(JSON.parse(result.body)).toMatchObject({
+      orgId: ORG_ID,
+      intent: { mode: 'create', provider: 'github', agentId: AGENT_UUID }
+    })
+    expect(calls.every((call) => call.method === 'GET')).toBe(true)
+    expect(toolDescriptor(tool)._meta?.ui.resourceUri).toBe('ui://agentconnect/integration-setup')
+    for (const extra of [{ orgId: 'another-org' }, { token: 'secret' }, { html: '<script></script>' }]) {
+      expect(tool.schema.safeParse({ mode: 'create', ...extra }).success).toBe(false)
+    }
+  })
+
+  it('opens the code-host surface read-only and refuses a provider this deployment has not configured', async () => {
+    const tool = findTool('manageCodeHosts')!
+    const { ctx, calls } = recordingCtx()
+    const result = await tool.call(ctx, { provider: 'gitlab' })
+    expect(JSON.parse(result.body)).toMatchObject({ orgId: ORG_ID, intent: { provider: 'gitlab' } })
+    expect(calls.map((call) => call.path)).toEqual([`/orgs/${ORG_ID}`, `/orgs/${ORG_ID}/gitlab/connections`])
+    expect(toolDescriptor(tool)._meta?.ui.resourceUri).toBe('ui://agentconnect/code-host-setup')
+    // A token, an install URL or another org's id is not an argument this surface accepts.
+    for (const extra of [{ orgId: 'another-org' }, { token: 'secret' }, { provider: 'bitbucket' }])
+      expect(tool.schema.safeParse(extra).success).toBe(false)
+    ctx.get = async (path) =>
+      path.endsWith('/gitea/connections')
+        ? { statusCode: 404, body: '{}' }
+        : { statusCode: 200, body: JSON.stringify({ id: ORG_ID }) }
+    const refused = await tool.call(ctx, { provider: 'gitea' })
+    expect(refused.statusCode).toBe(400)
+    expect(JSON.parse(refused.body).message).toContain('not configured')
+  })
+
+  it('reads the code hosts’ own connection surfaces without naming another org', async () => {
+    for (const [tool, path] of [
+      ['listGitlabConnections', '/gitlab/connections'],
+      ['listGitlabBots', '/gitlab/accounts'],
+      ['listGitlabProjects', '/gitlab/projects'],
+      ['listGiteaConnections', '/gitea/connections'],
+      ['listGiteaRepositories', '/gitea/repositories']
+    ] as const) {
+      const { calls } = await run(tool)
+      expect(calls).toEqual([{ method: 'GET', path: `/orgs/${ORG_ID}${path}` }])
+    }
+  })
+
+  it('opens the agent editor for one agent and keeps `created` a server annotation', async () => {
+    const tool = findTool('configureAgent')!
+    const { ctx, calls } = recordingCtx()
+    const result = await tool.call(ctx, { agentId: AGENT_UUID, section: 'secrets' })
+    expect(JSON.parse(result.body)).toEqual({
+      resourceUri: 'ui://agentconnect/agent-setup',
+      resourceVersion: 1,
+      orgId: ORG_ID,
+      intent: { agentId: AGENT_UUID, section: 'secrets' }
+    })
+    expect(calls).toEqual([{ method: 'GET', path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}` }])
+    expect(toolDescriptor(tool)._meta?.ui.resourceUri).toBe('ui://agentconnect/agent-setup')
+    expect(tool.schema.safeParse({ agentId: AGENT_UUID, created: true }).success).toBe(false)
+  })
+
+  it('opens one agent’s tools and skills roster, optionally narrowed to one of them', async () => {
+    const tool = findTool('manageAgentTools')!
+    const { ctx, calls } = recordingCtx()
+    expect(JSON.parse((await tool.call(ctx, { agentId: AGENT_UUID, focus: 'skills' })).body)).toEqual({
+      resourceUri: 'ui://agentconnect/agent-tools',
+      resourceVersion: 1,
+      orgId: ORG_ID,
+      intent: { agentId: AGENT_UUID, focus: 'skills' }
+    })
+    expect(calls).toEqual([{ method: 'GET', path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}` }])
+    // Removal is a row the user clicks, never a name the model passes.
+    for (const args of [
+      { agentId: AGENT_UUID, remove: 'brainstorming' },
+      { agentId: AGENT_UUID, focus: 'both' }
+    ]) {
+      expect(tool.schema.safeParse(args).success).toBe(false)
+    }
+  })
+
+  it('an unreadable agent is refused before any editor opens', async () => {
+    for (const name of ['configureAgent', 'installSkill', 'installMcpServer', 'manageAgentTools']) {
+      const tool = findTool(name)!
+      const { ctx } = recordingCtx()
+      ctx.get = async () => ({ statusCode: 404, body: '{"message":"not found"}' })
+      expect((await tool.call(ctx, { agentId: AGENT_UUID })).statusCode, name).toBe(404)
+    }
+  })
+
+  it('the installers carry no credential and pass their own preferences through', async () => {
+    const skill = findTool('installSkill')!
+    expect(JSON.parse((await skill.call(recordingCtx().ctx, { source: 'git' })).body)).toMatchObject({
+      resourceUri: 'ui://agentconnect/skill-setup',
+      orgId: ORG_ID,
+      intent: { source: 'git' }
+    })
+    const mcp = findTool('installMcpServer')!
+    expect(JSON.parse((await mcp.call(recordingCtx().ctx, {})).body)).toMatchObject({
+      resourceUri: 'ui://agentconnect/mcp-setup',
+      orgId: ORG_ID,
+      intent: {}
+    })
+    for (const [tool, args] of [
+      [skill, { url: 'https://example.test' }],
+      [skill, { orgId: 'another-org' }],
+      [mcp, { headers: { authorization: 'Bearer x' } }],
+      [mcp, { clientSecret: 'secret' }]
+    ] as const) {
+      expect(tool.schema.safeParse(args).success).toBe(false)
+    }
+  })
+
+  it('createAgent keeps its own answer and carries the new agent’s editor beside it', async () => {
+    const tool = findTool('createAgent')!
+    const { ctx, calls } = recordingCtx()
+    ctx.send = async (method, path, body) => {
+      calls.push({ method, path, ...(body ? { body } : {}) })
+      return { statusCode: 201, body: JSON.stringify({ id: AGENT_UUID, name: 'my-agent' }) }
+    }
+    const result = await tool.call(ctx, ARGS.createAgent!)
+    expect(result.statusCode).toBe(201)
+    expect(JSON.parse(result.body)).toEqual({
+      id: AGENT_UUID,
+      name: 'my-agent',
+      nativeUi: {
+        resourceUri: 'ui://agentconnect/agent-setup',
+        resourceVersion: 1,
+        orgId: ORG_ID,
+        intent: { agentId: AGENT_UUID, created: true }
+      }
+    })
+    expect(tool.uiEnvelope).toBe(true)
+  })
+
+  it('a delegated creation proposes the agent on a prefilled card instead of writing it', () => {
+    const tool = findTool('createAgent')!
+    const { ctx, calls } = recordingCtx()
+    const form = tool.delegatedForm!(ctx, {
+      name: 'my-agent',
+      runtime: 'claude',
+      daemonId: 'daemon-1',
+      pause: true,
+      workspace: { mode: 'git', gitRepo: 'acme/api', gitBranch: 'develop', access: 'write' }
+    })
+    expect(form.statusCode).toBe(200)
+    // Nothing was written, and `pause` — a field the dialog has no control for — is not carried.
+    expect(calls).toEqual([])
+    expect(JSON.parse(form.body)).toEqual({
+      resourceUri: 'ui://agentconnect/agent-setup',
+      resourceVersion: 1,
+      orgId: ORG_ID,
+      intent: {
+        draft: {
+          name: 'my-agent',
+          runtime: 'claude',
+          daemonId: 'daemon-1',
+          workspace: { mode: 'git', gitRepo: 'acme/api', gitBranch: 'develop', access: 'write' }
+        }
+      }
+    })
+  })
+
+  it('a creation that did not answer with an agent id keeps its answer unchanged', async () => {
+    const tool = findTool('createAgent')!
+    const { ctx } = recordingCtx()
+    ctx.send = async () => ({ statusCode: 202, body: JSON.stringify({ operationId: CRON_ID }) })
+    expect(JSON.parse((await tool.call(ctx, ARGS.createAgent!)).body)).toEqual({ operationId: CRON_ID })
+  })
+
+  it('resolves an edit target under the requested agent and refuses a different owner', async () => {
+    const tool = findTool('configureIntegration')!
+    const { ctx } = recordingCtx()
+    const hookId = '33333333-3333-4333-8333-333333333333'
+    const args = { mode: 'edit', agentId: AGENT_UUID, target: { kind: 'codehost-subscription', id: hookId } }
+    for (const agentId of [AGENT_UUID, HOST_AGENT_UUID]) {
+      ctx.get = async (path) => ({
+        statusCode: 200,
+        body: JSON.stringify(path.endsWith('/hooks') ? [{ id: hookId, kind: 'github', agentId }] : {})
+      })
+      expect((await tool.call(ctx, args)).statusCode).toBe(agentId === AGENT_UUID ? 200 : 404)
+    }
+  })
+  it('every tool only touches /me or the caller-org subtree', async () => {
+    for (const tool of MCP_TOOLS) {
+      const { calls } = await run(tool.name)
+      expect(calls.length, `${tool.name}: must issue at least one request`).toBeGreaterThan(0)
+      for (const c of calls) {
+        expect(
+          c.path === '/me' || c.path.startsWith(`/orgs/${ORG_ID}`),
+          `${tool.name}: unexpected path ${c.path}`
+        ).toBe(true)
+      }
+    }
+  })
+
+  it('read tools are GET-only; write tools are flagged and mutate', async () => {
+    for (const tool of MCP_TOOLS) {
+      const { calls } = await run(tool.name)
+      const mutations = calls.filter((c) => c.method !== 'GET')
+      if (tool.write) {
+        expect(mutations.length, `${tool.name}: a write tool must issue a mutating request`).toBe(1)
+      } else {
+        expect(mutations, `${tool.name}: a read tool may never mutate`).toEqual([])
+      }
+    }
+  })
+
+  it('destructive tools require a confirm argument; write-only tools must not', () => {
+    for (const tool of MCP_TOOLS.filter((t) => t.write)) {
+      const argsWithoutConfirm = { ...ARGS[tool.name] }
+      delete argsWithoutConfirm.confirm
+      const ok = tool.schema.safeParse(argsWithoutConfirm).success
+      if (tool.destructive) {
+        expect(tool.write, `${tool.name}: destructive implies write`).toBe(true)
+        expect(ok, `${tool.name}: destructive tools must require confirm`).toBe(false)
+      } else {
+        expect(ok, `${tool.name}: non-destructive tools must not require confirm`).toBe(true)
+      }
+    }
+  })
+
+  it('path parameters are encoded — a crafted id cannot traverse into a sibling route', async () => {
+    const { ctx, calls } = recordingCtx()
+    await findTool('getAgent')!.call(ctx, { agentId: '../me/keys?x=1#f' })
+    // The whole id stays ONE opaque segment under /agents/.
+    const agentSeg = calls[0]!.path.slice(`/orgs/${ORG_ID}/agents/`.length)
+    expect(calls[0]!.path.startsWith(`/orgs/${ORG_ID}/agents/`)).toBe(true)
+    for (const bad of ['/', '?', '#']) expect(agentSeg).not.toContain(bad)
+
+    // Write paths run through the same seg(): a two-param route keeps its exact shape.
+    const w = recordingCtx()
+    await findTool('setChannelTrigger')!.call(w.ctx, {
+      integrationId: 'i/../x',
+      channelId: 'C?limit=1',
+      trigger: 'any'
+    })
+    const rest = w.calls[0]!.path.slice(`/orgs/${ORG_ID}/integrations/`.length)
+    expect(rest.split('/')).toEqual(['i%2F..%2Fx', 'channels', 'C%3Flimit%3D1'])
+  })
+
+  it('the operation reads are scoped to the delegated conversation, never to a named one', async () => {
+    const operationId = '0a5f4b3c-2d1e-4f6a-9b8c-7d6e5f4a3b2c'
+    const one = await run('getOperation')
+    expect(one.calls).toEqual([
+      {
+        method: 'GET',
+        path: `/orgs/${ORG_ID}/agents/${HOST_AGENT_UUID}/webchat/${CONVERSATION_ID}/mcp-operations/${operationId}`
+      }
+    ])
+    const pending = await run('listOperations')
+    expect(pending.calls).toEqual([
+      { method: 'GET', path: `/orgs/${ORG_ID}/agents/${HOST_AGENT_UUID}/webchat/${CONVERSATION_ID}/mcp-operations` }
+    ])
+    // The conversation is server-supplied, so there is no argument to point elsewhere.
+    expect(findTool('getOperation')!.schema.safeParse({ operationId, conversationId: 'other' }).success).toBe(false)
+    expect(findTool('listOperations')!.schema.safeParse({ conversationId: 'other' }).success).toBe(false)
+  })
+
+  it('an external credential has no operations, and is told so without a request', async () => {
+    for (const [tool, args] of [
+      ['getOperation', { operationId: '0a5f4b3c-2d1e-4f6a-9b8c-7d6e5f4a3b2c' }],
+      ['listOperations', {}]
+    ] as const) {
+      const calls: RecordedCall[] = []
+      const external: McpToolCtx = {
+        orgId: ORG_ID,
+        get: async (path) => {
+          calls.push({ method: 'GET', path })
+          return { statusCode: 200, body: '{}' }
+        },
+        send: async () => ({ statusCode: 500, body: 'never' })
+      }
+      const out = await findTool(tool)!.call(external, args)
+      expect(out.statusCode, tool).toBe(400)
+      expect(JSON.parse(out.body).message).toContain('webchat conversation')
+      expect(calls, `${tool}: must not reach a route`).toEqual([])
+    }
+  })
+
+  it('strict schemas reject unknown arguments', () => {
+    expect(findTool('listAgents')!.schema.safeParse({ surprise: true }).success).toBe(false)
+    expect(findTool('getAgent')!.schema.safeParse({ agentId: 'a', extra: 1 }).success).toBe(false)
+    expect(findTool('getUsage')!.schema.safeParse({ range: 'd999' }).success).toBe(false)
+    expect(findTool('createAgent')!.schema.safeParse({ name: 'a', runtime: 'claude', secrets: {} }).success).toBe(false)
+    expect(findTool('updateAgent')!.schema.safeParse({ agentId: 'a', visibility: 'org' }).success).toBe(false)
+  })
+
+  it.each([
+    ['updateAgent', { agentId: AGENT_UUID.replaceAll('-', ''), model: 'bypass' }],
+    ['updateAgent', { agentId: `{${AGENT_UUID}}`, model: 'bypass' }],
+    ['deleteAgent', { agentId: AGENT_UUID.replaceAll('-', ''), confirm: 'my-agent' }],
+    ['deleteAgent', { agentId: `{${AGENT_UUID}}`, confirm: 'my-agent' }],
+    ['setAgentWorkspace', { agentId: AGENT_UUID.replaceAll('-', ''), confirm: 'my-agent', mode: 'scratch' }],
+    ['setAgentWorkspace', { agentId: `{${AGENT_UUID}}`, confirm: 'my-agent', mode: 'scratch' }]
+  ] as const)('%s rejects PostgreSQL-compatible noncanonical UUID text before dispatch', (toolName, args) => {
+    expect(findTool(toolName)!.schema.safeParse(args).success).toBe(false)
+  })
+
+  it.each([
+    ['updateAgent', { agentId: AGENT_UUID.replaceAll('-', ''), model: 'bypass' }],
+    ['updateAgent', { agentId: `{${AGENT_UUID}}`, model: 'bypass' }],
+    ['deleteAgent', { agentId: AGENT_UUID.replaceAll('-', ''), confirm: 'my-agent' }],
+    ['deleteAgent', { agentId: `{${AGENT_UUID}}`, confirm: 'my-agent' }],
+    ['setAgentWorkspace', { agentId: AGENT_UUID.replaceAll('-', ''), confirm: 'my-agent', mode: 'scratch' }],
+    ['setAgentWorkspace', { agentId: `{${AGENT_UUID}}`, confirm: 'my-agent', mode: 'scratch' }]
+  ] as const)('%s refuses a direct noncanonical UUID call without issuing REST requests', async (toolName, args) => {
+    const { ctx, calls } = recordingCtx()
+    const result = await findTool(toolName)!.call(ctx, args)
+    expect(result.statusCode).toBe(400)
+    expect(calls).toEqual([])
+  })
+
+  it('tool names are unique and descriptors publish well-formed JSON Schema + annotations', () => {
+    const names = MCP_TOOLS.map((t) => t.name)
+    expect(new Set(names).size).toBe(names.length)
+    for (const tool of MCP_TOOLS) {
+      const d = toolDescriptor(tool)
+      expect(d.name).toBe(tool.name)
+      expect(d.description.length).toBeGreaterThan(10)
+      const schema = d.inputSchema as { type?: string; $schema?: string; properties?: object }
+      expect(schema.type).toBe('object')
+      expect(schema.$schema).toBeUndefined()
+      if (tool.write) {
+        expect(d.annotations).toEqual({ readOnlyHint: false, destructiveHint: tool.destructive === true })
+      } else {
+        expect(d.annotations).toEqual({ readOnlyHint: true })
+      }
+    }
+  })
+
+  it('getSession/getUsage pass filters through as query parameters', async () => {
+    const { ctx, calls } = recordingCtx()
+    await findTool('listSessions')!.call(ctx, { agentId: 'a1', platform: 'slack', limit: 5 })
+    expect(calls[0]).toEqual({
+      method: 'GET',
+      path: `/orgs/${ORG_ID}/sessions`,
+      query: { agentId: 'a1', platform: 'slack', channel: undefined, limit: 5 }
+    })
+    // The tool still speaks day presets; the ROUTE takes an explicit window, so the
+    // tool resolves one — d7 by default, and `source` passes straight through.
+    const usage = recordingCtx()
+    await findTool('getUsage')!.call(usage.ctx, {})
+    const call = usage.calls[0] as { method: string; path: string; query: Record<string, string> }
+    expect(call.method).toBe('GET')
+    expect(call.path).toBe(`/orgs/${ORG_ID}/usage`)
+    expect(call.query.source).toBeUndefined()
+    const span = Date.parse(call.query.to!) - Date.parse(call.query.from!)
+    expect(span).toBe(7 * 24 * 60 * 60 * 1000)
+
+    const scoped = recordingCtx()
+    await findTool('getUsage')!.call(scoped.ctx, { range: 'd30', source: 'gateway' })
+    const scopedCall = scoped.calls[0] as { query: Record<string, string> }
+    expect(scopedCall.query.source).toBe('gateway')
+    expect(Date.parse(scopedCall.query.to!) - Date.parse(scopedCall.query.from!)).toBe(30 * 24 * 60 * 60 * 1000)
+  })
+
+  it('workspace reads carry the scope and the byte slice as query parameters', async () => {
+    const { ctx, calls } = recordingCtx()
+    await findTool('listWorkspaceFiles')!.call(ctx, { agentId: 'a1', path: 'src', limit: 50 })
+    expect(calls[0]).toEqual({
+      method: 'GET',
+      path: `/orgs/${ORG_ID}/agents/a1/workspace/files`,
+      query: { path: 'src', sessionId: undefined, repo: undefined, cursor: undefined, limit: 50 }
+    })
+    // `offset` is the answer's own nextOffset fed back, so it must survive verbatim.
+    const file = recordingCtx()
+    await findTool('readWorkspaceFile')!.call(file.ctx, {
+      agentId: 'a1',
+      path: 'src/index.ts',
+      sessionId: 's1',
+      offset: 65536
+    })
+    expect(file.calls[0]).toEqual({
+      method: 'GET',
+      path: `/orgs/${ORG_ID}/agents/a1/workspace/file`,
+      query: { path: 'src/index.ts', sessionId: 's1', repo: undefined, offset: 65536, limit: undefined }
+    })
+  })
+
+  it('listSessions filters by every canonical platform — the /sessions route accepts the same set', () => {
+    const schema = findTool('listSessions')!.schema
+    // S1a: the wire Platform schema is an open string; the MCP filter surface
+    // deliberately stays the closed KNOWN_PLATFORMS vocabulary until S1b.
+    for (const platform of KNOWN_PLATFORMS) {
+      expect(schema.safeParse({ platform }).success, `platform=${platform} must be filterable`).toBe(true)
+    }
+    expect(schema.safeParse({ platform: 'irc' }).success).toBe(false)
+  })
+
+  it('whoami merges /me and the org view, and surfaces the first failure', async () => {
+    const okCtx: McpToolCtx = {
+      orgId: ORG_ID,
+      get: async (path) =>
+        path === '/me'
+          ? { statusCode: 200, body: JSON.stringify({ userId: 'u1' }) }
+          : { statusCode: 200, body: JSON.stringify({ id: ORG_ID, role: 'owner' }) },
+      send: async () => ({ statusCode: 500, body: 'never' })
+    }
+    const ok = await findTool('whoami')!.call(okCtx, {})
+    expect(ok.statusCode).toBe(200)
+    expect(JSON.parse(ok.body)).toEqual({ user: { userId: 'u1' }, organization: { id: ORG_ID, role: 'owner' } })
+
+    const failCtx: McpToolCtx = {
+      ...okCtx,
+      get: async (path) =>
+        path === '/me'
+          ? { statusCode: 200, body: '{}' }
+          : { statusCode: 404, body: JSON.stringify({ message: 'organization not found' }) }
+    }
+    const fail = await findTool('whoami')!.call(failCtx, {})
+    expect(fail.statusCode).toBe(404)
+  })
+})
+
+describe('MCP write tools — bodies and upsert semantics', () => {
+  it('updateAgent sends ONLY the provided fields (PATCH absent-vs-present)', async () => {
+    const { calls } = await run('updateAgent', { agentId: AGENT_UUID, model: null, pause: true })
+    expect(calls).toEqual([
+      { method: 'PATCH', path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}`, body: { model: null, pause: true } }
+    ])
+  })
+
+  it('updateAgent merges an env patch over the live variables, since REST replaces env wholesale', async () => {
+    const { ctx, calls } = recordingCtx()
+    ctx.get = async (path) => {
+      calls.push({ method: 'GET', path })
+      return { statusCode: 200, body: JSON.stringify({ id: AGENT_UUID, env: { KEEP: '1', DROP: 'x', SET: 'old' } }) }
+    }
+    const tool = findTool('updateAgent')!
+    const args = tool.schema.parse({ agentId: AGENT_UUID, env: { SET: 'new', DROP: null, ADD: 'a' } })
+    await tool.call(ctx, args)
+    expect(calls).toEqual([
+      { method: 'GET', path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}` },
+      {
+        method: 'PATCH',
+        path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}`,
+        body: { env: { KEEP: '1', SET: 'new', ADD: 'a' } }
+      }
+    ])
+  })
+
+  it('updateAgent writes nothing when the env read fails, and never takes secret values', async () => {
+    const { ctx, calls } = recordingCtx()
+    ctx.get = async () => ({ statusCode: 404, body: '{"message":"not found"}' })
+    const tool = findTool('updateAgent')!
+    const result = await tool.call(ctx, tool.schema.parse({ agentId: AGENT_UUID, env: { A: '1' } }))
+    expect(result.statusCode).toBe(404)
+    expect(calls.some((call) => call.method !== 'GET')).toBe(false)
+    for (const extra of [
+      { secrets: { TOKEN: 'x' } },
+      { liveSecrets: { TOKEN: { value: 'x' } } },
+      { env: { 'BAD-NAME': '1' } }
+    ]) {
+      expect(tool.schema.safeParse({ agentId: AGENT_UUID, ...extra }).success).toBe(false)
+    }
+  })
+
+  it('createAgent posts the curated body to the org agents collection', async () => {
+    const { calls } = await run('createAgent', { name: 'helper', runtime: 'claude', fastMode: true })
+    expect(calls).toEqual([
+      { method: 'POST', path: `/orgs/${ORG_ID}/agents`, body: { name: 'helper', runtime: 'claude', fastMode: true } }
+    ])
+  })
+
+  it('createAgent carries a git workspace through in the same POST', async () => {
+    const { calls } = await run('createAgent', {
+      name: 'reviewer',
+      runtime: 'claude',
+      workspace: { mode: 'git', gitRepo: 'acme/api', gitBranch: 'main', access: 'write' }
+    })
+    expect(calls).toEqual([
+      {
+        method: 'POST',
+        path: `/orgs/${ORG_ID}/agents`,
+        body: {
+          name: 'reviewer',
+          runtime: 'claude',
+          workspace: { mode: 'git', gitRepo: 'acme/api', gitBranch: 'main', access: 'write' }
+        }
+      }
+    ])
+    // The address is the ONLY repository input: derived provenance is never accepted here.
+    const schema = findTool('createAgent')!.schema
+    expect(schema.safeParse({ name: 'a', runtime: 'claude', workspace: { mode: 'git' } }).success).toBe(false)
+    expect(
+      schema.safeParse({ name: 'a', runtime: 'claude', workspace: { mode: 'git', gitRepo: 'a/b', repoId: '1' } })
+        .success
+    ).toBe(false)
+  })
+
+  it('setAgentWorkspace PUTs the workspace body to the agent’s workspace edit path', async () => {
+    const { calls } = await run('setAgentWorkspace')
+    // The confirm lookup reads the agent first; `agentId`/`confirm` are routing-only.
+    expect(calls).toEqual([
+      { method: 'GET', path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}` },
+      {
+        method: 'PUT',
+        path: `/orgs/${ORG_ID}/agents/${AGENT_UUID}/workspace`,
+        body: { mode: 'git', gitRepo: 'acme/api', access: 'write' }
+      }
+    ])
+    const scratch = await run('setAgentWorkspace', { agentId: AGENT_UUID, confirm: 'my-agent', mode: 'scratch' })
+    expect(scratch.calls[1]!.body).toEqual({ mode: 'scratch' })
+  })
+
+  it('a webchat conversation may change its own host agent but not delete it', async () => {
+    const update = await run('updateAgent', { agentId: HOST_AGENT_UUID, model: 'opus' })
+    expect(update.calls).toEqual([
+      { method: 'PATCH', path: `/orgs/${ORG_ID}/agents/${HOST_AGENT_UUID}`, body: { model: 'opus' } }
+    ])
+    const workspace = await run('setAgentWorkspace', { agentId: HOST_AGENT_UUID, confirm: 'my-agent', mode: 'scratch' })
+    expect(workspace.calls.filter((c) => c.method !== 'GET')).toEqual([
+      { method: 'PUT', path: `/orgs/${ORG_ID}/agents/${HOST_AGENT_UUID}/workspace`, body: { mode: 'scratch' } }
+    ])
+    const deletion = await run('deleteAgent', { agentId: HOST_AGENT_UUID, confirm: 'my-agent' })
+    expect(deletion.result.statusCode).toBe(403)
+    expect(deletion.calls).toEqual([])
+  })
+
+  it('createGithubTrigger POSTs a github-kind hook, and the webhook kind stays out of the catalog', async () => {
+    const { calls } = await run('createGithubTrigger')
+    expect(calls).toEqual([
+      {
+        method: 'POST',
+        path: `/orgs/${ORG_ID}/hooks`,
+        body: { kind: 'github', ...ARGS.createGithubTrigger }
+      }
+    ])
+    // No tool may mint an ingress URL or a signing secret (§6.3).
+    const schema = findTool('createGithubTrigger')!.schema
+    expect(schema.safeParse({ ...ARGS.createGithubTrigger, kind: 'webhook' }).success).toBe(false)
+    expect(schema.safeParse({ ...ARGS.createGithubTrigger, hmac: true }).success).toBe(false)
+    expect(schema.safeParse({ ...ARGS.createGithubTrigger, repoFullName: 'acme' }).success).toBe(false)
+    // A release never opens: the description must name the events GitHub actually sends for one.
+    const { description } = findTool('createGithubTrigger')!
+    expect(description).toContain('["release:published"]')
+    expect(description).toContain('["release:*"]')
+  })
+
+  it('upsertCron PUTs to the given cron id, and mints a UUID when creating', async () => {
+    const edit = await run('upsertCron', { ...ARGS.upsertCron, cronId: CRON_ID })
+    expect(edit.calls[0]!.method).toBe('PUT')
+    expect(edit.calls[0]!.path).toBe(`/orgs/${ORG_ID}/crons/${CRON_ID}`)
+    expect(edit.calls[0]!.body).not.toHaveProperty('cronId') // routing key stays out of the body
+
+    const create = await run('upsertCron')
+    const minted = create.calls[0]!.path.slice(`/orgs/${ORG_ID}/crons/`.length)
+    expect(minted).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  })
+
+  // A caller that omitted the zone used to inherit the CP process's own, so "every morning at 9"
+  // silently meant 9am somewhere else. There is no zone to guess from here, so the tool asks.
+  it('upsertCron refuses a schedule with no timezone rather than choosing one', async () => {
+    const { timezone: _omitted, ...withoutZone } = ARGS.upsertCron!
+    const tool = findTool('upsertCron')!
+    expect(tool.schema.safeParse(withoutZone).success).toBe(false)
+    expect(tool.schema.safeParse(ARGS.upsertCron).success).toBe(true)
+  })
+})
+
+describe('MCP destructive tools — the §6.4 confirm gate', () => {
+  it('a confirm mismatch blocks the mutation (412, nothing sent)', async () => {
+    for (const [tool, args] of [
+      ['deleteAgent', { agentId: AGENT_UUID, confirm: 'wrong' }],
+      ['deleteCron', { cronId: 'c1', confirm: 'wrong' }],
+      ['removeIntegration', { integrationId: 'integ-1', confirm: 'wrong' }],
+      ['setAgentWorkspace', { agentId: AGENT_UUID, confirm: 'wrong', mode: 'scratch' }],
+      ['deleteDecision', { decisionId: DECISION_ID, confirm: 'wrong' }],
+      ['deleteCodeHostDecisionRouting', { ...REPO_SCOPE, confirm: 'wrong' }]
+    ] as const) {
+      const { calls, result } = await run(tool, args)
+      expect(result.statusCode, tool).toBe(412)
+      expect(JSON.parse(result.body).message).toContain('confirmation mismatch')
+      expect(JSON.parse(result.body).message).not.toContain('my-agent') // never echo the expected name
+      expect(
+        calls.filter((c) => c.method !== 'GET'),
+        `${tool}: must not mutate`
+      ).toEqual([])
+    }
+  })
+
+  // Discarding a daemon-local checkout is irreversible without a row disappearing,
+  // so this one is 🔥 with a PUT rather than a DELETE behind the same gate.
+  it('a matching confirm releases the workspace replacement', async () => {
+    const { calls, result } = await run('setAgentWorkspace')
+    expect(result.statusCode).toBe(200)
+    const mutations = calls.filter((c) => c.method !== 'GET')
+    expect(mutations).toHaveLength(1)
+    expect(mutations[0]!.method).toBe('PUT')
+  })
+
+  it('a matching confirm releases exactly one DELETE', async () => {
+    for (const tool of [
+      'deleteAgent',
+      'deleteCron',
+      'removeIntegration',
+      'deleteDecision',
+      'deleteCodeHostDecisionRouting'
+    ]) {
+      const { calls, result } = await run(tool)
+      expect(result.statusCode, tool).toBe(200)
+      const mutations = calls.filter((c) => c.method !== 'GET')
+      expect(mutations, tool).toHaveLength(1)
+      expect(mutations[0]!.method).toBe('DELETE')
+    }
+  })
+
+  it('deleteCron falls back to the id as the confirm value for unnamed crons', async () => {
+    const calls: RecordedCall[] = []
+    const ctx: McpToolCtx = {
+      orgId: ORG_ID,
+      get: async (path) => {
+        calls.push({ method: 'GET', path })
+        return { statusCode: 200, body: JSON.stringify({ id: 'c1', name: null }) }
+      },
+      send: async (method, path) => {
+        calls.push({ method, path })
+        return { statusCode: 204, body: '' }
+      }
+    }
+    const blocked = await findTool('deleteCron')!.call(ctx, { cronId: 'c1', confirm: 'anything' })
+    expect(blocked.statusCode).toBe(412)
+    const ok = await findTool('deleteCron')!.call(ctx, { cronId: 'c1', confirm: 'c1' })
+    expect(ok.statusCode).toBe(204)
+  })
+
+  it('the confirm lookup surfaces resource errors as-is (404 passes through, nothing sent)', async () => {
+    const ctx: McpToolCtx = {
+      orgId: ORG_ID,
+      get: async () => ({ statusCode: 404, body: JSON.stringify({ message: 'agent not found' }) }),
+      send: async () => {
+        throw new Error('must not be called')
+      }
+    }
+    const out = await findTool('deleteAgent')!.call(ctx, { agentId: AGENT_UUID, confirm: 'x' })
+    expect(out.statusCode).toBe(404)
+  })
+
+  it('removeIntegration 404s on an id absent from the integration list', async () => {
+    const { result } = await run('removeIntegration', { integrationId: 'other', confirm: 'my-agent' })
+    expect(result.statusCode).toBe(404)
+  })
+})
+
+describe('MCP Decision tools', () => {
+  it('setChannelTrigger carries a By decision gate and a session mode, and never a null owner', async () => {
+    const tool = findTool('setChannelTrigger')!
+    const { calls } = await run('setChannelTrigger', {
+      integrationId: 'integ-1',
+      channelId: 'C1',
+      trigger: 'decision',
+      decisionBinding: GATE,
+      sessionMode: 'append'
+    })
+    expect(calls).toEqual([
+      {
+        method: 'PATCH',
+        path: `/orgs/${ORG_ID}/integrations/integ-1/channels/C1`,
+        body: { trigger: 'decision', decisionBinding: GATE, sessionMode: 'append' }
+      }
+    ])
+    // The route refuses a gate without its trigger and the reverse, and has not cleared an owner with null since #117.
+    const base = { integrationId: 'integ-1', channelId: 'C1' }
+    expect(tool.schema.safeParse({ ...base, trigger: 'decision' }).success).toBe(false)
+    expect(tool.schema.safeParse({ ...base, trigger: 'any', decisionBinding: GATE }).success).toBe(false)
+    expect(tool.schema.safeParse({ ...base, agentId: null }).success).toBe(false)
+  })
+
+  it('reads each evaluation source from its own lane with the paging query', async () => {
+    const lanes = [
+      [
+        { source: 'conversation', integrationId: INTEGRATION_ID, channelId: 'C1', limit: 5 },
+        `/orgs/${ORG_ID}/integrations/${INTEGRATION_ID}/channels/C1/decision-evaluations`
+      ],
+      [
+        { source: 'bot', botId: BOT_ID, channelId: 'C1', limit: 5 },
+        `/orgs/${ORG_ID}/bots/${BOT_ID}/decision-routing/evaluations`
+      ],
+      [
+        { source: 'repository', ...REPO_SCOPE, limit: 5 },
+        `/orgs/${ORG_ID}/decision-routing/github/42/pull_request/evaluations`
+      ],
+      [
+        { source: 'model_selection', agentId: AGENT_UUID, limit: 5 },
+        `/orgs/${ORG_ID}/agents/${AGENT_UUID}/model-evaluations`
+      ]
+    ] as const
+    for (const [args, path] of lanes) {
+      const { calls } = await run('listDecisionEvaluations', args)
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.path, args.source).toBe(path)
+      expect(calls[0]!.query).toMatchObject({ limit: 5 })
+    }
+  })
+
+  it('refuses an evaluation source without the ids that name it, or a family its host does not route', () => {
+    const tool = findTool('listDecisionEvaluations')!
+    expect(tool.schema.safeParse({ source: 'conversation', integrationId: INTEGRATION_ID }).success).toBe(false)
+    expect(tool.schema.safeParse({ source: 'bot' }).success).toBe(false)
+    expect(
+      tool.schema.safeParse({ source: 'repository', provider: 'github', repoId: '42', family: 'merge_request' }).success
+    ).toBe(false)
+    expect(
+      findTool('getCodeHostDecisionRouting')!.schema.safeParse({ ...REPO_SCOPE, family: 'merge_request' }).success
+    ).toBe(false)
+  })
+
+  it('a Decision’s audience stays out of the catalog', () => {
+    for (const name of ['createDecision', 'updateDecision']) {
+      const tool = findTool(name)!
+      expect(tool.schema.safeParse({ ...ARGS[name], visibility: 'restricted' }).success, name).toBe(false)
+      expect(tool.schema.safeParse({ ...ARGS[name], sharedWith: ['u1'] }).success, name).toBe(false)
+    }
+  })
+
+  it('previewDecision tries a saved Decision by id without asking for its definition', async () => {
+    const { calls } = await run('previewDecision')
+    expect(calls.map((c) => c.method)).toEqual(['GET', 'POST'])
+    expect(calls[1]).toEqual({
+      method: 'POST',
+      path: `/orgs/${ORG_ID}/decisions/preview`,
+      body: {
+        decision: { ...DECISION, name: 'my-agent' },
+        target: { kind: 'pool' },
+        state: SAMPLE,
+        consumer: { type: 'none' }
+      }
+    })
+    const tool = findTool('previewDecision')!
+    const both = { ...ARGS.previewDecision, decision: DECISION }
+    expect(tool.schema.safeParse(both).success).toBe(false)
+    const neither = { target: { kind: 'pool' }, state: SAMPLE }
+    expect(tool.schema.safeParse(neither).success).toBe(false)
+  })
+
+  it('every preview spends an evaluator call and carries a message sample', () => {
+    for (const name of ['previewDecision', 'previewIntegrationChannelDecision', 'previewBotDecisionRouting']) {
+      const tool = findTool(name)!
+      expect(tool.write, name).toBe(true)
+      expect(tool.destructive, name).toBeUndefined()
+      expect(tool.contentArgs, name).toEqual(['state'])
+    }
+  })
+
+  it('updateAgent carries the Decision-driven model selection', async () => {
+    const modelSelection = {
+      decisionId: DECISION_ID,
+      rules: [{ when: { type: 'boolean', values: [true] }, runtime: 'claude', model: 'opus' }]
+    }
+    const { calls } = await run('updateAgent', { agentId: AGENT_UUID, modelSelection, decisionIds: [DECISION_ID] })
+    expect(calls[0]!.body).toEqual({ modelSelection, decisionIds: [DECISION_ID] })
+  })
+})

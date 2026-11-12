@@ -1,0 +1,499 @@
+import { timingSafeEqual } from 'node:crypto'
+import {
+  chmodSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  statSync,
+  symlinkSync,
+  unlinkSync
+} from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import type { RuntimeDef } from '../config/config-schema.js'
+import { readRegularFileSync } from '../fs/regular-file.js'
+import { looksLikePlaceholder } from '../credential-proxy/placeholder.js'
+import {
+  resolveClaudeCredentialSources,
+  resolveCodexCredentialSources,
+  resolveKimiCredentialDir,
+  resolveQoderCredentialSources,
+  sharedCredentialProfile
+} from './runtime-credential-sources.js'
+import { runtimeStateLocations } from './probe.js'
+export { sharedCredentialProfile, type SharedCredentialProfile } from './runtime-credential-sources.js'
+
+export interface SharedRuntimeCredentialAccess {
+  env: Record<string, string>
+  /** Host paths that the trusted ACP runtime may update for login refresh. */
+  writablePaths: string[]
+  /** Private-HOME destinations that must no longer receive copy-once auth. */
+  seedExclusions: string[]
+  /** Finish migration/linking after the private runtime HOME exists. */
+  preparePrivateHome: (runtimeHome: string) => void
+}
+
+function ensureOwnedDirectory(path: string, label: string): string {
+  mkdirSync(path, { recursive: true, mode: 0o700 })
+  const real = realpathSync(path)
+  const stat = statSync(real)
+  if (!stat.isDirectory()) throw new Error(`${label} is not a directory: ${path}`)
+  const uid = process.getuid?.()
+  if (uid !== undefined && stat.uid !== uid) throw new Error(`${label} is not owned by the daemon user: ${real}`)
+  try {
+    chmodSync(real, 0o700)
+  } catch {
+    // Linux is the only enabled shared-login target; keep tests portable.
+  }
+  return real
+}
+
+function existingFileTarget(path: string): string {
+  const info = lstatSync(path)
+  const target = info.isSymbolicLink() ? realpathSync(path) : path
+  if (!statSync(target).isFile()) throw new Error(`credential path is not a regular file: ${path}`)
+  return target
+}
+
+function lstatIfPresent(path: string): ReturnType<typeof lstatSync> | undefined {
+  try {
+    return lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+function secureCredentialFile(path: string): void {
+  try {
+    chmodSync(path, 0o600)
+  } catch {
+    // Best effort on non-POSIX test filesystems.
+  }
+}
+
+const MAX_CREDENTIAL_FILE_BYTES = 2 * 1024 * 1024
+
+// Both the private HOME and the shared host credential dir are runtime-writable, so no read here may wait on a FIFO.
+function credentialBytes(path: string): Buffer {
+  return readRegularFileSync(path, MAX_CREDENTIAL_FILE_BYTES)
+}
+
+function sameFileContents(a: string, b: string): boolean {
+  const left = credentialBytes(a)
+  const right = credentialBytes(b)
+  return left.length === right.length && timingSafeEqual(left, right)
+}
+
+function claudeCredentialGeneration(path: string): number | undefined {
+  try {
+    const parsed = JSON.parse(credentialBytes(path).toString('utf8')) as {
+      claudeAiOauth?: { expiresAt?: unknown; expires_at?: unknown }
+    }
+    const value = parsed.claudeAiOauth?.expiresAt ?? parsed.claudeAiOauth?.expires_at
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string') {
+      const numeric = Number(value)
+      if (Number.isFinite(numeric)) return numeric
+      const timestamp = Date.parse(value)
+      return Number.isFinite(timestamp) ? timestamp : undefined
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+function prepareClaudeCredentials(env: NodeJS.ProcessEnv): SharedRuntimeCredentialAccess {
+  const source = resolveClaudeCredentialSources(env)
+  ensureOwnedDirectory(source.configDir, 'host Claude config directory')
+  const credentialDir = ensureOwnedDirectory(source.credentialDir, 'Claude secure credential directory')
+  const destination = join(credentialDir, '.credentials.json')
+  if (existsSync(destination)) secureCredentialFile(existingFileTarget(destination))
+
+  return {
+    // The ACP runtime has a private HOME, so pass the resolved host directory
+    // explicitly even when Claude's default secure-storage location is used.
+    env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: credentialDir },
+    writablePaths: [credentialDir],
+    seedExclusions: [join('.claude', '.credentials.json')],
+    preparePrivateHome: (runtimeHome) => {
+      const privateCredential = join(runtimeHome, '.claude', '.credentials.json')
+      const privateInfo = lstatIfPresent(privateCredential)
+      if (!privateInfo) return
+      if (privateInfo.isSymbolicLink()) {
+        let linked: string
+        try {
+          linked = realpathSync(privateCredential)
+        } catch {
+          throw new Error(`private Claude credential link is dangling: ${privateCredential}`)
+        }
+        if (!existsSync(destination) || linked !== existingFileTarget(destination)) {
+          throw new Error(
+            `private Claude credential link points outside the shared host credential: ${privateCredential}`
+          )
+        }
+        unlinkSync(privateCredential)
+        return
+      }
+      if (!privateInfo.isFile()) {
+        throw new Error(`private Claude credential path is not a regular file: ${privateCredential}`)
+      }
+
+      if (!existsSync(destination)) {
+        renameSync(privateCredential, destination)
+        secureCredentialFile(destination)
+        return
+      }
+      const authoritative = existingFileTarget(destination)
+      if (sameFileContents(privateCredential, authoritative)) {
+        unlinkSync(privateCredential)
+        return
+      }
+      const privateGeneration = claudeCredentialGeneration(privateCredential)
+      const hostGeneration = claudeCredentialGeneration(authoritative)
+      if (privateGeneration === undefined || hostGeneration === undefined || privateGeneration === hostGeneration) {
+        throw new Error(
+          `conflicting Claude credentials at ${privateCredential} and ${destination}; run host claude /login after resolving the conflict`
+        )
+      }
+      if (privateGeneration > hostGeneration) {
+        renameSync(privateCredential, authoritative)
+        secureCredentialFile(authoritative)
+      } else {
+        unlinkSync(privateCredential)
+      }
+    }
+  }
+}
+
+function refreshTimestamp(path: string): number | undefined {
+  try {
+    const parsed = JSON.parse(credentialBytes(path).toString('utf8')) as {
+      last_refresh?: unknown
+      lastRefresh?: unknown
+    }
+    const value = parsed.last_refresh ?? parsed.lastRefresh
+    if (typeof value !== 'string') return undefined
+    const timestamp = Date.parse(value)
+    return Number.isFinite(timestamp) ? timestamp : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function proxyProjectedCodexAuth(path: string): boolean {
+  try {
+    const key = (JSON.parse(credentialBytes(path).toString('utf8')) as { OPENAI_API_KEY?: unknown }).OPENAI_API_KEY
+    return typeof key === 'string' && looksLikePlaceholder(key)
+  } catch {
+    return false
+  }
+}
+
+function prepareCodexCredentials(env: NodeJS.ProcessEnv): SharedRuntimeCredentialAccess {
+  const source = resolveCodexCredentialSources(env)
+  const codexHome = ensureOwnedDirectory(source.configDir, 'host CODEX_HOME')
+  const hostAuth = join(codexHome, 'auth.json')
+  if (existsSync(hostAuth)) secureCredentialFile(existingFileTarget(hostAuth))
+  const writablePaths = existsSync(hostAuth) ? [existingFileTarget(hostAuth)] : []
+
+  return {
+    env: {},
+    // A missing file cannot be rebound by SRT. The private link remains
+    // dangling until host `codex login` creates it; restarting the ACP host then
+    // picks it up without ever copying the credential.
+    writablePaths,
+    seedExclusions: [join('.codex', 'auth.json')],
+    preparePrivateHome: (runtimeHome) => {
+      const privateDir = ensureOwnedDirectory(join(runtimeHome, '.codex'), 'private Codex config directory')
+      const privateAuth = join(privateDir, 'auth.json')
+      const privateInfo = lstatIfPresent(privateAuth)
+      if (privateInfo) {
+        const info = privateInfo
+        if (info.isSymbolicLink()) {
+          let linked: string | undefined
+          try {
+            linked = realpathSync(privateAuth)
+          } catch {
+            // A dangling link is valid when the host has not logged in yet.
+          }
+          const authoritative = existsSync(hostAuth) ? existingFileTarget(hostAuth) : undefined
+          const lexicalTarget = resolve(dirname(privateAuth), readlinkSync(privateAuth))
+          if ((linked && authoritative && linked !== authoritative) || (!linked && lexicalTarget !== hostAuth)) {
+            throw new Error(`private Codex auth link points outside the shared host credential: ${privateAuth}`)
+          }
+          // Avoid a two-hop link through the hidden host HOME when auth.json is
+          // itself linked elsewhere. The private HOME should point directly at
+          // the exact writable file carved back into the sandbox.
+          if (authoritative && lexicalTarget !== authoritative) {
+            unlinkSync(privateAuth)
+            symlinkSync(authoritative, privateAuth)
+          }
+          return
+        }
+        if (!info.isFile()) throw new Error(`private Codex auth path is not a regular file: ${privateAuth}`)
+
+        // A copy an srt launch projected for the credential proxy holds only its placeholder, never a login.
+        if (proxyProjectedCodexAuth(privateAuth)) unlinkSync(privateAuth)
+        else if (!existsSync(hostAuth)) {
+          renameSync(privateAuth, hostAuth)
+          secureCredentialFile(hostAuth)
+          writablePaths.push(hostAuth)
+        } else {
+          const authoritative = existingFileTarget(hostAuth)
+          if (sameFileContents(privateAuth, authoritative)) {
+            unlinkSync(privateAuth)
+          } else {
+            const privateRefresh = refreshTimestamp(privateAuth)
+            const hostRefresh = refreshTimestamp(authoritative)
+            if (privateRefresh === undefined || hostRefresh === undefined || privateRefresh === hostRefresh) {
+              throw new Error(
+                `conflicting Codex credentials at ${privateAuth} and ${hostAuth}; run host codex login after resolving the conflict`
+              )
+            }
+            if (privateRefresh > hostRefresh) {
+              renameSync(privateAuth, authoritative)
+              secureCredentialFile(authoritative)
+            } else {
+              unlinkSync(privateAuth)
+            }
+          }
+        }
+      }
+      if (!lstatIfPresent(privateAuth)) {
+        symlinkSync(existsSync(hostAuth) ? existingFileTarget(hostAuth) : hostAuth, privateAuth)
+      }
+    }
+  }
+}
+
+function moveCredentialFile(source: string, destination: string): void {
+  try {
+    renameSync(source, destination)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error
+    copyFileSync(source, destination, constants.COPYFILE_EXCL)
+    unlinkSync(source)
+  }
+  secureCredentialFile(destination)
+}
+
+function regularFileIfPresent(path: string, label: string): ReturnType<typeof lstatSync> | undefined {
+  const info = lstatIfPresent(path)
+  if (!info) return undefined
+  if (info.isSymbolicLink() || !info.isFile()) throw new Error(`${label} is not a regular file: ${path}`)
+  return info
+}
+
+/** Fold a pre-shared-login private Qoder auth directory into the host directory.
+ * The opaque `user` credential is never chosen silently: a divergent host/private
+ * login fails closed. A private login may become authoritative only when the host
+ * has no login yet; its paired machine id follows it. */
+function migratePrivateQoderAuth(privateAuth: string, sharedAuth: string, label: string): void {
+  const privateUser = join(privateAuth, 'user')
+  const sharedUser = join(sharedAuth, 'user')
+  const privateHasUser = regularFileIfPresent(privateUser, `${label} private user credential`) !== undefined
+  const sharedHasUser = regularFileIfPresent(sharedUser, `${label} host user credential`) !== undefined
+
+  if (privateHasUser && sharedHasUser && !sameFileContents(privateUser, sharedUser)) {
+    throw new Error(
+      `conflicting ${label} credentials at ${privateUser} and ${sharedUser}; run host ${label} /login after resolving the conflict`
+    )
+  }
+
+  const privateLoginWins = privateHasUser && !sharedHasUser
+  if (privateLoginWins) {
+    moveCredentialFile(privateUser, sharedUser)
+    const privateMachine = join(privateAuth, 'machine_id')
+    const sharedMachine = join(sharedAuth, 'machine_id')
+    if (regularFileIfPresent(privateMachine, `${label} private machine id`)) {
+      if (regularFileIfPresent(sharedMachine, `${label} host machine id`)) unlinkSync(sharedMachine)
+      moveCredentialFile(privateMachine, sharedMachine)
+    }
+  }
+
+  for (const entry of readdirSync(privateAuth, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.isSymbolicLink()) {
+      throw new Error(`${label} private auth contains an unsupported entry: ${join(privateAuth, entry.name)}`)
+    }
+    const source = join(privateAuth, entry.name)
+    const destination = join(sharedAuth, entry.name)
+    regularFileIfPresent(source, `${label} private auth file`)
+    const destinationInfo = regularFileIfPresent(destination, `${label} host auth file`)
+    if (!destinationInfo) {
+      moveCredentialFile(source, destination)
+    } else if (
+      sameFileContents(source, destination) ||
+      entry.name === 'machine_id' ||
+      entry.name === 'dynamic-error-codes.json' ||
+      entry.name === 'dynamic-texts.json'
+    ) {
+      // Host login state wins over a logged-out private machine id; the other
+      // two files are provider-owned caches, not credentials.
+      unlinkSync(source)
+    } else {
+      throw new Error(
+        `conflicting ${label} auth state at ${source} and ${destination}; run host ${label} /login after resolving the conflict`
+      )
+    }
+  }
+  rmdirSync(privateAuth)
+}
+
+function prepareQoderCredentials(profile: 'qoder' | 'qoder-cn', env: NodeJS.ProcessEnv): SharedRuntimeCredentialAccess {
+  const configName = profile === 'qoder-cn' ? '.qoder-cn' : '.qoder'
+  const source = resolveQoderCredentialSources(profile, env)
+  const configDir = ensureOwnedDirectory(source.configDir, `host ${profile} config directory`)
+  const sharedAuth = ensureOwnedDirectory(join(configDir, '.auth'), `host ${profile} auth`)
+  return {
+    env: {},
+    writablePaths: [sharedAuth],
+    seedExclusions: [join(configName, '.auth', 'user'), join(configName, '.auth', 'machine_id')],
+    preparePrivateHome: (runtimeHome) => {
+      const privateConfig = ensureOwnedDirectory(join(runtimeHome, configName), `private ${profile} config directory`)
+      const privateAuth = join(privateConfig, '.auth')
+      const privateInfo = lstatIfPresent(privateAuth)
+      if (privateInfo?.isSymbolicLink()) {
+        let linked: string
+        try {
+          linked = realpathSync(privateAuth)
+        } catch {
+          throw new Error(`private ${profile} auth link is dangling: ${privateAuth}`)
+        }
+        if (linked !== sharedAuth)
+          throw new Error(`private ${profile} auth link points outside host credentials: ${privateAuth}`)
+        return
+      }
+      if (privateInfo) {
+        if (!privateInfo.isDirectory())
+          throw new Error(`private ${profile} auth path is not a directory: ${privateAuth}`)
+        migratePrivateQoderAuth(privateAuth, sharedAuth, profile)
+      }
+      symlinkSync(sharedAuth, privateAuth)
+    }
+  }
+}
+
+/** An OAuth record's expiry, in ms, or undefined when the file is not one. */
+function kimiCredentialExpiry(path: string): number | undefined {
+  try {
+    const expires = (
+      JSON.parse(readRegularFileSync(path, MAX_CREDENTIAL_FILE_BYTES).toString('utf8')) as { expires_at?: unknown }
+    ).expires_at
+    return typeof expires === 'number' ? (expires < 1e11 ? expires * 1000 : expires) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** A real directory beneath the shared Kimi root, created if missing; the runtime can write that tree, so a link there is refused. */
+function kimiSharedSubdirectory(sharedRoot: string, path: string): string {
+  const info = lstatIfPresent(path)
+  if (info && (info.isSymbolicLink() || !info.isDirectory())) {
+    throw new Error(`kimi host credentials path is not a real directory: ${path}`)
+  }
+  if (!info) mkdirSync(path, { mode: 0o700 })
+  const real = realpathSync(path)
+  const inside = relative(sharedRoot, real)
+  if (!inside || inside.startsWith('..') || isAbsolute(inside)) {
+    throw new Error(`kimi host credentials path escapes the credentials directory: ${path}`)
+  }
+  return real
+}
+
+/** Fold a copy-seeded private Kimi credentials tree into the host's: a missing file moves, a rotated login with the later expiry wins. */
+function migratePrivateKimiCredentials(privateDir: string, sharedDir: string, sharedRoot: string): void {
+  for (const entry of readdirSync(privateDir, { withFileTypes: true })) {
+    const source = join(privateDir, entry.name)
+    const destination = join(sharedDir, entry.name)
+    if (entry.isDirectory()) {
+      migratePrivateKimiCredentials(source, kimiSharedSubdirectory(sharedRoot, destination), sharedRoot)
+      rmdirSync(source)
+      continue
+    }
+    if (!entry.isFile()) throw new Error(`kimi private credentials contain an unsupported entry: ${source}`)
+    if (!regularFileIfPresent(destination, 'kimi host credential')) {
+      moveCredentialFile(source, destination)
+    } else if (sameFileContents(source, destination)) {
+      unlinkSync(source)
+    } else {
+      const privateExpiry = kimiCredentialExpiry(source)
+      const hostExpiry = kimiCredentialExpiry(destination)
+      if (privateExpiry === undefined || hostExpiry === undefined || privateExpiry === hostExpiry) {
+        throw new Error(
+          `conflicting kimi credentials at ${source} and ${destination}; run host kimi login after resolving the conflict`
+        )
+      }
+      if (privateExpiry > hostExpiry) {
+        unlinkSync(destination)
+        moveCredentialFile(source, destination)
+      } else {
+        unlinkSync(source)
+      }
+    }
+  }
+}
+
+/** Kimi Code rotates its OAuth refresh token, so every private HOME shares the host's credentials directory instead of a copy. */
+function prepareKimiCredentials(env: NodeJS.ProcessEnv): SharedRuntimeCredentialAccess {
+  const sharedDir = ensureOwnedDirectory(resolveKimiCredentialDir(env), 'host kimi credentials directory')
+  const declared = runtimeStateLocations('kimi', env)
+    .filter((location) => location.destination === '.kimi-code')
+    .flatMap((location) =>
+      (location.credentialFiles ?? [])
+        .filter((file) => file.format === 'oauth')
+        .map((file) => join('.kimi-code', file.path))
+    )
+  const hosted = readdirSync(sharedDir).map((name) => join('.kimi-code', 'credentials', name))
+  return {
+    env: {},
+    writablePaths: [sharedDir],
+    seedExclusions: [...new Set([...declared, ...hosted])],
+    preparePrivateHome: (runtimeHome) => {
+      const privateRoot = ensureOwnedDirectory(join(runtimeHome, '.kimi-code'), 'private kimi config directory')
+      const privateDir = join(privateRoot, 'credentials')
+      const privateInfo = lstatIfPresent(privateDir)
+      if (privateInfo?.isSymbolicLink()) {
+        let linked: string
+        try {
+          linked = realpathSync(privateDir)
+        } catch {
+          throw new Error(`private kimi credentials link is dangling: ${privateDir}`)
+        }
+        if (linked !== sharedDir)
+          throw new Error(`private kimi credentials link points outside host credentials: ${privateDir}`)
+        return
+      }
+      if (privateInfo) {
+        if (!privateInfo.isDirectory())
+          throw new Error(`private kimi credentials path is not a directory: ${privateDir}`)
+        migratePrivateKimiCredentials(privateDir, sharedDir, sharedDir)
+        rmdirSync(privateDir)
+      }
+      symlinkSync(sharedDir, privateDir)
+    }
+  }
+}
+
+export function prepareSharedRuntimeCredentials(opts: {
+  runtimeId: string
+  runtime?: RuntimeDef
+  hostEnv?: NodeJS.ProcessEnv
+  platform?: NodeJS.Platform
+}): SharedRuntimeCredentialAccess | undefined {
+  if ((opts.platform ?? process.platform) !== 'linux') return undefined
+  if (opts.runtimeId === 'kimi') return prepareKimiCredentials(opts.hostEnv ?? process.env)
+  const profile = sharedCredentialProfile(opts.runtimeId, opts.runtime)
+  if (!profile) return undefined
+  const env = opts.hostEnv ?? process.env
+  if (profile === 'claude') return prepareClaudeCredentials(env)
+  if (profile === 'codex') return prepareCodexCredentials(env)
+  return prepareQoderCredentials(profile, env)
+}

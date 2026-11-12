@@ -1,0 +1,40 @@
+packages:
+  - 'packages/*'
+
+# pnpm 11 only runs install/build scripts for dependencies approved here.
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+  sharp: true
+  unrs-resolver: true
+  better-sqlite3: false
+  cpu-features: false
+  onnxruntime-node: false
+  protobufjs: false
+  ssh2: false
+  '@playwright/browser-chromium': false
+  '@swc/core': false
+  core-js: false
+  # next-intl's message-extraction watcher; only its CLI needs the native binary.
+  '@parcel/watcher': false
+
+minimumReleaseAge: 60
+
+# Custom ACP evaluations do not use these optional providers with unpatched dependencies.
+ignoredOptionalDependencies:
+  - '@huggingface/transformers'
+  - '@openai/codex-security'
+
+# Prisma 7 still pins these affected dependencies; remove when upstream updates them.
+overrides:
+  '@prisma/config@7>deepmerge-ts': 8.0.2
+  'prisma@7>mysql2': 3.24.4
+  # Promptfoo still uses SDK 2, so its API must stay separate from the application's SDK 3.
+  'promptfoo@0.125.1>@opentelemetry/api': 1.9.1
+
+patchedDependencies:
+  # Its TLS-terminated upstream leg ignores parentProxy (an upstream TODO); remove when upstream honors it.
+  '@anthropic-ai/sandbox-runtime@0.0.81': patches/@anthropic-ai__sandbox-runtime@0.0.81.patch
+  '@microsoft/agent-host-protocol@1.0.0': patches/@microsoft__agent-host-protocol@1.0.0.patch

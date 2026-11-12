@@ -1,0 +1,405 @@
+import { z } from 'zod'
+import {
+  DEFAULT_WORKSPACE_GIT_ALLOWED_ORIGINS,
+  normalizeWorkspaceGitOrigin,
+  RelayRosterEntry,
+  SESSION_RETENTION_RE,
+  type SessionRetentionSetting
+} from '@agentconnect.md/protocol'
+
+/** The `{name, value}[]` shape shared by runtime env, MCP env, and MCP headers. */
+const NameValueList = z.array(z.object({ name: z.string(), value: z.string() })).default([])
+
+export const RuntimeDefSchema = z.object({
+  command: z.string(),
+  args: z.array(z.string()).default([]),
+  env: NameValueList,
+  // Audited identity passed to the exact `skills` CLI. This is capability
+  // metadata, not a destination path. null explicitly marks an otherwise-known
+  // runtime id unsupported for an operator override.
+  skillsAgentId: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/)
+    .nullable()
+    .optional(),
+  // Operator/registry-owned read-only installation roots needed by a runtime
+  // whose executable or dependencies live below a host path hidden from the
+  // sandbox (most commonly HOME). Agent configuration can select a runtime but
+  // cannot add entries here.
+  readRoots: z.array(z.string()).optional(),
+  // Reviewed exception for thin bridges (e.g. `openclaw acp`): agent execution
+  // lives in a machine-local external service the OS sandbox cannot contain,
+  // and netns isolation would sever the bridge's loopback dial — so the bridge
+  // launches like any unsandboxed runtime (admission probes still use a
+  // disposable isolated HOME). A sandboxing strategy refuses it outright.
+  externalExecution: z.boolean().optional(),
+  // Scope of session/new|load mcpServers: 'per-session' (default), 'per-process' (the last session's serve them all, so each session gets its own host), or 'unsupported' (rejected: sessions run without MCP tools, as on OpenClaw).
+  sessionMcpServers: z.enum(['per-session', 'per-process', 'unsupported']).optional(),
+  // A loaded session keeps the tool definitions it started with, so the daemon restates changed ones in the conversation.
+  keepsSessionToolDefinitions: z.boolean().optional(),
+  // Whether the runtime shows the model the `image` content of an MCP tool result; computer use needs it.
+  mcpImageContent: z.boolean().optional()
+})
+export type RuntimeDef = z.infer<typeof RuntimeDefSchema>
+
+// A daemon-configured MCP server, keyed by name in `config.mcpServers`. The name
+// is what an agent's `mcpServers` list references, and what the daemon reports
+// to the CP — definitions (command/url/headers) never leave the daemon.
+// The name "agentconnect" is reserved for the daemon's own injected bridge entry.
+export const McpServerDefSchema = z
+  .object({
+    transport: z.enum(['stdio', 'http', 'sse']).default('stdio'),
+    // stdio transport: the executable to spawn (required for stdio).
+    command: z.string().optional(),
+    args: z.array(z.string()).default([]),
+    env: NameValueList,
+    // Same trusted installation-root escape hatch as RuntimeDefSchema, for a
+    // daemon-configured stdio MCP child spawned by the runtime.
+    readRoots: z.array(z.string()).optional(),
+    // http/sse transports: the server endpoint (required for http/sse).
+    url: z.string().optional(),
+    headers: NameValueList,
+    // http/sse: also send the session's X-AC-Channel, X-AC-Thread and X-AC-Session headers, so the server knows the caller.
+    sessionHeaders: z.boolean().optional(),
+    // MCP Apps (webchat-mcp-apps.md §4): this server is hosted by the DAEMON rather than attached
+    // to the runtime, so the daemon can advertise the `io.modelcontextprotocol/ui` extension, read
+    // the server's `ui://` templates, and render them in webchat. Opt-in rather than probed on
+    // purpose: hosting a server daemon-side moves who holds its transport credentials, which is an
+    // operator's decision. `resolveAgentMcpServers` skips one, or its tools would be callable on
+    // two paths with only one of them rendering.
+    ui: z.boolean().optional()
+  })
+  .superRefine((def, ctx) => {
+    if (def.transport === 'stdio' && !def.command)
+      ctx.addIssue({ code: 'custom', path: ['command'], message: 'a stdio MCP server requires "command"' })
+    if (def.transport !== 'stdio' && !def.url)
+      ctx.addIssue({ code: 'custom', path: ['url'], message: `a ${def.transport} MCP server requires "url"` })
+  })
+export type McpServerDef = z.infer<typeof McpServerDefSchema>
+
+const EnvironmentName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'invalid environment variable name')
+const MemoryPluginCommandRef = z
+  .string()
+  .min(1)
+  .max(128)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'invalid memory plugin commandRef')
+const ProcessValue = z
+  .string()
+  .max(16 * 1024)
+  .refine((value) => !value.includes('\0'), 'process value contains NUL')
+export const WorkspaceGitOrigin = z.string().transform((value, ctx) => {
+  try {
+    return normalizeWorkspaceGitOrigin(value)
+  } catch {
+    ctx.addIssue({
+      code: 'custom',
+      message: 'workspace Git origins must be "*" or exact credential-free HTTPS or SSH origins without a path'
+    })
+    return z.NEVER
+  }
+})
+
+/** Operator-owned local memory-plugin allowlist. A tenant/CP sends only the map
+ * key (`commandRef`); command, args, static env, and logical-secret→env mapping
+ * never cross the control plane. */
+export const StdioMemoryPluginDefSchema = z
+  .object({
+    command: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine((value) => !value.includes('\0'), 'command contains NUL'),
+    args: z.array(ProcessValue).max(128).default([]),
+    env: z
+      .array(z.object({ name: EnvironmentName, value: ProcessValue }).strict())
+      .max(128)
+      .default([]),
+    secretEnv: z.record(z.string().min(1).max(128), EnvironmentName).default({})
+  })
+  .strict()
+  .superRefine((def, ctx) => {
+    const staticNames = def.env.map((entry) => entry.name)
+    if (new Set(staticNames).size !== staticNames.length) {
+      ctx.addIssue({ code: 'custom', path: ['env'], message: 'stdio memory plugin env names must be unique' })
+    }
+    const secretTargets = Object.values(def.secretEnv)
+    if (new Set(secretTargets).size !== secretTargets.length) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['secretEnv'],
+        message: 'stdio memory plugin secret env targets must be unique'
+      })
+    }
+    if (secretTargets.some((name) => staticNames.includes(name))) {
+      ctx.addIssue({ code: 'custom', path: ['secretEnv'], message: 'secret env must not overwrite static env' })
+    }
+  })
+export type StdioMemoryPluginDef = z.infer<typeof StdioMemoryPluginDefSchema>
+
+const SandboxMountSchema = z
+  .object({
+    source: z.string().min(1),
+    target: z.string().min(1),
+    mode: z.enum(['readonly', 'writable', 'overlay']).default('readonly')
+  })
+  .strict()
+export type SandboxMount = z.infer<typeof SandboxMountSchema>
+
+/** The two sandboxing strategies of the `sandbox` table (session-executors.md §5). */
+export type SandboxBackend = 'srt' | 'microsandbox'
+
+export const MicrosandboxConfigSchema = z
+  .object({
+    image: z.string().trim().min(1).optional(),
+    // The backend accepts u8 CPUs and u32 MiB resource sizes.
+    cpus: z.number().int().positive().max(255).default(2),
+    memoryMiB: z.number().int().positive().max(0xffffffff).default(2048),
+    diskGiB: z
+      .number()
+      .int()
+      .positive()
+      .max(Math.floor(0xffffffff / 1024))
+      .default(10)
+  })
+  .strict()
+export type MicrosandboxConfig = z.infer<typeof MicrosandboxConfigSchema>
+
+// A strategy with no parameters (session-executors.md §5): `false` withdraws it, `true` or `{}` offers it.
+const StrategyOffer = z.union([z.boolean(), z.object({}).strict()]).transform((value) => value !== false)
+// `true` takes the defaults, an object sets them, `false` withdraws the strategy.
+const MicrosandboxOffer = z
+  .union([z.boolean(), MicrosandboxConfigSchema])
+  .transform((value): MicrosandboxConfig | false =>
+    value === true ? MicrosandboxConfigSchema.parse({}) : value === false ? false : value
+  )
+
+/** The daemon's AHP serving mode: no serving, observation only, or serving alongside legacy Webchat. */
+export const AhpMode = z.enum(['off', 'shadow', 'on'])
+
+export const ConfigSchema = z.object({
+  version: z.literal(1),
+  daemonId: z.string().optional(),
+  // Base URL of the Web App console; used to build the §9.1 "details" deep link
+  // (`<webAppUrl>/sessions/<sessionId>`). Unset ⇒ the daemon adopts the URL the CP sends
+  // down on `auth/ok` (the CP is authoritative for its own console origin); only truly
+  // absent when neither is set. A local config value wins over the CP-provided one.
+  webAppUrl: z.string().optional(),
+  controlPlane: z
+    .object({
+      enabled: z.boolean().default(true),
+      url: z.string().optional(),
+      key: z.string().optional(), // CP API key (opaque); sent as `apiKey` on the auth frame
+      heartbeatMs: z.number().int().default(15000)
+    })
+    .default({ enabled: false, heartbeatMs: 15000 }),
+  // Whether this daemon reports session usage to the control plane. On by default:
+  // a daemon meters its own sessions and the console's history depends on it.
+  //
+  // A deployment that meters upstream of the daemon turns it OFF so that plane is the
+  // single writer for those sessions — two writers on one session would fight over the
+  // same cumulative row. This ONLY silences the daemon→CP report: usage is still
+  // recorded locally, because session status, `session/list`, context/compaction
+  // detection and the daemon's own bookkeeping all read it from there.
+  usageReporting: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+  // Where this daemon keeps its state (#2188): a file under its root, or PostgreSQL named by a credentials file in the pool mount's shape; `--k8s` always reads the mount.
+  store: z
+    .discriminatedUnion('backend', [
+      z.object({ backend: z.literal('sqlite') }),
+      z.object({ backend: z.literal('postgres'), configFile: z.string().min(1) })
+    ])
+    .default({ backend: 'sqlite' }),
+  agentsDir: z.string().optional(), // resolved against root if absent
+  runtimes: z.record(z.string(), RuntimeDefSchema).optional(),
+  // MCP servers this daemon can attach to agent sessions (reported to the CP as
+  // facts by name + transport; agents opt in by name via their `mcpServers` list).
+  mcpServers: z.record(z.string(), McpServerDefSchema).optional(),
+  // Local memory plugins are daemon-private, operator-installed extensions.
+  // Agent/tenant configuration can reference a key but can never supply a
+  // command, path, args, or secret environment target.
+  memoryPlugins: z.record(MemoryPluginCommandRef, StdioMemoryPluginDefSchema).optional(),
+  // The strategy table (session-executors.md §5): every strategy is offered by default, and its startup probe decides whether it is available.
+  sandbox: z
+    .object({
+      host: StrategyOffer.default(true),
+      srt: StrategyOffer.default(true),
+      microsandbox: MicrosandboxOffer.prefault(true),
+      env: z.record(EnvironmentName, ProcessValue).default({}),
+      mounts: z.array(SandboxMountSchema).default([]),
+      // The executor facet switch (session-executors.md §10): this machine hosts isolated sessions of its group's other members, under ITS runtime sign-in. The owner's consent, so `config/push` never sets it.
+      share: z.boolean().default(false)
+    })
+    .strict()
+    .prefault({}),
+  security: z
+    .object({
+      // Prevent ACP runtimes from implicitly inheriting apps/connectors attached
+      // to the signed-in cloud account. Explicit local and daemon-injected MCP
+      // servers remain available. Set false only to opt this daemon out.
+      isolateAccountApps: z.boolean().default(true),
+      // Operator-owned remote-origin policy for daemon-managed workspace clone/pull. Default
+      // ['*'] admits any https/ssh origin; exact scheme+host+port entries tighten it, and []
+      // disables remote Git workspaces entirely.
+      workspaceGitAllowedOrigins: z.array(WorkspaceGitOrigin).default([...DEFAULT_WORKSPACE_GIT_ALLOWED_ORIGINS])
+    })
+    .strict()
+    .default({
+      isolateAccountApps: true,
+      workspaceGitAllowedOrigins: [...DEFAULT_WORKSPACE_GIT_ALLOWED_ORIGINS]
+    }),
+  // Relay roster the CP last published (shared-bot-relay.md §5). Persisted whole so
+  // the daemon can re-dial its relays at boot while the CP is unreachable (graceful
+  // degradation); the CP's register/ok snapshot re-converges it authoritatively once
+  // connected. CP-owned — overwritten on every roster converge, not hand-edited.
+  relays: z.array(RelayRosterEntry).default([]),
+  logging: z
+    .object({ level: z.enum(['trace', 'debug', 'info', 'warn', 'error']).default('info') })
+    .default({ level: 'info' }),
+  /** Daemon-local rollout switches. They are intentionally operator-owned and
+   * never negotiated through the control plane or placed on the message hot path. */
+  features: z
+    .object({
+      turnFinalContextRefresh: z.boolean().default(true),
+      // AHP serves only where the CP and relay also run AHP_MODE=on; `off` opts a daemon out.
+      ahp: z.object({ mode: AhpMode.default('on') }).default({ mode: 'on' }),
+      // Steer a message into the live turn over `_session/steering` instead of queueing it.
+      sessionSteering: z.boolean().default(true),
+      // Run the `auto` session mode and advertise it (auto-session-mode.md §3.1); off routes `auto` as Per thread and keeps every session's task tools.
+      autoSessionMode: z.boolean().default(true)
+    })
+    .default({
+      turnFinalContextRefresh: true,
+      sessionSteering: true,
+      ahp: { mode: 'on' },
+      autoSessionMode: true
+    }),
+  sessions: z
+    .object({
+      // A finished session untouched this long loses its row and transcript (#485); legacy '2weeks'/'1month' normalize to days.
+      retention: z
+        .union([
+          z.custom<SessionRetentionSetting>((v) => typeof v === 'string' && SESSION_RETENTION_RE.test(v), {
+            message: "expected 'never' or '<days>d' (e.g. '7d')"
+          }),
+          z.enum(['2weeks', '1month']).transform((v): SessionRetentionSetting => (v === '2weeks' ? '14d' : '30d'))
+        ])
+        .default('90d'),
+      // A finished session's workspace, sandbox and runtime home go after this, its row and transcript after `retention`.
+      workspaceRetention: z
+        .custom<SessionRetentionSetting>((v) => typeof v === 'string' && SESSION_RETENTION_RE.test(v), {
+          message: "expected 'never' or '<days>d' (e.g. '7d')"
+        })
+        .default('7d')
+    })
+    .default({ retention: '90d', workspaceRetention: '7d' }),
+  // The Azure CLI extension directory a proxied session loads `azure-devops` from (azure-devops-integration.md §6.4); absent ⇒ the daemon user's ~/.azure/cliextensions.
+  azureDevOps: z
+    .object({ cliExtensionDir: z.string().min(1).optional() })
+    .strict()
+    .optional(),
+  // The Google Chat write budget (google-chat-integration.md §10.8): 3,000 writes a minute per project over the pool; both knobs override.
+  googleChat: z
+    .object({
+      poolSize: z.number().int().min(1).default(4),
+      writesPerMinute: z.number().int().min(1).optional(),
+      writeBurst: z.number().int().min(1).optional()
+    })
+    .default({ poolSize: 4 }),
+  limits: z
+    .object({
+      maxAgents: z.number().int().default(32),
+      maxConcurrentSessions: z.number().int().default(32),
+      // Idle window before the sweep TTL-closes a session (§7.3) AND reaps its
+      // agent's ACP host back to `provisioned` (§7.2). Background work is protected
+      // by the SDK-lifecycle lease (a session with live background tasks or a running
+      // SDK cycle is not reclaimed regardless of this window — see
+      // docs/designs/background-task-aware-reclaim.md), so this no longer has to be
+      // stretched to "long enough that background jobs finish first". 15min: reclaim
+      // genuinely-idle hosts promptly (freeing runtime child RSS); the lease, not this
+      // window, is what keeps background work alive. (Was widened to 2h by bb328c01 as
+      // an interim workaround before the lease existed; now dialed back.)
+      agentIdleTimeoutMs: z.number().int().default(900_000),
+      // Ceiling on what may hold an idle host: live background work from host start, and a turn's unanswered card from when it was asked. 6h.
+      agentMaxLifetimeMs: z.number().int().default(21_600_000),
+      // How often the idle sweep runs: reaps idle ACP adapter children back to
+      // `provisioned` (§7.2) and TTL-closes idle sessions (§7.3). Keep well below
+      // agentIdleTimeoutMs so a host lingers at most one interval past its window.
+      idleSweepMs: z.number().int().default(60_000),
+      // Quiet window before the sweep removes an agent's materialized config-file
+      // secrets (shim/config-file-env.ts) — much shorter than the host TTL: the
+      // files are re-written before the next turn is dispatched, so a warm host
+      // stays fully usable and this only bounds how long the secret material
+      // rests on disk while no turn or background task is running.
+      configFilesIdleMs: z.number().int().default(60_000),
+      // SIGTERM/daemon-drain grace window: in-flight turns get this long to finish
+      // before the daemon cancels stragglers and tears children down (§2.5/§5.3).
+      shutdownDrainMs: z.number().int().default(25_000),
+      // The same window for a pool member (`--k8s`), which holds duty leases: a rollout waits for
+      // in-flight turns rather than cutting them, then releases every held group with an
+      // acknowledged `duty/release` inside this bound. terminationGracePeriodSeconds must exceed it.
+      poolShutdownDrainMs: z.number().int().default(300_000),
+      // How long a runtime config change lets running turns finish before cutting them for replay.
+      configRespawnDrainMs: z.number().int().default(300_000),
+      // §7.3 force-cancel backstop: after `!stop` we send session/cancel and wait
+      // this long; if the turn still hasn't yielded, we force-stop the host.
+      cancelBackstopMs: z.number().int().default(30_000),
+      // Stall watchdog (#1915, daemon-detailed-design.md §7.3): cancel a prompt with no runtime signal for this long; checked each idleSweepMs; 0 disables.
+      turnStallTimeoutMs: z.number().int().min(0).default(1_800_000),
+      // How many times to (re)try launching an agent's ACP host — spawn + the
+      // `initialize` handshake — before giving up and surfacing the failure to the
+      // session. Covers transient failures (a resource race, a slow cold start). A
+      // deterministic failure (missing binary) just burns all attempts then reports.
+      agentStartAttempts: z.number().int().min(1).default(3),
+      // Fixed backoff between agent-start attempts.
+      agentStartBackoffMs: z.number().int().min(0).default(500),
+      // Cap (bytes) for inlining an inbound attachment into the ACP prompt.
+      // Files larger than this are passed as a resource_link pointer, never
+      // downloaded/base64'd — bounds daemon RSS and the prompt frame size.
+      maxAttachmentBytes: z
+        .number()
+        .int()
+        .default(8 * 1024 * 1024),
+      // Hard cap (bytes) for ONE outbound file share (shareFile / sendMessage attachment).
+      // Its own knob because the two directions differ: inbound overflow degrades to a
+      // resource_link, outbound overflow is a refusal. Unset ⇒ follows maxAttachmentBytes.
+      maxOutboundFileBytes: z.number().int().positive().optional(),
+      // Total outbound file bytes ONE turn may upload. Unset ⇒ 2× the per-file cap.
+      maxOutboundFileBytesPerTurn: z.number().int().positive().optional()
+    })
+    .default({
+      maxAgents: 32,
+      maxConcurrentSessions: 32,
+      agentIdleTimeoutMs: 900_000,
+      agentMaxLifetimeMs: 21_600_000,
+      idleSweepMs: 60_000,
+      configFilesIdleMs: 60_000,
+      shutdownDrainMs: 25_000,
+      poolShutdownDrainMs: 300_000,
+      configRespawnDrainMs: 300_000,
+      cancelBackstopMs: 30_000,
+      turnStallTimeoutMs: 1_800_000,
+      agentStartAttempts: 3,
+      agentStartBackoffMs: 500,
+      maxAttachmentBytes: 8 * 1024 * 1024
+    })
+})
+export type Config = z.infer<typeof ConfigSchema>
+
+export type SessionRetention = Config['sessions']['retention']
+
+/** Retention setting → sweep window in ms ('<n>d' = n days); null ⇒ retention
+ * is disabled and the sweep never deletes anything. */
+export function sessionRetentionMs(retention: SessionRetention): number | null {
+  if (retention === 'never') return null
+  const days = Number.parseInt(retention, 10)
+  // Schema-validated 'Nd' always parses; a malformed value fails open to 'never'
+  // (keep sessions) rather than sweeping with a NaN window.
+  return Number.isFinite(days) && days > 0 ? days * 24 * 3_600_000 : null
+}
+
+/** The window after which a finished session's workspace goes: never later than its row, since a purge takes both. */
+export function workspaceRetentionMs(sessions: Config['sessions']): number | null {
+  const own = sessionRetentionMs(sessions.workspaceRetention)
+  const row = sessionRetentionMs(sessions.retention)
+  if (own === null) return row
+  return row === null ? own : Math.min(own, row)
+}

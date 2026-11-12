@@ -1,0 +1,1177 @@
+// No 'use client' here: rendered only by ModalProvider (the client boundary).
+
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { AgentModelProvider } from '@agentconnect.md/protocol'
+import { ModelProviderField } from '@/components/console/ModelProviderField'
+import { useSavedModelSource } from '@/lib/use-saved-model-source'
+import { useTranslations } from 'next-intl'
+import {
+  FALLBACK_RUNTIME_IDS,
+  selectableRuntimeIds,
+  modelCapability,
+  preferredModelFor,
+  resolveEffortForModel,
+  coordinatorModelOf,
+  permissionModeDefault,
+  runtimeSwitchPermissionMode,
+  runtimeLabel,
+  agentLabel,
+  poolLabel,
+  poolTagline,
+  POOL_PLACEMENT,
+  groupPlacementValue,
+  groupSetIdOf,
+  type MemberSetRow,
+  placementValueOf,
+  type Agent,
+  type AgentCallPolicy
+} from '@/lib/data'
+import { acpRuntime, useAcpRegistry } from '@/lib/acp-registry'
+import { fetchAgentDto, type AgentCallPolicyInput, type UpdateAgentInput } from '@/lib/api'
+import { useConsoleData } from '@/lib/data-context'
+import { featureFlagEnabled } from '@/lib/feature-flags'
+import { useOrgs } from '@/lib/org-context'
+import { buildAgentReachabilityGraph } from '@/lib/agent-reachability'
+import { Spinner } from '@/components/marks'
+import { Button, Icon, Toggle } from '@/components/ui'
+import { DaemonSelect, type DaemonSelectOption } from '@/components/console/DaemonSelect'
+import { useModal } from '@/components/console/ModalProvider'
+import { ModelSelectionField } from '@/components/console/decisions/ModelSelectionField'
+import type { AgentCoordinatorFilter, AgentModelSelection } from '@agentconnect.md/protocol/decision'
+import {
+  agentFilterPlacement,
+  coordinatorFilterSupported,
+  useCoordinatorFilterProviders
+} from '@/lib/coordinator-filter'
+import type { CoordinatorModel } from '@agentconnect.md/protocol/coordinator-model'
+import { editAgentCapabilitySource, editAgentDaemonChoices, preselectPlacementReset } from './edit-agent-daemon-choice'
+import { storedModelAfterPick } from './fallback-model'
+import { VisibilityField, sameSharing, type SharingValue } from '@/components/console/VisibilityField'
+import { AgentCallVisibility } from '@/components/console/AgentCallVisibility'
+import {
+  EnvSecretsFields,
+  envRecordFromRows,
+  envRowsFromEnv,
+  envSecretsError,
+  secretRowsFromKeys,
+  secretsPatchFromRows,
+  type EnvVarDraft,
+  type SecretDraft
+} from '@/components/console/EnvSecretsFields'
+import { OutputModeField } from '@/components/console/OutputModeField'
+import { ChatActionsField } from '@/components/console/ChatActionsField'
+import { ExecutionStrategyField } from '@/components/console/ExecutionStrategyField'
+import {
+  agentStrategies,
+  agentStrategyValue,
+  daemonStrategies,
+  executionAsk,
+  groupStrategies,
+  HOST_ONLY_TABLE,
+  HOST_STRATEGY,
+  strategyModelSource,
+  strategyOptions,
+  strategyUsesImage,
+  type PlacementStrategies
+} from '@/lib/execution-strategy'
+import { isOutputMode, type OutputMode } from '@/lib/output-mode'
+import { useDaemonDetail } from '@/lib/use-daemon-detail'
+
+// The edit dialog mirrors the Add-agent modal: a single scrolling form with a
+// section rail beside it. Every group card on the Configuration page opens this
+// modal at the matching anchor (basics / runtime behavior / access), so the two
+// edit surfaces stay identical. Workspace and Memory keep their own dedicated
+// editors (the Workspace card / the Memory tab), so they are NOT sections here.
+export type EditAgentSection = 'basics' | 'runtime' | 'access' | 'secrets'
+
+/** The agent-form settings a dialog can open on prefilled (capability-requests.md §4.12). */
+export interface EditAgentPrefill {
+  model?: string
+  reasoningEffort?: string
+  outputMode?: OutputMode
+  fastMode?: boolean
+  permissionMode?: string
+  runtime?: string
+  execution?: string
+  chatActions?: 'talk' | 'approve' | 'settings'
+  introduceOnJoin?: boolean
+  showFooter?: boolean
+  showStatusBar?: boolean
+  displayName?: string
+}
+
+// A picker row that opens the join-command dialog instead of naming a placement. Never a
+// daemonId, so it can never be saved: the onChange below intercepts it.
+const ADD_DAEMON = '__add_daemon__'
+
+const SECTIONS: ReadonlyArray<{ id: EditAgentSection; icon: string }> = [
+  { id: 'basics', icon: 'id-card' },
+  { id: 'runtime', icon: 'sliders-horizontal' },
+  { id: 'access', icon: 'lock' },
+  { id: 'secrets', icon: 'code-xml' }
+]
+
+const RAIL_ITEM_ON =
+  'flex flex-none cursor-pointer items-center gap-[9px] rounded-sm border-0 bg-(--surface-card) px-[10px] py-[7px] text-left font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary) shadow-(--shadow-xs)'
+const RAIL_ITEM_OFF =
+  'flex flex-none cursor-pointer items-center gap-[9px] rounded-sm border-0 bg-transparent px-[10px] py-[7px] text-left font-sans text-[12.5px] font-medium leading-normal text-(--text-secondary) hover:bg-(--surface-hover)'
+
+// Set-equality for the agent-call allow-lists (order-insensitive).
+function sameIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id) => b.includes(id))
+}
+
+// Drop self-references and duplicates before persisting an allow-list.
+function normalizeSelected(subjectAgentId: string, ids: string[]): string[] {
+  return [...new Set(ids)].filter((id) => id !== subjectAgentId)
+}
+
+export default function EditAgentModal({
+  agent,
+  focusSection,
+  preselectDaemonId,
+  prefill,
+  onSaved,
+  onFailed,
+  onClose
+}: {
+  agent: Agent
+  focusSection?: EditAgentSection
+  /** Runtime settings to open on as pending changes, as a capability request asked for them; the reader may still edit them. */
+  prefill?: EditAgentPrefill
+  /** A daemon to open the placement picker on — set when a chained Add-daemon dialog just
+   *  connected one, so Continue lands on a form already pointed at the new machine. */
+  preselectDaemonId?: string
+  /** Fired once the save went through — a native MCP App card reports it back to the agent. */
+  onSaved?: () => void
+  /** Why a submitted save did not land — the same card reports a refusal as well as a save. */
+  onFailed?: (message: string) => void
+  onClose: () => void
+}) {
+  const t = useTranslations('Agents.dialog')
+  const acpRegistry = useAcpRegistry()
+  const {
+    updateAgent,
+    moveAgent,
+    saveSharing,
+    saveAgentCallPolicy,
+    daemons,
+    agents,
+    memberSets,
+    memberSetsLoading,
+    orgSetIds
+  } = useConsoleData()
+  // Only owners may change organization entries, so only they get a link into
+  // Organization settings from the read-only "From organization" group (§8.2);
+  // other members see the group and its explanation alone.
+  const { myRole, orgPath } = useOrgs()
+  const { openModal } = useModal()
+  const [loaded, setLoaded] = useState(false)
+  const [sharing, setSharing] = useState<SharingValue>({ visibility: agent.visibility, sharedWith: agent.sharedWith })
+  const initialSharing = useRef<SharingValue>({ visibility: agent.visibility, sharedWith: agent.sharedWith })
+  const [name, setName] = useState(agent.name)
+  const [displayName, setDisplayName] = useState(agent.displayName ?? '')
+  const initialDisplayName = useRef(agent.displayName ?? '')
+  const [runtime, setRuntime] = useState(agent.runtime)
+  const initialRuntime = useRef(agent.runtime)
+  // The row's `daemon` cannot tell Cloud from one of the org's groups — only the set id plus the
+  // org's own list can (daemon-groups.md §2) — so seed through the same mapping the reload uses.
+  const initialPlacementValue =
+    placementValueOf(
+      {
+        placementKind: agent.placementKind,
+        daemonId: agent.daemon === '—' || agent.daemon === POOL_PLACEMENT ? null : agent.daemon,
+        setId: agent.setId
+      },
+      orgSetIds
+    ) ?? ''
+  const [daemonId, setDaemonId] = useState(initialPlacementValue)
+  const initialDaemonId = useRef(initialPlacementValue)
+  const [model, setModel] = useState('')
+  const initialModel = useRef('')
+  const [modelSelection, setModelSelection] = useState<AgentModelSelection | null>(null)
+  const initialModelSelection = useRef<AgentModelSelection | null>(null)
+  const [modelSelectionValid, setModelSelectionValid] = useState(true)
+  const [coordinatorModel, setCoordinatorModel] = useState<CoordinatorModel | null>(null)
+  const initialCoordinatorModel = useRef<CoordinatorModel | null>(null)
+  const [coordinatorDisabled, setCoordinatorDisabled] = useState(false)
+  const initialCoordinatorDisabled = useRef(false)
+  const [coordinatorFilter, setCoordinatorFilter] = useState<AgentCoordinatorFilter | null>(null)
+  const initialCoordinatorFilter = useRef<AgentCoordinatorFilter | null>(null)
+  const [outputMode, setOutputMode] = useState<OutputMode | ''>('')
+  const initialOutputMode = useRef<OutputMode | ''>('')
+  const [showFooter, setShowFooter] = useState(agent.showFooter)
+  const initialShowFooter = useRef(agent.showFooter)
+  const [showStatusBar, setShowStatusBar] = useState(agent.showStatusBar)
+  const initialShowStatusBar = useRef(agent.showStatusBar)
+  const [modelProvider, setModelProvider] = useState<AgentModelProvider | null>(null)
+  const initialModelProvider = useRef<AgentModelProvider | null>(null)
+  const [effort, setEffort] = useState('')
+  const initialEffort = useRef('')
+  const [fastMode, setFastMode] = useState(agent.fastMode)
+  const initialFastMode = useRef(agent.fastMode)
+  const [permissionMode, setPermissionMode] = useState(permissionModeDefault(agent.runtime))
+  const initialPermissionMode = useRef(permissionModeDefault(agent.runtime))
+  const [chatActions, setChatActions] = useState(agent.chatActions)
+  const initialChatActions = useRef(agent.chatActions)
+  const [introduceOnJoin, setIntroduceOnJoin] = useState(agent.introduceOnJoin)
+  const initialIntroduceOnJoin = useRef(agent.introduceOnJoin)
+  const [execution, setExecution] = useState(() => agentStrategyValue(agent))
+  const initialExecution = useRef(agentStrategyValue(agent))
+  // Agent-call visibility (both directions) — prefilled from the list `Agent`
+  // (which already carries the policy), edited here, and saved on the modal's
+  // Save alongside the spec/sharing diffs rather than immediately per change.
+  const [inboundMode, setInboundMode] = useState<AgentCallPolicy>(agent.callPolicy)
+  const initialInboundMode = useRef(agent.callPolicy)
+  const [inboundSelected, setInboundSelected] = useState<string[]>(agent.allowedCallerAgentIds)
+  const initialInboundSelected = useRef(agent.allowedCallerAgentIds)
+  const [outboundMode, setOutboundMode] = useState<AgentCallPolicy>(agent.outboundPolicy)
+  const initialOutboundMode = useRef(agent.outboundPolicy)
+  const [outboundSelected, setOutboundSelected] = useState<string[]>(agent.allowedTargetAgentIds)
+  const initialOutboundSelected = useRef(agent.allowedTargetAgentIds)
+  // "Secrets and variables" section — env vars (replaced wholesale) + write-only
+  // secrets (key-by-key patch), prefilled from the agent and diffed at save.
+  const [envRows, setEnvRows] = useState<EnvVarDraft[]>(() => envRowsFromEnv(agent.env))
+  const initialEnvRecord = useRef(envRecordFromRows(envRowsFromEnv(agent.env)))
+  const [secretRows, setSecretRows] = useState<SecretDraft[]>(() => secretRowsFromKeys(agent.secretKeys))
+  const initialSecretKeys = useRef(agent.secretKeys)
+  // Live secrets marked for removal; sent as `null` on save, like a removed secret.
+  const [removedLiveSecrets, setRemovedLiveSecrets] = useState<string[]>([])
+  // The list projection omits live secrets, so the detail read below supplies them.
+  const [liveSecrets, setLiveSecrets] = useState(agent.liveSecrets ?? [])
+  // What the saved placement offers, as the Control Plane projected it with the agent.
+  const [savedStrategies, setSavedStrategies] = useState<PlacementStrategies>(() => agentStrategies(agent, false))
+  const [repairPlacement, setRepairPlacement] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const fetched = useRef(false)
+
+  // Section rail: which section is highlighted, and the scroll pane it tracks.
+  const [activeSection, setActiveSection] = useState<EditAgentSection>(focusSection ?? 'basics')
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const sectionRefs = useRef(new Map<EditAgentSection, HTMLElement>())
+  const pinnedScrollTop = useRef<number | null>(null)
+  const sectionRef = (id: EditAgentSection) => (node: HTMLElement | null) => {
+    if (node) sectionRefs.current.set(id, node)
+    else sectionRefs.current.delete(id)
+  }
+
+  // Prefill from the raw spec (GET /agents/:id) — the UI `Agent` drops the exact
+  // runtime configuration and placement fields this modal edits.
+  //
+  // Waits for the group list, because resolving a placement is the one thing this prefill cannot
+  // redo: it happens once and seeds BOTH the picker's value and the ref every later change is
+  // compared against. Telling a group from Cloud needs the org's own set ids, and without them
+  // `placementValueOf` answers Cloud by design — so resolving early would leave a group-placed
+  // agent reading as Cloud forever, and make a real group-to-Cloud move look like no change at
+  // all and submit nothing. The form is behind its spinner until `loaded`, so this costs nothing
+  // visible. `memberSetsLoading` is false in mock mode and after a failed fetch, where an empty
+  // list IS the right answer.
+  useEffect(() => {
+    if (fetched.current || memberSetsLoading) return
+    fetched.current = true
+    fetchAgentDto(agent.id).then(
+      (dto) => {
+        setName(dto.name)
+        setLiveSecrets(dto.liveSecrets ?? [])
+        setDisplayName(dto.displayName ?? '')
+        initialDisplayName.current = dto.displayName ?? ''
+        setRuntime(dto.runtime ?? '')
+        initialRuntime.current = dto.runtime ?? ''
+        // Through the SAME mapping the list projection uses, so a pool agent reloads as the pool
+        // rather than as unplaced — `daemonId` is null for it by design.
+        const placement = placementValueOf(dto, orgSetIds) ?? ''
+        // The ref stays the SAVED placement — a preselect is a pending change like any other,
+        // so the move flow and the Save button see it as one.
+        setDaemonId(preselectDaemonId || placement)
+        initialDaemonId.current = placement
+        setModel(dto.model ?? '')
+        initialModel.current = dto.model ?? ''
+        setModelSelection(dto.modelSelection ?? null)
+        initialModelSelection.current = dto.modelSelection ?? null
+        setCoordinatorModel(dto.coordinatorModel ?? null)
+        initialCoordinatorModel.current = dto.coordinatorModel ?? null
+        setCoordinatorDisabled(dto.coordinatorDisabled === true)
+        initialCoordinatorDisabled.current = dto.coordinatorDisabled === true
+        setCoordinatorFilter(dto.coordinatorFilter ?? null)
+        initialCoordinatorFilter.current = dto.coordinatorFilter ?? null
+        setModelProvider(dto.modelProvider ?? null)
+        initialModelProvider.current = dto.modelProvider ?? null
+        setEffort(dto.reasoningEffort ?? '')
+        initialEffort.current = dto.reasoningEffort ?? ''
+        const nextOutputMode = isOutputMode(dto.outputMode) ? dto.outputMode : ''
+        setOutputMode(nextOutputMode)
+        initialOutputMode.current = nextOutputMode
+        setShowFooter(dto.showFooter ?? true)
+        initialShowFooter.current = dto.showFooter ?? true
+        setShowStatusBar(dto.showStatusBar ?? false)
+        initialShowStatusBar.current = dto.showStatusBar ?? false
+        setFastMode(dto.fastMode ?? false)
+        initialFastMode.current = dto.fastMode ?? false
+        setPermissionMode(dto.permissionMode ?? permissionModeDefault(dto.runtime ?? ''))
+        initialPermissionMode.current = dto.permissionMode ?? permissionModeDefault(dto.runtime ?? '')
+        setChatActions(dto.chatActions ?? 'talk')
+        initialChatActions.current = dto.chatActions ?? 'talk'
+        setIntroduceOnJoin(dto.introduceOnJoin ?? false)
+        initialIntroduceOnJoin.current = dto.introduceOnJoin ?? false
+        // An older CP that names no strategy reads as the unplaced agent's host-only table.
+        const storedExecution = agentStrategyValue({ execution: dto.execution ?? HOST_STRATEGY })
+        setExecution(storedExecution)
+        initialExecution.current = storedExecution
+        setSavedStrategies(agentStrategies({ strategies: dto.strategies ?? HOST_ONLY_TABLE }, false))
+        const fresh: SharingValue = { visibility: dto.visibility, sharedWith: dto.sharedWith }
+        setSharing(fresh)
+        initialSharing.current = fresh
+        // A chained Add-daemon lands the form on a brand-new machine — reset the runtime/model
+        // to what it actually reports rather than a pair it cannot run.
+        const target = preselectDaemonId ? daemons.find((d) => d.daemonId === preselectDaemonId) : undefined
+        const reset = preselectPlacementReset(target?.runtimeModels, dto.runtime ?? '', dto.model ?? '')
+        if (reset?.kind === 'runtime') {
+          setRuntime(reset.runtime)
+          setModel('')
+          setEffort('')
+          setPermissionMode(runtimeSwitchPermissionMode(target, reset.runtime))
+        } else if (reset?.kind === 'model') {
+          setModel('')
+          setEffort('')
+        }
+        // Applied after the saved values so they read as unsaved edits and Save writes them.
+        // A prefilled runtime switches as the picker would, so a model it does not offer is cleared unless one is prefilled too.
+        if (prefill?.runtime !== undefined && prefill.runtime !== (dto.runtime ?? '')) {
+          setRuntime(prefill.runtime)
+          setModel('')
+          setEffort('')
+          setPermissionMode(
+            runtimeSwitchPermissionMode(
+              daemons.find((d) => d.daemonId === placement),
+              prefill.runtime
+            )
+          )
+        }
+        if (prefill?.model !== undefined) setModel(prefill.model)
+        if (prefill?.reasoningEffort !== undefined) setEffort(prefill.reasoningEffort)
+        if (prefill?.outputMode !== undefined) setOutputMode(prefill.outputMode)
+        if (prefill?.fastMode !== undefined) setFastMode(prefill.fastMode)
+        if (prefill?.permissionMode !== undefined) setPermissionMode(prefill.permissionMode)
+        if (prefill?.execution !== undefined) setExecution(prefill.execution)
+        if (prefill?.chatActions !== undefined) setChatActions(prefill.chatActions)
+        if (prefill?.introduceOnJoin !== undefined) setIntroduceOnJoin(prefill.introduceOnJoin)
+        if (prefill?.showFooter !== undefined) setShowFooter(prefill.showFooter)
+        if (prefill?.showStatusBar !== undefined) setShowStatusBar(prefill.showStatusBar)
+        // A built-in agent's name is fixed; the route refuses it, so a prefill must not make Save fail.
+        if (prefill?.displayName !== undefined && !agent.builtin) setDisplayName(prefill.displayName)
+        setLoaded(true)
+      },
+      (e) => {
+        setErr(e instanceof Error ? e.message : String(e))
+        setLoaded(true)
+      }
+    )
+    // Re-runs only to pick up the moment the group list finishes loading; `fetched` latches it to
+    // one fetch, so this cannot double-fetch.
+  }, [agent.id, memberSetsLoading])
+
+  // An unplaced agent defaults to Cloud, then the first placement-ready local daemon.
+  const autofilledDaemon = useRef(false)
+  useEffect(() => {
+    if (!loaded || autofilledDaemon.current || initialDaemonId.current || daemonId) return
+    const ready = (d: (typeof daemons)[number]) => d.status === 'online' && d.caps.features.includes('agent-move-v1')
+    // With the pool hidden it is not a default either — an unplaced agent lands on a machine.
+    const offered = featureFlagEnabled('daemon-pool') ? daemons : daemons.filter((d) => !d.pool)
+    const target = offered.find((d) => d.pool && ready(d)) ?? offered.find(ready)
+    if (target) {
+      autofilledDaemon.current = true
+      setDaemonId(target.daemonId)
+    }
+  }, [loaded, daemons, daemonId])
+
+  // Jump to the requested section once the form has rendered. Both `scrollIntoView`
+  // and `scrollTo` resolve to a no-op inside the dialog's nested overflow
+  // containers, so the pane's `scrollTop` is assigned outright (same technique the
+  // Add-agent modal uses). Gated on `loaded` — the section nodes only exist then.
+  useEffect(() => {
+    if (!loaded) return
+    const target = focusSection ?? 'basics'
+    setActiveSection(target)
+    const pane = scrollRef.current
+    const node = sectionRefs.current.get(target)
+    if (!pane || !node) return
+    pane.scrollTop = pane.scrollTop + node.getBoundingClientRect().top - pane.getBoundingClientRect().top - 20
+    pinnedScrollTop.current = pane.scrollTop
+  }, [loaded, focusSection])
+
+  const goToSection = (id: EditAgentSection) => {
+    setActiveSection(id)
+    const pane = scrollRef.current
+    const node = sectionRefs.current.get(id)
+    if (!pane || !node) return
+    pane.scrollTop = pane.scrollTop + node.getBoundingClientRect().top - pane.getBoundingClientRect().top - 20
+    pinnedScrollTop.current = pane.scrollTop
+  }
+
+  // Scroll-spy: highlight the last section whose heading crossed the top of the
+  // scroller; reaching the bottom always selects the final (short) section.
+  // Re-armed on `loaded` because the scroll pane only mounts after the fetch.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const sync = () => {
+      if (pinnedScrollTop.current !== null) {
+        if (Math.abs(el.scrollTop - pinnedScrollTop.current) < 2) return
+        pinnedScrollTop.current = null
+      }
+      const scrollable = el.scrollHeight - el.clientHeight > 8
+      if (scrollable && el.scrollTop + el.clientHeight >= el.scrollHeight - 4) {
+        setActiveSection(SECTIONS[SECTIONS.length - 1]!.id)
+        return
+      }
+      const paneTop = el.getBoundingClientRect().top
+      let current = SECTIONS[0]!.id
+      for (const s of SECTIONS) {
+        const node = sectionRefs.current.get(s.id)
+        if (node && node.getBoundingClientRect().top - paneTop <= 24) current = s.id
+      }
+      setActiveSection(current)
+    }
+    sync()
+    el.addEventListener('scroll', sync, { passive: true })
+    return () => el.removeEventListener('scroll', sync)
+  }, [loaded])
+
+  const moveReady = (d: (typeof daemons)[number] | undefined) =>
+    !!d &&
+    (!d.approval || d.approval.status === 'approved') &&
+    d.status === 'online' &&
+    d.caps.features.includes('agent-move-v1')
+  // The group the picker currently names, if any — the one thing `daemonId` alone cannot say.
+  const selectedGroupId = groupSetIdOf(daemonId)
+  const selectedGroup = memberSets.find((group) => group.setId === selectedGroupId)
+  const memberOf = (group: MemberSetRow | undefined) =>
+    group && daemons.find((d) => group.memberDaemonIds.includes(d.daemonId) && moveReady(d))
+  const selectedGroupServing = memberOf(selectedGroup) !== undefined
+  const daemonChoices = editAgentDaemonChoices(
+    daemons,
+    daemonId,
+    initialDaemonId.current,
+    featureFlagEnabled('daemon-pool')
+  )
+  // The daemon whose reported CAPABILITIES the form reads — one live member for a set target, and
+  // never the placement itself.
+  // The model catalogs live on the single-daemon read; until it lands this is the fleet row.
+  const daemon = useDaemonDetail(editAgentCapabilitySource(daemons, daemonId, memberSets, daemonChoices.poolChoice))
+  const sourceDaemon = daemons.find((d) => d.daemonId === initialDaemonId.current)
+  const daemonChanged = daemonId !== initialDaemonId.current
+  // The filter is offered where the agent runs now and its daemon screens messages (auto-session-mode.md §4.7).
+  const filterProviders = useCoordinatorFilterProviders(agentFilterPlacement(agent))
+  const filterOffered = !daemonChanged && coordinatorFilterSupported(daemon?.caps?.features)
+  const initialPlacement = daemonChanged && !initialDaemonId.current
+  const placementRequested = daemonChanged || repairPlacement
+  // Placement consumes the durable agent definition. Pending execution config
+  // is therefore saved first so the selected runtime/model and call policy ride
+  // the target activation bundle. Sharing is saved last because a valid edit may
+  // remove the current editor's own access.
+  // A pending move shows the target's offer; the picker stays locked until the move is saved.
+  const placementStrategies: PlacementStrategies =
+    daemonId === POOL_PLACEMENT
+      ? { kind: 'pool' }
+      : !daemonChanged
+        ? savedStrategies
+        : selectedGroup
+          ? groupStrategies(
+              daemons
+                .filter((d) => d.status === 'online' && selectedGroup.memberDaemonIds.includes(d.daemonId))
+                .map((d) => d.caps)
+            )
+          : daemonStrategies(daemon?.caps)
+  const executionOptions = strategyOptions(placementStrategies, execution)
+  // Only a strategy that starts the image's install reads its image-binary warning.
+  const readsImage = placementStrategies.kind !== 'pool' && strategyUsesImage(execution)
+  // Models come from the chosen strategy's catalog: the host install's for host and srt, the image's for a VM.
+  const strategySource =
+    daemon && strategyModelSource(daemon, placementStrategies.kind === 'pool' ? undefined : execution)
+  const savedCredentials = daemonId !== POOL_PLACEMENT && modelProvider !== null
+  const {
+    source: modelSource,
+    status: modelSourceStatus,
+    retry: retryModelSource
+  } = useSavedModelSource(strategySource, savedCredentials)
+  const poolServing = daemons.some((candidate) => candidate.pool && moveReady(candidate))
+  const daemonOptions: DaemonSelectOption[] = [
+    // With the flag off the picker offers Cloud only to an agent already ON it — same rule
+    // the groups below follow, and for the same reason: "No daemon" for a placed agent is untrue.
+    ...(daemonChoices.offerPool
+      ? [
+          {
+            // The POOL, named as itself. The server picks the member — and re-picks it after every
+            // rollout, which is the whole reason this stopped being a member id.
+            value: POOL_PLACEMENT,
+            label: poolLabel(),
+            ...(poolServing ? {} : { meta: 'unavailable' }),
+            title: poolServing ? poolTagline() : `${poolLabel()} is currently unavailable.`,
+            kind: 'pool' as const,
+            disabled: initialDaemonId.current !== POOL_PLACEMENT && !poolServing
+          }
+        ]
+      : []),
+    ...(daemonChoices.currentPoolChoice
+      ? [
+          {
+            value: daemonChoices.currentPoolChoice.daemonId,
+            label: 'Current placement',
+            title: `Currently on an unavailable node — select ${poolLabel()} above to recover.`
+          }
+        ]
+      : []),
+    // Groups without a serving member remain listed but disabled unless they are the current placement.
+    ...memberSets.map((group) => {
+      const serving = group.memberDaemonIds.some((id) => moveReady(daemons.find((d) => d.daemonId === id)))
+      const current = groupPlacementValue(group.setId) === initialDaemonId.current
+      return {
+        value: groupPlacementValue(group.setId),
+        label: group.name,
+        meta: `${group.memberDaemonIds.length} daemon${group.memberDaemonIds.length === 1 ? '' : 's'}`,
+        title: serving
+          ? 'Any daemon in the group can serve this agent.'
+          : group.memberDaemonIds.length === 0
+            ? 'No daemons in this group yet.'
+            : 'No daemon in this group is serving right now.',
+        kind: 'group' as const,
+        disabled: !current && !serving
+      }
+    }),
+    ...(!initialDaemonId.current ? [{ value: '', label: t('edit.noDaemon'), title: t('edit.noDaemonHint') }] : []),
+    ...(daemonId && !daemon && !selectedGroup && daemonId !== POOL_PLACEMENT
+      ? [
+          {
+            value: daemonId,
+            label: `Current daemon (${daemonId.slice(0, 8)})`,
+            title: 'This daemon is no longer visible.'
+          }
+        ]
+      : []),
+    ...daemonChoices.localChoices.map((candidate) => {
+      const eligible = moveReady(candidate)
+      const current = candidate.daemonId === initialDaemonId.current
+      const unapproved = candidate.approval && candidate.approval.status !== 'approved'
+      return {
+        value: candidate.daemonId,
+        label: candidate.name,
+        ...(unapproved
+          ? { meta: t('daemonSelect.approvalRequired') }
+          : candidate.status !== 'online'
+            ? { meta: 'offline' }
+            : !candidate.caps.features.includes('agent-move-v1')
+              ? { meta: 'needs update' }
+              : {}),
+        title: unapproved
+          ? t('daemonSelect.approvalRequired')
+          : candidate.status !== 'online'
+            ? 'Offline — bring this machine online to use it.'
+            : !candidate.caps.features.includes('agent-move-v1')
+              ? 'Upgrade required before this machine can host the agent.'
+              : 'Uses the credentials on this machine.',
+        disabled: !current && !eligible
+      }
+    }),
+    // Last row: no machine to pick means the picker itself offers connecting one.
+    { value: ADD_DAEMON, label: t('edit.addDaemon'), title: t('edit.addDaemonHint'), icon: 'plus' }
+  ]
+  const sourceUnavailable = !!sourceDaemon && !moveReady(sourceDaemon)
+  const sourceOffline = sourceDaemon?.status === 'offline'
+  // Offline source + ready destination ⇒ the move is a force reassign; the banner says so.
+  const forceMove = daemonChanged && !initialPlacement && sourceOffline && moveReady(daemon)
+  const sourceBlocksSafeMove = daemonChanged && sourceUnavailable && !forceMove
+
+  // Preserve the configured runtime while keeping the selected daemon's reported choices authoritative.
+  const reportedRuntimeIds = daemon ? selectableRuntimeIds(daemon, runtime) : []
+  const runtimeIds = daemon ? reportedRuntimeIds : FALLBACK_RUNTIME_IDS
+  const runtimeOptions = savedCredentials
+    ? selectableRuntimeIds(modelSource ?? { runtimeModels: [] }, runtime)
+    : runtime && !runtimeIds.includes(runtime)
+      ? [runtime, ...runtimeIds]
+      : runtimeIds
+  const runtimeMeta = acpRuntime(acpRegistry, runtime)
+  // Models are only what the daemon reports for this runtime — advertised ids
+  // verbatim, never a synthesized "Default" entry: an agent without an explicit
+  // model DISPLAYS the runtime's resolved default (else the first model) — the
+  // stored value stays '' until the user picks one themselves, so opening+saving
+  // never silently pins. A runtime that advertises nothing (cursor) leaves the
+  // picker inert. During a move a stale stored id stays visible as unavailable
+  // so Save can require an explicit compatible choice.
+  const runtimeProfile = modelSource?.runtimeModels.find((r) => r.runtime === runtime)
+  const reportedModels = runtimeProfile?.models ?? []
+  const selectedModel =
+    model && (savedCredentials || reportedModels.includes(model) || daemonChanged)
+      ? model
+      : preferredModelFor(modelSource, runtime)
+  const runtimeUnavailable = daemonChanged && reportedRuntimeIds.length > 0 && !reportedRuntimeIds.includes(runtime)
+  const modelUnavailable =
+    daemonChanged && !!selectedModel && reportedModels.length > 0 && !reportedModels.includes(selectedModel)
+  // A new strategy whose catalog lacks the stored model: Save keeps the one the picker shows in its place.
+  const strategyModel =
+    execution !== initialExecution.current && !!model && !!selectedModel && selectedModel !== model
+      ? selectedModel
+      : undefined
+  const credentialModel =
+    savedCredentials && modelProvider !== initialModelProvider.current && !model ? selectedModel : undefined
+
+  // Agent-call reachability, computed with THIS agent's in-progress policy so the
+  // "X of Y" hints track the pending edits (same graph the standalone card built).
+  const peers = useMemo(() => agents.filter((candidate) => candidate.id !== agent.id), [agents, agent.id])
+  const reachability = useMemo(
+    () =>
+      buildAgentReachabilityGraph(
+        agents.map((candidate) =>
+          candidate.id === agent.id
+            ? {
+                ...candidate,
+                callPolicy: inboundMode,
+                allowedCallerAgentIds: inboundSelected,
+                outboundPolicy: outboundMode,
+                allowedTargetAgentIds: outboundSelected
+              }
+            : candidate
+        )
+      ),
+    [agent.id, agents, inboundMode, inboundSelected, outboundMode, outboundSelected]
+  )
+  const inboundEffectivePeerIds = reachability.incomingByAgentId.get(agent.id) ?? []
+  const outboundEffectivePeerIds = reachability.outgoingByAgentId.get(agent.id) ?? []
+  const callVisibilityEditable = agent.canEdit
+
+  // A runtime switch resets the per-runtime model and effort, and preselects the new runtime's auto mode, else full access, else its default.
+  const onRuntimeChange = (nextRuntime: string) => {
+    setRuntime(nextRuntime)
+    setModel('')
+    setEffort('')
+    setPermissionMode(runtimeSwitchPermissionMode(modelSource, nextRuntime))
+  }
+
+  const normalizedDisplayName = displayName.trim() ? displayName.trim() : null
+  // env is replaced wholesale; secrets is a key-by-key merge (set/replace/delete).
+  const envRecord = envRecordFromRows(envRows)
+  const secretsPatch = secretsPatchFromRows(secretRows, initialSecretKeys.current)
+  const envChanged =
+    Object.keys(envRecord).length !== Object.keys(initialEnvRecord.current).length ||
+    Object.keys(envRecord).some((k) => envRecord[k] !== initialEnvRecord.current[k])
+  const secretsChanged = Object.keys(secretsPatch).length > 0
+  const modelSelectionChanged = JSON.stringify(modelSelection) !== JSON.stringify(initialModelSelection.current)
+  const validateModelSelection =
+    savedCredentials ||
+    modelSelectionChanged ||
+    model !== initialModel.current ||
+    runtime !== initialRuntime.current ||
+    daemonChanged ||
+    execution !== initialExecution.current
+  const envSecretError = envSecretsError(envRows, secretRows)
+  const patch: UpdateAgentInput = {
+    ...(normalizedDisplayName !== (initialDisplayName.current.trim() || null)
+      ? { displayName: normalizedDisplayName }
+      : {}),
+    ...(strategyModel || credentialModel
+      ? { model: strategyModel || credentialModel }
+      : model !== initialModel.current
+        ? { model: model || (modelSelection ? selectedModel : null) }
+        : {}),
+    ...(JSON.stringify(coordinatorModel) !== JSON.stringify(initialCoordinatorModel.current)
+      ? { coordinatorModel }
+      : {}),
+    ...(coordinatorDisabled !== initialCoordinatorDisabled.current ? { coordinatorDisabled } : {}),
+    ...(JSON.stringify(coordinatorFilter) !== JSON.stringify(initialCoordinatorFilter.current)
+      ? { coordinatorFilter }
+      : {}),
+    ...(modelSelectionChanged ? { modelSelection, ...(modelSelection && !model ? { model: selectedModel } : {}) } : {}),
+    ...(runtime.trim() !== initialRuntime.current ? { runtime: runtime.trim() } : {}),
+    ...(daemonId !== POOL_PLACEMENT && modelProvider !== initialModelProvider.current ? { modelProvider } : {}),
+    ...(effort !== initialEffort.current ? { reasoningEffort: effort || null } : {}),
+    ...(outputMode !== initialOutputMode.current ? { outputMode: outputMode || null } : {}),
+    ...(showFooter !== initialShowFooter.current ? { showFooter } : {}),
+    ...(showStatusBar !== initialShowStatusBar.current ? { showStatusBar } : {}),
+    ...(fastMode !== initialFastMode.current ? { fastMode } : {}),
+    // A runtime switch always sends its mode: without one the Control Plane picks the new runtime's own.
+    ...(permissionMode !== initialPermissionMode.current || runtime.trim() !== initialRuntime.current
+      ? { permissionMode }
+      : {}),
+    ...(chatActions !== initialChatActions.current ? { chatActions } : {}),
+    ...(introduceOnJoin !== initialIntroduceOnJoin.current ? { introduceOnJoin } : {}),
+    // Saved before any move, so it is asked of the saved placement.
+    ...(execution !== initialExecution.current ? executionAsk(savedStrategies, execution) : {}),
+    ...(envChanged ? { env: envRecord } : {}),
+    ...(secretsChanged ? { secrets: secretsPatch } : {}),
+    ...(removedLiveSecrets.length > 0
+      ? { liveSecrets: Object.fromEntries(removedLiveSecrets.map((name) => [name, null])) }
+      : {})
+  }
+  const hasSpecChanges = Object.keys(patch).length > 0
+  const hasSharingChanges = !sameSharing(sharing, initialSharing.current)
+  const hasCallPolicyChanges =
+    inboundMode !== initialInboundMode.current ||
+    outboundMode !== initialOutboundMode.current ||
+    !sameIds(inboundSelected, initialInboundSelected.current) ||
+    !sameIds(outboundSelected, initialOutboundSelected.current)
+
+  const save = async () => {
+    if (saving || (validateModelSelection && !modelSelectionValid)) return
+    if (envSecretError) {
+      setErr(t(`errors.${envSecretError.key}`, envSecretError.values))
+      return
+    }
+    if (daemonChanged) {
+      // A restricted current daemon may be intentionally absent from this
+      // viewer's daemon list. Let the server perform the authoritative source
+      // readiness check in that case; only reject a source we can actually see.
+      if (initialDaemonId.current && sourceDaemon && !moveReady(sourceDaemon) && !forceMove) {
+        setErr(
+          sourceDaemon.status === 'offline'
+            ? t('edit.bringOnlineRetry', { daemon: sourceDaemon.name })
+            : t('edit.upgradeBeforeMove', { daemon: sourceDaemon.name })
+        )
+        return
+      }
+      // A set is a target, not a member: ready when any live member could serve it.
+      const targetReady =
+        daemonId === POOL_PLACEMENT ? poolServing : selectedGroup ? selectedGroupServing : moveReady(daemon)
+      if (!targetReady) {
+        setErr(
+          daemonId === POOL_PLACEMENT
+            ? t('edit.noOnlinePool', { pool: poolLabel() })
+            : selectedGroup
+              ? t('edit.noOnlineGroup', { group: selectedGroup.name })
+              : t('edit.chooseOnlineDaemon')
+        )
+        return
+      }
+      // Placement is where a deferred runtime becomes mandatory (§3.2). Ahead of
+      // `runtimeUnavailable`, which an unset runtime also trips — a target that
+      // advertises profiles cannot advertise the empty one, and "does not
+      // advertise the — runtime" is not the problem to report.
+      if (initialPlacement && !runtime.trim()) {
+        setErr(t('edit.chooseRuntime'))
+        return
+      }
+      if (runtimeUnavailable) {
+        setErr(
+          t('edit.runtimeUnavailable', {
+            daemon: daemon?.name ?? poolLabel(),
+            runtime: runtimeLabel(runtime, runtimeMeta?.name)
+          })
+        )
+        return
+      }
+      if (modelUnavailable) {
+        // Reachable only when the target DOES advertise models (see
+        // `modelUnavailable`), so the picker always has a real id to point at —
+        // never a synthesized "Default" the runtime does not offer.
+        setErr(t('edit.modelUnavailable', { daemon: daemon?.name ?? poolLabel(), model: selectedModel }))
+        return
+      }
+    }
+    if (repairPlacement && !daemonId) {
+      setErr(t('edit.noCurrentDaemon'))
+      return
+    }
+    if (repairPlacement && daemon && !moveReady(daemon)) {
+      setErr(t('edit.currentDaemonNotReady'))
+      return
+    }
+    setSaving(true)
+    setErr(null)
+    try {
+      // `name` is intentionally never sent: the slug is the daemon-facing handle
+      // (workspace dir, launch key) and is immutable in the console — only the
+      // display name is renameable.
+      // Description is edited on its own card (EditDescriptionModal) — never sent here.
+      // Save daemon-affecting settings before placement so the target receives
+      // one current activation snapshot. These endpoints are intentionally
+      // durable: if placement later fails, the completed edits remain saved.
+      if (hasSpecChanges) await updateAgent(agent.id, patch)
+      // Agent-call visibility is a normal agent edit and uses canEdit.
+      if (hasCallPolicyChanges) {
+        const body: AgentCallPolicyInput = {
+          callPolicy: inboundMode,
+          allowedCallerAgentIds: inboundMode === 'selected' ? normalizeSelected(agent.id, inboundSelected) : [],
+          outboundPolicy: outboundMode,
+          allowedTargetAgentIds: outboundMode === 'selected' ? normalizeSelected(agent.id, outboundSelected) : []
+        }
+        await saveAgentCallPolicy(agent.id, body)
+      }
+      if (placementRequested) {
+        const target =
+          daemonId === POOL_PLACEMENT
+            ? { kind: 'pool' as const }
+            : selectedGroup
+              ? { kind: 'set' as const, setId: selectedGroup.setId }
+              : { kind: 'daemon' as const, daemonId }
+        await moveAgent(agent.id, target, forceMove ? { force: true } : undefined)
+      }
+      // Sharing uses canManageSharing and may intentionally remove this editor's
+      // own visibility. Apply it only after every operation that still needs the
+      // editor's authorization, including placement.
+      if (hasSharingChanges) await saveSharing('agents', agent.id, sharing)
+      onSaved?.()
+      onClose()
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e)
+      setErr(message)
+      onFailed?.(message)
+      setSaving(false)
+    }
+  }
+
+  const target = <span className="font-mono text-[12.5px]">{agentLabel(agent)}</span>
+
+  return (
+    <>
+      <div className="modalhead">
+        <span className="flex-1 font-sans text-[16px] font-semibold leading-normal">
+          {t('edit.title')} <span className="mono text-[14px]">{agent.name}</span>
+        </span>
+        <button className="iconbtn" onClick={onClose}>
+          <Icon name="x" size={16} />
+        </button>
+      </div>
+      {!loaded ? (
+        <div className="modalbody flex justify-center py-8">
+          <Spinner size={28} />
+        </div>
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col desktop:min-h-[420px] desktop:flex-row">
+          {/* Section rail: a column beside the form on desktop, a scrollable strip
+              above it on phones (a 172px rail would eat a bottom sheet). */}
+          <nav className="flex flex-none items-center gap-1 overflow-x-auto border-b border-(--border-subtle) bg-(--surface-sunken) p-2 desktop:w-[200px] desktop:flex-col desktop:items-stretch desktop:gap-[2px] desktop:overflow-x-visible desktop:overflow-y-auto desktop:border-r desktop:border-b-0 desktop:py-[10px]">
+            {SECTIONS.map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                className={activeSection === s.id ? RAIL_ITEM_ON : RAIL_ITEM_OFF}
+                onClick={() => goToSection(s.id)}
+              >
+                <Icon
+                  name={s.icon}
+                  size={14}
+                  color={activeSection === s.id ? 'var(--brand)' : 'var(--text-tertiary)'}
+                  className="flex-none"
+                />
+                <span className="truncate">{t(`sections.${s.id}`)}</span>
+              </button>
+            ))}
+          </nav>
+          <div ref={scrollRef} className="min-w-0 flex-1 overflow-y-auto p-5">
+            <section ref={sectionRef('basics')}>
+              <div className="font-sans text-[13px] font-semibold leading-normal text-(--text-primary)">
+                {t('sections.basics')}
+              </div>
+              <div className="mt-[13px] grid grid-cols-1 gap-[14px] desktop:grid-cols-2">
+                <div className="fld">
+                  <span className="fldlbl">{t('name')}</span>
+                  <input
+                    className="inp mn cursor-not-allowed text-(--text-tertiary)"
+                    value={name}
+                    disabled
+                    aria-label={t('edit.nameReadOnly')}
+                  />
+                </div>
+                <div className="fld">
+                  <span className="fldlbl">{t('displayName')}</span>
+                  {/* Built-in preset agents keep their fixed brand identity — the CP
+                      refuses the change too. */}
+                  <input
+                    className="inp"
+                    placeholder={t('displayNamePlaceholder')}
+                    value={displayName}
+                    onChange={(e) => setDisplayName(e.target.value)}
+                    disabled={!!agent.builtin}
+                    title={agent.builtin ? t('edit.builtinNameLocked') : undefined}
+                    autoFocus={!agent.builtin}
+                  />
+                </div>
+                {/* Placement belongs to Basics; runtime and model are configured together below. */}
+                <div
+                  className={`desktop:col-span-2 grid grid-cols-1 gap-[14px] ${daemonId !== POOL_PLACEMENT ? 'desktop:grid-cols-2' : ''}`}
+                >
+                  <div className="fld min-w-0">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="fldlbl">{t('runsOn')}</span>
+                      {!!initialDaemonId.current && !daemonChanged && (
+                        <button
+                          type="button"
+                          className="font-sans text-[11.5px] font-medium leading-normal text-(--accent) hover:underline"
+                          onClick={() => {
+                            setRepairPlacement((value) => !value)
+                            setErr(null)
+                          }}
+                        >
+                          {repairPlacement ? t('edit.cancelRepair') : t('edit.repairPlacement')}
+                        </button>
+                      )}
+                    </div>
+                    <DaemonSelect
+                      value={daemonId}
+                      options={daemonOptions}
+                      placeholder={t('edit.noDaemon')}
+                      onChange={(nextDaemonId) => {
+                        // Continue reopens this dialog with the fresh daemon listed.
+                        if (nextDaemonId === ADD_DAEMON) {
+                          openModal('daemon', agent, { focusSection: 'basics' })
+                          return
+                        }
+                        setDaemonId(nextDaemonId)
+                        setRepairPlacement(false)
+                        setErr(null)
+                      }}
+                    />
+                  </div>
+                  {daemonId !== POOL_PLACEMENT && (
+                    <ModelProviderField value={modelProvider} onChange={setModelProvider} />
+                  )}
+                  {/* Keep the placement warning with the daemon selector. */}
+                  {sourceDaemon && sourceUnavailable && (
+                    <div className="col-span-full flex items-start gap-[9px] rounded-md border border-(--amber-500) bg-(--status-paused-soft) px-3 py-[10px]">
+                      <Icon name="triangle-alert" size={15} color="var(--amber-500)" className="mt-[1px] flex-none" />
+                      <div className="min-w-0 flex-1">
+                        <div className="font-sans text-[12.5px] font-semibold leading-normal text-(--text-primary)">
+                          {t('edit.safeMoveUnavailable')}
+                        </div>
+                        <div className="mt-[3px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-secondary)">
+                          {forceMove ? (
+                            <>{t('edit.sourceForceOffline', { daemon: sourceDaemon.name })}</>
+                          ) : sourceOffline ? (
+                            <>{t('edit.bringOnline', { daemon: sourceDaemon.name })}</>
+                          ) : (
+                            <>{t('edit.upgradeBeforeMove', { daemon: sourceDaemon.name })}</>
+                          )}
+                        </div>
+                        {sourceOffline && !daemonChanged && (
+                          <div className="mt-[5px] font-sans text-[11.5px] font-normal leading-[1.5] text-(--text-tertiary)">
+                            {t('edit.selectOnlineDestination')}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            <section ref={sectionRef('runtime')} className="mt-5 border-t border-(--border-subtle) pt-5">
+              <ModelSelectionField
+                agentId={agent.id}
+                value={modelSelection}
+                onChange={(value) => {
+                  setModelSelection(value)
+                  if (savedCredentials) setModelProvider('auto')
+                }}
+                onValidityChange={setModelSelectionValid}
+                fallback={{ runtime, model: selectedModel, effort, permissionMode, fastMode }}
+                source={modelSource}
+                sourceStatus={modelSourceStatus}
+                onRetrySource={retryModelSource}
+                runtimes={runtimeOptions}
+                readsImage={readsImage}
+                requireAvailableModel={savedCredentials}
+                aside={<ChatActionsField value={chatActions} onChange={setChatActions} />}
+                coordinator={{
+                  value: coordinatorModelOf({ runtime, model: selectedModel, coordinatorModel }, modelSource),
+                  onChange: setCoordinatorModel,
+                  disabled: coordinatorDisabled,
+                  onDisabledChange: setCoordinatorDisabled,
+                  ...(filterOffered
+                    ? {
+                        filter: { value: coordinatorFilter, providers: filterProviders, onChange: setCoordinatorFilter }
+                      }
+                    : {})
+                }}
+                onFallbackChange={(target) => {
+                  if (savedCredentials) setModelProvider('auto')
+                  if (target.runtime !== runtime) onRuntimeChange(target.runtime)
+                  setModel((stored) => storedModelAfterPick(target, runtime, selectedModel, stored))
+                  setEffort(
+                    (current) =>
+                      target.effort ??
+                      resolveEffortForModel(
+                        target.runtime,
+                        modelCapability(daemon, target.runtime, target.model),
+                        current
+                      )
+                  )
+                  if (target.permissionMode !== undefined) setPermissionMode(target.permissionMode)
+                  if (target.fastMode !== undefined) setFastMode(target.fastMode)
+                }}
+              />
+              <div className="mt-[13px] grid grid-cols-1 gap-[14px] desktop:grid-cols-2">
+                {placementStrategies.kind !== 'pool' && (
+                  <ExecutionStrategyField
+                    options={executionOptions}
+                    value={execution}
+                    onChange={setExecution}
+                    disabledReason={placementRequested ? t('edit.saveComputerFirst') : undefined}
+                  />
+                )}
+                <OutputModeField
+                  className="desktop:col-span-2"
+                  value={outputMode}
+                  onChange={(mode) => setOutputMode(mode)}
+                  showFooter={showFooter}
+                  onShowFooterChange={setShowFooter}
+                  showStatusBar={showStatusBar}
+                  onShowStatusBarChange={setShowStatusBar}
+                />
+                <div className="fld desktop:col-span-2">
+                  <span className="fldlbl">{t('edit.introduceOnJoin')}</span>
+                  <div className="inp min-w-0 justify-between gap-3">
+                    <span className="inline-flex min-w-0 items-center gap-2">
+                      <Icon name="users" size={16} color="var(--text-tertiary)" className="flex-none" />
+                      <span className="truncate font-sans text-[13px] font-medium leading-normal text-(--text-secondary)">
+                        {introduceOnJoin ? t('edit.introduceOnJoinOn') : t('off')}
+                      </span>
+                    </span>
+                    <Toggle checked={introduceOnJoin} onChange={setIntroduceOnJoin} />
+                  </div>
+                  <span className="mt-[6px] text-[11px] text-(--text-secondary)">{t('edit.introduceOnJoinHint')}</span>
+                </div>
+              </div>
+            </section>
+
+            <section ref={sectionRef('access')} className="mt-5 border-t border-(--border-subtle) pt-5">
+              <div className="font-sans text-[13px] font-semibold leading-normal text-(--text-primary)">
+                {t('sections.access')}
+              </div>
+              <div className="flex flex-col gap-[14px]">
+                <VisibilityField
+                  value={sharing}
+                  onChange={setSharing}
+                  disabled={!agent.canManageSharing}
+                  label={t('teamVisibility')}
+                />
+                <div className="fld">
+                  <span className="fldlbl">{t('agentVisibility')}</span>
+                  <div className="flex flex-col gap-3">
+                    <AgentCallVisibility
+                      variant="section"
+                      direction="inbound"
+                      mode={inboundMode}
+                      selectedIds={inboundSelected}
+                      effectivePeerIds={inboundEffectivePeerIds}
+                      peers={peers}
+                      daemons={daemons}
+                      groups={memberSets}
+                      target={target}
+                      editable={callVisibilityEditable}
+                      busy={saving}
+                      onChange={(mode, selectedIds) => {
+                        setInboundMode(mode)
+                        setInboundSelected(selectedIds)
+                      }}
+                    />
+                    <AgentCallVisibility
+                      variant="section"
+                      direction="outbound"
+                      mode={outboundMode}
+                      selectedIds={outboundSelected}
+                      effectivePeerIds={outboundEffectivePeerIds}
+                      peers={peers}
+                      daemons={daemons}
+                      groups={memberSets}
+                      target={target}
+                      editable={callVisibilityEditable}
+                      busy={saving}
+                      onChange={(mode, selectedIds) => {
+                        setOutboundMode(mode)
+                        setOutboundSelected(selectedIds)
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section ref={sectionRef('secrets')} className="mt-5 border-t border-(--border-subtle) pt-5">
+              <EnvSecretsFields
+                envRows={envRows}
+                setEnvRows={setEnvRows}
+                secretRows={secretRows}
+                setSecretRows={setSecretRows}
+                // Assigned organization entries render above the editable rows as a
+                // read-only group. Only owners get the Manage link; other members
+                // see the group and its explanation alone (design §8.2).
+                organizationVariables={agent.organizationVariables}
+                organizationSecretKeys={agent.organizationSecretKeys}
+                liveSecrets={liveSecrets.filter((secret) => !removedLiveSecrets.includes(secret.name))}
+                onRemoveLiveSecret={(name) => setRemovedLiveSecrets((names) => [...names, name])}
+                {...(myRole === 'owner' ? { organizationSettingsHref: orgPath('/settings') } : {})}
+              />
+            </section>
+
+            {placementRequested && (
+              <div className="mt-[18px] flex items-start gap-[9px] rounded-md border border-(--amber-500) bg-(--status-paused-soft) px-3 py-[11px]">
+                <Icon name="triangle-alert" size={15} color="var(--amber-500)" className="mt-[1px] flex-none" />
+                {initialPlacement ? (
+                  <span className="font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-secondary)">
+                    {t('edit.initialPlacementNotice', { daemon: daemon?.name ?? t('edit.selectedDaemon') })}
+                  </span>
+                ) : daemonChanged && forceMove ? (
+                  <span className="font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-secondary)">
+                    {t('edit.forceReassignNotice', { daemon: sourceDaemon?.name ?? t('edit.currentDaemon') })}
+                  </span>
+                ) : daemonChanged ? (
+                  <span className="font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-secondary)">
+                    {t('edit.hardCutoverNotice', { daemon: sourceDaemon?.name ?? t('edit.currentDaemon') })}
+                  </span>
+                ) : (
+                  <span className="font-sans text-[12.5px] font-normal leading-[1.5] text-(--text-secondary)">
+                    {t('edit.reprovisionNotice')}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="mt-[14px] flex items-center gap-2 rounded-md bg-(--surface-sunken) px-3 py-[11px] font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+              <Icon name="info" size={14} />
+              {t('edit.agentNameImmutable')}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="modalfoot flex-wrap">
+        {err && (
+          <div
+            role="alert"
+            className="flex w-full items-start gap-2 rounded-md border border-(--status-error) bg-(--status-error-soft) px-3 py-[11px] font-sans text-[12.5px] font-normal leading-[1.5] text-(--status-error)"
+          >
+            <Icon name="triangle-alert" size={15} className="flex-none" />
+            {err}
+          </div>
+        )}
+        <div className="flex-1" />
+        <Button variant="ghost" onClick={onClose}>
+          {t('cancel')}
+        </Button>
+        <Button
+          variant={forceMove ? 'danger' : 'primary'}
+          disabled={saving || !loaded || sourceBlocksSafeMove || (validateModelSelection && !modelSelectionValid)}
+          onClick={() => void save()}
+        >
+          <Icon name={forceMove ? 'triangle-alert' : 'check'} size={15} />
+          {saving
+            ? initialPlacement
+              ? t('edit.placing')
+              : forceMove
+                ? t('edit.reassigning')
+                : daemonChanged
+                  ? t('edit.moving')
+                  : repairPlacement
+                    ? t('edit.repairing')
+                    : t('edit.saving')
+            : initialPlacement
+              ? t('edit.placeAgent')
+              : forceMove
+                ? t('edit.forceReassign')
+                : daemonChanged
+                  ? t('edit.moveAgent')
+                  : repairPlacement
+                    ? t('edit.repairAgent')
+                    : t('edit.saveChanges')}
+        </Button>
+      </div>
+    </>
+  )
+}

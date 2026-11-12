@@ -1,0 +1,195 @@
+import { cache } from 'react'
+
+// Runtime public config injection.
+//
+// Next inlines `NEXT_PUBLIC_*` at build time, which would pin a prebuilt image to
+// one tenant. Instead the server reads plain (non-public) env at request time and
+// emits an inline script that sets `window.__AC_ENV` before the app bundle runs;
+// the client (lib/auth.ts) reads from there. Same image, configured at deploy
+// time. Values here are public (they ship to the browser regardless) — never put
+// secrets in __AC_ENV. Falls back to the NEXT_PUBLIC_* build-time vars so local
+// dev (.env.local) keeps working unchanged.
+
+// LOGTO_* gate the social-login UI; CP_URL points the console at its Control
+// Plane; RELAY_URL points at the public relay ingress. OTEL_WEB_* configures
+// browser-side tracing only. All are public (they reach the browser anyway) —
+// never add secrets.
+const KEYS = [
+  'LOGTO_ENDPOINT',
+  'LOGTO_APP_ID',
+  'LOGTO_API_RESOURCE',
+  // Which social sign-in methods this deployment offers (comma-separated Logto
+  // connector targets; unset/`*` ⇒ all). The console is the only side that reads
+  // it — see lib/social-login-providers.
+  'SOCIAL_PROVIDERS',
+  // The SSO connector the sign-in page offers, and the name on its button.
+  'SSO_CONNECTOR_ID',
+  'SSO_NAME',
+  'CP_URL',
+  'RELAY_URL',
+  // The deployment's GitLab instance base URL (workspace tile derivation). Served
+  // by the CP's runtime-config below; this env key is the local-dev fallback.
+  'GITLAB_URL',
+  // Dedicated MCP origin (mirrors the CP's PUBLIC_MCP_URL). Unset ⇒ the console
+  // renders the MCP endpoint as CP_URL + /mcp (ConnectAiCard).
+  'MCP_URL',
+  // Billing service base URL. Only an address: whether the console offers billing
+  // is the `billing` feature flag in FEATURE_FLAGS. Both are PRESENTATION only —
+  // the billing service authenticates and authorizes every request itself.
+  'BILLING_URL',
+  // Help-menu link targets — let an OSS fork point the rail-footer help menu at its
+  // own docs / connector guide / releases / support channel without rebuilding.
+  // Unset ⇒ the agentconnect.md defaults (see Shell.tsx HELP_LINK_DEFAULTS).
+  // Sender address the waitlist page tells approved users to expect the activation
+  // link from. Must match the admin mailer's verified sender. Unset ⇒ the
+  // agentconnect.md default (see Waitlist.tsx FROM_EMAIL_DEFAULT).
+  'WAITLIST_FROM_EMAIL',
+  'HELP_MCP_URL',
+  'HELP_DOCS_URL',
+  'HELP_RELEASES_URL',
+  'HELP_SUPPORT_URL',
+  // The deployed release tag (chart image.tag); unset ⇒ the release baked into this build.
+  'RELEASE_VERSION',
+  'OTEL_WEB_ENABLED',
+  'OTEL_WEB_TRACES_ENDPOINT',
+  'OTEL_WEB_SERVICE_NAME',
+  'OTEL_WEB_DEPLOYMENT_ENVIRONMENT',
+  'OTEL_WEB_RESOURCE_ATTRIBUTES',
+  'OTEL_WEB_PROPAGATE_TRACE_HEADER_URLS',
+  // PostHog product analytics (opt-in). POSTHOG_API_KEY is PostHog's PUBLIC
+  // project key (phc_…) — safe in the browser. Unset ⇒ analytics is a no-op
+  // (lib/analytics never initializes). POSTHOG_HOST defaults to us.i.posthog.com.
+  'POSTHOG_API_KEY',
+  'POSTHOG_HOST',
+  // The per-file cap of console file transfer, set when the Control Plane signs them, and the largest part
+  // when uploads may go in parts. Served by the CP's runtime-config below; these env keys are the local-dev fallback.
+  'FILE_TRANSFER_MAX_BYTES',
+  'FILE_TRANSFER_PART_BYTES',
+  // Console feature flags this deployment turns on — a comma-separated list of ids
+  // (lib/feature-flags.ts). Unset ⇒ none: a flagged surface ships in every build and appears
+  // only where an environment asks for it, so one prebuilt image serves them all.
+  'WEBCHAT_PROTOCOL',
+  'AHP_ENABLED',
+  'AHP_PUBLIC_ACCESS',
+  'FEATURE_FLAGS'
+] as const
+
+interface RuntimeConfigResponse {
+  schemaVersion: '1'
+  revision: number | null
+  config: null | {
+    auth: null | {
+      endpoint: string
+      issuer: string
+      appId: string
+      apiResource: string | null
+      socialProviders: string[]
+      sso?: null | { connectorId: string; name: string }
+    }
+    gitlab?: null | { instanceUrl: string }
+  }
+  fileTransfer?: null | { maxBytes: number; partBytes?: number }
+  webchatProtocol?: 'legacy' | 'ahp'
+  ahp?: { enabled: boolean; publicAccess: boolean }
+}
+
+interface DeploymentEnv {
+  /** The DB-owned deployment config, which replaces the env auth keys; null for an env-only deployment. */
+  config: Record<string, string> | null
+  /** Process topology the CP serves either way. */
+  topology: Record<string, string>
+}
+
+// The CP's runtime switches (Webchat protocol, AHP access) reach a running console within this window.
+const DEPLOYMENT_ENV_TTL_MS = 30_000
+let deploymentEnv: Promise<DeploymentEnv | null> | undefined
+let deploymentSnapshot: { env: DeploymentEnv | null; at: number } | undefined
+
+// A stale snapshot serves while one refresh runs, so a CP outage never stalls a page; none yet means wait for it.
+function currentDeploymentEnv(): DeploymentEnv | null | Promise<DeploymentEnv | null> {
+  if (deploymentSnapshot && Date.now() - deploymentSnapshot.at < DEPLOYMENT_ENV_TTL_MS) return deploymentSnapshot.env
+  if (!deploymentEnv) {
+    const pending = loadDeploymentEnv()
+    deploymentEnv = pending
+    pending
+      .then((env) => (deploymentSnapshot = { env, at: Date.now() }))
+      .catch(() => {})
+      .finally(() => {
+        if (deploymentEnv === pending) deploymentEnv = undefined
+      })
+  }
+  return deploymentSnapshot ? deploymentSnapshot.env : deploymentEnv
+}
+
+async function loadDeploymentEnv(): Promise<DeploymentEnv | null> {
+  const base = process.env.CP_INTERNAL_URL
+  if (!base) return null
+  const url = new URL('runtime-config', base.endsWith('/') ? base : `${base}/`)
+  const response = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(5_000) })
+  if (!response.ok) throw new Error(`runtime config returned HTTP ${response.status}`)
+  const body = (await response.json()) as RuntimeConfigResponse
+  if (body.schemaVersion !== '1') return null
+  const topology: Record<string, string> = {
+    WEBCHAT_PROTOCOL: body.webchatProtocol === 'ahp' ? 'ahp' : 'legacy',
+    AHP_ENABLED: String(body.ahp?.enabled === true),
+    AHP_PUBLIC_ACCESS: String(body.ahp?.publicAccess === true)
+  }
+  if (body.fileTransfer) topology.FILE_TRANSFER_MAX_BYTES = String(body.fileTransfer.maxBytes)
+  if (body.fileTransfer?.partBytes) topology.FILE_TRANSFER_PART_BYTES = String(body.fileTransfer.partBytes)
+  if (body.config === null) return { config: null, topology }
+
+  const env: Record<string, string> = {}
+  if (body.config.auth) {
+    env.LOGTO_ENDPOINT = body.config.auth.endpoint
+    env.LOGTO_APP_ID = body.config.auth.appId
+    if (body.config.auth.apiResource) env.LOGTO_API_RESOURCE = body.config.auth.apiResource
+    env.SOCIAL_PROVIDERS = body.config.auth.socialProviders.join(',')
+    if (body.config.auth.sso) {
+      env.SSO_CONNECTOR_ID = body.config.auth.sso.connectorId
+      env.SSO_NAME = body.config.auth.sso.name
+    }
+  }
+  if (body.config.gitlab?.instanceUrl) env.GITLAB_URL = body.config.gitlab.instanceUrl
+  return { config: env, topology }
+}
+
+// Share one resolved snapshot between server-rendered content and the browser's inline config.
+export const resolvePublicEnv = cache(async (): Promise<Record<string, string>> => {
+  const env: Record<string, string> = {}
+  for (const k of KEYS) {
+    const v = process.env[k] ?? process.env[`NEXT_PUBLIC_${k}`] ?? ''
+    if (v) env[k] = v
+  }
+  // Accept the Control Plane's PUBLIC_RELAY_URL name in shared local env files.
+  const relayUrl = process.env.RELAY_URL ?? process.env.PUBLIC_RELAY_URL ?? process.env.NEXT_PUBLIC_RELAY_URL
+  if (relayUrl) env.RELAY_URL = relayUrl
+
+  if (process.env.CP_INTERNAL_URL) {
+    let persisted: DeploymentEnv | null = null
+    try {
+      persisted = await currentDeploymentEnv()
+    } catch {}
+    if (persisted?.config) {
+      for (const key of [
+        'LOGTO_ENDPOINT',
+        'LOGTO_APP_ID',
+        'LOGTO_API_RESOURCE',
+        'SOCIAL_PROVIDERS',
+        'SSO_CONNECTOR_ID',
+        'SSO_NAME'
+      ]) {
+        delete env[key]
+      }
+      Object.assign(env, persisted.config)
+    }
+    if (persisted) Object.assign(env, persisted.topology)
+  }
+  return env
+})
+
+/** Inline <script> that publishes the runtime public config to the browser. */
+export async function PublicEnvScript() {
+  // Escape `<` so a configured value cannot terminate the inline script.
+  const json = JSON.stringify(await resolvePublicEnv()).replaceAll('<', '\\u003c')
+  return <script dangerouslySetInnerHTML={{ __html: `window.__AC_ENV=${json}` }} />
+}

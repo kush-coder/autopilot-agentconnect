@@ -1,0 +1,669 @@
+/**
+ * SessionRepo.recordMilestone — converged milestones, NO bodies (design §3.8, §6 Phase 1).
+ *
+ * One row per ACP session, storing ONLY the converged milestone + list/detail
+ * metadata — never the message stream. Body-locality is enforced structurally:
+ * there is no text/content/messages/body column to write.
+ * `recordMilestone` is an upsert keyed on sessionId so repeated `event/session`
+ * frames advance the same row's phase.
+ */
+import { describe, it, expect } from 'vitest'
+import { prisma } from '../setup.db.js'
+import { PgSessionRepo } from '../../src/persistence/repositories/session.repo.js'
+import { DEF_ORG, seedAgent, seedDaemon, seedLaunch } from '../fixtures/seed.js'
+import { DEFAULT_OWNER_ID } from '../../prisma/seed.js'
+import { AgentId, BotId, DaemonId, LaunchId, SessionId } from '../../src/domain/ids.js'
+import { poolSetId } from '../fakes/member-set.js'
+
+const AGENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+const OTHER_AGENT = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+const DAEMON = 'd1111111-1111-4111-8111-111111111111'
+const OTHER_DAEMON = 'd2222222-2222-4222-8222-222222222222'
+const LAUNCH = '11111111-1111-4111-8111-111111111111'
+const SESSION = '55555555-5555-4555-8555-555555555555'
+
+async function fixtures(): Promise<void> {
+  await seedDaemon(prisma, DAEMON)
+  await seedAgent(prisma, AGENT)
+  await seedLaunch(prisma, LAUNCH, AGENT, DAEMON)
+}
+
+function ev(phase: 'start' | 'plan' | 'problem' | 'end', extra: Record<string, unknown> = {}) {
+  return {
+    sessionId: SessionId(SESSION),
+    agentId: AgentId(AGENT),
+    launchId: LaunchId(LAUNCH),
+    phase,
+    platform: 'slack' as const,
+    channel: 'C1',
+    thread: 'T1',
+    at: new Date(),
+    ...extra
+  }
+}
+
+describe('SessionRepo.recordMilestone — milestone-only (real Postgres)', () => {
+  const CONVERSATION = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+
+  async function webchatFixture(): Promise<void> {
+    await fixtures()
+    await prisma.webchatConversation.create({
+      data: { id: CONVERSATION, orgId: DEF_ORG, agentId: AGENT, userId: DEFAULT_OWNER_ID }
+    })
+  }
+
+  function webchatEv(sessionId: string, phase: 'start' | 'end', at: Date) {
+    return {
+      sessionId: SessionId(sessionId),
+      agentId: AgentId(AGENT),
+      phase,
+      platform: 'webchat' as const,
+      channel: CONVERSATION,
+      thread: '',
+      at,
+      classification: {
+        visibility: 'private' as const,
+        ownerIdentity: `user:${DEFAULT_OWNER_ID}`,
+        source: 'default' as const
+      }
+    }
+  }
+
+  it('authorizes the current webchat session even after per-turn end milestones stamp endedAt', async () => {
+    await webchatFixture()
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(webchatEv('acp-current', 'start', new Date('2026-07-05T10:00:00.000Z')))
+    // The daemon emits phase 'end' after EVERY turn; an idle-between-turns
+    // session (endedAt set) is still the currently installed one.
+    await repo.recordMilestone(webchatEv('acp-current', 'end', new Date('2026-07-05T10:05:00.000Z')))
+
+    const row = await prisma.sessionMeta.findUnique({ where: { id: 'acp-current' } })
+    expect(row?.endedAt).not.toBeNull()
+    expect(row?.visibility).toBe('private')
+    const current = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(current?.currentSessionId).toBe('acp-current')
+  })
+
+  it('never lets an old row steal the pointer back from a replacement', async () => {
+    await webchatFixture()
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(webchatEv('acp-old-private', 'start', new Date('2026-07-05T10:00:00.000Z')))
+    await repo.recordMilestone(webchatEv('acp-old-private', 'end', new Date('2026-07-05T10:05:00.000Z')))
+    // Session rebuild: a replacement session becomes current and is widened.
+    await repo.recordMilestone(webchatEv('acp-replacement', 'start', new Date('2026-07-05T11:00:00.000Z')))
+    await prisma.sessionMeta.update({ where: { id: 'acp-replacement' }, data: { visibility: 'org' } })
+
+    const conversation = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(conversation?.currentSessionId).toBe('acp-replacement')
+
+    // A late re-emit from the OLD session must not steal the pointer back.
+    await repo.recordMilestone(webchatEv('acp-old-private', 'end', new Date('2026-07-05T11:30:00.000Z')))
+    const after = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(after?.currentSessionId).toBe('acp-replacement')
+  })
+
+  it('keeps the pointer on the coordinator when a task keyed on a thread lands on the conversation (webchat-threads.md §5.4)', async () => {
+    await webchatFixture()
+    const repo = new PgSessionRepo(prisma)
+    const at = (iso: string) => new Date(`2026-07-05T${iso}:00.000Z`)
+    await repo.recordMilestone({
+      ...webchatEv('acp-coordinator', 'start', at('10:00')),
+      thread: 'append:coordinator-1'
+    })
+    // A newer task row on the conversation's channel, keyed on a root's postId, with its owner already reported.
+    await repo.recordMilestone({
+      ...webchatEv('acp-task', 'start', at('10:05')),
+      thread: '11111111-1111-4111-8111-111111111111',
+      taskParentSessionId: SessionId('acp-coordinator')
+    })
+    const conversation = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(conversation?.currentSessionId).toBe('acp-coordinator')
+    // A later re-emit of the task without its thread keeps the thread recorded before, so it still takes nothing.
+    await repo.recordMilestone({ ...webchatEv('acp-task', 'end', at('10:10')), thread: undefined })
+    const after = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(after?.currentSessionId).toBe('acp-coordinator')
+  })
+
+  it('tracks a member’s own pointer until it is removed, then never reinstalls one', async () => {
+    await webchatFixture()
+    await seedAgent(prisma, OTHER_AGENT)
+    await prisma.webchatConversationAgent.createMany({
+      data: [
+        { conversationId: CONVERSATION, agentId: AGENT, role: 'primary', ord: 0, addedByUserId: DEFAULT_OWNER_ID },
+        { conversationId: CONVERSATION, agentId: OTHER_AGENT, role: 'member', ord: 1, addedByUserId: DEFAULT_OWNER_ID }
+      ]
+    })
+    const repo = new PgSessionRepo(prisma)
+    const memberEv = (sessionId: string, at: Date) => ({
+      ...webchatEv(sessionId, 'start', at),
+      agentId: AgentId(OTHER_AGENT)
+    })
+    const member = () =>
+      prisma.webchatConversationAgent.findUnique({
+        where: { conversationId_agentId: { conversationId: CONVERSATION, agentId: OTHER_AGENT } }
+      })
+
+    await repo.recordMilestone(memberEv('acp-member', new Date('2026-07-05T10:00:00.000Z')))
+    expect((await member())?.currentSessionId).toBe('acp-member')
+
+    await prisma.webchatConversationAgent.update({
+      where: { conversationId_agentId: { conversationId: CONVERSATION, agentId: OTHER_AGENT } },
+      data: { removedAt: new Date(), currentSessionId: null }
+    })
+    await repo.recordMilestone(memberEv('acp-member-late', new Date('2026-07-05T11:00:00.000Z')))
+    expect((await member())?.currentSessionId).toBeNull()
+  })
+
+  it('leaves the conversation pointer null when nothing maintained it', async () => {
+    await webchatFixture()
+    const repo = new PgSessionRepo(prisma)
+    // Historical rows exist, but nothing maintained the pointer (e.g. the
+    // session row was deleted → FK SetNull).
+    await prisma.sessionMeta.create({
+      data: {
+        id: 'orphan-private',
+        agentId: AGENT,
+        platform: 'webchat',
+        channel: CONVERSATION,
+        phase: 'start',
+        orgId: DEF_ORG,
+        ownerIdentity: `user:${DEFAULT_OWNER_ID}`,
+        visibility: 'private',
+        visibilitySource: 'default',
+        lastActivityAt: new Date(),
+        startedAt: new Date()
+      }
+    })
+    const conversation = await prisma.webchatConversation.findUnique({ where: { id: CONVERSATION } })
+    expect(conversation?.currentSessionId).toBeNull()
+  })
+
+  it('creates a session row on the first milestone with the launch tie', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+
+    const lastActivityAt = new Date('2026-07-05T10:51:00.000Z')
+    await repo.recordMilestone(
+      ev('start', {
+        summary: 'kickoff',
+        link: 'https://x/y',
+        title: 'Roll out api@1.4.2',
+        status: 'prompting',
+        lastActivityAt,
+        triggeredBy: 'U-DANA',
+        channelName: 'deploys',
+        triggeredByName: 'Dana Reyes',
+        threadUrl: 'https://slack.example/archives/C1/p1',
+        runtime: 'claude',
+        model: 'opus',
+        effort: 'high',
+        fastMode: false,
+        permissionMode: 'acceptEdits',
+        outputMode: 'medium',
+        workspaceIsolation: 'session',
+        daemonId: DaemonId(DAEMON)
+      })
+    )
+
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    expect(got).not.toBeNull()
+    expect(got?.phase).toBe('start')
+    expect(got?.launchId).toBe(LAUNCH)
+    expect(got?.summary).toBe('kickoff')
+    expect(got?.link).toBe('https://x/y')
+    expect(got?.platform).toBe('slack')
+    expect(got?.title).toBe('Roll out api@1.4.2')
+    expect(got?.status).toBe('prompting')
+    expect(got?.lastActivityAt?.toISOString()).toBe(lastActivityAt.toISOString())
+    expect(got?.triggeredBy).toBe('U-DANA')
+    expect(got?.channelName).toBe('deploys')
+    expect(got?.triggeredByName).toBe('Dana Reyes')
+    expect(got?.threadUrl).toBe('https://slack.example/archives/C1/p1')
+    expect(got?.runtime).toBe('claude')
+    expect(got?.model).toBe('opus')
+    expect(got?.effort).toBe('high')
+    expect(got?.fastMode).toBe(false) // an explicit false roundtrips (≠ null/unset)
+    expect(got?.permissionMode).toBe('acceptEdits')
+    expect(got?.outputMode).toBe('medium')
+    expect(got?.workspaceIsolation).toBe('session')
+    expect(got?.daemonId).toBe(DAEMON)
+  })
+
+  it('keeps the first reporting daemon as the immutable content owner', async () => {
+    await fixtures()
+    await seedDaemon(prisma, OTHER_DAEMON)
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(DAEMON) }))
+    await repo.recordMilestone(ev('end', { daemonId: DaemonId(OTHER_DAEMON) }))
+
+    const row = await prisma.sessionMeta.findUnique({ where: { id: SESSION } })
+    expect(row?.daemonId).toBe(DAEMON)
+  })
+
+  // The recorder's row is deleted 15 minutes after a pool Pod goes silent and takes `daemonId`
+  // with it, so where the bodies went has to be recorded beside it, at the one moment it is
+  // knowable (domain/session-content.ts).
+  it('stamps the shared content store of a pool recorder, and nothing for a private one', async () => {
+    await fixtures()
+    const setId = (await prisma.memberSet.findFirstOrThrow({ where: { orgId: null } })).id
+    const POOL_MEMBER = 'd3333333-3333-4333-8333-333333333333'
+    await prisma.daemon.create({ data: { id: POOL_MEMBER, orgId: null, sessionEpoch: 1n, status: 'ready' } })
+    await prisma.memberSetMember.create({ data: { setId, daemonId: POOL_MEMBER } })
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(POOL_MEMBER) }))
+    expect((await prisma.sessionMeta.findUnique({ where: { id: SESSION } }))?.contentSetId).toBe(setId)
+
+    // DAEMON is org-scoped and in no set — its store is its own, so no peer may read it.
+    await prisma.sessionMeta.delete({ where: { id: SESSION } })
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(DAEMON) }))
+    expect((await prisma.sessionMeta.findUnique({ where: { id: SESSION } }))?.contentSetId).toBeNull()
+  })
+
+  // A daemon group's members choose their own stores (#2188); only the store id they report says
+  // whether two of them share rows, so it is stamped beside the set.
+  it('stamps an org-set recorder only when it reports a shared store, and that store id', async () => {
+    await fixtures()
+    const STORE = 'a5555555-5555-4555-8555-555555555555'
+    const setId = (
+      await prisma.memberSet.create({
+        data: { id: 'b7777777-7777-4777-8777-777777777777', orgId: DEF_ORG, name: 'group-g' }
+      })
+    ).id
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { capabilities: { features: [], contentStore: STORE } } })
+    await prisma.memberSetMember.create({ data: { setId, daemonId: DAEMON } })
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(DAEMON) }))
+    let row = await prisma.sessionMeta.findUnique({ where: { id: SESSION } })
+    expect(row?.contentSetId).toBe(setId)
+    expect(row?.contentStoreId).toBe(STORE)
+
+    // The same member on a private store: no set, no store, so no peer may read it.
+    await prisma.sessionMeta.delete({ where: { id: SESSION } })
+    await prisma.daemon.update({ where: { id: DAEMON }, data: { capabilities: { features: [] } } })
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(DAEMON) }))
+    row = await prisma.sessionMeta.findUnique({ where: { id: SESSION } })
+    expect(row?.contentSetId).toBeNull()
+    expect(row?.contentStoreId).toBeNull()
+  })
+
+  it('never lets a later reporter claim the content store of a session it did not record', async () => {
+    await fixtures()
+    const setId = (await prisma.memberSet.findFirstOrThrow({ where: { orgId: null } })).id
+    const POOL_MEMBER = 'd4444444-4444-4444-8444-444444444444'
+    await prisma.daemon.create({ data: { id: POOL_MEMBER, orgId: null, sessionEpoch: 1n, status: 'ready' } })
+    await prisma.memberSetMember.create({ data: { setId, daemonId: POOL_MEMBER } })
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start', { daemonId: DaemonId(DAEMON) }))
+    await repo.recordMilestone(ev('end', { daemonId: DaemonId(POOL_MEMBER) }))
+
+    const row = await prisma.sessionMeta.findUnique({ where: { id: SESSION } })
+    expect(row?.daemonId).toBe(DAEMON)
+    expect(row?.contentSetId).toBeNull()
+  })
+
+  it('keeps the recorded execution config when a later milestone omits it', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(
+      ev('start', { runtime: 'claude', model: 'opus', effort: 'high', fastMode: true, daemonId: DaemonId(DAEMON) })
+    )
+    await repo.recordMilestone(ev('end')) // e.g. an old daemon's refresh — no exec-config echo
+
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    expect(got?.runtime).toBe('claude')
+    expect(got?.model).toBe('opus')
+    expect(got?.effort).toBe('high')
+    expect(got?.fastMode).toBe(true)
+    expect(got?.daemonId).toBe(DAEMON)
+
+    // A later snapshot CAN move them (e.g. in-session model switch on the next turn).
+    await repo.recordMilestone(ev('end', { model: 'sonnet', fastMode: false }))
+    const moved = await repo.getUnscoped(SessionId(SESSION))
+    expect(moved?.model).toBe('sonnet')
+    expect(moved?.fastMode).toBe(false)
+
+    // Explicit observed unknown clears the named model. A later legacy refresh
+    // that omits model still preserves that null rather than reviving config.
+    await repo.recordMilestone(ev('end', { model: null }))
+    await repo.recordMilestone(ev('end'))
+    expect((await repo.getUnscoped(SessionId(SESSION)))?.model).toBeNull()
+  })
+
+  it('records the birth verdict as one fact: the half a report carries replaces the other', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    const verdict = async () => {
+      const row = await prisma.sessionMeta.findUniqueOrThrow({ where: { id: SESSION } })
+      return { executorDaemonId: row.executorDaemonId, stayedHomeReason: row.stayedHomeReason }
+    }
+
+    // A daemon that predates the fields reports neither, and the row says so.
+    await repo.recordMilestone(ev('start'))
+    expect(await verdict()).toEqual({ executorDaemonId: null, stayedHomeReason: null })
+
+    await repo.recordMilestone(ev('plan', { executorDaemonId: DaemonId(OTHER_DAEMON) }))
+    await repo.recordMilestone(ev('plan')) // a refresh that carries neither half moves nothing
+    expect(await verdict()).toEqual({ executorDaemonId: OTHER_DAEMON, stayedHomeReason: null })
+
+    // Its executor was lost and the session came home: the reason replaces the machine.
+    await repo.recordMilestone(ev('plan', { stayedHomeReason: 'holder_least_loaded' }))
+    expect(await verdict()).toEqual({ executorDaemonId: null, stayedHomeReason: 'holder_least_loaded' })
+
+    await repo.recordMilestone(ev('end', { executorDaemonId: DaemonId(DAEMON) }))
+    expect(await verdict()).toEqual({ executorDaemonId: DAEMON, stayedHomeReason: null })
+  })
+
+  it('advances phase on subsequent milestones (upsert on sessionId)', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start'))
+    await repo.recordMilestone(ev('plan', { summary: 'planning' }))
+    await repo.recordMilestone(ev('end', { link: 'https://done' }))
+
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    expect(got?.phase).toBe('end')
+    expect(got?.summary).toBe('planning') // last non-empty summary retained
+    expect(got?.link).toBe('https://done')
+    expect(got?.endedAt).not.toBeNull() // end phase stamps endedAt
+
+    // still exactly one row — it's an upsert, not an append
+    const all = await repo.list({ agentId: AgentId(AGENT) })
+    expect(all).toHaveLength(1)
+  })
+
+  it('never rebinds an existing session id to another agent', async () => {
+    await fixtures()
+    await seedAgent(prisma, OTHER_AGENT, { daemonId: DAEMON })
+    const repo = new PgSessionRepo(prisma)
+
+    expect((await repo.recordMilestone(ev('start', { title: 'Original', daemonId: DaemonId(DAEMON) }))).recorded).toBe(
+      true
+    )
+    expect(
+      (
+        await repo.recordMilestone(
+          ev('end', {
+            agentId: AgentId(OTHER_AGENT),
+            launchId: undefined,
+            title: 'Forged',
+            daemonId: DaemonId(DAEMON)
+          })
+        )
+      ).recorded
+    ).toBe(false)
+
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    expect(got?.agentId).toBe(AGENT)
+    expect(got?.title).toBe('Original')
+    expect(got?.phase).toBe('start')
+  })
+
+  it('atomically assigns a concurrently reported session id to only one agent', async () => {
+    await fixtures()
+    await seedAgent(prisma, OTHER_AGENT, { daemonId: DAEMON })
+    const repo = new PgSessionRepo(prisma)
+
+    const accepted = await Promise.all([
+      repo.recordMilestone(ev('start', { title: 'Agent A', daemonId: DaemonId(DAEMON) })),
+      repo.recordMilestone(
+        ev('end', {
+          agentId: AgentId(OTHER_AGENT),
+          launchId: undefined,
+          title: 'Agent B',
+          daemonId: DaemonId(DAEMON)
+        })
+      )
+    ])
+
+    expect(accepted.filter((result) => result.recorded)).toHaveLength(1)
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    if (accepted[0]!.recorded) {
+      expect(got).toMatchObject({ agentId: AGENT, title: 'Agent A', phase: 'start' })
+    } else {
+      expect(got).toMatchObject({ agentId: OTHER_AGENT, title: 'Agent B', phase: 'end' })
+    }
+  })
+
+  it('does not regress a terminal phase on later metadata refreshes', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+
+    await repo.recordMilestone(ev('start', { title: 'fallback', status: 'prompting' }))
+    await repo.recordMilestone(ev('end', { status: 'idle' }))
+    await repo.recordMilestone(ev('plan', { title: 'Runtime title', status: 'idle', channelName: 'deploys' }))
+
+    const got = await repo.getUnscoped(SessionId(SESSION))
+    expect(got?.phase).toBe('end')
+    expect(got?.title).toBe('Runtime title')
+    expect(got?.status).toBe('idle')
+    expect(got?.channelName).toBe('deploys')
+    expect(got?.endedAt).not.toBeNull()
+  })
+
+  it('stores NO message body — the schema has only milestone metadata', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(ev('plan', { summary: 's' }))
+
+    // Assert structurally: the session_meta table has no text/content/messages column.
+    const cols = await prisma.$queryRawUnsafe<{ column_name: string }[]>(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'session_meta'`
+    )
+    const names = cols.map((c) => c.column_name)
+    expect(names).not.toContain('text')
+    expect(names).not.toContain('content')
+    expect(names).not.toContain('messages')
+    expect(names).not.toContain('body')
+    // it DOES have the converged-milestone fields
+    expect(names).toContain('phase')
+    expect(names).toContain('summary')
+  })
+
+  it('filters by platform/channel in list()', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(ev('start'))
+
+    expect(await repo.list({ platform: 'slack', channel: 'C1' })).toHaveLength(1)
+    expect(await repo.list({ platform: 'telegram' })).toHaveLength(0)
+  })
+
+  it("scopes shared-bot thread fallback to the bot's active agent, whatever places it", async () => {
+    await fixtures()
+    await seedDaemon(prisma, OTHER_DAEMON)
+    await seedAgent(prisma, OTHER_AGENT, { daemonId: OTHER_DAEMON })
+    await prisma.agent.update({ where: { id: AGENT }, data: { daemonId: DAEMON, status: 'active' } })
+    const repo = new PgSessionRepo(prisma)
+    const botId = '22222222-2222-4222-8222-222222222221'
+    const otherBotId = '22222222-2222-4222-8222-222222222222'
+    const integrationId = '66666666-6666-4666-8666-666666666661'
+
+    await prisma.bot.createMany({
+      data: [
+        { id: botId, orgId: DEF_ORG, platform: 'slack', name: 'requested-bot' },
+        { id: otherBotId, orgId: DEF_ORG, platform: 'slack', name: 'other-bot' }
+      ]
+    })
+    await prisma.integration.createMany({
+      data: [
+        { id: integrationId, orgId: DEF_ORG, agentId: AGENT, botId, name: 'requested-bot' },
+        {
+          id: '66666666-6666-4666-8666-666666666662',
+          orgId: DEF_ORG,
+          agentId: OTHER_AGENT,
+          botId: otherBotId,
+          name: 'other-bot'
+        }
+      ]
+    })
+    await repo.recordMilestone(
+      ev('start', {
+        sessionId: SessionId('requested-bot-session'),
+        daemonId: DaemonId(DAEMON),
+        lastActivityAt: new Date('2026-07-05T08:08:00.000Z')
+      })
+    )
+    await repo.recordMilestone(
+      ev('start', {
+        sessionId: SessionId('other-bot-session'),
+        agentId: AgentId(OTHER_AGENT),
+        launchId: undefined,
+        daemonId: DaemonId(OTHER_DAEMON),
+        lastActivityAt: new Date('2026-07-05T10:51:00.000Z')
+      })
+    )
+
+    // The AGENT is the answer; which member serves it is the placement resolver's, so the
+    // reply carries no daemon and asks nothing about placement.
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toEqual({ agentId: AGENT })
+    expect(await repo.findThreadOwner(BotId(otherBotId), 'C1', 'T1')).toEqual({ agentId: OTHER_AGENT })
+
+    await prisma.integration.update({ where: { id: integrationId }, data: { status: 'revoked' } })
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toBeNull()
+
+    await prisma.integration.update({ where: { id: integrationId }, data: { status: 'active' } })
+    await prisma.agent.update({ where: { id: AGENT }, data: { daemonId: OTHER_DAEMON } })
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toEqual({ agentId: AGENT })
+
+    await prisma.daemon.delete({ where: { id: DAEMON } })
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toEqual({ agentId: AGENT })
+
+    // A SET placement — placed, naming no machine. The old predicate required a non-null
+    // `agent.daemonId`, so every pool agent fell out of this fallback entirely.
+    await prisma.agent.update({
+      where: { id: AGENT },
+      data: { daemonId: null, placementKind: 'set', setId: await poolSetId(prisma) }
+    })
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toEqual({ agentId: AGENT })
+
+    // Unplaced entirely is still an answer here: only the integration gates this read now, and
+    // `lookupThread` refuses the target when nothing is routable for the agent.
+    await prisma.agent.update({
+      where: { id: AGENT },
+      data: { placementKind: 'daemon', setId: null, status: 'inactive' }
+    })
+    expect(await repo.findThreadOwner(BotId(botId), 'C1', 'T1')).toEqual({ agentId: AGENT })
+  })
+
+  it('joins usage into list() and sorts by latest activity', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    const older = SessionId('older-session')
+    const newer = SessionId('newer-session')
+    await repo.recordMilestone(
+      ev('start', {
+        sessionId: older,
+        lastActivityAt: new Date('2026-07-05T08:08:00.000Z')
+      })
+    )
+    await repo.recordMilestone(
+      ev('start', {
+        sessionId: newer,
+        lastActivityAt: new Date('2026-07-05T10:51:00.000Z')
+      })
+    )
+    await prisma.sessionUsage.create({
+      data: {
+        agentId: AGENT,
+        sessionId: newer,
+        platform: 'slack',
+        channel: 'C1',
+        lastActivityAt: new Date('2026-07-05T10:51:00.000Z'),
+        totalTokens: 123,
+        inputTokens: 100,
+        outputTokens: 23
+      }
+    })
+
+    const list = await repo.list({ agentId: AgentId(AGENT) })
+    expect(list.map((s) => s.id)).toEqual([newer, older])
+    expect(list[0]!.usage?.totalTokens).toBe(123)
+    expect(list[0]!.usage?.inputTokens).toBe(100)
+    expect(list[1]!.usage).toBeNull()
+  })
+})
+
+describe('SessionRepo.markContentPurged — retention-GC receipt (#485)', () => {
+  const OTHER_SESSION = '66666666-6666-4666-8666-666666666666'
+
+  it("stamps the reporting agent's rows, keeps the metadata, and is first-wins", async () => {
+    await fixtures()
+    await seedAgent(prisma, OTHER_AGENT)
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(ev('end', { title: 'nightly review' }))
+    await repo.recordMilestone(ev('end', { sessionId: SessionId(OTHER_SESSION), agentId: AgentId(OTHER_AGENT) }))
+
+    const purgedAt = new Date('2026-08-04T09:00:00.000Z')
+    const first = await repo.markContentPurged(
+      AgentId(AGENT),
+      // The foreign row is claimed too: a session id is only a purge claim for the
+      // agent it is bound to, so it must be skipped rather than stamped.
+      [SessionId(SESSION), SessionId(OTHER_SESSION)],
+      'retention',
+      purgedAt
+    )
+    expect(first.marked).toEqual([SessionId(SESSION)])
+    expect(first.alreadyPurged).toBe(1)
+
+    const row = await repo.getUnscoped(SessionId(SESSION))
+    expect(row?.contentPurgedAt).toEqual(purgedAt)
+    expect(row?.contentPurgedReason).toBe('retention')
+    // The metadata row survives the purge — it is the whole remaining record.
+    expect(row?.title).toBe('nightly review')
+    expect((await repo.getUnscoped(SessionId(OTHER_SESSION)))?.contentPurgedAt).toBeNull()
+
+    // At-least-once redelivery must not move the date the content went away.
+    const again = await repo.markContentPurged(
+      AgentId(AGENT),
+      [SessionId(SESSION)],
+      'retention',
+      new Date('2026-09-01T00:00:00.000Z')
+    )
+    expect(again.marked).toEqual([])
+    expect((await repo.getUnscoped(SessionId(SESSION)))?.contentPurgedAt).toEqual(purgedAt)
+  })
+
+  it('stamps only the rows a named recorder wrote (#2246)', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    await repo.recordMilestone(ev('end', { daemonId: DaemonId(DAEMON) }))
+    const purgedAt = new Date('2026-08-04T09:00:00.000Z')
+
+    const foreign = await repo.markContentPurged(
+      AgentId(AGENT),
+      [SessionId(SESSION)],
+      'retention',
+      purgedAt,
+      DaemonId(OTHER_DAEMON)
+    )
+    expect(foreign.marked).toEqual([])
+    expect((await repo.getUnscoped(SessionId(SESSION)))?.contentPurgedAt).toBeNull()
+
+    const own = await repo.markContentPurged(
+      AgentId(AGENT),
+      [SessionId(SESSION)],
+      'retention',
+      purgedAt,
+      DaemonId(DAEMON)
+    )
+    expect(own.marked).toEqual([SessionId(SESSION)])
+    expect((await repo.getUnscoped(SessionId(SESSION)))?.contentPurgedAt).toEqual(purgedAt)
+  })
+
+  it('is a no-op for an unknown session and for an empty report', async () => {
+    await fixtures()
+    const repo = new PgSessionRepo(prisma)
+    expect(await repo.markContentPurged(AgentId(AGENT), [], 'retention', new Date())).toEqual({
+      marked: [],
+      alreadyPurged: 0
+    })
+    const unknown = await repo.markContentPurged(AgentId(AGENT), [SessionId(OTHER_SESSION)], 'retention', new Date())
+    expect(unknown.marked).toEqual([])
+  })
+})

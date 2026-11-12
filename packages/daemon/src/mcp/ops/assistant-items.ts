@@ -1,0 +1,616 @@
+// The follow-up tools (assistant-mode.md §5.12): an assistant-mode agent takes a follow-up, a watch task (§5.18), and its checks record what they saw over the bridge.
+import { z } from 'zod'
+import {
+  ASSISTANT_PROPOSAL_SENTENCE_MAX,
+  ASSISTANT_PROPOSAL_TASK_MAX,
+  ASSISTANT_PROPOSAL_WHY_MAX
+} from '@agentconnect.md/protocol'
+import type { Agent } from '../../agents/agent-schema.js'
+import type { NormalizedMessage } from '../../messages/normalized.js'
+import type { CheckedTask, CheckedTasks } from '../../assistant/checked-tasks.js'
+import { ASSISTANT_ITEM_LIMITS, type AssistantPlace } from '../../store/assistant-items.js'
+import type { WatchTaskStatus } from '../../store/assistant-watch-tasks.js'
+import { obj, type JsonValue, type ObjectToolSchema, type ToolDescriptor } from '../../tool-schema/descriptor.js'
+import { isCheckCoordinate, isSubsessionCoordinate } from '../../session/subsession-coordinate.js'
+import type { SessionContext, ToolHandler } from './context.js'
+import { parseArgs, requiredString } from './args.js'
+
+/** The task-store calls a check's tools make, by the task's one id. */
+export type AssistantItemLedgerPort = Pick<CheckedTasks, 'get' | 'appendObservation' | 'schedule'>
+
+/** What a request for a getting-to-know task says back. */
+export type GettingToKnowRequest =
+  { kind: 'started'; taskId: string } | { kind: 'refused'; reason: string; message: string }
+
+/** What `followUp` asks the daemon to take. */
+export interface FollowUpInput {
+  title: string
+  doneWhen: string
+  nextCheck?: number
+  summary?: string
+  asker: string
+  /** The URL it watches (assistant-mode.md §5.14). */
+  watch?: string
+}
+
+/** A follow-up's watch as a tool says it back (§5.14). */
+export type WatchOutcomeView =
+  { kind: 'watching'; target: string } | { kind: 'pending' } | { kind: 'refused'; reason: string } | { kind: 'none' }
+
+/** What the tools ask of the follow-ups' watches (§5.14). */
+export interface FollowUpWatchToolPort {
+  /** Refuse a URL that names no pull request, merge request or issue, before anything is written. */
+  check(url: string): void
+  set(agentId: string, taskKey: string, url: string): Promise<WatchOutcomeView>
+  clear(agentId: string, taskKey: string): Promise<WatchOutcomeView>
+  end(agentId: string, taskKey: string): Promise<void>
+}
+
+export interface AssistantItemDeps {
+  assistantItems?: {
+    /** The agent's follow-ups while its assistant mode is on, else undefined: checked per call, so switching it off takes effect at once. */
+    ledgerFor(agentId: string): AssistantItemLedgerPort | undefined
+    /** The person whose message started the session's live turn, as an asker identity; undefined when no person did. */
+    askerFor(ctx: SessionContext): Promise<string | undefined>
+    /** Take a follow-up of the session's place (assistant-mode.md §5.12): a watch task, by its task key. */
+    take?(ctx: SessionContext, input: FollowUpInput): Promise<CheckedTask>
+    /** Start a getting-to-know task of the session's place, as its long session asked (assistant-mode.md §5.13). */
+    gettingToKnow?(ctx: SessionContext): Promise<GettingToKnowRequest>
+    /** A conversation turn's proposal: a getting-to-know task report round's suggestions (§5.13), else an offered follow-up (§5.10). */
+    proposeFromTurn?(ctx: SessionContext, input: ProposeInput): Promise<Record<string, unknown>>
+    /** The follow-ups' watches; absent when the Control Plane takes none, so `watch` is refused. */
+    watches?(): FollowUpWatchToolPort | undefined
+    /** A check's side, in the follow-up's own session. */
+    check?: {
+      /** The task key of the task this session's check is running for; undefined once it ended. */
+      taskFor(ctx: SessionContext): Promise<string | undefined>
+      /** Keep the check's report; it reaches the follow-up's conversation once the check ends. False once it ended. */
+      report(ctx: SessionContext, taskKey: string, text: string): Promise<boolean>
+      /** Ask for approval to act on the follow-up (assistant-mode.md §5.10); once per check, nothing runs here. */
+      propose?(ctx: SessionContext, input: ProposeInput): Promise<Record<string, unknown>>
+      now(): number
+    }
+  }
+}
+
+export function assistantModeOn(agent: Pick<Agent, 'assistantMode'> | undefined): boolean {
+  return agent?.assistantMode?.enabled === true
+}
+
+/** The asker identity of a turn's sender (§5.12): `'user:<id>'` in webchat, `'<platform>:<tenant scope>:<uid>'` elsewhere. */
+export function askerIdentity(msg: NormalizedMessage, tenantScope: string | undefined): string | undefined {
+  if (msg.source !== 'user' || msg.sender.isBot) return undefined
+  const uid = msg.sender.id
+  if (!uid || /[\s:]/.test(uid)) return undefined
+  if (msg.platform === 'webchat') return `user:${uid}`
+  return memberAskerIdentity(msg.platform, tenantScope, uid)
+}
+
+/** A chat member's asker identity, `'<platform>:<tenant scope>:<uid>'`, as a turn's sender would have it. */
+export function memberAskerIdentity(
+  platform: string,
+  tenantScope: string | undefined,
+  uid: string
+): string | undefined {
+  if (!uid || /[\s:]/.test(uid)) return undefined
+  return tenantScope && !/\s/.test(tenantScope) ? `${platform}:${tenantScope}:${uid}` : undefined
+}
+
+/** The place a session belongs to (§5.2): its conversation, never a thread inside it. */
+export function placeOfSession(ctx: Pick<SessionContext, 'platform' | 'channel' | 'transportScope'>): AssistantPlace {
+  return { platform: ctx.platform, channel: ctx.channel, transportScope: ctx.transportScope ?? null }
+}
+
+export const OFFSET_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/i
+const INSTANT_MESSAGE = 'argument nextCheck must be an ISO-8601 instant with an offset, e.g. 2026-10-09T09:00:00+08:00'
+
+const boundedString = (key: string, max: number) =>
+  requiredString(key).max(max, `argument ${key} must be at most ${max} characters`)
+const optionalBoundedString = (key: string, max: number, min = 0) =>
+  z
+    .string(`argument ${key} must be a string`)
+    .min(min, `argument ${key} must not be empty`)
+    .max(max, `argument ${key} must be at most ${max} characters`)
+    .nullish()
+    .transform((value) => value ?? undefined)
+const nextCheckArg = z
+  .string(INSTANT_MESSAGE)
+  .refine((value) => OFFSET_INSTANT.test(value) && !Number.isNaN(Date.parse(value)), INSTANT_MESSAGE)
+  .nullish()
+  .transform((value) => (value == null ? undefined : Date.parse(value)))
+
+export const FOLLOW_UP_ARGS = z.object({
+  title: boundedString('title', ASSISTANT_ITEM_LIMITS.title),
+  doneWhen: boundedString('doneWhen', ASSISTANT_ITEM_LIMITS.doneWhen),
+  nextCheck: nextCheckArg,
+  summary: optionalBoundedString('summary', ASSISTANT_ITEM_LIMITS.summary),
+  watch: optionalBoundedString('watch', ASSISTANT_ITEM_LIMITS.watchUrl, 1)
+})
+
+/** A check may not set its next check sooner than this, so a follow-up cannot wake itself in a loop. */
+export const MIN_NEXT_CHECK_MS = 5 * 60_000
+
+/** A check's `recordCheck` (assistant-mode.md §5.12): what it saw, always, its schedule, and an optional report. */
+export const RECORD_CHECK_ARGS = z.object({
+  observation: boundedString('observation', ASSISTANT_ITEM_LIMITS.observation),
+  // A getting-to-know task's report is longer; a follow-up's is held to an observation's length below.
+  report: optionalBoundedString('report', ASSISTANT_ITEM_LIMITS.gettingToKnowReport, 1),
+  nextCheck: nextCheckArg,
+  done: z
+    .boolean('argument done must be a boolean')
+    .nullish()
+    .transform((value) => value ?? undefined),
+  // An empty string stops watching; leaving it out keeps the watch.
+  watch: optionalBoundedString('watch', ASSISTANT_ITEM_LIMITS.watchUrl)
+})
+
+/** `propose` (assistant-mode.md §5.10, §5.13): the card's sentence, the reason, and the task an approval runs or the follow-up it takes. */
+export const PROPOSE_ARGS = z
+  .object({
+    sentence: boundedString('sentence', ASSISTANT_PROPOSAL_SENTENCE_MAX),
+    why: boundedString('why', ASSISTANT_PROPOSAL_WHY_MAX),
+    task: optionalBoundedString('task', ASSISTANT_PROPOSAL_TASK_MAX, 1),
+    followUp: z
+      .object(
+        {
+          title: boundedString('followUp.title', ASSISTANT_ITEM_LIMITS.title),
+          doneWhen: boundedString('followUp.doneWhen', ASSISTANT_ITEM_LIMITS.doneWhen),
+          nextCheck: nextCheckArg,
+          watch: optionalBoundedString('followUp.watch', ASSISTANT_ITEM_LIMITS.watchUrl, 1)
+        },
+        'argument followUp must be an object with title and doneWhen'
+      )
+      .nullish()
+      .transform((value) => value ?? undefined)
+  })
+  .refine((input) => (input.task === undefined) !== (input.followUp === undefined), {
+    message: 'propose takes either `task` or `followUp`, not both and not neither; nothing was proposed'
+  })
+export type ProposeInput = z.infer<typeof PROPOSE_ARGS>
+
+/** What an approval of a proposal does: the task it runs, or the follow-up form's follow-up it takes (§5.13). */
+export function proposalWork(
+  input: ProposeInput
+):
+  { task: string } | { followUp: { title: string; doneWhen: string; nextCheck: number | null; watch: string | null } } {
+  return input.followUp
+    ? {
+        followUp: {
+          title: input.followUp.title,
+          doneWhen: input.followUp.doneWhen,
+          nextCheck: input.followUp.nextCheck ?? null,
+          watch: input.followUp.watch ?? null
+        }
+      }
+    : { task: input.task ?? '' }
+}
+
+/** `watch` on `followUp` and the follow-up form of `propose` (assistant-mode.md §5.14). */
+const WATCH_PROPERTY: JsonValue = {
+  type: 'string',
+  maxLength: ASSISTANT_ITEM_LIMITS.watchUrl,
+  description:
+    'Optional. The URL of the one pull request, merge request or issue this follow-up waits on; its events then ' +
+    'wake a check early.'
+}
+
+/** `watch` on `recordCheck` (§5.14). */
+const RECORD_CHECK_WATCH_PROPERTY: JsonValue = {
+  type: 'string',
+  maxLength: ASSISTANT_ITEM_LIMITS.watchUrl,
+  description:
+    'Optional. A new pull request, merge request or issue URL to watch instead, or an empty string to stop watching.'
+}
+
+/** A descriptor with `watch` added to its arguments, its own description untouched. */
+function withWatch(tool: ToolDescriptor, property: JsonValue): ToolDescriptor {
+  const schema = tool.inputSchema as ObjectToolSchema
+  return { ...tool, inputSchema: { ...schema, properties: { ...schema.properties, watch: property } } }
+}
+
+const NEXT_CHECK =
+  'an ISO-8601 instant with an offset, e.g. `2026-10-09T09:00:00+08:00`. At that time a read-only check runs on ' +
+  'its own and reports in this conversation only if something changed.'
+
+export const FOLLOW_UP_TOOL: ToolDescriptor = {
+  name: 'followUp',
+  description:
+    'Take on following something up for the person asking: a task in watch mode, where at each next check a ' +
+    'read-only check runs in the background and reports here only if something changed. It only looks and records what it saw, so promise a ' +
+    'check then, never an action. First restate in your reply what you will watch, what counts as done and when ' +
+    'to look next, and call this only after the person confirms. Call listTasks before restating: when an open ' +
+    'follow-up of this conversation already covers the request, offer to send the change to it with sendMessage ' +
+    'action `messageTask` instead of taking a second one. The follow-up belongs to this conversation: here it is ' +
+    'listed with listTasks, given new instructions with messageTask and ended with stopTask, by the `taskId` this ' +
+    'returns. That id is for those calls alone: never show it to people, who know the follow-up by its title. ' +
+    'Taken in a public channel, its title is also listed in your other internal conversations, so name it ' +
+    'plainly. When you are the one offering a follow-up nobody asked for and `propose` is offered, propose it ' +
+    'instead of asking in prose.',
+  inputSchema: obj(
+    {
+      title: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_ITEM_LIMITS.title,
+        description: 'A short name for what is followed up.'
+      },
+      doneWhen: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_ITEM_LIMITS.doneWhen,
+        description: 'What counts as done, as the person confirmed it.'
+      },
+      nextCheck: {
+        type: 'string',
+        description: `Optional. When to check first: ${NEXT_CHECK} Without it, it waits until messaged.`
+      },
+      summary: {
+        type: 'string',
+        maxLength: ASSISTANT_ITEM_LIMITS.summary,
+        description: 'Optional. Who asked for what and where it stands.'
+      }
+    },
+    ['title', 'doneWhen']
+  )
+}
+
+/** What a check records with (assistant-mode.md §5.12); offered only inside a check. */
+export const RECORD_CHECK_TOOL: ToolDescriptor = {
+  name: 'recordCheck',
+  description:
+    'Record what this check of your follow-up found. `observation` is what you checked and saw; a check that ' +
+    'records nothing counts as failed, and your next check reads it if this context is lost. Then set its ' +
+    'schedule: `nextCheck` to when to look again, `done: true` when its done-when holds, which ends it, or neither ' +
+    'to wait until its conversation messages it. Add `report` only when something changed since the latest ' +
+    'observation that the people in its conversation should know, or a message from them asked for an answer: one ' +
+    'short message, which that conversation passes on. Leave it out to stay silent. When something should be ' +
+    'done, use `propose` instead of a report.',
+  inputSchema: obj(
+    {
+      observation: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_ITEM_LIMITS.observation,
+        description: 'What you checked and saw, quoting no one.'
+      },
+      report: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_ITEM_LIMITS.observation,
+        description:
+          'Optional. What changed, for the people in its conversation; omit it when nothing did. It says what you ' +
+          'found and promises no later message, no time anyone will hear back and no next check.'
+      },
+      nextCheck: {
+        type: 'string',
+        description: `Optional. At least five minutes from now: ${NEXT_CHECK} Not with \`done\`.`
+      },
+      done: { type: 'boolean', description: 'Optional. True when its done-when holds; this ends the follow-up.' }
+    },
+    ['observation']
+  )
+}
+
+/** A check's third outcome (assistant-mode.md §5.10), and a getting-to-know task's suggestions (§5.13): ask for approval to act. */
+export const PROPOSE_TOOL: ToolDescriptor = {
+  name: 'propose',
+  description:
+    'Ask for approval to act on the follow-up this check is for, or on what you found getting to know a place, when something ' +
+    'should be done rather than only reported. `sentence` is the one plain sentence the approver reads first ("I ' +
+    'want to do X because Y"); `why` is the reason; `task` is exactly what a background session with your normal ' +
+    'permissions should do once approved, e.g. "rebase PR #12 onto main and push"; or, in place of `task`, ' +
+    '`followUp` is the follow-up of that conversation an approval takes, with the approver as its asker. Nothing ' +
+    'runs until a person approves it, within 24 hours; the approved proposal then reports back in the conversation ' +
+    'the follow-up belongs to. Propose at most once per check and do not also report it; still record what you ' +
+    'saw with recordCheck. After getting to know a place, propose at most three times, on the round its report arrives.',
+  inputSchema: obj(
+    {
+      sentence: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_PROPOSAL_SENTENCE_MAX,
+        description: 'One plain sentence: "I want to do X because Y".'
+      },
+      why: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_PROPOSAL_WHY_MAX,
+        description: 'Why it should be done, from what this check found.'
+      },
+      task: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_PROPOSAL_TASK_MAX,
+        description:
+          'Unless `followUp` is given: what the approved background session does, specific enough to carry out ' +
+          'without asking.'
+      },
+      followUp: obj(
+        {
+          title: {
+            type: 'string',
+            minLength: 1,
+            maxLength: ASSISTANT_ITEM_LIMITS.title,
+            description: 'A short name for what is followed up.'
+          },
+          doneWhen: {
+            type: 'string',
+            minLength: 1,
+            maxLength: ASSISTANT_ITEM_LIMITS.doneWhen,
+            description:
+              'One sentence people read on the card, in the place’s language: when you look, what you do and when ' +
+              'you stop, e.g. "I’ll look each Monday morning and remind the owner here; I stop once every issue has ' +
+              'a root cause".'
+          },
+          nextCheck: { type: 'string', description: `Optional. When to check first: ${NEXT_CHECK}` }
+        },
+        ['title', 'doneWhen']
+      )
+    },
+    ['sentence', 'why']
+  )
+}
+
+const OFFER_DESCRIPTION =
+  'Offer to follow something up when you think it is worth it and nobody asked: instead of ending your reply with a ' +
+  'question such as "shall I check again at 15:30?", call this, and do not also ask in prose. A card with Approve and ' +
+  'Deny is posted in the thread you reply in, after your reply. Approving it takes the follow-up of this ' +
+  'conversation with the approver as its asker, reporting in that thread as one taken with followUp here would; ' +
+  'nothing runs, you get no turn for it, and it expires after 24 hours. `sentence` is the one plain sentence people ' +
+  'read first ("I can check the deploy again at 15:30 and tell you here"); `why` is the reason; `followUp` is what ' +
+  'is followed up. At most once per turn. When someone asked you to follow something up, restate it and use ' +
+  'followUp once they confirm instead.'
+
+const checkProposal = PROPOSE_TOOL.inputSchema as ObjectToolSchema
+const checkFollowUpForm = checkProposal.properties.followUp as ObjectToolSchema
+
+const OFFER_FOLLOW_UP: JsonValue = obj(
+  {
+    title: checkFollowUpForm.properties.title!,
+    doneWhen: checkFollowUpForm.properties.doneWhen!,
+    nextCheck: {
+      type: 'string',
+      description: `Optional. When to check first: ${NEXT_CHECK} Without it, it waits until messaged.`
+    }
+  },
+  ['title', 'doneWhen']
+)
+
+/** An ordinary conversation turn's `propose` (assistant-mode.md §5.10): the follow-up form only, where the conversation has approval cards. */
+export const PROPOSE_OFFER_TOOL: ToolDescriptor = {
+  name: 'propose',
+  description: OFFER_DESCRIPTION,
+  inputSchema: obj(
+    {
+      sentence: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_PROPOSAL_SENTENCE_MAX,
+        description: 'The one plain sentence people read first, in their language.'
+      },
+      why: {
+        type: 'string',
+        minLength: 1,
+        maxLength: ASSISTANT_PROPOSAL_WHY_MAX,
+        description: 'Why it is worth following up.'
+      },
+      followUp: OFFER_FOLLOW_UP
+    },
+    ['sentence', 'why', 'followUp']
+  )
+}
+
+/** The same for a place's long session that may get to know it (§5.13): its report's round may also propose a task. */
+export const PROPOSE_PLACE_TOOL: ToolDescriptor = {
+  name: 'propose',
+  description:
+    OFFER_DESCRIPTION +
+    ' On the round a getting-to-know report arrives, propose its suggestions here instead, at most three, as that ' +
+    'report says; there `task` may replace `followUp`: what a background session with your normal permissions does ' +
+    'once approved.',
+  inputSchema: obj(
+    {
+      ...(PROPOSE_OFFER_TOOL.inputSchema as ObjectToolSchema).properties,
+      task: checkProposal.properties.task!
+    },
+    ['sentence', 'why']
+  )
+}
+
+/** The tools with `watch`, offered only toward a Control Plane that takes watches (§5.14). */
+export const FOLLOW_UP_WATCH_TOOL = withWatch(FOLLOW_UP_TOOL, WATCH_PROPERTY)
+export const RECORD_CHECK_WATCH_TOOL = withWatch(RECORD_CHECK_TOOL, RECORD_CHECK_WATCH_PROPERTY)
+/** A `propose` descriptor whose follow-up form also takes `watch`. */
+function proposeWithWatch(tool: ToolDescriptor): ToolDescriptor {
+  const schema = tool.inputSchema as ObjectToolSchema
+  const form = schema.properties.followUp as ObjectToolSchema
+  return {
+    ...tool,
+    inputSchema: {
+      ...schema,
+      properties: {
+        ...schema.properties,
+        followUp: { ...form, properties: { ...form.properties, watch: WATCH_PROPERTY } }
+      }
+    }
+  }
+}
+export const PROPOSE_WATCH_TOOL = proposeWithWatch(PROPOSE_TOOL)
+export const PROPOSE_OFFER_WATCH_TOOL = proposeWithWatch(PROPOSE_OFFER_TOOL)
+export const PROPOSE_PLACE_WATCH_TOOL = proposeWithWatch(PROPOSE_PLACE_TOOL)
+
+/** The follow-up tools a conversation is offered: `followUp` in assistant mode, none otherwise; with `watch` toward a Control Plane that takes it. */
+export function followUpToolsFor(
+  agent: Pick<Agent, 'assistantMode'>,
+  opts: { watch?: boolean } = {}
+): ToolDescriptor[] {
+  return assistantModeOn(agent) ? [opts.watch ? FOLLOW_UP_WATCH_TOOL : FOLLOW_UP_TOOL] : []
+}
+
+/** `propose` for an ordinary turn's offer (§5.10): an assistant-mode conversation with approval cards, never a background session's. */
+export function followUpOfferToolsFor(
+  agent: Pick<Agent, 'assistantMode'>,
+  at: { thread: string },
+  opts: { cards: boolean; watch?: boolean }
+): ToolDescriptor[] {
+  if (!assistantModeOn(agent) || !opts.cards || isSubsessionCoordinate(at.thread)) return []
+  return [opts.watch ? PROPOSE_OFFER_WATCH_TOOL : PROPOSE_OFFER_TOOL]
+}
+
+function watchesOf(deps: AssistantItemDeps): FollowUpWatchToolPort {
+  const port = deps.assistantItems?.watches?.()
+  if (!port) throw new Error('watching is not available here; take it without `watch`, woken by time only')
+  return port
+}
+
+/** What a tool says back about a follow-up's watch. */
+function watchNote(outcome: WatchOutcomeView): string | undefined {
+  switch (outcome.kind) {
+    case 'watching':
+      return `Watching ${outcome.target}: its events wake a check early.`
+    case 'pending':
+      return 'Not confirmed yet: it is watched once the connection returns, and checked by time until then.'
+    case 'refused':
+      return `Not watched: ${outcome.reason}. It is checked by time only; tell the person why.`
+    case 'none':
+      return undefined
+  }
+}
+
+function ledgerOf(ctx: SessionContext, deps: AssistantItemDeps): AssistantItemLedgerPort {
+  const ledger = deps.assistantItems?.ledgerFor(ctx.agentId)
+  if (!ledger) throw new Error('follow-ups are available only to an agent in assistant mode')
+  return ledger
+}
+
+const iso = (ms: number | null): string | null => (ms === null ? null : new Date(ms).toISOString())
+
+export const followUp: ToolHandler<AssistantItemDeps> = async (ctx, args, deps) => {
+  const input = parseArgs(FOLLOW_UP_ARGS, args)
+  ledgerOf(ctx, deps)
+  if (input.watch !== undefined) watchesOf(deps).check(input.watch)
+  const take = deps.assistantItems?.take
+  if (!take) throw new Error('followUp: taking a follow-up is not available on this daemon')
+  const asker = await deps.assistantItems?.askerFor(ctx)
+  if (!asker) throw new Error("followUp needs a person's request: this turn was not started by a person's message")
+  const item = await take(ctx, {
+    title: input.title,
+    doneWhen: input.doneWhen,
+    ...(input.nextCheck !== undefined ? { nextCheck: input.nextCheck } : {}),
+    ...(input.summary !== undefined ? { summary: input.summary } : {}),
+    asker
+  })
+  // The person confirmed the follow-up, not the watch: it is taken either way (§5.14).
+  const watch =
+    input.watch !== undefined ? watchNote(await watchesOf(deps).set(ctx.agentId, item.taskKey, input.watch)) : undefined
+  return {
+    taskId: item.taskKey,
+    followUp: {
+      title: item.title,
+      doneWhen: item.doneWhen,
+      nextCheck: iso(item.nextAt),
+      summary: item.background
+    },
+    ...(watch !== undefined ? { watch } : {}),
+    note:
+      (item.nextAt === null
+        ? 'Taken. It runs no check until you message it with messageTask and this taskId.'
+        : 'Taken. Its first check runs at nextCheck; listTasks shows it, messageTask changes it, stopTask ends it.') +
+      ' Never show the taskId to people; name the follow-up by its title.'
+  }
+}
+
+/** A check's write (assistant-mode.md §5.12): what it saw on its own follow-up, the schedule, and a report kept for its end. */
+export const recordCheck: ToolHandler<AssistantItemDeps> = async (ctx, args, deps) => {
+  if (!isCheckCoordinate(ctx.thread)) throw new Error('recordCheck is available only in a follow-up’s check')
+  const input = parseArgs(RECORD_CHECK_ARGS, args)
+  const ledger = ledgerOf(ctx, deps)
+  const port = deps.assistantItems?.check
+  const taskKey = port ? await port.taskFor(ctx) : undefined
+  if (!port || taskKey === undefined) throw new Error('this check has ended; nothing was written')
+  const item = await ledger.get(ctx.agentId, taskKey)
+  if (item?.gettingToKnow) return await handBackGettingToKnow(ctx, input, taskKey, ledger, port)
+  if (input.report !== undefined && input.report.length > ASSISTANT_ITEM_LIMITS.observation)
+    throw new Error(
+      `argument report must be at most ${ASSISTANT_ITEM_LIMITS.observation} characters; nothing was written`
+    )
+  if (input.done === true && input.nextCheck !== undefined)
+    throw new Error('recordCheck takes `done` or `nextCheck`, not both; nothing was written')
+  if (input.nextCheck !== undefined && input.nextCheck < port.now() + MIN_NEXT_CHECK_MS)
+    throw new Error('nextCheck must be at least five minutes from now; nothing was written')
+  const watches = input.watch !== undefined || input.done === true ? deps.assistantItems?.watches?.() : undefined
+  if (input.watch !== undefined && input.watch !== '') watchesOf(deps).check(input.watch)
+  const next: { status: WatchTaskStatus; nextAt: number | null } =
+    input.done === true
+      ? { status: 'done', nextAt: null }
+      : input.nextCheck !== undefined
+        ? { status: 'active', nextAt: input.nextCheck }
+        : { status: 'waiting', nextAt: null }
+  // What it saw becomes its summary, the last check's result (assistant-mode.md §5.18).
+  const appended = await ledger.appendObservation(ctx.agentId, taskKey, { text: input.observation, author: 'check' })
+  if (!appended) throw new Error('this follow-up is gone; nothing was written')
+  // One its conversation ended while this check ran stays ended; what the check saw is still recorded.
+  const open = await ledger.schedule(ctx.agentId, taskKey, next)
+  // `done` ends the watch with the follow-up; a new URL moves it, an empty one stops it (§5.14).
+  let watch: string | undefined
+  if (input.done === true || !open) {
+    if (item?.watch) await watches?.end(ctx.agentId, taskKey)
+  } else if (input.watch === '')
+    watch = watchNote(await watchesOf(deps).clear(ctx.agentId, taskKey)) ?? 'No longer watched.'
+  else if (input.watch !== undefined) watch = watchNote(await watchesOf(deps).set(ctx.agentId, taskKey, input.watch))
+  if (input.report !== undefined && !(await port.report(ctx, taskKey, input.report)))
+    throw new Error('this check has ended; the observation was written but the report was not kept')
+  return {
+    ok: true,
+    followUp: open
+      ? { state: next.status === 'done' ? 'done' : 'waiting', nextCheck: iso(next.nextAt) }
+      : { state: 'ended', nextCheck: null },
+    ...(watch !== undefined ? { watch } : {}),
+    ...(input.report !== undefined ? { report: 'passed on when this check ends' } : {})
+  }
+}
+
+/** A getting-to-know task hands back its one report (assistant-mode.md §5.13); its check's end delivers it and marks it done. */
+async function handBackGettingToKnow(
+  ctx: SessionContext,
+  input: z.infer<typeof RECORD_CHECK_ARGS>,
+  taskKey: string,
+  ledger: AssistantItemLedgerPort,
+  port: NonNullable<NonNullable<AssistantItemDeps['assistantItems']>['check']>
+): Promise<Record<string, unknown>> {
+  if (input.report === undefined)
+    throw new Error('a getting-to-know task hands back its whole answer as `report`; nothing was written')
+  const appended = await ledger.appendObservation(ctx.agentId, taskKey, { text: input.observation, author: 'check' })
+  if (!appended) throw new Error('this getting-to-know task is gone; nothing was written')
+  if (!(await port.report(ctx, taskKey, input.report)))
+    throw new Error('this getting-to-know task has ended; the observation was written but the report was not kept')
+  return { ok: true, report: 'passed on when this task ends; end your turn now' }
+}
+
+/** A check asks for approval to act (assistant-mode.md §5.10), as does a conversation turn: a getting-to-know task's suggestions (§5.13) or an offered follow-up; it runs nothing itself. */
+export const propose: ToolHandler<AssistantItemDeps> = async (ctx, args, deps) => {
+  const fromTurn = deps.assistantItems?.proposeFromTurn
+  const check = isCheckCoordinate(ctx.thread)
+  if (!check && (!fromTurn || !ctx.tools.some((tool) => tool.name === 'propose')))
+    throw new Error('propose is available only in a follow-up’s check')
+  const input = parseArgs(PROPOSE_ARGS, args)
+  ledgerOf(ctx, deps)
+  if (input.followUp?.watch !== undefined) watchesOf(deps).check(input.followUp.watch)
+  if (!check) return await fromTurn!(ctx, input)
+  const port = deps.assistantItems?.check
+  if (!port?.propose) throw new Error('this check has ended; nothing was proposed')
+  return await port.propose(ctx, input)
+}
+
+/** Registry entries for `ops.ts`, kept here so the shared registry grows by one spread. */
+export const ASSISTANT_ITEM_HANDLERS: [string, ToolHandler<AssistantItemDeps>][] = [
+  ['followUp', followUp],
+  ['recordCheck', recordCheck],
+  ['propose', propose]
+]
+
+export const ASSISTANT_ITEM_ARG_SCHEMAS: [string, z.ZodType][] = [
+  ['followUp', FOLLOW_UP_ARGS],
+  ['recordCheck', RECORD_CHECK_ARGS],
+  ['propose', PROPOSE_ARGS]
+]

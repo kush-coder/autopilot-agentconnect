@@ -1,0 +1,423 @@
+#!/usr/bin/env node
+import { fileURLToPath } from 'node:url'
+import { Command, Option } from 'commander'
+import { selfHealCliEntry } from './self-heal.js'
+import { delegate } from './delegate.js'
+import { runComputer } from './computer/commands.js'
+import { runShell } from './run-shell.js'
+import { runServiceHost } from './service-host.js'
+import {
+  classifyInvocation,
+  firstPositional,
+  parseInstanceFlag,
+  parseRootFlag,
+  parseValueFlag,
+  withResolvedRoot
+} from './route.js'
+import { cliCommand, setInvocation } from './invocation.js'
+import { runLogin } from './login.js'
+import {
+  controllerFor,
+  isElevated,
+  listInstances,
+  lookupAccount,
+  resolveController,
+  resolveServiceTarget,
+  sudoAccountName
+} from './service/index.js'
+import { performInstallService, performUninstallService } from './install-service.js'
+import { runUpgrade, versionInstall, versionList, versionPrune, versionUse } from './version-commands.js'
+import { DEFAULT_KEEP_VERSIONS } from './version-ops.js'
+import { CLI_VERSION } from './version.js'
+
+/** Commands that address the OS service, and so may run under sudo. */
+const SERVICE_COMMANDS = new Set([
+  'install-service',
+  'uninstall-service',
+  'up',
+  'down',
+  'restart',
+  'status',
+  'instances'
+])
+
+/**
+ * Under sudo `os.homedir()` is root's, so an operator who typed
+ * `sudo agentconnect install-service` by hand would install a unit pointing at
+ * `/root/.agentconnect` — and would not see the legacy user unit that has to be
+ * retired first. Re-point HOME at the account that will own the service before
+ * any root resolution runs, so an elevated invocation resolves the same root,
+ * default root and unit set as the unelevated one. Service commands only; an
+ * explicit `--root` still wins, since it is read straight off argv.
+ */
+function adoptServiceAccountHome(argv: string[], flags: { serviceUser?: string; serviceHome?: string }): void {
+  if (process.platform !== 'linux' || !isElevated()) return
+  const cmd = firstPositional(argv)
+  if (cmd === undefined || !SERVICE_COMMANDS.has(cmd)) return
+  const name = flags.serviceUser ?? sudoAccountName()
+  const home = flags.serviceHome ?? (name ? lookupAccount(name)?.home : undefined)
+  if (home) process.env.HOME = home
+}
+
+const fail = (cmd: string, err: unknown): never => {
+  console.error(`agentconnect ${cmd}: ${(err as Error).message}`)
+  process.exit(1)
+}
+
+async function main(): Promise<void> {
+  let argv = process.argv.slice(2)
+  // The computer daemon has its own data dir, so it is routed before any agent-daemon root or instance resolution.
+  if (classifyInvocation(argv) === 'computer') {
+    setInvocation({ cliEntry: fileURLToPath(import.meta.url), path: process.env.PATH, platform: process.platform })
+    return runComputer(argv, cliCommand())
+  }
+  // `--instance <name>` is CLI vocabulary for "that daemon's root" (service/
+  // instance.ts). Resolve it here, then rewrite argv into the `--root` form the
+  // daemon understands so run/delegate never see the flag.
+  const instance = parseInstanceFlag(argv)
+  const rootFlag = parseRootFlag(argv)
+  const serviceUser = parseValueFlag(argv, '--service-user')
+  const serviceHome = parseValueFlag(argv, '--service-home')
+  const servicePath = parseValueFlag(argv, '--service-path')
+  adoptServiceAccountHome(argv, { serviceUser, serviceHome })
+  const target = resolveServiceTarget({
+    ...(rootFlag !== undefined ? { root: rootFlag } : {}),
+    ...(instance !== undefined ? { instance } : {})
+  })
+  const root = target.root
+  if (instance !== undefined) argv = withResolvedRoot(argv, root)
+  const cliEntry = fileURLToPath(import.meta.url)
+  selfHealCliEntry(root, cliEntry)
+  // Elevated, PATH is sudo's secure_path; the pre-sudo snapshot is what the operator's shell resolves.
+  setInvocation({ cliEntry, path: servicePath ?? process.env.PATH, platform: process.platform })
+
+  // ── Route by the first positional command (honoring global options before it),
+  //    reserving only CLI-owned commands; everything else delegates verbatim (§4.2).
+  // The Windows logon task's supervisor (service/schtasks.ts) — never typed by hand, so not in the help.
+  if (firstPositional(argv) === 'service-run') return runServiceHost(root, cliEntry)
+  const route = classifyInvocation(argv)
+  if (route === 'run') return runShell(root, argv)
+  if (route === 'delegate') return delegate(root, argv)
+
+  // ── CLI-owned surface: lifecycle, login, version management. ──
+  const program = new Command()
+  program
+    .name('agentconnect')
+    .description('AgentConnect CLI — daemon lifecycle, version management, upgrade')
+    .version(CLI_VERSION)
+
+  // Global options. The CLI itself only reads --root/--config/--api-*/--daemon-id;
+  // the rest are declared so they pass validation on CLI-owned commands and are
+  // forwarded verbatim to the daemon on delegated ones.
+  program
+    .option('--config <path>', 'path to config.json (default ~/.agentconnect/config.json)')
+    .option('--root <dir>', 'override ~/.agentconnect root directory')
+    .option('--instance <name>', 'address a named daemon service instance (root defaults to ~/.agentconnect-<name>)')
+    .option('--api-url <url>', 'override AgentConnect API WebSocket URL')
+    .option('--api-key <key>', 'override daemon API key')
+    .option('--no-cp', 'run fully local, do not connect to the Control Plane')
+    .option('--daemon-id <id>', 'override daemon identity')
+    .option('--log-level <level>', 'trace|debug|info|warn|error')
+    .option('--agents-dir <dir>', 'override agents directory')
+    .option('--max-agents <n>', 'max agents this daemon advertises / enforces')
+    .option('--dry-run', 'load + validate config and print the reconcile plan, then exit')
+    .option('--agent <name>', 'select a single agent by id (run/chat)')
+    .option('--service-user <name>', 'Linux: the account the installed system unit runs the daemon as')
+    // Injected by the sudo re-exec so the elevated CLI resolves the same account,
+    // root and PATH the operator's shell had. Not part of the public surface.
+    .addOption(new Option('--service-home <dir>', 'internal').hideHelp())
+    .addOption(new Option('--service-path <path>', 'internal').hideHelp())
+
+  // Every service command addresses the same target the argv scan above resolved,
+  // and every suggested follow-up command repeats that selector so a copy-paste
+  // lands on this instance rather than the default one.
+  const serviceTarget = () => ({ root, ...(instance !== undefined ? { instance } : {}) })
+  const selector = cliCommand(serviceTarget())
+  const controller = () => resolveController(serviceTarget())
+  const requireInstalled = (c: ReturnType<typeof controller>): void => {
+    if (!c.isInstalled()) {
+      console.error(
+        `agentconnect: no service installed (${c.label}) — run \`${selector} install-service\` first, or \`${selector} run\` for foreground`
+      )
+      process.exit(1)
+    }
+  }
+  const serviceParams = () => ({
+    root,
+    ...(instance !== undefined ? { instance } : {}),
+    cliEntry,
+    ...(serviceUser !== undefined ? { serviceUser } : {}),
+    ...(servicePath !== undefined ? { servicePath } : {})
+  })
+
+  program
+    .command('up')
+    .description('Start the installed background service (launchd / systemd / Windows Task Scheduler)')
+    .action(async () => {
+      const c = controller()
+      requireInstalled(c)
+      try {
+        await c.up()
+        console.log('agentconnect: service started')
+      } catch (err) {
+        fail('up', err)
+      }
+    })
+
+  program
+    .command('down')
+    .description('Stop the installed background service')
+    .action(async () => {
+      const c = controller()
+      requireInstalled(c)
+      try {
+        await c.down()
+        console.log('agentconnect: service stopped')
+      } catch (err) {
+        fail('down', err)
+      }
+    })
+
+  program
+    .command('restart')
+    .description('Restart the installed background service')
+    .action(async () => {
+      const c = controller()
+      requireInstalled(c)
+      try {
+        await c.down()
+      } catch (err) {
+        fail('restart', err)
+      }
+      try {
+        await c.up()
+        console.log('agentconnect: service restarted')
+      } catch (err) {
+        console.error(
+          `agentconnect restart: service stopped but failed to start again — run \`${selector} up\` to retry: ${(err as Error).message}`
+        )
+        process.exit(1)
+      }
+    })
+
+  program
+    .command('status')
+    .description('Print service status (installed / running / pid / log path)')
+    .action(async () => {
+      try {
+        const s = await controller().status()
+        if (!s.installed) {
+          console.log(
+            `service: not installed (${s.label}). Run \`${selector} install-service\` or \`${selector} run\`.`
+          )
+          return
+        }
+        console.log(`service:  ${s.label}`)
+        console.log(`root:     ${root}`)
+        console.log(`state:    ${s.running ? 'running' : 'stopped'}${s.pid ? ` (pid ${s.pid})` : ''}`)
+        console.log(`logs:     ${s.logPath}`)
+      } catch (err) {
+        fail('status', err)
+      }
+    })
+
+  program
+    .command('install-service')
+    .description(
+      'Install the launchd / systemd service, or a Windows logon task (does not start it — run `agentconnect up`)'
+    )
+    .action(async () => {
+      try {
+        const outcome = await performInstallService(serviceParams())
+        if (outcome.kind === 'delegated') process.exit(outcome.code)
+        console.log(`agentconnect: service installed (${outcome.controller.label}, root ${root}).`)
+        if (!outcome.unprivilegedControl) {
+          console.log(
+            `Neither a polkit rule nor a sudoers grant could be installed on this host, so \`up\`/\`down\`/\`restart\` need sudo (\`sudo systemctl start ${outcome.controller.label}\`).`
+          )
+        }
+        console.log(`Run \`${selector} up\` to start it.`)
+      } catch (err) {
+        fail('install-service', err)
+      }
+    })
+
+  program
+    .command('uninstall-service')
+    .description('Stop and remove the system service')
+    .action(async () => {
+      try {
+        const outcome = await performUninstallService(serviceParams())
+        if (outcome.kind === 'delegated') process.exit(outcome.code)
+        console.log(`agentconnect: service uninstalled (${outcome.controller.label})`)
+      } catch (err) {
+        fail('uninstall-service', err)
+      }
+    })
+
+  program
+    .command('instances')
+    .description('List the daemon services installed on this host (one per instance)')
+    .action(async () => {
+      try {
+        const found = listInstances()
+        if (found.length === 0) {
+          console.log(
+            `no daemon service installed — run \`${cliCommand()} install-service\` (add \`--instance <name>\` for a second one)`
+          )
+          return
+        }
+        for (const unit of found) {
+          const s = await controllerFor(unit).status()
+          const state = s.running ? `running${s.pid ? ` (pid ${s.pid})` : ''}` : 'stopped'
+          const where = unit.scope === 'user' ? ' [per-user unit — does not survive logout]' : ''
+          console.log(`${unit.instance ?? '(default)'}\t${state}\t${unit.root}\t${unit.label}${where}`)
+        }
+      } catch (err) {
+        fail('instances', err)
+      }
+    })
+
+  // Listed for help only: `computer` is routed to the computer module before commander parses.
+  program
+    .command('computer')
+    .description(
+      'Install, upgrade and run the computer daemon (install, upgrade, doctor, status, setup, …); `agentconnect computer --help` lists them'
+    )
+    .allowUnknownOption()
+    .helpOption(false)
+
+  program
+    .command('login')
+    .description(
+      'Interactive onboarding: test API credentials, save them, then install+start the service or run in the foreground'
+    )
+    .action(async () => {
+      const opts = program.opts()
+      try {
+        await runLogin({
+          apiUrl: opts.apiUrl,
+          apiKey: opts.apiKey,
+          daemonId: opts.daemonId,
+          root,
+          ...(instance !== undefined ? { instance } : {}),
+          configPath: opts.config,
+          cliEntry,
+          ...(serviceUser !== undefined ? { serviceUser } : {}),
+          ...(servicePath !== undefined ? { servicePath } : {})
+        })
+        process.exit(0)
+      } catch (err) {
+        fail('login', err)
+      }
+    })
+
+  // Version management (cli-daemon-split.md §5).
+  const asChannel = (c?: string): 'stable' | 'rc' | undefined =>
+    c === 'stable' || c === 'rc'
+      ? c
+      : c === undefined
+        ? undefined
+        : fail('version', new Error(`unknown channel '${c}' (use stable|rc)`))
+  // `--keep <n>` → a non-negative retention count; 0 disables cleanup, a non-number is rejected.
+  const keepOption = (n?: string): number | undefined => {
+    if (n === undefined) return undefined
+    const k = Number(n)
+    if (!Number.isInteger(k) || k < 0)
+      return fail('version', new Error(`invalid --keep '${n}' (use a whole number ≥ 0)`))
+    return k
+  }
+
+  const version = program.command('version').description('Manage installed daemon versions')
+  // Bare `agentconnect version` → list (and the CLI's own version prints via --version).
+  version.action(() => versionList(root))
+  version
+    .command('list')
+    .description('List installed daemon versions and the active one')
+    .action(() => versionList(root))
+  version
+    .command('install [version]')
+    .description('Download and unpack a daemon version (defaults to the channel dist-tag)')
+    .option('--channel <channel>', 'stable|rc (default: the stored channel)')
+    .option('--keep <n>', 'how many versions to keep afterwards (0 disables cleanup)', String(DEFAULT_KEEP_VERSIONS))
+    .action(async (v: string | undefined, o: { channel?: string; keep?: string }) => {
+      try {
+        await versionInstall(root, { to: v, channel: asChannel(o.channel), keep: keepOption(o.keep) })
+      } catch (err) {
+        fail('version install', err)
+      }
+    })
+  version
+    .command('use <version>')
+    .description('Activate an installed daemon version (does not restart)')
+    .action(async (v: string) => {
+      try {
+        await versionUse(root, v)
+      } catch (err) {
+        fail('version use', err)
+      }
+    })
+  version
+    .command('prune')
+    .description('Remove old daemon versions, keeping the newest N in total (current/previous always kept)')
+    .option('--keep <n>', 'how many versions to keep in total', String(DEFAULT_KEEP_VERSIONS))
+    .action(async (o: { keep: string }) => {
+      try {
+        await versionPrune(root, keepOption(o.keep) ?? DEFAULT_KEEP_VERSIONS)
+      } catch (err) {
+        fail('version prune', err)
+      }
+    })
+  // Top-level `install` — the convenient alias of `version install`. First
+  // install on a fresh root also activates it (versionInstall), so manual
+  // installs do not need a follow-up `version use`.
+  program
+    .command('install [version]')
+    .description('Download, unpack, and (on a fresh host) activate a daemon version')
+    .option('--channel <channel>', 'stable|rc (default: the stored channel)')
+    .option('--keep <n>', 'how many versions to keep afterwards (0 disables cleanup)', String(DEFAULT_KEEP_VERSIONS))
+    .action(async (v: string | undefined, o: { channel?: string; keep?: string }) => {
+      try {
+        await versionInstall(root, { to: v, channel: asChannel(o.channel), keep: keepOption(o.keep) })
+      } catch (err) {
+        fail('install', err)
+      }
+    })
+
+  program
+    .command('upgrade')
+    .description('Install the latest daemon version, switch to it, and (with --restart) restart + health-check')
+    .option('--to <version>', 'upgrade to a specific version instead of the channel latest')
+    .option('--channel <channel>', 'stable|rc (default: the stored channel)')
+    .option('--restart', 'restart the service now and roll back if it fails its health check')
+    .option(
+      '--keep <n>',
+      'how many versions to keep after upgrading (0 disables cleanup)',
+      String(DEFAULT_KEEP_VERSIONS)
+    )
+    .action(async (o: { to?: string; channel?: string; restart?: boolean; keep?: string }) => {
+      try {
+        await runUpgrade(root, {
+          to: o.to,
+          configPath: program.opts().config,
+          channel: asChannel(o.channel),
+          restart: Boolean(o.restart),
+          keep: keepOption(o.keep)
+        })
+      } catch (err) {
+        fail('upgrade', err)
+      }
+    })
+
+  await program.parseAsync()
+}
+
+// Delegation / run-shell surface their failures (e.g. no active daemon) as thrown
+// errors; present them as a clean CLI message rather than an unhandled stack trace.
+// (commander handles its own command errors and exits before returning here.)
+try {
+  await main()
+} catch (err) {
+  console.error(`agentconnect: ${(err as Error).message}`)
+  process.exit(1)
+}

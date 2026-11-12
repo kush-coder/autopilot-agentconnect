@@ -1,0 +1,388 @@
+/**
+ * Unit tests for the per-user repo authorization gate (identity assertion,
+ * design open question #7): the Logto identity resolution (fake fetch — M2M token
+ * caching, login extraction across connector shapes, negative caching) and the
+ * GithubUserAuthzService decision matrix. No Docker, no network.
+ */
+import { describe, it, expect } from 'vitest'
+import { FakeClock } from '../../test/fakes/fake-clock.js'
+import type { GithubInstallationRecord, SocialIdentityMutationGate } from '../persistence/ports.js'
+import { LogtoIdentityService, resolveLogtoMgmtConfig, LogtoApiError } from './logto-identity.js'
+import { GithubUserAuthzService, UserAuthzDeniedError, type RepoPermission } from './user-authz.js'
+
+const INS = { installationId: 123n } as GithubInstallationRecord
+
+describe('resolveLogtoMgmtConfig', () => {
+  it('returns undefined when nothing is set (feature off)', () => {
+    expect(resolveLogtoMgmtConfig({})).toBeUndefined()
+  })
+
+  it('treats an endpoint without credentials as topology, not feature enablement', () => {
+    expect(resolveLogtoMgmtConfig({ LOGTO_MGMT_ENDPOINT: 'https://x.logto.app' })).toBeUndefined()
+    expect(() => resolveLogtoMgmtConfig({ LOGTO_MGMT_APP_ID: 'id' })).toThrow(
+      /missing LOGTO_MGMT_ENDPOINT, LOGTO_MGMT_APP_SECRET/
+    )
+  })
+
+  it('defaults the resource to `${endpoint}/api` and strips a trailing slash', () => {
+    const cfg = resolveLogtoMgmtConfig({
+      LOGTO_MGMT_ENDPOINT: 'https://x.logto.app/',
+      LOGTO_MGMT_APP_ID: 'id',
+      LOGTO_MGMT_APP_SECRET: 'sec'
+    })
+    expect(cfg?.endpoint).toBe('https://x.logto.app')
+    expect(cfg?.resource).toBe('https://x.logto.app/api')
+  })
+
+  it('honors an explicit resource (custom-domain tenants)', () => {
+    const cfg = resolveLogtoMgmtConfig({
+      LOGTO_MGMT_ENDPOINT: 'https://auth.example.com',
+      LOGTO_MGMT_APP_ID: 'id',
+      LOGTO_MGMT_APP_SECRET: 'sec',
+      LOGTO_MGMT_RESOURCE: 'https://tenant.logto.app/api'
+    })
+    expect(cfg?.resource).toBe('https://tenant.logto.app/api')
+  })
+})
+
+const EPOCH = 1_777_000_000_000
+const MGMT = { endpoint: 'https://t.logto.app', appId: 'app', appSecret: 'sec', resource: 'https://t.logto.app/api' }
+const MUTATIONS: SocialIdentityMutationGate = {
+  runExclusive: async (_oidcSubject, mutation) => mutation()
+}
+
+/** Fake Logto: one token endpoint + a user directory. Counts calls. */
+function fakeLogto(users: Record<string, unknown>, opts: { tokenTtlSec?: number } = {}) {
+  const calls = { token: 0, user: 0 }
+  const fetchImpl = async (url: string, init?: RequestInit): Promise<Response> => {
+    if (url.endsWith('/oidc/token')) {
+      calls.token++
+      expect(init?.method).toBe('POST')
+      const body = String(init?.body)
+      expect(body).toContain('grant_type=client_credentials')
+      expect(body).toContain(encodeURIComponent('https://t.logto.app/api'))
+      return Response.json({ access_token: `tok-${calls.token}`, expires_in: opts.tokenTtlSec ?? 3600 })
+    }
+    calls.user++
+    const sub = decodeURIComponent(url.split('/').pop()!)
+    const user = users[sub]
+    if (!user) return new Response('{}', { status: 404 })
+    return Response.json(user)
+  }
+  return { fetchImpl, calls }
+}
+
+describe('LogtoIdentityService', () => {
+  it('resolves the github login from the connector rawData (userInfo shape)', async () => {
+    const { fetchImpl } = fakeLogto({
+      'sub-1': { identities: { github: { userId: '9', details: { rawData: { userInfo: { login: 'octocat' } } } } } }
+    })
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+    expect(await svc.githubLoginFor('sub-1')).toBe('octocat')
+  })
+
+  it('falls back to the flat rawData.login (older connector shape)', async () => {
+    const { fetchImpl } = fakeLogto({
+      'sub-1': { identities: { github: { details: { rawData: { login: 'flat' } } } } }
+    })
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+    expect(await svc.githubLoginFor('sub-1')).toBe('flat')
+  })
+
+  it('returns null for accounts without a github identity, and for unknown users', async () => {
+    const { fetchImpl } = fakeLogto({ 'sub-google': { identities: { google: { userId: 'g' } } } })
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+    expect(await svc.githubLoginFor('sub-google')).toBeNull()
+    expect(await svc.githubLoginFor('sub-missing')).toBeNull()
+  })
+
+  it('caches the login (10 min) and the M2M token; a miss is re-asked after 60s', async () => {
+    const clock = new FakeClock(0)
+    const users: Record<string, unknown> = {}
+    const { fetchImpl, calls } = fakeLogto(users)
+    const svc = new LogtoIdentityService(MGMT, clock, MUTATIONS, fetchImpl)
+
+    expect(await svc.githubLoginFor('sub-1')).toBeNull() // 404 → negative cache
+    expect(await svc.githubLoginFor('sub-1')).toBeNull() // served from cache
+    expect(calls.user).toBe(1)
+
+    clock.advance(61_000) // negative TTL passed; user has linked meanwhile
+    users['sub-1'] = { identities: { github: { details: { rawData: { userInfo: { login: 'late' } } } } } }
+    expect(await svc.githubLoginFor('sub-1')).toBe('late')
+    expect(calls.user).toBe(2)
+
+    clock.advance(60_000) // positive cache holds
+    expect(await svc.githubLoginFor('sub-1')).toBe('late')
+    expect(calls.user).toBe(2)
+    expect(calls.token).toBe(1) // one M2M token covered everything
+  })
+
+  it('can bypass the display login cache for a fresh authorization assertion', async () => {
+    const users: Record<string, unknown> = {
+      'sub-1': { identities: { github: { details: { rawData: { userInfo: { login: 'before' } } } } } }
+    }
+    const { fetchImpl, calls } = fakeLogto(users)
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+
+    expect(await svc.githubLoginFor('sub-1')).toBe('before')
+    users['sub-1'] = { identities: { github: { details: { rawData: { userInfo: { login: 'after' } } } } } }
+    expect(await svc.githubLoginFor('sub-1', 0)).toBe('after')
+    expect(calls.user).toBe(2)
+  })
+
+  it('surfaces mgmt-API failures as retryable LogtoApiError (the gate fails closed)', async () => {
+    const fetchImpl = async (url: string): Promise<Response> =>
+      url.endsWith('/oidc/token')
+        ? Response.json({ access_token: 't', expires_in: 3600 })
+        : new Response('boom', { status: 503 })
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+    await expect(svc.githubLoginFor('s')).rejects.toThrow(LogtoApiError)
+    await expect(svc.githubLoginFor('s')).rejects.toMatchObject({ retryable: true })
+  })
+
+  it('resolves a connector id and unlinks through the same M2M token', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const fetchImpl = async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith('/oidc/token')) {
+        return Response.json({ access_token: 'mgmt-token', expires_in: 3600 })
+      }
+      requests.push({ url, init })
+      if (url.endsWith('/api/connectors?target=google')) {
+        return Response.json([{ id: 'google connector', target: 'google', type: 'Social' }])
+      }
+      if (url.endsWith('/api/users/logto%20user') && !init?.method) {
+        return Response.json({ identities: { google: {}, github: {} } })
+      }
+      if (init?.method === 'DELETE') return new Response(null, { status: 204 })
+      return Response.json({})
+    }
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+
+    await expect(svc.socialConnectorIdFor('google')).resolves.toBe('google connector')
+    await svc.unlinkSocialIdentity('logto user', 'google')
+
+    // Notably absent: /authorization-uri and POST …/identities. Both run the
+    // connector without a session, so linking is the browser's job now.
+    expect(requests.map(({ url, init }) => [url, init?.method])).toEqual([
+      ['https://t.logto.app/api/connectors?target=google', undefined],
+      ['https://t.logto.app/api/users/logto%20user', undefined],
+      ['https://t.logto.app/api/users/logto%20user/identities/google', 'DELETE']
+    ])
+    expect(requests.every(({ init }) => new Headers(init?.headers).get('authorization') === 'Bearer mgmt-token')).toBe(
+      true
+    )
+  })
+
+  it('rejects a target with no Social connector in the tenant', async () => {
+    const fetchImpl = async (url: string): Promise<Response> =>
+      url.endsWith('/oidc/token')
+        ? Response.json({ access_token: 'mgmt-token', expires_in: 3600 })
+        : Response.json(url.includes('target=slack') ? [] : [{ id: 'x', target: 'google', type: 'Social' }])
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+
+    await expect(svc.socialConnectorIdFor('slack')).rejects.toMatchObject({ status: 404 })
+  })
+
+  it('refuses to unlink the last social sign-in method', async () => {
+    const methods: Array<string | undefined> = []
+    const fetchImpl = async (url: string, init?: RequestInit): Promise<Response> => {
+      if (url.endsWith('/oidc/token')) return Response.json({ access_token: 'mgmt-token', expires_in: 3600 })
+      methods.push(init?.method)
+      return Response.json({ identities: { google: {} } })
+    }
+    const svc = new LogtoIdentityService(MGMT, new FakeClock(0), MUTATIONS, fetchImpl)
+
+    await expect(svc.unlinkSocialIdentity('logto-user', 'google')).rejects.toMatchObject({
+      status: 409,
+      code: 'LAST_SOCIAL_IDENTITY'
+    })
+    expect(methods).toEqual([undefined])
+  })
+})
+
+// ── decision matrix ──────────────────────────────────────────────────────────
+
+function authz(opts: {
+  sub?: string | null
+  login?: string | null
+  repo?: { private: boolean } | null
+  permission?: RepoPermission
+  /** Per-repo override keyed by "owner/repo" (falls back to `permission`). */
+  permissions?: Record<string, RepoPermission>
+}) {
+  // Seeded with a real epoch, not 0: the permission/meta caches record an
+  // entry's start time and read a falsy one as "no TTL", which would make every
+  // entry immortal and quietly pass the expiry assertions below (see `cache.ts`).
+  const clock = new FakeClock(EPOCH)
+  const calls = { permission: 0, loginCaps: [] as Array<number | undefined> }
+  const svc = new GithubUserAuthzService({
+    identity: {
+      githubLoginFor: async (_sub, maxAgeMs) => {
+        calls.loginCaps.push(maxAgeMs)
+        return opts.login ?? null
+      }
+    },
+    users: { getOidcSubject: async () => (opts.sub === undefined ? 'sub-1' : opts.sub) },
+    github: {
+      getRepoMeta: async () => (opts.repo === undefined ? { private: true } : opts.repo),
+      userRepoPermission: async (_ins, owner, repo) => {
+        calls.permission++
+        return opts.permissions?.[`${owner}/${repo}`] ?? opts.permission ?? 'none'
+      }
+    },
+    clock
+  })
+  return { svc, clock, calls }
+}
+
+describe('GithubUserAuthzService', () => {
+  it('denies GITHUB_IDENTITY_REQUIRED when the user row has no OIDC subject', async () => {
+    const { svc } = authz({ sub: null })
+    await expect(svc.assertAccess('u1', INS, 'o', 'r', 'read')).rejects.toMatchObject({
+      code: 'GITHUB_IDENTITY_REQUIRED'
+    })
+  })
+
+  it('denies GITHUB_IDENTITY_REQUIRED when the account has no github identity', async () => {
+    const { svc } = authz({ login: null })
+    await expect(svc.assertAccess('u1', INS, 'o', 'r', 'read')).rejects.toMatchObject({
+      code: 'GITHUB_IDENTITY_REQUIRED'
+    })
+  })
+
+  it('allows public read without a GitHub identity but keeps write identity-gated', async () => {
+    const { svc, calls } = authz({ login: null, repo: { private: false } })
+    await expect(svc.assertAccess('u1', INS, 'o', 'public', 'read')).resolves.toMatchObject({
+      canRead: true,
+      canWrite: false,
+      identityRequired: true
+    })
+    await expect(svc.assertAccess('u1', INS, 'o', 'public', 'write')).rejects.toMatchObject({
+      code: 'GITHUB_IDENTITY_REQUIRED'
+    })
+    expect(calls.permission).toBe(0)
+  })
+
+  it('private + none ⇒ no read; public + none ⇒ read but never write', async () => {
+    const closed = authz({ login: 'me', repo: { private: true }, permission: 'none' })
+    await expect(closed.svc.assertAccess('u1', INS, 'o', 'r', 'read')).rejects.toMatchObject({
+      code: 'USER_NO_ACCESS'
+    })
+
+    const open = authz({ login: 'me', repo: { private: false }, permission: 'none' })
+    await expect(open.svc.assertAccess('u1', INS, 'o', 'r', 'read')).resolves.toMatchObject({ canRead: true })
+    await expect(open.svc.assertAccess('u1', INS, 'o', 'r', 'write')).rejects.toMatchObject({
+      code: 'USER_NO_ACCESS'
+    })
+  })
+
+  it('read permission satisfies read but not write; write/admin satisfy both', async () => {
+    const reader = authz({ login: 'me', permission: 'read' })
+    await expect(reader.svc.assertAccess('u1', INS, 'o', 'r', 'read')).resolves.toMatchObject({ permission: 'read' })
+    await expect(reader.svc.assertAccess('u1', INS, 'o', 'r', 'write')).rejects.toMatchObject({
+      code: 'USER_NO_ACCESS'
+    })
+
+    for (const permission of ['write', 'admin'] as const) {
+      const { svc } = authz({ login: 'me', permission })
+      await expect(svc.assertAccess('u1', INS, 'o', 'r', 'write')).resolves.toMatchObject({ canWrite: true })
+    }
+  })
+
+  it('an out-of-grant repo reads as private/no-access (callers 404 first)', async () => {
+    const { svc, calls } = authz({ login: 'me', repo: null })
+    await expect(svc.assertAccess('u1', INS, 'o', 'r', 'read')).rejects.toMatchObject({ code: 'USER_NO_ACCESS' })
+    expect(calls.permission).toBe(0) // no permission call for a repo the installation can't see
+  })
+
+  it('caches the decision for 5 minutes per (installation, repo, login)', async () => {
+    const { svc, clock, calls } = authz({ login: 'me', permission: 'write' })
+    await svc.assertAccess('u1', INS, 'o', 'r', 'write')
+    await svc.assertAccess('u1', INS, 'o', 'r', 'read')
+    expect(calls.permission).toBe(1)
+    clock.advance(5 * 60_000 + 1)
+    await svc.assertAccess('u1', INS, 'o', 'r', 'write')
+    expect(calls.permission).toBe(2)
+  })
+
+  it('coalesces concurrent callers into one permission probe', async () => {
+    const { svc, calls } = authz({ login: 'me', permission: 'read' })
+
+    await Promise.all([
+      svc.permissionForUser('u1', INS, 'o', 'r'),
+      svc.permissionForUser('u1', INS, 'o', 'r'),
+      svc.permissionForUser('u1', INS, 'o', 'r')
+    ])
+
+    expect(calls.permission).toBe(1)
+  })
+
+  it('can bypass the picker cache for a shorter-lived authorization lease', async () => {
+    const { svc, calls } = authz({ login: 'me', permission: 'read' })
+    await svc.permissionForUser('u1', INS, 'o', 'r')
+    await svc.permissionForUser('u1', INS, 'o', 'r')
+    expect(calls.permission).toBe(1)
+
+    await svc.permissionForUser('u1', INS, 'o', 'r', { maxCacheAgeMs: 0 })
+    expect(calls.permission).toBe(2)
+  })
+
+  it('splits the caps: the login leg rides the identity lease while the permission is re-proved', async () => {
+    const { svc, calls } = authz({ login: 'me', permission: 'read' })
+
+    await svc.permissionForUser('u1', INS, 'o', 'r', { maxCacheAgeMs: 0, loginMaxAgeMs: 120_000 })
+    await svc.permissionForUser('u1', INS, 'o', 'r', { maxCacheAgeMs: 0, loginMaxAgeMs: 120_000 })
+    // The identity leg may accept a ≤120 s cached login — it answers "which
+    // GitHub account", invalidated on link/unlink — while the permission, the
+    // revocable fact, is still re-proved against GitHub on every call.
+    expect(calls.loginCaps).toEqual([120_000, 120_000])
+    expect(calls.permission).toBe(2)
+
+    // One cap without the split option keeps its old both-legs meaning.
+    await svc.permissionForUser('u1', INS, 'o', 'r', { maxCacheAgeMs: 0 })
+    expect(calls.loginCaps).toEqual([120_000, 120_000, 0])
+    expect(calls.permission).toBe(3)
+  })
+
+  it('filters the repo list: public stays, readable private stays, no-access private drops', async () => {
+    const { svc, calls } = authz({
+      login: 'me',
+      permissions: { 'o/readable': 'read', 'o/secret': 'none' }
+    })
+    const page = [
+      { fullName: 'o/pub', private: false },
+      { fullName: 'o/readable', private: true },
+      { fullName: 'o/secret', private: true }
+    ]
+    const visible = await svc.filterReposForUser('u1', INS, page)
+    expect(visible.repos.map((r) => r.fullName)).toEqual(['o/pub', 'o/readable'])
+    expect(visible.privateReposHidden).toBe(false)
+    expect(calls.permission).toBe(2) // public repos are never probed
+  })
+
+  it('list filter reuses the same permission cache as the gates', async () => {
+    const { svc, calls } = authz({ login: 'me', repo: { private: true }, permission: 'read' })
+    await svc.filterReposForUser('u1', INS, [{ fullName: 'o/r', private: true }])
+    await svc.assertAccess('u1', INS, 'o', 'r', 'read') // cache hit — no second probe
+    expect(calls.permission).toBe(1)
+  })
+
+  it('list filter keeps public rows and marks private rows hidden without a GitHub identity', async () => {
+    const { svc } = authz({ login: null })
+    await expect(
+      svc.filterReposForUser('u1', INS, [
+        { fullName: 'o/pub', private: false },
+        { fullName: 'o/private', private: true }
+      ])
+    ).resolves.toEqual({
+      repos: [{ fullName: 'o/pub', private: false }],
+      privateReposHidden: true
+    })
+  })
+
+  it('denial messages carry the effective permission for the write case', async () => {
+    const { svc } = authz({ login: 'me', permission: 'read' })
+    await expect(svc.assertAccess('u1', INS, 'o', 'r', 'write')).rejects.toThrow(/effective: read/)
+    await expect(svc.assertAccess('u1', INS, 'o', 'r', 'write')).rejects.toBeInstanceOf(UserAuthzDeniedError)
+  })
+})

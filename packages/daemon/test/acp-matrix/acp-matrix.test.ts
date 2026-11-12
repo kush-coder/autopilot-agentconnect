@@ -1,0 +1,1133 @@
+/**
+ * LOCAL-ONLY live runtime support matrix.
+ *
+ * This suite discovers the runtimes installed on this machine, starts their real
+ * ACP adapters, and sends real prompts to their configured model providers. It is
+ * intentionally skipped in CI: results are facts about this host's installation,
+ * authentication, sandbox, and provider access, not deterministic unit contracts.
+ *
+ * Run explicitly with:
+ *   pnpm --filter @agentconnect.md/daemon test:runtime-matrix
+ */
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { createServer, type Server } from 'node:http'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { createServer as createSocketServer, type AddressInfo, type Server as SocketServer } from 'node:net'
+import type { McpServer } from '@agentclientprotocol/sdk/unstable'
+import { AcpHost, turnFailureCode, turnFailureReason } from '../../src/acp/acp-host.js'
+import { detectSandbox } from '../../src/acp/sandbox.js'
+import { loadConfig } from '../../src/config/load-config.js'
+import { MicrosandboxConfigSchema, type Config, type RuntimeDef } from '../../src/config/config-schema.js'
+import { microsandboxLauncher } from '../../src/execution/executor-vm.js'
+import { LocalExecutor } from '../../src/execution/local-executor.js'
+import { makeLogger } from '../../src/log.js'
+import type { MicrosandboxManager } from '../../src/microsandbox/driver.js'
+import { installMicrosandbox, microsandboxHostUnavailable } from '../../src/microsandbox/install.js'
+import { prepareMicrosandboxLaunch } from '../../src/microsandbox/launch.js'
+import { localMicrosandboxEnvironment } from '../../src/microsandbox/placement.js'
+import { definitionEnv } from '../../src/microsandbox/secrets.js'
+import { microsandboxSupportMounts } from '../../src/microsandbox/support.js'
+import { sandboxSubjectAgentId } from '../../src/remote/sandbox-subject.js'
+import { declaredRuntimeCatalog } from '../../src/runtimes/k8s-runtimes.js'
+import { resolveRoot } from '../../src/paths.js'
+import { installSkills } from '../../src/skills/install-skills.js'
+import { composeRuntimeLaunch } from '../../src/launch/compose.js'
+import { installedRuntimeCatalog } from '../../src/runtimes/probe.js'
+import {
+  resolveRuntimeCatalog,
+  type ResolvedRuntimeCatalog,
+  type ResolvedRuntimeEntry
+} from '../../src/runtimes/registry.js'
+import {
+  aggregate,
+  probeTools,
+  runSendMessageScenarios,
+  scenarioGrid,
+  selectedScenarios,
+  sendMessageFixture,
+  sendMessageReport,
+  SCENARIOS,
+  unreachableRuns,
+  type SendMessageFixture,
+  type SendMessageRun,
+  type ScoredRun,
+  type SendMessageScenario
+} from './send-message-probe.js'
+import {
+  CO_SCENARIOS,
+  coordinatorFixture,
+  coordinatorPrompt,
+  coordinatorTools,
+  runCoordinatorScenarios,
+  selectedCoordinatorScenarios,
+  unreachableCoordinatorRuns,
+  type CoordinatorFixture,
+  type CoordinatorRun,
+  type CoordinatorScenario
+} from './coordinator-probe.js'
+import { FEATURES, type FeatureId } from './support-matrix.js'
+import { autoOrFullAccessPermissionMode } from '@agentconnect.md/protocol'
+
+const IS_CI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS)
+const TURN_TIMEOUT = 180_000
+const SUITE_TIMEOUT = 30 * 60_000
+// The sendMessage probe runs targets × scenarios × reps sessions, each bounded by a session and a prompt timeout.
+const SEND_MESSAGE_TIMEOUT = sendMessageBudget()
+const COORDINATOR_TIMEOUT = coordinatorBudget()
+const SKILL_NAME = 'runtime-matrix-probe'
+const DEBUG_CHILD = process.env.AC_RUNTIME_MATRIX_DEBUG === '1'
+// Kept between runs so the msb package and the image are pulled once; short because VM socket paths must fit 108 bytes.
+const VM_ROOT = join(tmpdir(), 'acm-matrix')
+// A source build has no release image metadata; the full image ships every runtime the matrix can put in a VM.
+const DEFAULT_VM_IMAGE = 'ghcr.io/agentconnect-md/runtime-sandbox-full:latest'
+
+type Status = 'ok' | 'degrade' | 'na' | 'unavailable' | 'fail'
+interface Outcome {
+  status: Status
+  detail: string
+}
+interface RuntimeResult {
+  id: string
+  reachable: boolean
+  features: Partial<Record<FeatureId, Outcome>>
+  error?: string
+  cleanupError?: string
+  models: string[]
+  modes: string[]
+  mcp: { http: boolean; sse: boolean }
+}
+
+interface RuntimeTarget {
+  id: string
+  runtime: RuntimeDef
+  entry: ResolvedRuntimeEntry
+}
+
+interface ProbeEndpoint {
+  server: Server
+  url: string
+  calls: () => number
+}
+
+function withTimeout<T>(promise: Promise<T>, label: string, timeout = TURN_TIMEOUT): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeout}ms`)), timeout)
+      timer.unref?.()
+    })
+  ])
+}
+
+function textChunks(updates: unknown[], from = 0): string[] {
+  return updates
+    .slice(from)
+    .filter(
+      (update: any) =>
+        update?.sessionUpdate === 'agent_message_chunk' &&
+        update?.content?.type === 'text' &&
+        typeof update.content.text === 'string'
+    )
+    .map((update: any) => update.content.text as string)
+}
+
+function mcpProbeEndpoint(): Promise<ProbeEndpoint> {
+  let toolCalls = 0
+  const server = createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk: Buffer) => (body += chunk.toString('utf8')))
+    req.on('end', () => {
+      let rpc: { id?: string | number; method?: string } = {}
+      try {
+        rpc = JSON.parse(body) as typeof rpc
+      } catch {
+        // A malformed request is still a real compatibility failure: answer 400.
+        res.writeHead(400).end()
+        return
+      }
+      if (req.method !== 'POST') {
+        res.writeHead(405).end()
+        return
+      }
+      if (rpc.id === undefined) {
+        res.writeHead(202).end()
+        return
+      }
+      if (rpc.method === 'tools/call') {
+        toolCalls += 1
+        res.writeHead(200, { 'content-type': 'application/json' }).end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { content: [{ type: 'text', text: 'MATRIX_MCP_OK' }], isError: false }
+          })
+        )
+        return
+      }
+      const result =
+        rpc.method === 'initialize'
+          ? {
+              protocolVersion: '2025-06-18',
+              capabilities: { tools: {} },
+              serverInfo: { name: 'agentconnect-runtime-matrix', version: '1' }
+            }
+          : rpc.method === 'tools/list'
+            ? {
+                tools: [
+                  {
+                    name: 'runtime_matrix_probe',
+                    description: 'Returns MATRIX_MCP_OK. Use only for the AgentConnect runtime matrix.',
+                    inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+                  }
+                ]
+              }
+            : {}
+      res
+        .writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result }))
+    })
+  })
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address() as AddressInfo
+      resolve({ server, url: `http://127.0.0.1:${port}/mcp`, calls: () => toolCalls })
+    })
+  })
+}
+
+function selectAllowOption(params: any): { outcome: { outcome: 'selected'; optionId: string } } | undefined {
+  const options = Array.isArray(params?.options) ? params.options : []
+  const selected = options.find((option: any) => String(option?.kind ?? '').startsWith('allow')) ?? options[0]
+  return selected?.optionId ? { outcome: { outcome: 'selected', optionId: String(selected.optionId) } } : undefined
+}
+
+function providerUnavailable(error: unknown): boolean {
+  if (turnFailureCode(error) !== 'turn_failed') return true
+  const message = turnFailureReason(error).toLowerCase()
+  return [
+    'authentication required',
+    'authenticate first',
+    'credit usage limit',
+    'insufficient balance',
+    'requires usage credits',
+    'weekly limit',
+    'usage limit',
+    'quota',
+    'high demand',
+    'rate limit',
+    'too many requests'
+  ].some((part) => message.includes(part))
+}
+
+function runtimeErrorOutcome(error: unknown): Outcome {
+  return {
+    status: providerUnavailable(error) ? 'unavailable' : 'fail',
+    detail: turnFailureReason(error)
+  }
+}
+
+async function installProbeSkill(
+  target: RuntimeTarget,
+  root: string,
+  agentDir: string,
+  cwd: string,
+  token: string
+): Promise<Outcome> {
+  if (!target.entry.skillsAgentId) {
+    return { status: 'degrade', detail: 'runtime has no audited skills CLI identity' }
+  }
+  const sourceDir = join(root, 'skill-source')
+  mkdirSync(sourceDir, { recursive: true })
+  writeFileSync(
+    join(sourceDir, 'SKILL.md'),
+    `---\nname: ${SKILL_NAME}\ndescription: Use only when the user says ACTIVATE_SKILL_PROBE.\n---\n\n# Runtime matrix probe\n\nWhen invoked, reply with exactly: ${token}\n`
+  )
+  const result = await installSkills({ id: 'runtime-matrix', runtime: target.id, skills: [], dir: agentDir }, cwd, {
+    stateDir: join(root, 'skill-state'),
+    skillsAgentId: target.entry.skillsAgentId,
+    localSkills: [{ kind: 'managed', key: `matrix:${target.id}`, name: SKILL_NAME, sourceDir }]
+  })
+  if (result.errors.length > 0 || result.installed.length === 0) {
+    return { status: 'fail', detail: result.errors.map((error) => error.error).join('; ') || 'skill was not installed' }
+  }
+  return { status: 'ok', detail: `installed via skills CLI identity ${target.entry.skillsAgentId}` }
+}
+
+async function runSandboxProbe(target: RuntimeTarget, root: string, token: string): Promise<Outcome> {
+  const mechanism = detectSandbox()
+  if (!mechanism) return { status: 'degrade', detail: 'no supported sandbox mechanism on this host' }
+
+  const scopeDir = join(root, 'sandbox-agent')
+  const sandboxCwd = join(scopeDir, 'workspace')
+  mkdirSync(sandboxCwd, { recursive: true })
+  const composed = composeRuntimeLaunch({
+    runtimeId: target.id,
+    runtime: target.runtime,
+    provider: 'managed',
+    scopeDir,
+    cwd: sandboxCwd,
+    runInSandbox: true,
+    daemonRoot: root,
+    sandboxMechanism: mechanism,
+    hostEnv: process.env,
+    stateSourceEnv: process.env
+  })
+  const updates: unknown[] = []
+  const host = new AcpHost(composed.runtime, {
+    runtimeId: target.id,
+    suppressChildStderr: !DEBUG_CHILD,
+    onUpdate: (_sessionId, update) => updates.push(update),
+    env: composed.launch.env,
+    inheritProcessEnv: composed.launch.inheritProcessEnv,
+    sandbox: composed.launch.sandbox
+  })
+  let sessionId: string | undefined
+  try {
+    await withTimeout(host.start(), `${target.id}/sandbox start`)
+    sessionId = await withTimeout(host.newSession(sandboxCwd), `${target.id}/sandbox session`)
+    await withTimeout(
+      host.prompt(sessionId, [{ type: 'text', text: `Reply with exactly ${token} and nothing else.` }]),
+      `${target.id}/sandbox prompt`
+    )
+    const output = textChunks(updates).join('')
+    return output.includes(token)
+      ? { status: 'ok', detail: `real model turn completed inside ${mechanism}` }
+      : { status: 'fail', detail: `sandboxed model reply did not contain ${token}` }
+  } finally {
+    try {
+      if (sessionId && host.deleteSupported())
+        await withTimeout(host.deleteSession(sessionId), `${target.id}/sandbox session delete`)
+    } finally {
+      await host.stop().catch(() => {})
+    }
+  }
+}
+
+const WEB_PAGE = 'https://example.com'
+const WEB_PROMPT =
+  `Use your own web tool to open ${WEB_PAGE} and reply with the exact text of its main heading and nothing else. ` +
+  'If you have no tool that can open a web page, reply NO_WEB_TOOL.'
+
+/** Organization research's web reach (assistant-mode.md §9 Q29): a credential-less launch in an empty directory, under the runtime's auto mode, fetching one public page. */
+async function runWebProbe(target: RuntimeTarget, root: string): Promise<Outcome> {
+  const scopeDir = join(root, 'research-agent')
+  const cwd = join(scopeDir, 'research')
+  mkdirSync(cwd, { recursive: true })
+  const composed = composeRuntimeLaunch({
+    runtimeId: target.id,
+    runtime: target.runtime,
+    provider: 'managed',
+    scopeDir,
+    cwd,
+    runInSandbox: false,
+    daemonRoot: root,
+    hostEnv: process.env,
+    stateSourceEnv: process.env
+  })
+  const updates: any[] = []
+  let asked = 0
+  const host = new AcpHost(composed.runtime, {
+    runtimeId: target.id,
+    suppressChildStderr: !DEBUG_CHILD,
+    onUpdate: (_sessionId, update) => updates.push(update),
+    onPermission: async (_sessionId, params) => {
+      asked += 1
+      return selectAllowOption(params)
+    },
+    env: composed.launch.env,
+    inheritProcessEnv: composed.launch.inheritProcessEnv
+  })
+  let sessionId: string | undefined
+  try {
+    await withTimeout(host.start(), `${target.id}/web start`)
+    sessionId = await withTimeout(host.newSession(cwd), `${target.id}/web session`)
+    // A model the provider account can run, when its default cannot (AC_RUNTIME_MATRIX_WEB_MODEL, a substring of an offered id).
+    const wanted = process.env.AC_RUNTIME_MATRIX_WEB_MODEL?.trim()
+    const model = wanted ? host.modelOptions()?.models.find((id) => id.includes(wanted)) : undefined
+    if (model) await host.setSessionModel(sessionId, model)
+    // The mode switching assistant mode on picks (§1.8); a runtime with none mapped keeps its own default.
+    const offered = host.permissionModeOptions(sessionId)?.modes ?? []
+    const mode = autoOrFullAccessPermissionMode(target.entry.aliasOf ?? target.id, offered)
+    if (mode) await host.setSessionPermissionMode(sessionId, mode)
+    const current = host.permissionModeOptions(sessionId)?.current ?? 'default'
+    await withTimeout(host.prompt(sessionId, [{ type: 'text', text: WEB_PROMPT }]), `${target.id}/web prompt`)
+    const reply = textChunks(updates).join('').trim()
+    const calls = updates.filter(
+      (update) =>
+        update?.sessionUpdate === 'tool_call' &&
+        /fetch|web|search|http|browse|curl|open/i.test(`${update.kind ?? ''} ${update.title ?? ''}`)
+    )
+    const failed = updates.filter(
+      (update) => update?.sessionUpdate === 'tool_call_update' && update.status === 'failed'
+    ).length
+    const titles = [...new Set(calls.map((call) => `${call.kind ?? '?'}:${String(call.title ?? '').slice(0, 40)}`))]
+    const detail = `mode ${current}; ${calls.length} web call(s) [${titles.join(', ')}]; ${asked} permission request(s); ${failed} failed; reply ${JSON.stringify(reply.slice(0, 80))}`
+    if (/Example Domain/i.test(reply))
+      return {
+        status: asked === 0 ? 'ok' : 'degrade',
+        detail: `${asked === 0 ? 'works' : 'asks for permission'}: ${detail}`
+      }
+    if (reply.includes('NO_WEB_TOOL') || calls.length === 0)
+      return { status: 'degrade', detail: `tool absent: ${detail}` }
+    return { status: 'degrade', detail: `denied: ${detail}` }
+  } finally {
+    try {
+      if (sessionId && host.deleteSupported())
+        await withTimeout(host.deleteSession(sessionId), `${target.id}/web delete`)
+    } finally {
+      await host.stop().catch(() => {})
+    }
+  }
+}
+
+/** This host's microsandbox backend, booted once for every runtime the image ships. */
+interface VmBackend {
+  manager: MicrosandboxManager
+  local: LocalExecutor
+  runtimes: Record<string, RuntimeDef>
+  servers: SocketServer[]
+}
+
+let vm: VmBackend | undefined
+let vmUnavailable = 'VM probe not requested'
+
+async function startVm(config: Config, catalog: ResolvedRuntimeCatalog): Promise<void> {
+  const host = microsandboxHostUnavailable()
+  if (host) {
+    vmUnavailable = host
+    return
+  }
+  if (!existsSync(fileURLToPath(new URL('../../dist/shim/index.js', import.meta.url)))) {
+    vmUnavailable = 'the VM stages the bundled shim: run `pnpm --filter @agentconnect.md/daemon build` first'
+    return
+  }
+  const image =
+    process.env.AC_RUNTIME_MATRIX_VM_IMAGE?.trim() ||
+    (config.sandbox.microsandbox === false ? undefined : config.sandbox.microsandbox.image) ||
+    DEFAULT_VM_IMAGE
+  mkdirSync(VM_ROOT, { recursive: true, mode: 0o700 })
+  // Stand-ins for the daemon's MCP and agent channel servers: the probe turn needs neither, the VM needs both bound.
+  const sockets = { mcp: join(VM_ROOT, 'mcp.sock'), agent: join(VM_ROOT, 'agent.sock') }
+  const servers = await Promise.all(
+    Object.values(sockets).map(
+      (path) =>
+        new Promise<SocketServer>((resolve, reject) => {
+          rmSync(path, { force: true })
+          const server = createSocketServer((socket) => socket.end())
+          server.once('error', reject)
+          server.listen(path, () => resolve(server))
+        })
+    )
+  )
+  const log = makeLogger(DEBUG_CHILD ? 'info' : 'warn')
+  try {
+    const manager = await installMicrosandbox({
+      root: VM_ROOT,
+      config: MicrosandboxConfigSchema.parse({ image }),
+      sockets,
+      log
+    })
+    const table = await manager.prepare()
+    let generation = 0
+    const local = new LocalExecutor({
+      launcher: microsandboxLauncher({ manager: () => manager }),
+      generations: { nextSandboxGeneration: async () => ++generation },
+      tunnelSocketPath: (tunnel) => (tunnel === 'agent' || tunnel === 'mcp' ? sockets[tunnel] : undefined),
+      log
+    })
+    vm = { manager, local, runtimes: declaredRuntimeCatalog(catalog, table).catalog.runtimes, servers }
+  } catch (error) {
+    for (const server of servers) server.close()
+    vmUnavailable = `microsandbox backend unavailable: ${(error as Error).message}`
+  }
+}
+
+async function stopVm(): Promise<void> {
+  if (!vm) return
+  await vm.local.stop().catch(() => {})
+  await vm.manager.stopAll().catch(() => {})
+  for (const server of vm.servers) server.close()
+  vm = undefined
+}
+
+async function runVmProbe(target: RuntimeTarget, token: string): Promise<Outcome> {
+  if (!vm) return { status: 'degrade', detail: vmUnavailable }
+  const runtime = vm.runtimes[target.id]
+  if (!runtime) return { status: 'degrade', detail: 'runtime is not shipped in the microsandbox image' }
+
+  const leaf = target.id.replace(/[^a-z0-9-]/gi, '-')
+  const scopeDir = join(VM_ROOT, 'scopes', leaf)
+  const cwd = join(scopeDir, 'workspace')
+  rmSync(scopeDir, { recursive: true, force: true })
+  mkdirSync(cwd, { recursive: true })
+  // Composed as a local VM session of this machine is: the image's command, this host's credential step.
+  const launch = prepareMicrosandboxLaunch({
+    runtimeId: target.id,
+    runtime,
+    explicitEnv: definitionEnv(runtime),
+    scopeDir,
+    daemonRoot: VM_ROOT,
+    cwd,
+    stateSourceEnv: process.env,
+    trustedMounts: microsandboxSupportMounts(VM_ROOT),
+    mounts: []
+  })
+  const environmentId = `matrix/${leaf}`
+  const environment = localMicrosandboxEnvironment(environmentId, launch.microsandbox)
+  const updates: unknown[] = []
+  const host = new AcpHost(runtime, {
+    runtimeId: target.id,
+    suppressChildStderr: !DEBUG_CHILD,
+    onUpdate: (_sessionId, update) => updates.push(update),
+    driver: vm.local.driverFor(environment),
+    env: { ...launch.env, AC_AGENT_ID: sandboxSubjectAgentId(environmentId) },
+    inheritProcessEnv: false,
+    toolSandbox: launch.toolSandbox
+  })
+  let sessionId: string | undefined
+  try {
+    await withTimeout(host.start(), `${target.id}/vm start`)
+    sessionId = await withTimeout(host.newSession(cwd), `${target.id}/vm session`)
+    await withTimeout(
+      host.prompt(sessionId, [{ type: 'text', text: `Reply with exactly ${token} and nothing else.` }]),
+      `${target.id}/vm prompt`
+    )
+    return textChunks(updates).join('').includes(token)
+      ? { status: 'ok', detail: 'real model turn completed inside a microsandbox VM' }
+      : { status: 'fail', detail: `VM model reply did not contain ${token}` }
+  } finally {
+    try {
+      if (sessionId && host.deleteSupported())
+        await withTimeout(host.deleteSession(sessionId), `${target.id}/vm delete`)
+    } finally {
+      await host.stop().catch(() => {})
+      await vm.manager.suspend(environmentId, { drain: true }).catch(() => {})
+      await vm.manager.discard(environmentId).catch(() => {})
+      rmSync(scopeDir, { recursive: true, force: true })
+    }
+  }
+}
+
+async function runRuntime(target: RuntimeTarget): Promise<RuntimeResult> {
+  const result: RuntimeResult = {
+    id: target.id,
+    reachable: false,
+    features: {},
+    models: [],
+    modes: [],
+    mcp: { http: false, sse: false }
+  }
+  const root = mkdtempSync(join(tmpdir(), `ac-runtime-matrix-${target.id.replace(/[^a-z0-9-]/gi, '-')}-`))
+  const agentDir = join(root, 'agent')
+  const cwd = join(agentDir, 'workspace')
+  mkdirSync(cwd, { recursive: true })
+  const nonce = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const memoryToken = `MATRIX_MEMORY_OK_${nonce}`
+  const skillToken = `MATRIX_SKILL_OK_${nonce}`
+  const sandboxToken = `MATRIX_SANDBOX_OK_${nonce}`
+  const vmToken = `MATRIX_VM_OK_${nonce}`
+  const updates: unknown[] = []
+  let permissionRequested = false
+  let host: AcpHost | undefined
+  let endpoint: ProbeEndpoint | undefined
+  const sessionIds = new Set<string>()
+  const rememberSession = (sessionId: string): string => {
+    sessionIds.add(sessionId)
+    return sessionId
+  }
+
+  try {
+    const skillInstall = await installProbeSkill(target, root, agentDir, cwd, skillToken).catch((error): Outcome => ({
+      status: 'fail',
+      detail: `skills install: ${(error as Error).message}`
+    }))
+
+    host = new AcpHost(target.runtime, {
+      runtimeId: target.id,
+      suppressChildStderr: true,
+      onUpdate: (_sessionId, update) => updates.push(update),
+      onPermission: async (_sessionId, params) => {
+        permissionRequested = true
+        return selectAllowOption(params)
+      }
+    })
+    await withTimeout(host.start(), `${target.id}/start`)
+    result.reachable = true
+    result.mcp = host.mcpCapabilities() ?? { http: false, sse: false }
+
+    const usesMeta = host.usesMetaSystemPrompt()
+    const sessionId = rememberSession(
+      await withTimeout(host.newSession(cwd, [], undefined, usesMeta ? memoryToken : undefined), `${target.id}/session`)
+    )
+    result.models = host.modelOptions()?.models ?? []
+    result.modes = host.permissionModeOptions()?.modes ?? []
+    result.features.capabilities = {
+      status: 'ok',
+      detail: `${result.models.length} models, ${result.modes.length} modes, load=${host.loadSupported()}, mcp=http:${result.mcp.http}/sse:${result.mcp.sse}`
+    }
+    const lifecycleStart = updates.length
+    const lifecyclePrompt = usesMeta
+      ? `The standing context contains a token beginning MATRIX_MEMORY_OK_. Reply with that exact token only.`
+      : `# Memory\n${memoryToken}\n\nReply with the exact memory token above and nothing else.`
+    const lifecycle = await withTimeout(
+      host.prompt(sessionId, [{ type: 'text', text: lifecyclePrompt }]),
+      `${target.id}/lifecycle`
+    )
+    const lifecycleText = textChunks(updates, lifecycleStart).join('')
+    result.features.lifecycle = lifecycleText.trim()
+      ? { status: 'ok', detail: `real provider replied (${lifecycle.stopReason})` }
+      : { status: 'fail', detail: 'real provider returned no agent message' }
+    result.features.memory = lifecycleText.includes(memoryToken)
+      ? { status: 'ok', detail: `real model recalled session-start index via ${usesMeta ? '_meta' : 'inline block'}` }
+      : { status: 'fail', detail: `real model reply did not contain ${memoryToken}` }
+    result.features['usage-fold'] = lifecycle.usage
+      ? { status: 'ok', detail: `${lifecycle.usage.totalTokens} tokens` }
+      : { status: 'degrade', detail: 'runtime returned no ACP usage object' }
+
+    if (result.models.length >= 2) {
+      const from = host.modelOptions()?.current
+      const to = result.models.find((model) => model !== from)!
+      const sent = await host.setSessionModel(sessionId, to)
+      const current = host.modelOptions()?.current
+      result.features['model-switch'] =
+        sent && current === to
+          ? { status: 'ok', detail: `${from ?? '?'} -> ${to}` }
+          : { status: 'fail', detail: `requested ${to}; rpcSent=${sent}, current=${current ?? '?'}` }
+    } else {
+      result.features['model-switch'] = { status: 'degrade', detail: `${result.models.length} model(s)` }
+    }
+
+    if (result.modes.length >= 2) {
+      const from = host.permissionModeOptions()?.current
+      const to = result.modes.find((mode) => mode !== from)!
+      const sent = await host.setSessionPermissionMode(sessionId, to)
+      const current = host.permissionModeOptions()?.current
+      result.features['permission-mode-switch'] =
+        sent && current === to
+          ? { status: 'ok', detail: `${from ?? '?'} -> ${to}` }
+          : { status: 'fail', detail: `requested ${to}; rpcSent=${sent}, current=${current ?? '?'}` }
+    } else {
+      result.features['permission-mode-switch'] = { status: 'degrade', detail: `${result.modes.length} mode(s)` }
+    }
+
+    if (result.mcp.http) {
+      endpoint = await mcpProbeEndpoint()
+      const descriptor: McpServer = {
+        type: 'http',
+        name: 'runtime-matrix',
+        url: endpoint.url,
+        headers: []
+      }
+      const mcpSession = rememberSession(
+        await withTimeout(host.newSession(cwd, [descriptor]), `${target.id}/mcp session`)
+      )
+      const mcpStart = updates.length
+      await withTimeout(
+        host.prompt(mcpSession, [
+          {
+            type: 'text',
+            text: 'Call the MCP tool runtime_matrix_probe now. Reply with exactly the text returned by the tool.'
+          }
+        ]),
+        `${target.id}/mcp prompt`
+      )
+      const mcpText = textChunks(updates, mcpStart).join('')
+      result.features.mcp =
+        endpoint.calls() > 0 && mcpText.includes('MATRIX_MCP_OK')
+          ? { status: 'ok', detail: `${endpoint.calls()} real HTTP MCP tools/call request(s)` }
+          : { status: 'fail', detail: `toolCalls=${endpoint.calls()}, reply=${JSON.stringify(mcpText.slice(0, 120))}` }
+    } else {
+      result.features.mcp = {
+        status: 'degrade',
+        detail: result.mcp.sse ? 'SSE advertised; HTTP live probe unavailable' : 'HTTP/SSE not advertised'
+      }
+    }
+
+    if (skillInstall.status === 'ok') {
+      const skillStart = updates.length
+      await withTimeout(
+        host.prompt(sessionId, [
+          {
+            type: 'text',
+            text: `ACTIVATE_SKILL_PROBE. Use the ${SKILL_NAME} skill now and follow its instructions exactly.`
+          }
+        ]),
+        `${target.id}/skills prompt`
+      )
+      const skillText = textChunks(updates, skillStart).join('')
+      result.features.skills = skillText.includes(skillToken)
+        ? { status: 'ok', detail: `${skillInstall.detail}; real model discovered and followed it` }
+        : {
+            status: 'fail',
+            detail: `installed skill was not followed; reply=${JSON.stringify(skillText.slice(0, 120))}`
+          }
+    } else {
+      result.features.skills = skillInstall
+    }
+
+    // Keep this independent of the permission-mode switch above: modes such as
+    // read-only, plan, or full-access can suppress the permission request itself.
+    const permissionSession = rememberSession(
+      await withTimeout(host.newSession(cwd), `${target.id}/permission session`)
+    )
+    permissionRequested = false
+    const permissionStart = updates.length
+    await withTimeout(
+      host.prompt(permissionSession, [
+        {
+          type: 'text',
+          text: 'Using your file tool, create matrix-permission.txt in the current workspace containing OK, then reply done.'
+        }
+      ]),
+      `${target.id}/permission prompt`
+    )
+    result.features['interactive-permission'] = permissionRequested
+      ? { status: 'ok', detail: 'real runtime requested permission and received an allow decision' }
+      : {
+          status: 'degrade',
+          detail: `runtime completed without an ACP permission request (${textChunks(updates, permissionStart).join('').slice(0, 80)})`
+        }
+
+    // Run this independently before the resume/restart phase so a runtime-specific
+    // session/load failure cannot masquerade as a sandbox failure.
+    result.features.sandbox = await runSandboxProbe(target, root, sandboxToken).catch(runtimeErrorOutcome)
+    result.features.vm = await runVmProbe(target, vmToken).catch(runtimeErrorOutcome)
+
+    if (host.loadSupported()) {
+      await host.stop()
+      host = new AcpHost(target.runtime, {
+        runtimeId: target.id,
+        suppressChildStderr: true,
+        onUpdate: (_sessionId, update) => updates.push(update)
+      })
+      await withTimeout(host.start(), `${target.id}/resume start`)
+      await withTimeout(host.loadSession(sessionId, cwd), `${target.id}/session load`)
+      const resumeToken = `MATRIX_RESUME_OK_${nonce}`
+      const resumeStart = updates.length
+      await withTimeout(
+        host.prompt(sessionId, [{ type: 'text', text: `Reply with exactly ${resumeToken}.` }]),
+        `${target.id}/resume prompt`
+      )
+      result.features['load-resume'] = textChunks(updates, resumeStart).join('').includes(resumeToken)
+        ? { status: 'ok', detail: 'real adapter restarted, loaded session, and completed a provider turn' }
+        : { status: 'fail', detail: 'loaded session produced no matching provider reply' }
+    } else {
+      result.features['load-resume'] = { status: 'degrade', detail: 'runtime does not advertise session/load' }
+    }
+  } catch (error) {
+    result.error = turnFailureReason(error)
+    const status: Status = providerUnavailable(error) ? 'unavailable' : 'fail'
+    for (const feature of FEATURES) {
+      result.features[feature] ??= { status, detail: result.error }
+    }
+  } finally {
+    try {
+      if (host?.deleteSupported()) {
+        const failures: unknown[] = []
+        for (const sessionId of sessionIds) {
+          try {
+            await withTimeout(host.deleteSession(sessionId), `${target.id}/session delete`)
+          } catch (error) {
+            failures.push(error)
+          }
+        }
+        if (failures.length > 0) {
+          const cleanupError = `session cleanup: ${failures.map(turnFailureReason).join('; ')}`
+          result.cleanupError = cleanupError
+          result.error = result.error ? `${result.error}; ${cleanupError}` : cleanupError
+        }
+      }
+    } finally {
+      endpoint?.server.close()
+      await host?.stop().catch(() => {})
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+  return result
+}
+
+/** Probes that run without the shared host session, for `AC_RUNTIME_MATRIX_ONLY` reruns. */
+const ISOLATED_PROBES = {
+  sandbox: (target: RuntimeTarget, root: string, token: string) => runSandboxProbe(target, root, token),
+  vm: (target: RuntimeTarget, _root: string, token: string) => runVmProbe(target, token),
+  web: (target: RuntimeTarget, root: string) => runWebProbe(target, root)
+} satisfies Partial<Record<FeatureId, (target: RuntimeTarget, root: string, token: string) => Promise<Outcome>>>
+type IsolatedFeature = keyof typeof ISOLATED_PROBES
+
+async function runIsolatedProbe(feature: IsolatedFeature, target: RuntimeTarget): Promise<RuntimeResult> {
+  const root = mkdtempSync(join(tmpdir(), `ac-runtime-matrix-${feature}-${target.id}-`))
+  try {
+    const token = `MATRIX_${feature.toUpperCase()}_OK_${Date.now().toString(36)}`
+    const outcome = await ISOLATED_PROBES[feature](target, root, token).catch(runtimeErrorOutcome)
+    return {
+      id: target.id,
+      reachable: true,
+      features: { [feature]: outcome },
+      models: [],
+      modes: [],
+      mcp: { http: false, sse: false }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+/** One probe on one runtime: a host started once, a fresh session per scenario and repetition. */
+async function runProbeRuntime<R extends ScoredRun>(
+  target: RuntimeTarget,
+  feature: 'sendMessage' | 'coordinator',
+  probe: {
+    run: (host: AcpHost, cwd: string, updates: Array<{ sessionId: string; update: any }>) => Promise<R[]>
+    skipped: (note: string) => R[]
+    unreachable: (verdict: 'UNAVAILABLE' | 'FAIL', note: string) => R[]
+  }
+): Promise<{ result: RuntimeResult; runs: R[] }> {
+  const result: RuntimeResult = {
+    id: target.id,
+    reachable: false,
+    features: {},
+    models: [],
+    modes: [],
+    mcp: { http: false, sse: false }
+  }
+  const root = mkdtempSync(join(tmpdir(), `ac-runtime-matrix-${feature}-${target.id.replace(/[^a-z0-9-]/gi, '-')}-`))
+  const cwd = join(root, 'workspace')
+  mkdirSync(cwd, { recursive: true })
+  const updates: Array<{ sessionId: string; update: any }> = []
+  const host = new AcpHost(target.runtime, {
+    runtimeId: target.id,
+    suppressChildStderr: !DEBUG_CHILD,
+    onUpdate: (sessionId, update) => updates.push({ sessionId, update }),
+    onPermission: async (_sessionId, params) => selectAllowOption(params)
+  })
+  let runs: R[]
+  try {
+    await withTimeout(host.start(), `${target.id}/start`)
+    result.reachable = true
+    result.mcp = host.mcpCapabilities() ?? { http: false, sse: false }
+    runs = result.mcp.http ? await probe.run(host, cwd, updates) : probe.skipped('runtime does not advertise HTTP MCP')
+    result.features[feature] = result.mcp.http
+      ? aggregate(runs)
+      : { status: 'degrade', detail: 'HTTP MCP not advertised' }
+  } catch (error) {
+    result.error = turnFailureReason(error)
+    const unavailable = providerUnavailable(error)
+    runs = probe.unreachable(unavailable ? 'UNAVAILABLE' : 'FAIL', result.error)
+    result.features[feature] = { status: unavailable ? 'unavailable' : 'fail', detail: result.error }
+  } finally {
+    await host.stop().catch(() => {})
+    rmSync(root, { recursive: true, force: true })
+  }
+  return { result, runs }
+}
+
+/** The `sendMessage` probe on one runtime. */
+function runSendMessageRuntime(
+  target: RuntimeTarget,
+  fixture: SendMessageFixture,
+  tools: ReturnType<typeof probeTools>,
+  scenarios: SendMessageScenario[],
+  reps: number,
+  onRun: (run: SendMessageRun) => void
+): Promise<{ result: RuntimeResult; runs: SendMessageRun[] }> {
+  return runProbeRuntime(target, 'sendMessage', {
+    run: (host, cwd, updates) =>
+      runSendMessageScenarios({
+        runtime: target.id,
+        host,
+        cwd,
+        fixture,
+        tools,
+        scenarios,
+        reps,
+        updates,
+        support: { withTimeout, providerUnavailable, errorReason: turnFailureReason },
+        onRun
+      }),
+    skipped: (note) =>
+      scenarios.map((scenario) => ({
+        runtime: target.id,
+        scenario: scenario.id,
+        rep: 1,
+        comparable: scenario.newOnly !== true,
+        verdict: 'SKIPPED' as const,
+        ops: [],
+        counts: { sendMessage: 0, getToolGuide: 0, otherMcp: 0, acpToolCalls: 0 },
+        ms: 0,
+        notes: [note]
+      })),
+    unreachable: (verdict, note) => unreachableRuns(target.id, scenarios, reps, verdict, note)
+  })
+}
+
+/** The coordinator probe on one runtime. */
+function runCoordinatorRuntime(
+  target: RuntimeTarget,
+  fixture: CoordinatorFixture,
+  scenarios: CoordinatorScenario[],
+  reps: number,
+  onRun: (run: CoordinatorRun) => void
+): Promise<{ result: RuntimeResult; runs: CoordinatorRun[] }> {
+  return runProbeRuntime(target, 'coordinator', {
+    run: (host, cwd, updates) =>
+      runCoordinatorScenarios({
+        runtime: target.id,
+        host,
+        cwd,
+        fixture,
+        scenarios,
+        reps,
+        updates,
+        support: { withTimeout, providerUnavailable, errorReason: turnFailureReason },
+        ...(process.env.AC_RUNTIME_MATRIX_COORDINATOR_MODEL?.trim()
+          ? { model: process.env.AC_RUNTIME_MATRIX_COORDINATOR_MODEL.trim() }
+          : {}),
+        ...(process.env.AC_RUNTIME_MATRIX_COORDINATOR_EFFORT?.trim()
+          ? { effort: process.env.AC_RUNTIME_MATRIX_COORDINATOR_EFFORT.trim() }
+          : {}),
+        onRun
+      }),
+    skipped: (note) =>
+      unreachableCoordinatorRuns(target.id, scenarios, 1, 'FAIL', note).map((run) => ({
+        ...run,
+        verdict: 'SKIPPED' as const
+      })),
+    unreachable: (verdict, note) => unreachableCoordinatorRuns(target.id, scenarios, reps, verdict, note)
+  })
+}
+
+const SHORT: Record<FeatureId, string> = {
+  capabilities: 'caps',
+  lifecycle: 'life',
+  'model-switch': 'model',
+  'permission-mode-switch': 'pmode',
+  'load-resume': 'load',
+  'interactive-permission': 'perm',
+  'usage-fold': 'usage',
+  memory: 'memory',
+  sandbox: 'sbox',
+  vm: 'vm',
+  mcp: 'mcp',
+  skills: 'skills',
+  sendMessage: 'send',
+  coordinator: 'co',
+  web: 'web'
+}
+const CELL: Record<Status, string> = { ok: '✓', degrade: '·', na: '~', unavailable: 'U', fail: '✗' }
+
+function grid(results: RuntimeResult[], features: FeatureId[] = FEATURES): string {
+  const idWidth = Math.max(7, ...results.map((result) => result.id.length))
+  const widths = features.map((feature) => Math.max(3, SHORT[feature].length))
+  const head = 'runtime'.padEnd(idWidth) + ' | ' + features.map((f, i) => SHORT[f].padStart(widths[i]!)).join(' ')
+  const separator = '-'.repeat(idWidth) + '-+-' + widths.map((width) => '-'.repeat(width)).join('-')
+  const rows = results.map(
+    (result) =>
+      result.id.padEnd(idWidth) +
+      ' | ' +
+      features
+        .map((feature, index) => CELL[result.features[feature]?.status ?? 'na'].padStart(widths[index]!))
+        .join(' ')
+  )
+  return [head, separator, ...rows, '', 'legend: ✓ real pass · degrade ~ n/a U provider unavailable ✗ fail'].join('\n')
+}
+
+/** The sendMessage mode's test budget: every selected run at its worst case, for the named targets or a generous default count. */
+function sendMessageBudget(): number {
+  const named = (process.env.AC_RUNTIME_MATRIX_TARGETS ?? '').split(',').filter((id) => id.trim() !== '').length
+  const reps = Math.max(1, Number.parseInt(process.env.AC_RUNTIME_MATRIX_SENDMESSAGE_REPS ?? '1', 10) || 1)
+  let scenarios = SCENARIOS.length
+  try {
+    scenarios = selectedScenarios(process.env.AC_RUNTIME_MATRIX_SENDMESSAGE_SCENARIOS).length
+  } catch {
+    // An unknown scenario id fails in the test itself, with its message.
+  }
+  const perTarget = TURN_TIMEOUT * (2 + 3 * scenarios * reps)
+  return Math.max(SUITE_TIMEOUT, (named || 12) * perTarget)
+}
+
+/** The coordinator mode's test budget, sized like the sendMessage one. */
+function coordinatorBudget(): number {
+  const named = (process.env.AC_RUNTIME_MATRIX_TARGETS ?? '').split(',').filter((id) => id.trim() !== '').length
+  const reps = Math.max(1, Number.parseInt(process.env.AC_RUNTIME_MATRIX_COORDINATOR_REPS ?? '1', 10) || 1)
+  let scenarios = CO_SCENARIOS.length
+  try {
+    scenarios = selectedCoordinatorScenarios(process.env.AC_RUNTIME_MATRIX_COORDINATOR_SCENARIOS).length
+  } catch {
+    // An unknown scenario id fails in the test itself, with its message.
+  }
+  return Math.max(SUITE_TIMEOUT, (named || 12) * TURN_TIMEOUT * (2 + 3 * scenarios * reps))
+}
+
+/** Run the coordinator probe across targets, print its scenario grid, and always write the JSON report when asked. */
+async function runCoordinatorMatrix(targets: RuntimeTarget[], results: RuntimeResult[]): Promise<void> {
+  const scenarios = selectedCoordinatorScenarios(process.env.AC_RUNTIME_MATRIX_COORDINATOR_SCENARIOS)
+  const reps = Math.max(1, Number.parseInt(process.env.AC_RUNTIME_MATRIX_COORDINATOR_REPS ?? '1', 10) || 1)
+  const out = process.env.AC_RUNTIME_MATRIX_COORDINATOR_OUT?.trim()
+  const fixture = await coordinatorFixture()
+  const runs: CoordinatorRun[] = []
+  const write = (current: CoordinatorRun[]) => {
+    if (!out) return
+    mkdirSync(dirname(out), { recursive: true })
+    writeFileSync(
+      out,
+      `${JSON.stringify({ prompt: coordinatorPrompt(), tools: coordinatorTools(), runs: current }, null, 2)}\n`
+    )
+  }
+  try {
+    for (const target of targets) {
+      const live: CoordinatorRun[] = []
+      const probe = await runCoordinatorRuntime(target, fixture, scenarios, reps, (run) => {
+        live.push(run)
+        write([...runs, ...live])
+      })
+      results.push(probe.result)
+      runs.push(...probe.runs)
+      write(runs)
+      console.info(
+        `[runtime-matrix] ${target.id}: ${probe.result.features.coordinator?.detail ?? 'no result'}${probe.result.error ? ` — ${probe.result.error}` : ''}`
+      )
+    }
+  } finally {
+    fixture.server.close()
+    if (out) console.info(`[runtime-matrix] coordinator report written to ${out}`)
+  }
+  console.info(`\ncoordinator scenarios:\n${scenarioGrid(runs, scenarios)}\n`)
+  for (const run of runs) {
+    if (run.verdict === 'SKIPPED') continue
+    console.info(
+      `[runtime-matrix] coordinator ${run.verdict} ${run.runtime}/${run.scenario}#${run.rep}: ${run.outcomes.join(' ') || '-'} tools=[${run.toolCalls.join(', ')}] ${(run.ms / 1000).toFixed(1)}s ${run.notes.join('; ')}`
+    )
+  }
+}
+
+/** Run the `sendMessage` probe across targets, print its scenario grid, and always write the JSON report when asked. */
+async function runSendMessageMatrix(targets: RuntimeTarget[], results: RuntimeResult[]): Promise<void> {
+  const tools = probeTools()
+  const scenarios = selectedScenarios(process.env.AC_RUNTIME_MATRIX_SENDMESSAGE_SCENARIOS)
+  const reps = Math.max(1, Number.parseInt(process.env.AC_RUNTIME_MATRIX_SENDMESSAGE_REPS ?? '1', 10) || 1)
+  const out = process.env.AC_RUNTIME_MATRIX_SENDMESSAGE_OUT?.trim()
+  const fixture = await sendMessageFixture(tools)
+  const runs: SendMessageRun[] = []
+  // Rewritten after every run, so a test timeout still leaves every finished run on disk.
+  const write = (current: SendMessageRun[]) => {
+    if (!out) return
+    mkdirSync(dirname(out), { recursive: true })
+    writeFileSync(out, `${JSON.stringify(sendMessageReport(tools, current), null, 2)}\n`)
+  }
+  try {
+    for (const target of targets) {
+      const live: SendMessageRun[] = []
+      const probe = await runSendMessageRuntime(target, fixture, tools, scenarios, reps, (run) => {
+        live.push(run)
+        write([...runs, ...live])
+      })
+      results.push(probe.result)
+      runs.push(...probe.runs)
+      write(runs)
+      console.info(
+        `[runtime-matrix] ${target.id}: ${probe.result.features.sendMessage?.detail ?? 'no result'}${probe.result.error ? ` — ${probe.result.error}` : ''}`
+      )
+    }
+  } finally {
+    fixture.server.close()
+    if (out) {
+      write(runs)
+      console.info(`[runtime-matrix] sendMessage report written to ${out}`)
+    }
+  }
+  console.info(`\nsendMessage scenarios:\n${scenarioGrid(runs, scenarios)}\n`)
+  for (const run of runs) {
+    if (run.verdict === 'PASS' || run.verdict === 'SKIPPED') continue
+    console.info(
+      `[runtime-matrix] sendMessage ${run.verdict} ${run.runtime}/${run.scenario}#${run.rep}: ops=${run.ops.map((op) => `${op.op}${op.valid ? '' : '!'}`).join(' > ') || '-'} ${run.notes.join('; ')}`
+    )
+  }
+}
+
+describe.skipIf(IS_CI)('local live ACP runtime support matrix', () => {
+  let targets: RuntimeTarget[] = []
+  let features: FeatureId[] = FEATURES
+
+  beforeAll(async () => {
+    const daemonRoot = resolveRoot()
+    const config = loadConfig({ root: daemonRoot, optional: true })
+    const catalog = await resolveRuntimeCatalog(config, daemonRoot, { mode: 'cache-first' })
+    const installed = installedRuntimeCatalog(catalog)
+    const requested = new Set(
+      (process.env.AC_RUNTIME_MATRIX_TARGETS ?? '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
+    )
+    targets = Object.entries(installed.entries)
+      .filter(([id]) => id !== 'qoder-cli-cn' && (requested.size === 0 || requested.has(id)))
+      .map(([id, entry]) => ({ id, runtime: entry.runtime, entry }))
+      .sort((a, b) => a.id.localeCompare(b.id))
+    const only = process.env.AC_RUNTIME_MATRIX_ONLY?.trim()
+    if (only) {
+      if (!(only in ISOLATED_PROBES) && only !== 'sendMessage' && only !== 'coordinator')
+        throw new Error(
+          `AC_RUNTIME_MATRIX_ONLY must be one of: ${[...Object.keys(ISOLATED_PROBES), 'sendMessage', 'coordinator'].join(', ')}`
+        )
+      features = [only as IsolatedFeature | 'sendMessage' | 'coordinator']
+    }
+    if (features.includes('vm')) await startVm(config, catalog)
+  }, SUITE_TIMEOUT)
+
+  afterAll(stopVm)
+
+  it(
+    'starts every installed runtime and exercises its real model/provider',
+    async () => {
+      expect(targets.length, 'no installed ACP runtimes were discovered on this host').toBeGreaterThan(0)
+      const results: RuntimeResult[] = []
+      if (features.length === 1 && features[0] === 'sendMessage') {
+        await runSendMessageMatrix(targets, results)
+      } else if (features.length === 1 && features[0] === 'coordinator') {
+        await runCoordinatorMatrix(targets, results)
+      } else {
+        for (const target of targets) {
+          const isolated =
+            features.length === 1 && features[0]! in ISOLATED_PROBES ? (features[0] as IsolatedFeature) : undefined
+          const result = isolated ? await runIsolatedProbe(isolated, target) : await runRuntime(target)
+          results.push(result)
+          console.info(
+            `[runtime-matrix] ${target.id}: ${result.reachable ? 'reachable' : 'unavailable'}${result.error ? ` — ${result.error}` : ''}`
+          )
+        }
+      }
+
+      console.info(`\nREAL local runtime matrix (${results.length} installed):\n${grid(results, features)}\n`)
+      for (const result of results) {
+        for (const feature of features) {
+          const outcome = result.features[feature]
+          if (outcome?.status === 'fail')
+            console.info(`[runtime-matrix] FAIL ${result.id}/${feature}: ${outcome.detail}`)
+          else if (outcome && ((DEBUG_CHILD && outcome.status !== 'ok') || feature === 'web'))
+            console.info(`[runtime-matrix] ${outcome.status} ${result.id}/${feature}: ${outcome.detail}`)
+        }
+      }
+
+      const failures = results.flatMap((result) => [
+        ...features
+          .filter((feature) => result.features[feature]?.status === 'fail')
+          .map((feature) => `${result.id}/${feature}: ${result.features[feature]!.detail}`),
+        ...(result.cleanupError ? [`${result.id}/cleanup: ${result.cleanupError}`] : [])
+      ])
+      if (features.includes('lifecycle')) {
+        expect(
+          results.some((result) => result.features.lifecycle?.status === 'ok'),
+          'no installed runtime completed a real model/provider turn'
+        ).toBe(true)
+      }
+      expect(failures, `real runtime failures:\n${failures.join('\n')}`).toEqual([])
+    },
+    ({ sendMessage: SEND_MESSAGE_TIMEOUT, coordinator: COORDINATOR_TIMEOUT } as Record<string, number>)[
+      process.env.AC_RUNTIME_MATRIX_ONLY?.trim() ?? ''
+    ] ?? SUITE_TIMEOUT
+  )
+})

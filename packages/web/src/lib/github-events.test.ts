@@ -1,0 +1,349 @@
+import { describe, expect, it } from 'vitest'
+import {
+  commentFamiliesForFamilies,
+  DEPLOYMENT_CREATED_EVENT,
+  DEPLOYMENT_STATUS_EVENT,
+  eventsForFamilies,
+  GH_FAMILIES,
+  GH_TRIGGER_LABEL,
+  GH_TRIGGER_MODES,
+  GH_TRIGGER_PILL,
+  githubTriggerPill,
+  githubDefaultTriggerMode,
+  githubFamilyCarriesReviews,
+  githubFamilySubscription,
+  githubFamilyTile,
+  githubHookFamily,
+  githubHookNeedsNormalization,
+  githubMentionUsage,
+  githubTriggerDescription,
+  githubTriggerModes,
+  githubTriggerTooltip,
+  RELEASE_PUBLISHED_EVENT,
+  triggerModeOf,
+  THREAD_COMMENT_EVENT
+} from './github-events'
+
+describe('GH_TRIGGER_LABEL', () => {
+  it('opens a pull-request subscription on every update and every other one on the opening', () => {
+    expect(githubDefaultTriggerMode('pull_request')).toBe('every')
+    expect(GH_TRIGGER_LABEL[githubDefaultTriggerMode('pull_request')]).toBe('any update')
+    expect(githubDefaultTriggerMode('issues')).toBe('first')
+    expect(githubDefaultTriggerMode('push')).toBe('first')
+    expect(GH_TRIGGER_LABEL[githubDefaultTriggerMode('issues')]).toBe('opened')
+    // A deployment opens on creation too — every-status is one turn per state, so it is opted into.
+    expect(githubDefaultTriggerMode('deployment')).toBe('first')
+  })
+
+  it('spells the cadences out for the create surfaces', () => {
+    expect(GH_TRIGGER_LABEL.every).toBe('any update')
+    expect(GH_TRIGGER_LABEL.mention).toBe('@-mention')
+  })
+})
+
+describe('githubTriggerModes', () => {
+  it('offers the same three cadences on every thread family — labels are a filter, not a cadence', () => {
+    expect(githubTriggerModes('issues')).toEqual(['first', 'every', 'mention'])
+    expect(githubTriggerModes('pull_request')).toEqual(['first', 'every', 'mention'])
+    expect(githubTriggerModes('push')).toEqual(['first', 'every', 'mention'])
+  })
+
+  it('offers a deployment only the two plain cadences — nobody labels or @-mentions in one', () => {
+    expect(githubTriggerModes('deployment')).toEqual(['first', 'every'])
+    expect(githubTriggerTooltip('first', 'reviewer', 'deployment')).toBe('Runs when a deployment is created.')
+    expect(githubTriggerTooltip('every', 'reviewer', 'deployment')).toContain('every status it reports')
+    // The family-less form keeps reading as the thread copy.
+    expect(githubTriggerTooltip('first', 'reviewer', 'issues')).toBe(githubTriggerTooltip('first', 'reviewer'))
+  })
+
+  it('offers a release the same two plain cadences, worded for a publish', () => {
+    expect(githubTriggerModes('release')).toEqual(['first', 'every'])
+    expect(githubTriggerTooltip('first', 'reviewer', 'release')).toBe('Runs when a release or prerelease is published.')
+    expect(githubTriggerDescription('every', 'reviewer', 'release')).toContain('edited or unpublished')
+  })
+})
+
+describe('GH_TRIGGER_PILL', () => {
+  it('keeps mention as the last segment', () => {
+    expect(GH_TRIGGER_MODES[GH_TRIGGER_MODES.length - 1]).toBe('mention')
+    expect(GH_TRIGGER_PILL.mention).toBe('@-mention')
+  })
+
+  it('reads the design’s cadence names', () => {
+    expect(GH_TRIGGER_PILL.first).toBe('Opened')
+    expect(GH_TRIGGER_PILL.every).toBe('Any update')
+  })
+
+  it('names a deployment and a release row by their own cadences', () => {
+    expect(githubTriggerPill('first', 'deployment')).toBe('Created')
+    expect(githubTriggerPill('every', 'deployment')).toBe('Any status')
+    expect(githubTriggerPill('first', 'release')).toBe('Published')
+    expect(githubTriggerPill('every', 'release')).toBe('Any update')
+    expect(githubTriggerPill('first', 'pull_request')).toBe('Opened')
+    expect(githubTriggerPill('first', null)).toBe('Opened')
+  })
+
+  it('names the agent in the per-segment hover copy', () => {
+    expect(githubTriggerTooltip('first', 'reviewer')).toContain('@reviewer')
+    expect(githubTriggerTooltip('mention', 'reviewer')).toContain('@reviewer')
+    expect(githubTriggerTooltip('every', 'reviewer')).toBe(
+      'Runs when an issue or PR is opened and on supported updates and replies (close, reopen and title/body edits are ignored).'
+    )
+  })
+
+  it('offers the owner-qualified team form only for an organization-owned repository', () => {
+    // No organization (a personal installation) ⇒ no team to name.
+    expect(githubMentionUsage('reviewer')).toBe('Use @reviewer to trigger only this agent.')
+    expect(githubMentionUsage('reviewer', null)).toBe('Use @reviewer to trigger only this agent.')
+    const owned = githubMentionUsage('reviewer', 'acme')
+    expect(owned).toContain('@reviewer')
+    expect(owned).toContain('@acme/reviewer')
+  })
+
+  it('mention-mode copy admits the App broadcast and explicit App review requests, without an absolute "only"', () => {
+    const copy = githubTriggerTooltip('mention', 'reviewer')
+    expect(copy).toContain('GitHub App')
+    expect(copy).toContain('review request')
+    expect(copy).not.toMatch(/\bonly\b/)
+  })
+})
+
+describe('GH_FAMILIES', () => {
+  it('names each subject without promising signals its cadences do not carry', () => {
+    expect(GH_FAMILIES.map(({ label }) => label)).toEqual(['Pull requests', 'Issues', 'Deployments', 'Releases'])
+  })
+
+  it('omits the commit (push) family — the subscription flow is held back for now', () => {
+    expect(GH_FAMILIES.map(({ fam }) => fam)).toEqual(['pull_request', 'issues', 'deployment', 'release'])
+  })
+
+  it('still labels a stored push row the console never offers', () => {
+    expect(githubFamilyTile('push')?.pill).toBe('Commits')
+  })
+})
+
+describe('githubHookFamily', () => {
+  it('reads the row’s own family, whatever its stored events look like', () => {
+    expect(githubHookFamily({ family: 'issues', events: ['pull_request:*'] })).toBe('issues')
+    expect(githubHookFamily({ family: 'push', events: [] })).toBe('push')
+  })
+
+  it('falls back to the events for a legacy row the split could not place', () => {
+    expect(githubHookFamily({ family: null, events: ['issues:*', THREAD_COMMENT_EVENT] })).toBe('issues')
+    // Display order decides which family a legacy both-subject row shows as.
+    expect(githubHookFamily({ family: null, events: ['issues:*', 'pull_request:*'] })).toBe('pull_request')
+  })
+
+  it('names no family for a comment-only rule', () => {
+    expect(githubHookFamily({ family: null, events: [THREAD_COMMENT_EVENT] })).toBeNull()
+  })
+})
+
+describe('githubFamilySubscription', () => {
+  it('scopes the shared issue_comment subscription to the row’s own family', () => {
+    // The CP 400s an `issue_comment` pattern whose commentFamilies is empty.
+    expect(githubFamilySubscription('pull_request', 'every')).toEqual({
+      events: ['pull_request:*', THREAD_COMMENT_EVENT],
+      commentFamilies: ['pull_request'],
+      mentionOnly: false
+    })
+    expect(githubFamilySubscription('issues', 'mention')).toEqual({
+      events: ['issues:*', THREAD_COMMENT_EVENT],
+      commentFamilies: ['issues'],
+      mentionOnly: true
+    })
+  })
+
+  it('drops replies in created mode and comments altogether on a push row', () => {
+    expect(githubFamilySubscription('issues', 'first')).toEqual({
+      events: ['issues:opened'],
+      commentFamilies: ['issues'],
+      mentionOnly: false
+    })
+    expect(githubFamilySubscription('push', 'every')).toEqual({
+      events: ['push:*'],
+      commentFamilies: [],
+      mentionOnly: false
+    })
+  })
+
+  it('compiles a deployment row to its creation or to creation plus every status, with no reply scope', () => {
+    expect(githubFamilySubscription('deployment', 'first')).toEqual({
+      events: [DEPLOYMENT_CREATED_EVENT],
+      commentFamilies: [],
+      mentionOnly: false
+    })
+    expect(githubFamilySubscription('deployment', 'every')).toEqual({
+      events: ['deployment:*', DEPLOYMENT_STATUS_EVENT],
+      commentFamilies: [],
+      mentionOnly: false
+    })
+    // Cadences a deployment cannot carry narrow to the opening and never set the mention gate.
+    expect(githubFamilySubscription('deployment', 'mention')).toEqual(githubFamilySubscription('deployment', 'first'))
+  })
+
+  it('compiles a release row to its publish or to every change, and reads each back as its cadence', () => {
+    const published = githubFamilySubscription('release', 'first')
+    expect(published).toEqual({ events: [RELEASE_PUBLISHED_EVENT], commentFamilies: [], mentionOnly: false })
+    const every = githubFamilySubscription('release', 'every')
+    expect(every).toEqual({ events: ['release:*'], commentFamilies: [], mentionOnly: false })
+    expect(githubFamilySubscription('release', 'mention')).toEqual(published)
+    expect(triggerModeOf(published)).toBe('first')
+    expect(triggerModeOf(every)).toBe('every')
+    expect(githubHookNeedsNormalization(published)).toBe(false)
+    expect(githubHookNeedsNormalization(every)).toBe(false)
+  })
+
+  it('never emits a pattern from another family', () => {
+    for (const fam of ['pull_request', 'issues', 'push', 'deployment', 'release'] as const) {
+      for (const mode of GH_TRIGGER_MODES) {
+        const { events } = githubFamilySubscription(fam, mode)
+        expect(
+          events.every(
+            (event) =>
+              event.startsWith(`${fam}:`) ||
+              event === THREAD_COMMENT_EVENT ||
+              (fam === 'deployment' && event === DEPLOYMENT_STATUS_EVENT)
+          )
+        ).toBe(true)
+      }
+    }
+  })
+})
+
+describe('githubFamilyCarriesReviews', () => {
+  it('confines reviews and Checks to the change-proposal subject', () => {
+    expect(githubFamilyCarriesReviews('pull_request')).toBe(true)
+    expect(githubFamilyCarriesReviews('issues')).toBe(false)
+    expect(githubFamilyCarriesReviews('push')).toBe(false)
+  })
+})
+
+describe('commentFamiliesForFamilies', () => {
+  it('keeps the selected issue and PR families while excluding push and deployment', () => {
+    expect(commentFamiliesForFamilies(['issues', 'push', 'deployment', 'pull_request'])).toEqual([
+      'issues',
+      'pull_request'
+    ])
+  })
+
+  it('returns an empty scope when no thread family is selected', () => {
+    expect(commentFamiliesForFamilies(['push'])).toEqual([])
+    expect(commentFamiliesForFamilies(['deployment'])).toEqual([])
+  })
+})
+
+describe('eventsForFamilies', () => {
+  it('subscribes created mode to thread openings while leaving push as a wildcard', () => {
+    expect(eventsForFamilies(['issues', 'pull_request', 'push'], 'first')).toEqual([
+      'issues:opened',
+      'pull_request:opened',
+      'push:*'
+    ])
+  })
+
+  it('includes issue and PR replies in updated mode', () => {
+    expect(eventsForFamilies(['issues'], 'every')).toEqual(['issues:*', THREAD_COMMENT_EVENT])
+    expect(eventsForFamilies(['pull_request'], 'every')).toEqual(['pull_request:*', THREAD_COMMENT_EVENT])
+    expect(eventsForFamilies(['issues', 'pull_request'], 'every')).toEqual([
+      'issues:*',
+      'pull_request:*',
+      THREAD_COMMENT_EVENT
+    ])
+  })
+
+  it('does not subscribe a push-only integration to issue comments', () => {
+    expect(eventsForFamilies(['push'], 'every')).toEqual(['push:*'])
+  })
+
+  it('uses the same event subscriptions for mention and updated modes', () => {
+    expect(eventsForFamilies(['issues', 'pull_request', 'push'], 'mention')).toEqual(
+      eventsForFamilies(['issues', 'pull_request', 'push'], 'every')
+    )
+  })
+})
+
+describe('githubHookNeedsNormalization', () => {
+  it('flags legacy updated and mention encodings that lack canonical replies/scope', () => {
+    expect(githubHookNeedsNormalization({ events: ['issues:*'], commentFamilies: [], mentionOnly: false })).toBe(true)
+    expect(
+      githubHookNeedsNormalization({
+        events: ['issues:*', THREAD_COMMENT_EVENT],
+        commentFamilies: [],
+        mentionOnly: true
+      })
+    ).toBe(true)
+  })
+
+  it('accepts canonical updated and created encodings', () => {
+    expect(
+      githubHookNeedsNormalization({
+        events: ['issues:*', THREAD_COMMENT_EVENT],
+        commentFamilies: ['issues'],
+        mentionOnly: false
+      })
+    ).toBe(false)
+    expect(
+      githubHookNeedsNormalization({
+        events: ['pull_request:opened'],
+        commentFamilies: ['pull_request'],
+        mentionOnly: false
+      })
+    ).toBe(false)
+  })
+
+  it('leaves raw API comment-only rules outside the console normalization model', () => {
+    expect(
+      githubHookNeedsNormalization({ events: [THREAD_COMMENT_EVENT], commentFamilies: [], mentionOnly: false })
+    ).toBe(false)
+  })
+
+  it('accepts both canonical deployment encodings and flags a hand-written state pattern', () => {
+    expect(
+      githubHookNeedsNormalization({ events: [DEPLOYMENT_CREATED_EVENT], commentFamilies: [], mentionOnly: false })
+    ).toBe(false)
+    expect(
+      githubHookNeedsNormalization({
+        events: ['deployment:*', DEPLOYMENT_STATUS_EVENT],
+        commentFamilies: [],
+        mentionOnly: false
+      })
+    ).toBe(false)
+    // An API-only `deployment_status:failure` row is not what the console writes for "any status".
+    expect(
+      githubHookNeedsNormalization({
+        events: ['deployment:*', 'deployment_status:failure'],
+        commentFamilies: [],
+        mentionOnly: false
+      })
+    ).toBe(true)
+  })
+
+  it('flags the retired bare label row, so the next cadence pick rewrites it', () => {
+    expect(githubHookNeedsNormalization({ events: ['issues:labeled'], commentFamilies: [], mentionOnly: false })).toBe(
+      true
+    )
+  })
+})
+
+describe('triggerModeOf', () => {
+  it('reads the retired bare label event as any update — the cadence it migrated to', () => {
+    expect(triggerModeOf({ events: ['issues:labeled'], mentionOnly: false })).toBe('every')
+    expect(triggerModeOf({ events: ['issues:labeled', THREAD_COMMENT_EVENT], mentionOnly: false })).toBe('every')
+    // The mention flag still wins over every events shape.
+    expect(triggerModeOf({ events: ['issues:labeled'], mentionOnly: true })).toBe('mention')
+  })
+
+  it('keeps reading the opened and updated encodings', () => {
+    expect(triggerModeOf({ events: ['issues:opened'], mentionOnly: false })).toBe('first')
+    expect(triggerModeOf({ events: ['issues:*', THREAD_COMMENT_EVENT], mentionOnly: false })).toBe('every')
+  })
+
+  it('reads a bare deployment opening as created and anything wider as any status', () => {
+    expect(triggerModeOf({ events: [DEPLOYMENT_CREATED_EVENT], mentionOnly: false })).toBe('first')
+    expect(triggerModeOf({ events: ['deployment:*', DEPLOYMENT_STATUS_EVENT], mentionOnly: false })).toBe('every')
+    expect(triggerModeOf({ events: [DEPLOYMENT_CREATED_EVENT, DEPLOYMENT_STATUS_EVENT], mentionOnly: false })).toBe(
+      'every'
+    )
+  })
+})

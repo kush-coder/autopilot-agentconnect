@@ -1,0 +1,327 @@
+{{/* Base name, overridable. */}}
+{{- define "agentconnect.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Fully qualified release-scoped name. */}}
+{{- define "agentconnect.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Common labels. */}}
+{{- define "agentconnect.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/part-of: agentconnect
+{{- end -}}
+
+{{/* Per-component selector labels. Call with (dict "ctx" . "component" "web"). */}}
+{{- define "agentconnect.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "agentconnect.name" .ctx }}
+app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+app.kubernetes.io/component: {{ .component }}
+{{- end -}}
+
+{{/* The same triple, minus the instance label `agentconnect.labels` already emits — for a
+     `metadata.labels` map that includes both. Emitting the key twice renders duplicate YAML,
+     which every strict parser rejects. Selectors keep using
+     `selectorLabels`: the full triple is what a live Deployment's immutable selector holds. */}}
+{{- define "agentconnect.componentLabels" -}}
+app.kubernetes.io/name: {{ include "agentconnect.name" .ctx }}
+app.kubernetes.io/component: {{ .component }}
+{{- end -}}
+
+{{/* Shared fallback image tag (defaults to appVersion); per-component
+`<component>.tag` overrides win at each consumer. */}}
+{{- define "agentconnect.imageTag" -}}
+{{- default .Chart.AppVersion .Values.image.tag -}}
+{{- end -}}
+
+{{/* One image reference for the SandboxTemplate and the daemon-pool probe annotation. */}}
+{{- define "agentconnect.runtimeSandboxImage" -}}
+{{- $repository := .Values.daemonPool.runtime.repository | default (printf "%s/runtime-sandbox" .Values.image.registry) -}}
+{{- .Values.daemonPool.runtime.image | default (printf "%s:%s" $repository (.Values.daemonPool.runtime.tag | default (include "agentconnect.imageTag" .))) -}}
+{{- end -}}
+
+{{/* The daemon pool's agent-sandbox prerequisites, release-prefixed like every other chart-owned
+     object. "Warm pool" here is the SandboxWarmPool, not the member set. Derived rather
+     than configured: the warm pool a member claims against (AC_K8S_WARM_POOL) and the one
+     the chart renders are the same string by construction, so they cannot drift apart. */}}
+{{- define "agentconnect.runtimeTemplateName" -}}
+{{- printf "%s-runtime" (include "agentconnect.fullname" .) -}}
+{{- end -}}
+
+{{- define "agentconnect.warmPoolName" -}}
+{{- printf "%s-runtime-pool" (include "agentconnect.fullname" .) -}}
+{{- end -}}
+
+{{/* Setup Server's ServiceAccount. DEFAULTS to the control plane's account — it is the
+     identity the Vault kubernetes auth role binds by exact name, and both authenticate to
+     Vault with it. Sharing it also means the Setup Server inherits every RBAC grant the
+     control plane holds, which is why the two are separable at all. Giving it its own
+     account REQUIRES that name to be added to the Vault role FIRST: flip this before the
+     role knows the new name and the workload fail-fasts on its first secret operation. */}}
+{{- define "agentconnect.setupServerServiceAccountName" -}}
+{{- .Values.setupServer.serviceAccount.name | default (include "agentconnect.controlPlaneServiceAccountName" .) -}}
+{{- end -}}
+
+{{/* The control-plane's ServiceAccount name. Each release gets its OWN SA
+     (`<release>-control-plane`), so a Vault kubernetes auth role can bind a transit
+     policy to this release's identity and namespace alone — which is what keeps two
+     releases sharing one Vault from reaching each other's keys. Overridable via
+     controlPlane.serviceAccount.name. */}}
+{{- define "agentconnect.controlPlaneServiceAccountName" -}}
+{{- .Values.controlPlane.serviceAccount.name | default (printf "%s-control-plane" (include "agentconnect.fullname" .)) -}}
+{{- end -}}
+
+{{/* ServiceAccount of the crypto-shred CronJob. DISTINCT from the control
+     plane's on purpose: a Vault role binds to a ServiceAccount, so key
+     deletion granted to a role bound to the CP's SA would stay reachable from
+     the CP. The separation is the identity, not the role name. */}}
+{{- define "agentconnect.secretShredServiceAccountName" -}}
+{{- .Values.controlPlane.shred.serviceAccountName | default (printf "%s-secret-shred" (include "agentconnect.fullname" .)) -}}
+{{- end -}}
+
+{{/* Public host the relay is reached at (browser /webchat + daemon /rd/ws).
+     relay.host wins; else the apiHost (subdomain mode) it co-locates on; else the
+     website host. Empty ⇒ no relay routing / no PUBLIC_RELAY_URL. */}}
+{{- define "agentconnect.relayHost" -}}
+{{- .Values.relay.host | default .Values.apiHost | default (.Values.publicUrl | trimPrefix "https://" | trimPrefix "http://" | trimSuffix "/") -}}
+{{- end -}}
+
+{{/* The https:// origin the CP stores as PUBLIC_RELAY_URL. Webchat clients convert
+     http(s) to ws(s); webhook callers use this origin for POST /webhooks/in. */}}
+{{- define "agentconnect.relayPublicUrl" -}}
+{{- printf "https://%s" (include "agentconnect.relayHost" .) -}}
+{{- end -}}
+
+{{/* Whether the relay actually renders: enabled AND a public host resolves. With every host
+     input empty (the bare local default) an enabled relay would render only broken origins —
+     PUBLIC_RELAY_URL "https://", DAEMON_DIAL_URL "wss:///…" — and force RELAY_TOKEN on a CP
+     nothing can dial, so like the HTTPRoute it waits for a hostname instead. Emits "true" or
+     "": usable directly as an `if` condition. */}}
+{{- define "agentconnect.relayActive" -}}
+{{- if and .Values.relay.enabled (include "agentconnect.relayHost" .) -}}true{{- end -}}
+{{- end -}}
+
+{{/* The verified sender address the waitlist copy names. The CP and web both read it as
+     WAITLIST_FROM_EMAIL, from one value, so the two cannot disagree about who the activation
+     mail comes from. Whatever actually SENDS that mail is outside this chart, which is why
+     this is a plain string and not derived: set it to the same address that sender is
+     configured with, or users go looking for mail from an address nothing sent. Empty ⇒
+     callers omit the env entirely (no address to name). */}}
+{{- define "agentconnect.emailFrom" -}}
+{{- .Values.waitlistFromEmail -}}
+{{- end -}}
+
+{{/* The per-pod wss:// origin relays register as DAEMON_DIAL_URL. Kubernetes expands
+     POD_INDEX from the StatefulSet pod-index label; daemons append /rd/ws, and the
+     Gateway rewrites the short ordinal prefix onto that pod's single-endpoint Service. */}}
+{{- define "agentconnect.relayDaemonDialUrl" -}}
+{{- printf "wss://%s/relays/$(POD_INDEX)" (include "agentconnect.relayHost" .) -}}
+{{- end -}}
+
+{{/* The cluster environment BOTH the daemon-pool members and the orphan-reconciler CronJob
+     read: the in-cluster control-plane address, the warm pool claims resolve through, the
+     namespace sandbox objects live in, and the supervisor declaration. One partial so a
+     member and the job that sweeps after it cannot disagree about any of the four —
+     disagreeing on the namespace or the warm pool is a sweep that reads the wrong objects.
+     Member-only variables (shim port, readiness port, member id, generation) stay at their
+     own call site; the job needs none of them. */}}
+{{- define "agentconnect.daemonPoolClusterEnv" -}}
+- name: AC_CP_URL
+  value: {{ printf "ws://%s-control-plane:%v/daemon/ws" (include "agentconnect.fullname" .) .Values.controlPlane.port | quote }}
+- name: AC_K8S_WARM_POOL
+  value: {{ include "agentconnect.warmPoolName" . | quote }}
+{{- /* Where claims are created and swept. Required: a member without it refuses to start
+       and the job exits non-zero. */}}
+- name: AC_K8S_SANDBOX_NAMESPACE
+  value: {{ .Values.daemonPool.sandboxNamespace | default .Release.Namespace | quote }}
+- name: AGENTCONNECT_SUPERVISOR
+  value: k8s
+{{- with .Values.daemonPool.reconciler.graceMs }}
+{{- /* ONE safety window for both surfaces. The sweep calls a claim orphaned once nothing has touched
+       it for this long, and a member re-stamps the claims it holds on a cadence derived from the same
+       number — so a member reading a different grace than the job sweeping after it would let a claim
+       in use age past the window between two of its own ticks. Unset ⇒ the daemon's 10-minute default
+       on both sides. */}}
+- name: AC_K8S_ORPHAN_GRACE_MS
+  value: {{ . | quote }}
+{{- end }}
+{{- end -}}
+
+{{/* Project each model-egress client onto its consuming host; args: ctx, target. */}}
+{{- define "agentconnect.modelEgressEnv" -}}
+{{- $target := .target -}}
+{{- $egress := .ctx.Values.modelEgress -}}
+{{- $clients := dict
+  "claude" (dict "provider" "anthropic" "daemon" (dict "base" "ANTHROPIC_MODEL_BASE_URL" "key" "ANTHROPIC_MODEL_TOKEN") "runtime" (dict "base" "AC_CLAUDE_BASE_URL" "key" "AC_CLAUDE_API_KEY"))
+  "codex" (dict "provider" "openai" "daemon" (dict "base" "OPENAI_MODEL_BASE_URL" "key" "OPENAI_MODEL_TOKEN") "runtime" (dict "base" "AC_CODEX_BASE_URL" "key" "AC_CODEX_API_KEY"))
+  "deepseek" (dict "provider" "deepseek" "daemon" (dict "base" "DEEPSEEK_MODEL_BASE_URL" "key" "DEEPSEEK_MODEL_TOKEN") "runtime" (dict "base" "AC_DEEPSEEK_BASE_URL" "key" "AC_DEEPSEEK_API_KEY"))
+  "typesafe" (dict "provider" "typesafe" "daemon" (dict "base" "TYPESAFE_MODEL_BASE_URL"))
+-}}
+{{- range $client, $cfg := $egress.clients }}
+{{- $profile := get $clients $client }}
+{{- if not $profile }}{{ fail (printf "modelEgress.clients.%s is not a supported client (%s)" $client (join ", " (keys $clients | sortAlpha))) }}{{ end }}
+{{- if and $cfg.apiKey (not (get $profile.daemon "key")) }}{{ fail (printf "modelEgress.clients.%s does not accept an apiKey" $client) }}{{ end }}
+{{- $base := $cfg.baseUrl }}
+{{- if not $base }}
+{{- if not $egress.gatewayUrl }}{{ fail (printf "modelEgress.clients.%s needs a baseUrl, or modelEgress.gatewayUrl to derive one from" $client) }}{{ end }}
+{{- $base = printf "%s/%s" (trimSuffix "/" $egress.gatewayUrl) $profile.provider }}
+{{- end }}
+{{- with (get $profile $target) }}
+- name: {{ .base }}
+  value: {{ $base | quote }}
+{{- /* Over https the member supplies the key at launch, as a credential-proxy placeholder once the pod's shim serves one. */}}
+{{- if or (eq $target "daemon") (not (hasPrefix "https://" (lower $base))) }}
+{{- with .key }}
+- name: {{ . }}
+  value: {{ $cfg.apiKey | default "" | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/* Whether the bundled Source Cache store renders: no external bucket is enabled and the store has a public host. */}}
+{{- define "agentconnect.sourceCacheStore" -}}
+{{- $sourceCache := .Values.sourceCache | default dict }}
+{{- $store := $sourceCache.store | default dict }}
+{{- if and (not $sourceCache.enabled) $store.enabled $store.host }}
+{{- if or (contains "/" $store.host) (contains ":" $store.host) }}
+{{- fail "sourceCache.store.host must be a bare hostname, without a scheme, port or path" }}
+{{- end }}
+{{- print "true" }}
+{{- end }}
+{{- end }}
+
+{{/* The effective sourceCache values as JSON: the values themselves, or the bundled store's bucket, endpoint and key pair Secret. */}}
+{{- define "agentconnect.sourceCache" -}}
+{{- $sourceCache := deepCopy (.Values.sourceCache | default dict) }}
+{{- if include "agentconnect.sourceCacheStore" . }}
+{{- $store := $sourceCache.store }}
+{{- $_ := set $sourceCache "enabled" true }}
+{{- $_ := set $sourceCache "endpoint" (printf "https://%s" $store.host) }}
+{{- $_ := set $sourceCache "publicEndpoint" "" }}
+{{- $_ := set $sourceCache "region" "us-east-1" }}
+{{- $_ := set $sourceCache "bucket" $store.bucket }}
+{{- $_ := set $sourceCache "forcePathStyle" true }}
+{{- $secret := dict "name" (printf "%s-source-cache-store" (include "agentconnect.fullname" .)) "accessKeyIdKey" "AWS_ACCESS_KEY_ID" "secretAccessKeyKey" "AWS_SECRET_ACCESS_KEY" }}
+{{- $_ := set $sourceCache "credentials" (dict "source" "secret" "secret" $secret) }}
+{{- end }}
+{{- toJson $sourceCache }}
+{{- end }}
+
+{{/* The bucket credential source (mounted static keys or a web identity) of the effective sourceCache values passed in. */}}
+{{- define "agentconnect.sourceCacheCredentials" -}}
+{{- $sourceCacheCredentials := .credentials | default dict }}
+{{- if eq $sourceCacheCredentials.source "secret" }}
+{{- $secret := $sourceCacheCredentials.secret | default dict }}
+{{- $_ := required "sourceCache.credentials.secret.name is required for the secret credential source" $secret.name }}
+{{- $credentials := dict "source" "static" "dir" "/var/run/ac-source-cache" "accessKeyIdKey" $secret.accessKeyIdKey "secretAccessKeyKey" $secret.secretAccessKeyKey }}
+{{- with $secret.sessionTokenKey }}
+{{- $_ := set $credentials "sessionTokenKey" . }}
+{{- end }}
+{{- toJson $credentials }}
+{{- else if eq $sourceCacheCredentials.source "serviceAccount" }}
+{{- $identity := $sourceCacheCredentials.serviceAccount | default dict }}
+{{- $credentials := dict "source" "webIdentity" }}
+{{- if $identity.roleArn }}
+{{- $_ := set $credentials "roleArn" $identity.roleArn }}
+{{- $_ := set $credentials "tokenFile" "/var/run/ac-source-cache-identity/token" }}
+{{- end }}
+{{- with $identity.stsEndpoint }}
+{{- if not (hasPrefix "https://" .) }}
+{{- fail "sourceCache.credentials.serviceAccount.stsEndpoint must be an https:// origin" }}
+{{- end }}
+{{- $_ := set $credentials "stsEndpoint" . }}
+{{- end }}
+{{- with $identity.sessionDurationSeconds }}
+{{- $_ := set $credentials "durationSeconds" (int .) }}
+{{- end }}
+{{- toJson $credentials }}
+{{- else }}
+{{- fail "sourceCache.credentials.source must be serviceAccount or secret" }}
+{{- end }}
+{{- end }}
+
+{{/* Managed computers (computer-use.md §15.1): the computer image, template and warm pool, release-prefixed and derived. */}}
+{{- define "agentconnect.computerImage" -}}
+{{- $repository := .Values.computerPool.repository | default (printf "%s/computer" .Values.image.registry) -}}
+{{- .Values.computerPool.image | default (printf "%s:%s" $repository (.Values.computerPool.tag | default (include "agentconnect.imageTag" .))) -}}
+{{- end -}}
+
+{{- define "agentconnect.computerTemplateName" -}}
+{{- printf "%s-computer" (include "agentconnect.fullname" .) -}}
+{{- end -}}
+
+{{- define "agentconnect.computerWarmPoolName" -}}
+{{- printf "%s-computer-pool" (include "agentconnect.fullname" .) -}}
+{{- end -}}
+
+{{/* The Control Plane's public origin, as daemons and desktops reach it: the api host, else `<publicUrl>/cp`. */}}
+{{- define "agentconnect.publicCpUrl" -}}
+{{- if .Values.apiHost }}{{ printf "https://%s" .Values.apiHost }}{{ else }}{{ printf "%s/cp" (trimSuffix "/" .Values.publicUrl) }}{{ end -}}
+{{- end -}}
+
+{{/*
+AC_COMPUTER_PLAN (computer-use.md §15.4, §15.5): quotas, egress choices, and the desktop home volume in GiB that metering bills.
+*/}}
+{{- define "agentconnect.computerPlan" -}}
+{{- $size := toString .Values.computerPool.home.size -}}
+{{- $gib := 0.0 -}}
+{{- if hasSuffix "Ti" $size }}{{ $gib = mulf (trimSuffix "Ti" $size | float64) 1024.0 }}
+{{- else if hasSuffix "Gi" $size }}{{ $gib = trimSuffix "Gi" $size | float64 }}
+{{- else if hasSuffix "Mi" $size }}{{ $gib = divf (trimSuffix "Mi" $size | float64) 1024.0 }}
+{{- else }}{{ fail (printf "computerPool.home.size must be in Mi, Gi or Ti, not %s" $size) }}{{ end -}}
+{{- $egress := dict "orgProxy" .Values.computerPlan.egress.orgProxy -}}
+{{- with .Values.computerPlan.egress.description }}{{ $_ := set $egress "description" . }}{{ end -}}
+{{- toJson (dict "version" 1 "quotas" (.Values.computerPlan.quotas | default dict) "volumeGib" $gib "egress" $egress) -}}
+{{- end }}
+
+{{/*
+Viewer media egress ports (computer-use.md §7.2): relay TURN/STUN public and container ports (in-cluster LB traffic is DNATed first), external TURN and STUN URLs, and Cloudflare TURN's.
+*/}}
+{{- define "agentconnect.computerMediaPorts" -}}
+{{- $ports := list -}}
+{{- $turn := .Values.relay.turn -}}
+{{- if $turn.enabled -}}
+{{- range (list $turn.publicPort $turn.port) -}}
+{{- $ports = append $ports (dict "protocol" "UDP" "port" (int .)) -}}
+{{- $ports = append $ports (dict "protocol" "TCP" "port" (int .)) -}}
+{{- end -}}
+{{- if $turn.tls.secretName }}{{ range (list $turn.tls.publicPort $turn.tls.port) }}{{ $ports = append $ports (dict "protocol" "TCP" "port" (int .)) }}{{ end }}{{ end -}}
+{{- end -}}
+{{- $stun := .Values.relay.stun -}}
+{{- if $stun.enabled }}{{ range (list ($stun.publicPort | default $stun.port) $stun.port) }}{{ $ports = append $ports (dict "protocol" "UDP" "port" (int .)) }}{{ end }}{{ end -}}
+{{- range .Values.computerViewer.turn.urls -}}
+{{- $port := regexFind ":[0-9]+" (regexReplaceAll "^turns?:" . "") | trimPrefix ":" -}}
+{{- $port = $port | default (ternary "5349" "3478" (hasPrefix "turns:" .)) | int -}}
+{{- $ports = append $ports (dict "protocol" "UDP" "port" $port) -}}
+{{- $ports = append $ports (dict "protocol" "TCP" "port" $port) -}}
+{{- end -}}
+{{- range .Values.computerViewer.stun.urls -}}
+{{- $port := regexFind ":[0-9]+$" (trimPrefix "stun:" .) | trimPrefix ":" | default "3478" | int -}}
+{{- $ports = append $ports (dict "protocol" "UDP" "port" $port) -}}
+{{- end -}}
+{{- if .Values.computerViewer.turn.cloudflare.keyId -}}
+{{- range (list (dict "protocol" "UDP" "port" 3478) (dict "protocol" "TCP" "port" 3478) (dict "protocol" "TCP" "port" 5349)) }}{{ $ports = append $ports . }}{{ end -}}
+{{- end -}}
+{{- $seen := dict -}}
+{{- $out := list -}}
+{{- range $ports -}}
+{{- $key := printf "%s/%d" .protocol .port -}}
+{{- if and (ne $key "TCP/443") (not (hasKey $seen $key)) }}{{ $_ := set $seen $key true }}{{ $out = append $out . }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end }}

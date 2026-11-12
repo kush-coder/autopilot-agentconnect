@@ -1,0 +1,200 @@
+import type { Clock } from '@agentconnect.md/connection'
+import type { LaunchTimer, ClusterMetrics } from '../metrics/cluster-metrics.js'
+import type { ShimCapability } from '../shim/protocol.js'
+import type { ShimConnection } from '../shim/connection.js'
+import { ShimSession } from '../shim/session.js'
+import { spawnSubject, type SpawnRecord } from '../shim/binding.js'
+import { sandboxSubjectAgentId } from './sandbox-subject.js'
+import type { LaunchRegistry, Launch } from './launch-registry.js'
+import { LaunchTimeoutError, type ShimEndpointProvider } from './shim-endpoint.js'
+
+export interface ChannelBinderDeps<L extends Launch = Launch> {
+  registry: LaunchRegistry<L>
+  /** Where the launch's shim can be dialed; it also holds the sandbox for the length of the bind. */
+  endpoints: ShimEndpointProvider<L>
+  clock: Clock
+  log: { info: (m: string) => void; warn: (m: string) => void; debug?: (m: string) => void }
+  metrics: ClusterMetrics
+  /** How long a bind may wait for the pod's shim to dial back. */
+  channelTimeoutMs: number
+  /** Dials the resolved endpoint and binds the shim channel for this launch. */
+  connectChannel: (record: SpawnRecord, address: string, timeoutMs: number) => Promise<ShimConnection>
+  /** Stops any outbound channel when a bind is abandoned. */
+  revokeChannel?: (subject: string) => void
+  /** Prepares a freshly bound channel before anything runs on it; failures degrade, never fail the bind. */
+  onChannelReady?: (subject: string, session: ShimSession) => Promise<void>
+  /** Told of a failed bind while the bind still holds the launch; must not throw. */
+  onBindFailed?: (subject: string, launch: L) => void
+}
+
+/**
+ * A subject's logical channel to its pod: the session and the mount it reported.
+ *
+ * Two subject-keyed maps that only make sense together — the session survives the shim's
+ * credential renewals, and the workspace root is whatever the CURRENT bound pod reported.
+ *
+ * The binder owns those primitives only. Dropping a session alongside its launch is one
+ * invariant spanning this class and `LaunchRegistry`, so its ORCHESTRATION stays in the
+ * `K8sDriver` methods that own the other half.
+ */
+export class ChannelBinder<L extends Launch = Launch> {
+  /** Logical channels per subject, which survive the shim's credential renewals. */
+  private readonly sessions = new Map<string, ShimSession>()
+  /** Workspace mount per subject, as the bound pod's shim reported it. */
+  private readonly workspaceRoots = new Map<string, string>()
+
+  constructor(private readonly deps: ChannelBinderDeps<L>) {}
+
+  /** Resume the launch's pod, wait for it, and bind the shim channel onto the subject's session. */
+  async bindChannel(
+    subject: string,
+    launch: L,
+    timer: LaunchTimer | undefined,
+    grants: ShimCapability[]
+  ): Promise<ShimConnection> {
+    this.deps.endpoints.retain(launch)
+    try {
+      return await this.bindHeld(subject, launch, timer, grants)
+    } catch (err) {
+      // Before the release below, so the host learns of it while the pod is still held.
+      this.deps.onBindFailed?.(subject, launch)
+      throw err
+    } finally {
+      this.deps.endpoints.release(launch)
+    }
+  }
+
+  private async bindHeld(
+    subject: string,
+    launch: L,
+    timer: LaunchTimer | undefined,
+    grants: ShimCapability[]
+  ): Promise<ShimConnection> {
+    const releasedAt = this.deps.registry.releaseFence(subject)
+    // The fence only catches a release that lands DURING the bind; one that landed between
+    // `ensureSandbox` resolving and this continuation running is already in the snapshot, so the
+    // launch itself has to be re-read. Otherwise a departed member wakes a pod it no longer serves.
+    if (this.deps.registry.currentLaunch(subject) !== launch) {
+      throw new Error(`sandbox ${subject} left this member before its sandbox channel was bound`)
+    }
+    const endpoint = await this.deps.endpoints.resolve(launch, timer)
+    const channelTimeoutMs = this.deps.channelTimeoutMs
+    const waitingSince = this.deps.clock.now()
+    // Armed before the host's own deadline, so it fires first: a timer can come due before now() shows its budget spent.
+    let expired = false
+    const deadline = this.deps.clock.setTimeout(() => (expired = true), channelTimeoutMs)
+    const connection = await this.deps
+      .connectChannel(
+        {
+          agentId: sandboxSubjectAgentId(subject),
+          subject,
+          sandboxUid: launch.sandboxUid,
+          generation: launch.generation,
+          grants: [...grants],
+          podName: endpoint.peer.name,
+          peer: endpoint.peer.proof
+        },
+        endpoint.address,
+        channelTimeoutMs
+      )
+      .catch((err: unknown) => {
+        // The host's error text is not ours to match on; our own deadline, by timer or by clock, is.
+        if (expired || this.deps.clock.now() - waitingSince >= channelTimeoutMs) {
+          throw new LaunchTimeoutError(`no shim channel bound for ${subject} in time`)
+        }
+        throw err
+      })
+      .finally(() => this.deps.clock.clearTimeout(deadline))
+    timer?.mark('shim_handshake')
+    // Released mid-bind: the pod is another member's to serve now, so the channel is dropped.
+    if (!this.deps.registry.stillServed(subject, releasedAt)) {
+      this.deps.revokeChannel?.(subject)
+      throw new Error(`sandbox ${subject} left this member while its sandbox channel was being bound`)
+    }
+    this.recordWorkspaceRoot(subject, connection)
+    // The session is created HERE rather than in `launch`, because a channel bound for workspace
+    // preparation needs one too — and a second session per subject would mean the runtime and the
+    // workspace seam disagreeing about whether the channel is alive.
+    const existing = this.sessions.get(subject)
+    if (existing && existing.generation === connection.binding.generation) {
+      existing.attach(connection)
+    } else {
+      const session = new ShimSession(subject, connection.binding.generation, {
+        setTimeout: (fn, ms) => this.deps.clock.setTimeout(fn, ms),
+        clearTimeout: (handle) => this.deps.clock.clearTimeout(handle as never)
+      })
+      session.attach(connection)
+      this.sessions.set(subject, session)
+    }
+    // After the session exists and before the caller can use the channel. Reported rather than
+    // raised: a sandbox without its credential tunnel still runs, and refusing the launch would
+    // turn one degraded feature into no agent at all.
+    const ready = this.sessions.get(subject)
+    if (ready && this.deps.onChannelReady) {
+      await this.deps.onChannelReady(subject, ready).catch((err: unknown) => {
+        this.deps.log.warn(`cluster: sandbox ${subject} channel prepared with errors: ${(err as Error).message}`)
+      })
+    }
+    return connection
+  }
+
+  /** Re-attach a renewed or replacement connection to the session it belongs to. */
+  onChannelBound(connection: ShimConnection): void {
+    this.recordWorkspaceRoot(spawnSubject(connection.binding), connection)
+    const session = this.sessions.get(spawnSubject(connection.binding))
+    if (!session) return
+    // Counted apart from the first bind: a re-establishment rate is the signal that renewals or
+    // pod churn are happening more than they should, and pooling the two hides exactly that.
+    this.deps.metrics.channel('reestablished')
+    session.attach(connection)
+  }
+
+  /**
+   * End the subject's session because its channel is gone, reporting whether this call dropped it.
+   *
+   * A lost session is TERMINAL, so it must not survive to meet the replacement pod: `attach()`
+   * is a no-op once closed, and `bindChannel` re-attaches whenever the generations match — which
+   * they would, because a cached launch keeps its own. The caller forgets the launch on a `true`
+   * so the next turn re-claims at a FRESH generation, the fence the replacement pod is bound
+   * against. The workspace root is deliberately kept: the next bind overwrites or deletes it.
+   */
+  loseChannel(subject: string, reason: string): boolean {
+    this.deps.metrics.channel('dropped')
+    const session = this.sessions.get(subject)
+    session?.lose(reason)
+    if (!session || this.sessions.get(subject) !== session) return false
+    this.sessions.delete(subject)
+    return true
+  }
+
+  /** Drop the session without ending it as a loss — the suspend path, which keeps the root. */
+  dropSession(subject: string): void {
+    this.sessions.delete(subject)
+  }
+
+  /** The subject is no longer served here: both the session and the remembered mount go. */
+  forget(subject: string): void {
+    this.sessions.delete(subject)
+    this.workspaceRoots.delete(subject)
+  }
+
+  /** The bound session for a subject, so the workspace seam reaches the same channel the runtime
+   *  does rather than opening a second one that can disagree about whether it is alive. */
+  sessionFor(subject: string): ShimSession | undefined {
+    return this.sessions.get(subject)
+  }
+
+  /** Where the subject's bound pod mounts its workspace, or undefined before a bind (or when a
+   *  legacy shim reported nothing — callers fall back to the historical mount). */
+  workspaceRootFor(subject: string): string | undefined {
+    return this.workspaceRoots.get(subject)
+  }
+
+  // Mirrors the CURRENT pod, absence included: a root kept from a previous incarnation (an image
+  // rollback to a shim that reports none) names a mount this pod may not have — the exact failure
+  // this seam exists to remove. Unset ⇒ callers fall back to the historical mount.
+  private recordWorkspaceRoot(subject: string, connection: ShimConnection): void {
+    if (connection.workspaceRoot) this.workspaceRoots.set(subject, connection.workspaceRoot)
+    else this.workspaceRoots.delete(subject)
+  }
+}

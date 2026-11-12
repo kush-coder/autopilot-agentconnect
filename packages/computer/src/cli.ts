@@ -1,0 +1,1841 @@
+#!/usr/bin/env node
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir, hostname, networkInterfaces, tmpdir } from 'node:os'
+import { basename, join, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
+import { parseArgs } from 'node:util'
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio'
+import {
+  COMPUTER_DESKTOPS_MAX,
+  type ComputerAdminPromptMode,
+  type ComputerControlLease,
+  type ComputerDesktopReport,
+  type ComputerPolicy
+} from '@agentconnect.md/protocol/computer'
+import { AdminPromptHelper } from './admin-prompts.js'
+import { auditSinks, fileAuditSink, type AuditSink } from './audit.js'
+import { browserCloseCommand, browserCommand } from './browser/command.js'
+import { CommandLine, commandLineSupported, narrowedCommandLine } from './command-line.js'
+import { askYes, installable, offerDesktopInstall, runInherited } from './linux/desktops-install.js'
+import { describeDesktops, desktopsNotice, probeDesktopSupport, type DesktopSupport } from './linux/desktops-support.js'
+import { attributeSocket, realProc } from './form-fill/attribution.js'
+import { FORM_FILL_EXTENSION } from './form-fill/build.js'
+import { FormFillEndpoint } from './form-fill/endpoint.js'
+import {
+  configuredFormFillPort,
+  desktopInstallPlan,
+  desktopUninstallCommands,
+  detectBrowsers,
+  formFillCheck
+} from './form-fill/desktop-install.js'
+import { extensionId, extensionKey, installExtension } from './form-fill/package.js'
+import { FormFillService } from './form-fill/service.js'
+import { DesktopManager, loadDesktopState } from './linux/desktops.js'
+import { AuditReporter } from './cp/audit-report.js'
+import { ScreenshotStore } from './cp/screenshot-store.js'
+import { disableAutostart, enableAutostart, startAutostartNow } from './autostart.js'
+import { Computer, type ComputerDeps, type ScreenshotStash } from './computer.js'
+import {
+  authenticate,
+  configPath,
+  controlBaseUrl,
+  dataDir,
+  DaemonConfig,
+  DEFAULT_FORM_FILL_PORT,
+  isLoopbackHost,
+  isWildcardHost,
+  issueClientToken,
+  loadConfig,
+  saveConfig,
+  windowsServiceHome
+} from './config.js'
+import { CuaDriver, type DriverTool } from './driver/client.js'
+import { CUA_DRIVER_VERSION, installDriver, installedDriverPath, resolveDriverPath } from './driver/install.js'
+import { CONTROL_HEADER, startHttpServer, urlHost } from './http-server.js'
+import { canInstallFfmpeg, ffmpegAvailable, FFMPEG_VERSION, installFfmpeg, resolveFfmpegPath } from './stream/ffmpeg.js'
+import { RtcSessions } from './stream/rtc.js'
+import { ScreenStream } from './stream/screen-stream.js'
+import type { McpServer } from '@modelcontextprotocol/server'
+import { createComputerMcpServer, exposedDriverTools, type CommandLineAccess } from './tools.js'
+import { createViewer, type Viewer, type ViewerPrincipal } from './viewer.js'
+import { createViewerRouter } from './viewer-router.js'
+import { hasCommand, keepDisplayAwake } from './keep-awake.js'
+import { recordGrants } from './macos-grants.js'
+import { appBundlePath, managedEntry, menuBarHelperPath, runSelf, selfCommand, serviceEntry } from './self.js'
+import { ChannelAuthority } from './cp/authority.js'
+import { ComputerCpClient } from './cp/client.js'
+import { consoleStopHandler } from './cp/console-stop.js'
+import {
+  DAEMON_CONSOLE_STOP_REASON,
+  startLocalControls,
+  type LocalControls,
+  type LocallyControlled
+} from './local-controls.js'
+import { macMenuBarHost } from './menu-bar-host.js'
+import { windowsMenuBarHost } from './menu-bar-host-windows.js'
+import { watchAccessibility, type AccessibilityWatch } from './accessibility-watch.js'
+import { RelayLinks } from './cp/relay-links.js'
+import {
+  channelPrincipal,
+  createRelayedMcpHandler,
+  viewerAuthenticator,
+  mayWatch,
+  viewerPrincipal,
+  type McpPrincipal
+} from './mcp-access.js'
+import {
+  exchangeRegistrationToken,
+  loadRegistration,
+  markRevoked,
+  registerOrKeep,
+  registrationPath,
+  saveRegistration,
+  type Registration
+} from './cp/registration.js'
+import { capabilitiesFrom, computerOs, doctorReport, isolationKind, osVersion, sessionKind } from './cp/report.js'
+import {
+  COMPUTER_NAME_ENV,
+  CP_URL_ENV,
+  REGISTER_TOKEN_ENV,
+  registerFromEnv,
+  registrationFromEnv,
+  tokenSha256
+} from './cp/env-registration.js'
+import { poolBootstrapPort, startPoolBootstrap } from './cp/pool-bootstrap.js'
+import { EgressForwarder, egressPort } from './egress.js'
+import { publicBaseUrl, rtcAdvertiseAddress } from './public-address.js'
+import { COMPUTER_DAEMON_VERSION } from './version.js'
+import { scheduleDoctor } from './doctor-schedule.js'
+import * as linuxService from './service-linux.js'
+import * as windowsService from './service-windows.js'
+import {
+  installService,
+  plistPath,
+  restartService,
+  serviceStatus,
+  startService,
+  stopService,
+  uninstallService
+} from './service-macos.js'
+import {
+  doctor,
+  hostApp,
+  localizeChecks,
+  MAC_PANES,
+  macPermissions,
+  open,
+  overSsh,
+  printChecks,
+  setupPermissions,
+  setupWindowsFirewall,
+  type Check,
+  type SetupContext
+} from './setup.js'
+
+const help = (): string => `${selfCommand()} — the AgentConnect computer daemon (Cua Driver + computer_* MCP tools)
+
+Usage: ${selfCommand()} <command> [options]
+
+Commands:
+  setup [--client NAME] [--host H] [--port P] [--no-service]
+                                               one-time install, run on the desktop itself: config + client token,
+                                               Cua Driver ${CUA_DRIVER_VERSION}, ffmpeg, then the OS approvals (macOS
+                                               Accessibility + Screen Recording, Windows Firewall), then doctor
+  setup --register TOKEN --cp-url URL [--name NAME]
+                                               the same, registering this desktop as a Computer with the Control
+                                               Plane instead of minting a local client token (the key is kept in
+                                               a 0600 file in the data dir)
+  register TOKEN --cp-url URL [--name NAME]    only the registration part of setup; restart the daemon afterwards
+  init [--client NAME] [--host H] [--port P]   non-interactive part of setup: config + token + Cua Driver
+  install-driver                               download and verify the pinned Cua Driver build
+  install-ffmpeg                               download the pinned ffmpeg (${FFMPEG_VERSION}) for the WebRTC viewer
+  run [--host H] [--port P] [--expose-driver-tools] [--public-url URL] [--rtc-address A] [--rtc-ports MIN-MAX]
+                                               foreground: serve MCP at http://H:P/mcp and the remote
+                                               desktop viewer at http://H:P/view until Ctrl+C
+                                               (first run creates the token and downloads the driver);
+                                               H defaults to 127.0.0.1, --host 0.0.0.0 opens every interface;
+                                               registers first when ${REGISTER_TOKEN_ENV}(_FILE) and
+                                               AGENTCONNECT_CP_URL are set and no key for that CP is stored
+                                               (AGENTCONNECT_EGRESS_PORT runs the browser's egress forwarder,
+                                               as managed pods do)
+  stdio [--expose-driver-tools]                serve MCP over stdio (agent runs on this machine)
+  token add NAME | token list | token remove NAME
+  status | pause | resume                      owner controls for the running daemon (loopback)
+  doctor [--json] [--daemon]                   check install, session, permissions, capture, firewall
+                                               (read-only; exits 1 when a required check fails);
+                                               --daemon also fails when no daemon answers (health checks)
+  autostart enable | disable | start           Windows without the service: start 'run' at logon (Run key)
+  browser --profile DIR [--master DIR] [--source DIR]... [--browser PATH] [-- ARGS]
+                                               start a desktop's Chromium on its own profile, first merging the
+                                               logins of the other profiles into it (or hand ARGS to the running one)
+  browser-close --profile DIR [--display :N]   close that browser the way a person would, so it saves its cookies
+  desktops [on | off | status]                 Linux: give each agent its own desktop (the default where the
+                                               machine can: Xvfb, D-Bus and Xfce), or let agents share this one
+  form-fill [install | uninstall | status] [-y] Linux: let agents fill website forms in Chromium or Google Chrome
+                                               through a Fill card (asks for root once to write browser policy)
+  service install | uninstall [--purge] | start | stop | restart | status
+                                               background service: macOS .app LaunchAgent (the app holds
+                                               the permissions), Linux systemd user unit (graphical session),
+                                               Windows service running the daemon as SYSTEM in the signed-in
+                                               session, which can reach UAC prompts (asks for approval)
+
+Data dir: ${dataDir()}`
+
+// "7700-7719" → [7700, 7719]; DaemonConfig validates the bounds.
+const parsePortRange = (value: string): [number, number] => {
+  const [min, max = min] = value.split('-').map(Number)
+  return DaemonConfig.shape.rtcPortRange.parse([min, max])!
+}
+
+const log = (line: string): void => console.error(`[${new Date().toISOString()}] ${line}`)
+
+async function main(): Promise<void> {
+  const { values, positionals } = parseArgs({
+    allowPositionals: true,
+    options: {
+      host: { type: 'string' },
+      port: { type: 'string' },
+      'public-url': { type: 'string' },
+      'rtc-address': { type: 'string' },
+      'rtc-ports': { type: 'string' },
+      'form-fill-port': { type: 'string' },
+      'policy-dir': { type: 'string' },
+      client: { type: 'string', default: 'claude' },
+      'expose-driver-tools': { type: 'boolean' },
+      json: { type: 'boolean' },
+      here: { type: 'boolean' },
+      daemon: { type: 'boolean' },
+      prompt: { type: 'boolean' },
+      'capture-timeout': { type: 'string' },
+      'no-service': { type: 'boolean' },
+      register: { type: 'string' },
+      'cp-url': { type: 'string' },
+      name: { type: 'string' },
+      purge: { type: 'boolean' },
+      desktop: { type: 'string' },
+      profile: { type: 'string' },
+      master: { type: 'string' },
+      source: { type: 'string', multiple: true },
+      browser: { type: 'string' },
+      display: { type: 'string' },
+      'skip-path': { type: 'string', multiple: true },
+      yes: { type: 'boolean', short: 'y' },
+      help: { type: 'boolean', short: 'h' }
+    }
+  })
+  const [command, ...rest] = positionals
+  if (values.help || !command) return void console.log(help())
+  let dir = dataDir()
+  if (process.platform === 'win32') {
+    const installing =
+      (command === 'setup' && !values['no-service']) || (command === 'service' && rest[0] === 'install')
+    // The service's data is the administrators' to change, so these commands ask for approval once and run elevated.
+    const writes =
+      installing ||
+      (command === 'service' && rest[0] === 'uninstall') ||
+      (dir === windowsServiceHome() && ['register', 'init', 'install-driver', 'install-ffmpeg'].includes(command)) ||
+      (dir === windowsServiceHome() && command === 'token' && rest[0] !== 'list')
+    if (writes && !windowsService.isElevated()) {
+      console.log('Asking for administrator approval (UAC)…')
+      const env = Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => entry[0].startsWith('AGENTCONNECT_') && entry[1] !== undefined
+        )
+      )
+      if (installing) env.AGENTCONNECT_COMPUTER_HOME = windowsServiceHome()
+      process.exitCode = await windowsService.runElevated(resolve(process.argv[1]!), process.argv.slice(2), env)
+      return
+    }
+    if (installing && dir !== windowsServiceHome()) {
+      windowsService.migrateUserData(dir, windowsServiceHome(), (line) => console.log(line))
+      dir = windowsServiceHome()
+    }
+  }
+  const overrides = (config: DaemonConfig): DaemonConfig => ({
+    ...config,
+    ...(values.host ? { host: values.host } : {}),
+    ...(values.port ? { port: Number(values.port) } : {}),
+    ...(values['expose-driver-tools'] ? { exposeDriverTools: true } : {}),
+    ...(values['public-url'] ? { publicUrl: DaemonConfig.shape.publicUrl.parse(values['public-url']) } : {}),
+    ...(values['rtc-address'] ? { rtcAddress: values['rtc-address'] } : {}),
+    ...(values['rtc-ports'] ? { rtcPortRange: parsePortRange(values['rtc-ports']) } : {}),
+    ...(values['form-fill-port']
+      ? { formFillPort: DaemonConfig.shape.formFillPort.parse(Number(values['form-fill-port'])) }
+      : {})
+  })
+
+  switch (command) {
+    case 'init': {
+      let config = overrides(loadConfig(dir))
+      let token: string | undefined
+      if (!config.clients.some((client) => client.name === values.client)) {
+        ;({ config, token } = issueClientToken(config, values.client))
+      }
+      saveConfig(config, dir)
+      console.log(`Config: ${configPath(dir)}`)
+      await installDriver(dir)
+      if (token) printClientSetup(config, values.client, token)
+      else console.log(`Client "${values.client}" already exists; use "token add ${values.client}" to rotate it.`)
+      return
+    }
+    case 'setup': {
+      const config = overrides(loadConfig(dir))
+      if (values.register) {
+        const { register: token, 'cp-url': cpUrl, name } = values
+        const { registration, kept } = await registerOrKeep(dir, cpUrl, () => registerComputer(dir, token, cpUrl, name))
+        if (kept)
+          console.log(`The token is spent; keeping this desktop's registration as computer ${registration.computerId}.`)
+      }
+      const registered = Boolean(values.register) || Boolean(loadRegistration(dir))
+      return setup(dir, config, registered ? undefined : values.client, !values['no-service'])
+    }
+    case 'register': {
+      const token = rest[0] ?? values.register
+      if (!token) throw new Error('usage: register TOKEN --cp-url URL [--name NAME]')
+      await registerComputer(dir, token, values['cp-url'], values.name)
+      console.log(`Restart the daemon if it is running so it connects: ${selfCommand()} service restart`)
+      return
+    }
+    case 'install-driver':
+      await installDriver(dir)
+      return
+    case 'install-extension': {
+      // Image build (root): the CRX, its update manifest and the force-install policy (computer-form-fill-and-vault.md §8).
+      if (!FORM_FILL_EXTENSION) throw new Error('this build ships no form-fill extension')
+      const installed = installExtension({
+        build: FORM_FILL_EXTENSION,
+        dir: rest[0] ?? '/opt/agentconnect/extension',
+        policyDir: values['policy-dir'] ?? '/etc/chromium/policies/managed',
+        port: DaemonConfig.shape.formFillPort.parse(Number(values['form-fill-port'] ?? DEFAULT_FORM_FILL_PORT))!
+      })
+      console.log(`form-fill extension ${installed.id} ${installed.version} (build ${FORM_FILL_EXTENSION.buildId})`)
+      return
+    }
+    case 'install-ffmpeg':
+      console.log(`ffmpeg: ${await installFfmpeg(dir)}`)
+      return
+    case 'token':
+      return tokenCommand(dir, rest)
+    case 'run':
+      return run(dir, overrides(loadConfig(dir)), values.client)
+    case 'stdio':
+      return stdio(dir, overrides(loadConfig(dir)))
+    case 'status':
+    case 'pause':
+    case 'resume':
+      return controlCommand(overrides(loadConfig(dir)), command)
+    case 'doctor': {
+      const config = overrides(loadConfig(dir))
+      // On macOS the daemon's permissions are what matter; a running daemon checks from inside itself.
+      const remote =
+        (process.platform !== 'win32' || windowsService.serviceStatus().loaded) && !values.here
+          ? await daemonDoctor(config)
+          : undefined
+      const captureMs = Number(values['capture-timeout']) || 15_000
+      if (values.daemon && !remote) {
+        const down: Check = { name: 'daemon', status: 'fail', detail: `no daemon answers on ${controlBaseUrl(config)}` }
+        if (values.json) console.log(JSON.stringify([down]))
+        else printChecks([down])
+        process.exitCode = 1
+        return
+      }
+      const checks = remote ?? (await doctor(setupContext(dir, config), captureMs))
+      if (values.json) console.log(JSON.stringify(checks))
+      else {
+        if (remote) console.log(`(checked inside the running daemon: ${remote.host})\n`)
+        if (!printChecks(checks)) process.exitCode = 1
+      }
+      if (values.json && checks.some((check) => check.status === 'fail')) process.exitCode = 1
+      return
+    }
+    case 'permissions': {
+      const driver = new CuaDriver({
+        command: resolveDriverPath(dir, loadConfig(dir).driverPath),
+        callTimeoutMs: values.prompt ? 180_000 : 20_000
+      })
+      try {
+        const state = await macPermissions(driver, Boolean(values.prompt))
+        if (appBundlePath()) recordGrants(dir, state, Boolean(values.prompt))
+        console.log(JSON.stringify(state))
+      } finally {
+        await driver.close()
+      }
+      return
+    }
+    case 'service':
+      return await serviceCommand(dir, loadConfig(dir), rest[0], Boolean(values.purge))
+    case 'browser':
+      return browserCommand(values, rest, log, dir)
+    case 'browser-close':
+      return browserCloseCommand(values, log)
+    case 'desktops':
+      return desktopsCommand(dir, rest[0])
+    case 'form-fill':
+      return formFillCommand(dir, rest[0], values.yes === true)
+    case 'autostart': {
+      const action = rest[0]
+      if (action === 'enable') enableAutostart(dir, serviceEntry())
+      else if (action === 'disable') disableAutostart(dir)
+      else if (action === 'start') startAutostartNow(dir)
+      else throw new Error('usage: autostart enable | disable | start')
+      return void console.log(`autostart ${action}: ok`)
+    }
+    default:
+      throw new Error(`unknown command "${command}"\n\n${help()}`)
+  }
+}
+
+// Form filling on this Linux desktop (computer-form-fill-and-vault.md §8): the policy install needs root once, through sudo.
+async function formFillCommand(dir: string, action: string | undefined, yes: boolean): Promise<void> {
+  if (process.platform !== 'linux') throw new Error('form filling is available on Linux only')
+  const config = loadConfig(dir)
+  const browsers = detectBrowsers()
+  if (action === 'status' || action === undefined) {
+    const check = formFillCheck({
+      build: FORM_FILL_EXTENSION,
+      port: configuredFormFillPort(config.formFillPort),
+      browsers,
+      command: selfCommand()
+    })
+    console.log(`form fill: ${check.status}: ${check.detail}${check.fix ? `\n  fix: ${check.fix}` : ''}`)
+    return
+  }
+  const asRoot = process.getuid?.() === 0
+  const run = async (commands: string[][], what: string): Promise<boolean> => {
+    const lines = commands.map((command) => (asRoot ? command : ['sudo', ...command]))
+    // Without a terminal the commands are not printed: they read staged files deleted on return, and skip the daemon's config.
+    if (!yes && !process.stdin.isTTY) {
+      console.log(
+        `${what} needs root: run \`${selfCommand()} form-fill ${action} --yes\`${asRoot ? '' : ' (it runs sudo)'}, or run it in a terminal.`
+      )
+      return false
+    }
+    console.log(`${what} needs root:\n${lines.map((line) => `  ${line.join(' ')}`).join('\n')}`)
+    if (!yes && !(await askYes('Run them now? [Y/n] '))) return false
+    return lines.every((line) => runInherited(line) === 0)
+  }
+  if (action === 'uninstall') {
+    if (await run(desktopUninstallCommands(browsers), 'Removing the form-fill extension')) {
+      const { formFillPort: _port, ...rest } = config
+      saveConfig(DaemonConfig.parse(rest), dir)
+      console.log('Removed. Restart the browser and the daemon so both stop using it.')
+    }
+    return
+  }
+  if (action !== 'install') throw new Error('usage: form-fill install | uninstall | status')
+  if (!FORM_FILL_EXTENSION) throw new Error('this build ships no form-fill extension')
+  const usable = browsers.filter((browser) => browser.policyDir)
+  for (const browser of browsers.filter((candidate) => candidate.unsupported))
+    console.log(`${browser.name} (${browser.binary}): ${browser.unsupported}`)
+  if (usable.length === 0) throw new Error('no Chromium or Google Chrome from the distribution or Google is installed')
+  const port = config.formFillPort ?? DEFAULT_FORM_FILL_PORT
+  const stageDir = mkdtempSync(join(tmpdir(), 'ac-form-fill-'))
+  try {
+    const plan = desktopInstallPlan({ build: FORM_FILL_EXTENSION, port, browsers: usable, stageDir })
+    for (const file of plan.files) writeFileSync(join(stageDir, file.name), file.content, { mode: 0o644 })
+    if (
+      !(await run(
+        plan.commands,
+        `Installing the form-fill extension ${plan.id} for ${usable.map((b) => b.name).join(' and ')}`
+      ))
+    )
+      return
+    config.formFillPort = port
+    saveConfig(config, dir)
+    console.log(
+      `Installed. Restart the daemon (it serves the extension on 127.0.0.1:${port}) and quit and reopen ${usable.map((b) => b.name).join(' and ')}.`
+    )
+  } finally {
+    rmSync(stageDir, { recursive: true, force: true })
+  }
+}
+
+const lanAddresses = (): string[] =>
+  Object.values(networkInterfaces())
+    .flat()
+    .filter((net) => net && net.family === 'IPv4' && !net.internal)
+    .map((net) => net!.address)
+
+// With tokenFile the token goes to that 0600 file instead of the output, which a service or container log keeps.
+function printClientSetup(config: DaemonConfig, client: string, token: string, tokenFile?: string): void {
+  const host = urlHost(isWildcardHost(config.host) ? (lanAddresses()[0] ?? hostname()) : config.host)
+  const base = publicBaseUrl(config) ?? `http://${host}:${config.port}`
+  let shown = token
+  if (tokenFile) {
+    rmSync(tokenFile, { force: true })
+    writeFileSync(tokenFile, `${token}\n`, { mode: 0o600, flag: 'wx' })
+    shown = '<token>'
+    console.log(`\nClient "${client}" token written to ${tokenFile} (mode 0600); read it with: cat ${tokenFile}\n`)
+  } else {
+    console.log(`\nClient "${client}" token (shown once, stored only as a hash):\n  ${token}\n`)
+  }
+  console.log('Register with Claude Code:')
+  console.log(`  claude mcp add --transport http computer ${base}/mcp --header "Authorization: Bearer ${shown}"\n`)
+  console.log(`Remote desktop in a browser (the token stays in the URL fragment, never sent to the server):`)
+  console.log(`  ${base}/view#token=${shown}\n`)
+  if (isLoopbackHost(config.host)) {
+    console.log('Reachable from this machine only; use --host 0.0.0.0 (trusted networks) or an SSH tunnel for others.')
+  } else {
+    console.log(
+      `The daemon listens on ${config.host} over plain HTTP and the token is its only protection (trusted networks only).`
+    )
+  }
+}
+
+function tokenCommand(dir: string, args: string[]): void {
+  const [action, name] = args
+  const config = loadConfig(dir)
+  if (action === 'list') {
+    for (const client of config.clients) console.log(client.name)
+    return
+  }
+  if (!name) throw new Error('usage: token add NAME | token remove NAME | token list')
+  if (action === 'add') {
+    const issued = issueClientToken(config, name)
+    saveConfig(issued.config, dir)
+    printClientSetup(issued.config, name, issued.token)
+    console.log('Restart the daemon if it is running so it picks up the new token.')
+  } else if (action === 'remove') {
+    saveConfig({ ...config, clients: config.clients.filter((client) => client.name !== name) }, dir)
+    console.log(`removed ${name}; restart the daemon to revoke it`)
+  } else {
+    throw new Error('usage: token add NAME | token remove NAME | token list')
+  }
+}
+
+// Under a systemd service the driver gets its own scope: apps it launches would otherwise die with every restart.
+const driverWrapper = (): string[] | undefined =>
+  process.platform === 'linux' && process.env.INVOCATION_ID && hasCommand('systemd-run')
+    ? ['systemd-run', '--user', '--scope', '--quiet', '--collect', '--']
+    : undefined
+
+function buildComputer(
+  dir: string,
+  config: DaemonConfig,
+  onStatus?: (status: string) => void,
+  refusal?: () => string | undefined,
+  report?: AuditSink,
+  screenshots?: ScreenshotStash,
+  adminPrompts?: ComputerDeps['adminPrompts'],
+  name = process.env[COMPUTER_NAME_ENV]?.trim() || hostname(),
+  onHalt?: (reason: string) => void,
+  owner?: Pick<ComputerDeps, 'onOwnerPause' | 'onOwnerResume'>
+) {
+  const wrapper = driverWrapper()
+  const driver = new CuaDriver({
+    command: resolveDriverPath(dir, config.driverPath),
+    callTimeoutMs: config.driverCallTimeoutMs,
+    log,
+    ...(wrapper ? { wrapper } : {})
+  })
+  const computer = new Computer({
+    driver,
+    config,
+    audit: auditSinks(fileAuditSink(join(dir, 'audit.log')), ...(report ? [report] : [])),
+    log,
+    ...(onStatus ? { onStatus } : {}),
+    ...(refusal ? { refusal } : {}),
+    ...(screenshots ? { screenshots } : {}),
+    // The service's SYSTEM driver would start apps as SYSTEM; they start as the signed-in person instead.
+    ...(process.platform === 'win32' && windowsService.serviceHost()
+      ? { launchApp: (app: string) => windowsService.launchAsUser(app) }
+      : {}),
+    ...(adminPrompts ? { adminPrompts } : {}),
+    ...(onHalt ? { onHalt } : {}),
+    ...owner,
+    profile: { name: name.slice(0, 120), osVersion: osVersion(), session: sessionKind(), isolation: isolationKind() }
+  })
+  return { driver, computer }
+}
+
+// Exchanges a console registration token for this desktop's Computer key (computer-use.md §3.6).
+function exchangeFor(token: string, cpUrl: string | undefined, name: string | undefined): Promise<Registration> {
+  if (!cpUrl) throw new Error('--cp-url is required with a registration token (the console prints it)')
+  return exchangeRegistrationToken(cpUrl, token, {
+    name: (name ?? (process.env[COMPUTER_NAME_ENV]?.trim() || hostname())).slice(0, 120),
+    isolation: isolationKind(),
+    os: computerOs(),
+    osVersion: osVersion(),
+    session: sessionKind(),
+    desktopDaemonVersion: COMPUTER_DAEMON_VERSION,
+    driverVersion: CUA_DRIVER_VERSION
+  })
+}
+
+// Spends the token and stores the key 0600, with the token's hash so a container restart can recognize it.
+async function registerComputer(
+  dir: string,
+  token: string,
+  cpUrl: string | undefined,
+  name: string | undefined
+): Promise<Registration> {
+  const registration = { ...(await exchangeFor(token, cpUrl, name)), tokenSha256: tokenSha256(token) }
+  saveRegistration(registration, dir)
+  console.log(`Registered as computer ${registration.computerId}; key stored in ${registrationPath(dir)} (mode 0600).`)
+  return registration
+}
+
+const DOCTOR_INTERVAL_MS = 30 * 60_000
+
+// Connects a registered daemon to the Control Plane; returns how to stop it, or undefined when not registered.
+// The running agent desktops a heartbeat reports, each by the agent it serves; undefined while agents share this desktop.
+function desktopReports(manager: DesktopManager | undefined): ComputerDesktopReport[] | undefined {
+  if (!manager?.enabled()) return undefined
+  return manager
+    .runningDesktops()
+    .filter((desktop) => UUID.test(desktop.record.key))
+    .slice(0, COMPUTER_DESKTOPS_MAX)
+    .map((desktop) => {
+      const lease = desktop.computer.leaseActivity()
+      return {
+        id: desktop.record.id,
+        agentId: desktop.record.key,
+        status: desktop.computer.liveStatus(),
+        ...(lease ? { lease } : {})
+      }
+    })
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+// Serves the extension only where it can be trusted to be ours: Linux, a shipped build, a port and its extension ids (§8).
+async function startFormFill(
+  dir: string,
+  config: DaemonConfig,
+  desktops: DesktopManager | undefined,
+  log: (line: string) => void
+): Promise<{ endpoint: FormFillEndpoint; service: FormFillService } | undefined> {
+  if (process.platform !== 'linux' || config.formFillPort === undefined) return undefined
+  if (!FORM_FILL_EXTENSION) {
+    log('form fill: off, this build ships no extension')
+    return undefined
+  }
+  // The profiles a socket may come from, read per connection: an agent desktop's profile appears on its first start.
+  const profiles = (): { desktop: string; profile: string }[] => {
+    const known = desktops ? desktops.profiles() : []
+    // The person's own browsers run the default profiles, which are the main desktop's: Chromium's master, and Google Chrome's.
+    const defaults = [loadDesktopState(dir).master, join(homedir(), '.config', 'google-chrome')]
+    for (const path of defaults) {
+      if (!existsSync(path)) continue
+      const profile = realpathSync(path)
+      if (!known.some((entry) => entry.profile === profile)) known.push({ desktop: 'main', profile })
+    }
+    return known
+  }
+  const endpoint = new FormFillEndpoint({
+    port: config.formFillPort,
+    extensionIds: [extensionId(extensionKey(FORM_FILL_EXTENSION.buildId))],
+    buildId: FORM_FILL_EXTENSION.buildId,
+    desktopFor: (profile) => profiles().find((entry) => entry.profile === profile)?.desktop,
+    attribute: (clientPort, serverPort) =>
+      attributeSocket(
+        realProc,
+        clientPort,
+        serverPort,
+        profiles().map((entry) => entry.profile)
+      ),
+    log
+  })
+  try {
+    await endpoint.start()
+  } catch (error) {
+    log(`form fill: off, port ${config.formFillPort} is not available: ${(error as Error).message}`)
+    return undefined
+  }
+  log(`form fill: extension endpoint on 127.0.0.1:${config.formFillPort}`)
+  return { endpoint, service: new FormFillService(endpoint) }
+}
+
+function startCpChannel(options: {
+  dir: string
+  config: DaemonConfig
+  registration: Registration | undefined
+  authority: ChannelAuthority
+  computer: Computer
+  driver: CuaDriver
+  screenSize: Record<string, unknown>
+  createMcpServer: (principal: McpPrincipal) => McpServer
+  viewer: Viewer
+  local: () => LocalControls | undefined
+  // Checks only the running daemon can answer beyond the local controls', such as its form-fill browsers.
+  liveChecks?: () => Check[]
+  egress?: EgressForwarder | undefined
+  // The command-line tier runs here (§5.7).
+  commandLine?: boolean
+  // The form-fill extension's endpoint is up (computer-form-fill-and-vault.md §8).
+  formFill?: boolean
+  onPolicy?: (policy: ComputerPolicy) => void
+  // Linux: the per-agent desktops, whose status the heartbeat reports and whose leases the CP pushes (§3.9).
+  desktops?: () => DesktopManager | undefined
+  onDesktopLeases?: (leases: ComputerControlLease[]) => void
+  // A managed computer's arrangement, which the Control Plane decides from its allocation (§3.9).
+  onArrangement?: (perAgent: boolean) => void
+}): { client: ComputerCpClient; relays: RelayLinks; refreshDoctor(): void; stop(): void } | undefined {
+  const { dir, config, registration, authority, computer, driver, screenSize } = options
+  const num = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  // Until the first capture, the display comes from the driver's startup screen size.
+  const startupDisplay = {
+    screenWidth: num(screenSize.width),
+    screenHeight: num(screenSize.height),
+    scale: num(screenSize.scale_factor) || 1
+  }
+  if (!registration || registration.revokedAt) return undefined
+  // A NAT-ed desktop is reached through the relays it dials out to; calls arrive with CP-issued session tokens (§3.7).
+  const relayLinks = new RelayLinks({
+    computerId: registration.computerId,
+    desktopDaemonVersion: COMPUTER_DAEMON_VERSION,
+    token: () => authority.relayToken(registration.computerId),
+    handle: createRelayedMcpHandler({
+      authenticate: (header) => channelPrincipal(header, authority, () => registration.computerId),
+      createMcpServer: options.createMcpServer,
+      log,
+      // The console's embedded viewer signals and polls through the same link (computer-use.md §7, §10).
+      viewer: (request) => options.viewer.api(request)
+    }),
+    log
+  })
+  const session = sessionKind()
+  const profile = { osVersion: osVersion(), session, desktopDaemonVersion: COMPUTER_DAEMON_VERSION }
+  let checks: Check[] | undefined
+  let doctorAt: Date | undefined
+  const client = new ComputerCpClient({
+    channelUrl: registration.channelUrl,
+    apiKey: registration.apiKey,
+    desktopDaemonVersion: COMPUTER_DAEMON_VERSION,
+    authority,
+    log,
+    report: () => {
+      const display = computer.info().display as { screenWidth: number; screenHeight: number; scale: number } | null
+      const lease = computer.leaseActivity()
+      const local = options.local()
+      const desktops = desktopReports(options.desktops?.())
+      return {
+        status: computer.liveStatus(),
+        ...(lease ? { lease } : {}),
+        ...(desktops ? { desktops } : {}),
+        facts: {
+          ...profile,
+          driverVersion: driver.version ?? CUA_DRIVER_VERSION,
+          // Capabilities come from doctor, so they are reported only once it has run.
+          ...(checks && doctorAt
+            ? {
+                capabilities: capabilitiesFrom(checks, display ?? startupDisplay, {
+                  session,
+                  webrtc: config.webrtc,
+                  keyboardActivity: local?.keyboard() ?? false,
+                  egress: options.egress !== undefined,
+                  commandLine: options.commandLine === true,
+                  formFill: options.formFill === true
+                }),
+                doctor: doctorReport(
+                  [...checks, ...(local?.checks() ?? []), ...(options.liveChecks?.() ?? [])],
+                  doctorAt
+                )
+              }
+            : {})
+        }
+      }
+    },
+    onPolicy: (policy) => {
+      // Lease limits apply here; the agent daemon asks for approvals (§4.2) and the CP enforces agent grants.
+      config.leaseIdleSeconds = policy.leaseIdleSeconds
+      config.leaseMaxSeconds = policy.leaseMaxSeconds
+      options.onPolicy?.(policy)
+    },
+    onLease: (lease, desktops) => {
+      computer.applyControlLease(lease)
+      options.onDesktopLeases?.(desktops ?? [])
+    },
+    onReady: (ok) => {
+      computer.rename(ok.name)
+      if (ok.desktops) options.onArrangement?.(ok.desktops === 'per-agent')
+    },
+    onRelays: (relays) => relayLinks.converge(relays),
+    onStop: (stop) => applyConsoleStop(stop),
+    onEgress: (egress) => options.egress?.apply(egress),
+    onRevoked: (reason) => {
+      relayLinks.stop()
+      markRevoked(dir, reason)
+      log(`REVOKED by the Control Plane (${reason}): the key was forgotten and all input is refused`)
+    }
+  })
+  const applyConsoleStop = consoleStopHandler(computer, () => client.beat())
+  // Doctor runs in a child of the daemon, so it sees the service's own session and grants.
+  client.start()
+  // Runs never overlap, so a refresh during the first run reports right after it.
+  const doctor = scheduleDoctor({
+    intervalMs: DOCTOR_INTERVAL_MS,
+    onError: (error) => log(`doctor for the Control Plane report failed: ${error.message}`),
+    run: async () => {
+      // Where this daemon listens, which `--port` / PORT may have moved from the config's.
+      const output = await runSelf(
+        ['doctor', '--json', '--here', '--host', config.host, '--port', String(config.port)],
+        120_000
+      )
+      checks = localizeChecks(JSON.parse(output) as Check[])
+      doctorAt = new Date()
+      client.beat()
+    }
+  })
+  return {
+    client,
+    relays: relayLinks,
+    refreshDoctor: () => doctor.refresh(),
+    stop() {
+      doctor.stop()
+      relayLinks.stop()
+      client.stop()
+    }
+  }
+}
+
+// Viewer with WebRTC when ffmpeg is usable; a missing ffmpeg is fetched in the background where a build is pinned.
+function buildViewer(
+  dir: string,
+  config: DaemonConfig,
+  computer: Computer,
+  refusal?: () => string | undefined,
+  // A console member's CP-issued view token; local client tokens work only on the local port, never through a relay.
+  consoleViewer?: (authorization: string | undefined) => ViewerPrincipal | undefined,
+  advertiseAddress?: string,
+  onFfmpegInstalled?: () => void,
+  // An agent desktop's display and id (computer-use.md §3.9); its viewer leaves fetching ffmpeg to the main one.
+  display?: string,
+  desktopId = 'main'
+): Viewer & { statusChanged(): void } {
+  const ffmpeg = (): string => resolveFfmpegPath(dir, config.ffmpegPath)
+  let ffmpegState: 'ok' | 'missing' | 'downloading' = 'missing'
+  if (config.webrtc) {
+    ffmpegState = ffmpegAvailable(ffmpeg()) ? 'ok' : 'missing'
+    if (ffmpegState === 'missing' && canInstallFfmpeg() && !config.ffmpegPath && !display) {
+      ffmpegState = 'downloading'
+      installFfmpeg(dir, log)
+        .then(() => {
+          ffmpegState = ffmpegAvailable(ffmpeg()) ? 'ok' : 'missing'
+          if (ffmpegState === 'ok') onFfmpegInstalled?.()
+        })
+        .catch((error: Error) => {
+          ffmpegState = 'missing'
+          log(`ffmpeg download failed (${error.message}); the viewer falls back to screenshots`)
+        })
+    }
+    if (ffmpegState === 'missing') log('ffmpeg not found; the viewer falls back to screenshots')
+  }
+  const stream = new ScreenStream({
+    dataDir: dir,
+    ffmpeg,
+    fps: config.streamFps,
+    maxWidth: config.streamMaxWidth,
+    bitrateKbps: config.streamBitrateKbps,
+    // A person driving sees their browser's pointer at once, so the delayed one in the frames would be a second cursor.
+    cursor: () => computer.liveStatus() !== 'human_in_control',
+    ...(display ? { display } : {}),
+    log
+  })
+  const rtc = config.webrtc
+    ? new RtcSessions({
+        stream,
+        log,
+        onMessage: (principal, message) => viewer.channelMessage(principal, message),
+        reauthorize: (token) => {
+          const principal = consoleViewer?.(`Bearer ${token}`)
+          return principal && mayWatch(principal, desktopId) ? principal : undefined
+        },
+        ...(advertiseAddress ? { advertiseAddress } : {}),
+        ...(config.rtcPortRange ? { portRange: config.rtcPortRange } : {})
+      })
+    : undefined
+  const viewer: Viewer = createViewer({
+    computer,
+    authenticate: viewerAuthenticator(
+      (header) => consoleViewer?.(header),
+      (header) => authenticate(config, header),
+      desktopId
+    ),
+    log,
+    ...(rtc ? { rtc } : {}),
+    rtcUnavailable: () =>
+      ffmpegState === 'ok'
+        ? undefined
+        : ffmpegState === 'downloading'
+          ? 'ffmpeg is still downloading'
+          : 'ffmpeg not found',
+    streamError: () => stream.lastError,
+    ...(refusal ? { refusal } : {})
+  })
+  return { ...viewer, statusChanged: () => stream.refresh() }
+}
+
+async function loadDriverTools(driver: CuaDriver, config: DaemonConfig): Promise<DriverTool[]> {
+  if (!config.exposeDriverTools) return []
+  return exposedDriverTools(await driver.listTools())
+}
+
+// A container registers from its environment on first start; later starts with the same token keep the stored key.
+async function registerFromEnvironment(dir: string): Promise<void> {
+  const wanted = registrationFromEnv()
+  // Nothing this daemon starts (doctor, the driver, apps an agent launches) inherits the token.
+  delete process.env[REGISTER_TOKEN_ENV]
+  const outcome = await registerFromEnv({
+    wanted,
+    load: () => loadRegistration(dir),
+    exchange: (want) => exchangeFor(want.token, want.cpUrl, want.name),
+    save: (registration) => saveRegistration(registration, dir)
+  })
+  if (outcome.kind === 'kept') {
+    log(`registered as computer ${outcome.registration.computerId}; the registration token is not used again`)
+  } else if (outcome.kind === 'registered') {
+    log(`registered as computer ${outcome.registration.computerId}; key stored in ${registrationPath(dir)} (mode 0600)`)
+  } else if (outcome.kind === 'stays-revoked') {
+    log(
+      `registration refused (${outcome.reason}); keeping computer ${outcome.registration.computerId}, which refuses all input`
+    )
+  }
+}
+
+// A pool pod waits for the member that claimed it to push a registration, or keeps the key its volume holds.
+async function registerFromPool(dir: string): Promise<void> {
+  const port = poolBootstrapPort()
+  if (port === undefined) return
+  const cpUrl = process.env[CP_URL_ENV]?.trim()
+  if (!cpUrl) throw new Error(`${CP_URL_ENV} is required in the managed computer pool`)
+  const pool = await startPoolBootstrap({
+    port,
+    load: () => loadRegistration(dir),
+    register: async (token, name) => {
+      const registration = { ...(await exchangeFor(token, cpUrl, name)), tokenSha256: tokenSha256(token) }
+      saveRegistration(registration, dir)
+      return registration
+    },
+    log
+  })
+  await pool.registered
+}
+
+async function run(dir: string, initial: DaemonConfig, clientName: string): Promise<void> {
+  // First run sets itself up, so unzip + `run` is enough; nothing is installed as a service.
+  let config = initial
+  // In a managed pod the browser's only proxy; it lets nothing out until the Control Plane names the egress (§15.4).
+  const egressAt = egressPort()
+  const egress = egressAt !== undefined ? new EgressForwarder({ port: egressAt, log }) : undefined
+  if (egress) log(`egress forwarder on 127.0.0.1:${await egress.start()}`)
+  await registerFromPool(dir)
+  await registerFromEnvironment(dir)
+  const registration = loadRegistration(dir)
+  // A desktop no Control Plane manages has no egress policy to wait for.
+  if (!registration) egress?.apply({ mode: 'direct' })
+  if (config.clients.length === 0 && !registration) {
+    const issued = issueClientToken(config, clientName)
+    config = issued.config
+    saveConfig(config, dir)
+    // Without a terminal the output is a log (a service or `docker logs`), so the token goes to a file instead.
+    printClientSetup(config, clientName, issued.token, process.stdout.isTTY ? undefined : join(dir, 'client-token'))
+  }
+  if (!config.driverPath && !existsSync(installedDriverPath(dir))) await installDriver(dir)
+  const setTitle = (status: string): void => {
+    process.title = `AgentConnect Computer — ${status}`
+  }
+  // Filled once built; the authority and status callbacks below fire only after that.
+  const live: {
+    viewer?: ReturnType<typeof buildViewer>
+    viewerRouter?: ReturnType<typeof createViewerRouter>
+    channel?: ReturnType<typeof startCpChannel>
+    local?: LocalControls
+    accessibility?: AccessibilityWatch
+    computer?: Computer
+    // Linux: the per-agent desktops (computer-use.md §3.9).
+    desktops?: DesktopManager
+    // The Control Plane's lease of each agent desktop, by agent id, applied as a desktop starts too.
+    desktopLeases?: Map<string, ComputerControlLease>
+    // The policy the Control Plane last sent, which narrows a channel token's command-line tier at once (§5.7).
+    policy?: ComputerPolicy
+  } = {}
+  // Registered with a Control Plane: act only while its channel key is live, never after a revoke (§8.2).
+  const authority = new ChannelAuthority({
+    registered: Boolean(registration),
+    ...(registration?.revokedAt ? { revokedReason: registration.revokedReason ?? 'revoked' } : {}),
+    log,
+    onLost: (state) => {
+      const reason = state.kind === 'revoked' ? 'computer revoked' : 'Control Plane unreachable'
+      computer.suspend(reason)
+      live.desktops?.suspendAll(reason)
+      live.viewer?.disconnectAll(reason)
+      // No new data-plane calls without a live key; the next roster push after reconnecting reattaches.
+      live.channel?.relays.stop()
+    }
+  })
+  // A registered desktop also reports every call to the Control Plane, which keeps the owner's per-Computer audit (§8.2).
+  const auditReport =
+    registration && !registration.revokedAt
+      ? new AuditReporter({
+          send: (entries) => live.channel?.client.reportAudit(entries) ?? Promise.resolve('retry' as const),
+          log
+        })
+      : undefined
+  auditReport?.start()
+  // Agent sessions' screenshots go to the object store when the CP keeps them (§9); 0 retention writes nothing.
+  const screenshotStore =
+    registration && !registration.revokedAt
+      ? new ScreenshotStore({
+          retentionDays: () => live.channel?.client.screenshotRetentionDays() ?? 0,
+          computerId: () => registration.computerId,
+          sign: (put) => live.channel?.client.signScreenshot(put) ?? Promise.resolve('retry' as const),
+          commit: (commit) => live.channel?.client.commitScreenshot(commit) ?? Promise.resolve('retry' as const),
+          log
+        })
+      : undefined
+  // Windows under the service: the SYSTEM helper watches the secure desktop for UAC prompts (computer-use.md §4.2.1).
+  const adminPromptHelper =
+    process.platform === 'win32' && windowsService.serviceHost() && existsSync(windowsService.adminPromptHelperPath())
+      ? AdminPromptHelper.start(windowsService.adminPromptHelperPath(), {
+          onChange: () => {
+            void live.computer?.adminPromptChanged()
+            live.local?.update()
+          },
+          log
+        })
+      : undefined
+  // Commands and files on this machine for agent sessions whose token allows them; Linux only so far (§5.7).
+  const commandLine =
+    registration && !registration.revokedAt && commandLineSupported()
+      ? new CommandLine({
+          audit: auditSinks(fileAuditSink(join(dir, 'audit.log')), ...(auditReport ? [auditReport.sink] : [])),
+          refusal: () => authority.refusal(),
+          halted: () => live.computer?.haltReason(),
+          dataDir: dir,
+          log
+        })
+      : undefined
+  const { driver, computer } = buildComputer(
+    dir,
+    config,
+    (status) => {
+      setTitle(status)
+      live.channel?.client.beat()
+      live.local?.update()
+      live.viewer?.statusChanged()
+      // An agent that just took control may be the one a waiting prompt is answered for.
+      void live.computer?.adminPromptChanged()
+    },
+    () => authority.refusal(),
+    auditReport?.sink,
+    screenshotStore?.stash,
+    adminPromptHelper ? { source: adminPromptHelper, mode: () => config.adminPrompts } : undefined,
+    undefined,
+    (reason) => commandLine?.halt(reason),
+    { onOwnerPause: (reason) => live.desktops?.pauseAll(reason), onOwnerResume: () => live.desktops?.resumeAll() }
+  )
+  live.computer = computer
+  setTitle('online')
+  if (registration?.revokedAt)
+    log(`this computer was revoked (${registration.revokedReason ?? 'revoked'}); all input is refused`)
+  const screenSize = (await driver.call('get_screen_size', {})).structuredContent ?? {}
+  const sized = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  computer.setScreenSize({
+    screenWidth: sized(screenSize.width),
+    screenHeight: sized(screenSize.height),
+    scale: sized(screenSize.scale_factor) || 1
+  })
+  log(`Cua Driver ${driver.version ?? '?'} started (${resolveDriverPath(dir, config.driverPath)})`)
+  // Re-probed when switched on, so packages `desktops on` just installed count without a restart.
+  const desktopSupport: { current: DesktopSupport } | undefined =
+    process.platform === 'linux' ? { current: await probeDesktopSupport() } : undefined
+  if (desktopSupport) {
+    log(`per-agent desktops: ${describeDesktops(config.perAgentDesktops, desktopSupport.current)}`)
+  }
+  if (desktopSupport) {
+    live.desktops = new DesktopManager({
+      dataDir: dir,
+      config,
+      support: () => desktopSupport.current,
+      self: [process.execPath, resolve(process.argv[1]!)],
+      build: ({ id, key, label, env, launchBrowser }) => {
+        const desktopAudit = auditSinks(
+          fileAuditSink(join(dir, 'audit.log')),
+          ...(auditReport ? [auditReport.sink] : [])
+        )
+        const prefixed = (line: string): void => log(`desktop ${id}: ${line}`)
+        const desktopDriver = new CuaDriver({
+          command: resolveDriverPath(dir, config.driverPath),
+          callTimeoutMs: config.driverCallTimeoutMs,
+          log: prefixed,
+          env
+        })
+        const desktop = new Computer({
+          driver: desktopDriver,
+          config,
+          // Each entry names the desktop that served it (§3.9).
+          audit: (record) => desktopAudit({ ...record, desktop: id }),
+          log: prefixed,
+          onStatus: () => live.local?.update(),
+          refusal: () => authority.refusal(),
+          ...(screenshotStore ? { screenshots: screenshotStore.stash } : {}),
+          launchBrowser,
+          profile: {
+            name: `${String(computer.info().name)} · ${label}`.slice(0, 120),
+            osVersion: osVersion(),
+            session: 'xvfb',
+            isolation: isolationKind()
+          }
+        })
+        desktop.applyControlLease(live.desktopLeases?.get(key) ?? null)
+        return { driver: desktopDriver, computer: desktop }
+      },
+      log,
+      onChange: () => live.local?.update(),
+      onStopped: (id) => live.viewerRouter?.dropDesktop(id)
+    })
+  }
+  // The tray's switch applies at once and saves itself so the next start agrees.
+  const setDesktops = async (on: boolean): Promise<void> => {
+    config.perAgentDesktops = on
+    try {
+      saveConfig({ ...loadConfig(dir), perAgentDesktops: on }, dir)
+    } catch (error) {
+      log(`per-agent desktops: could not save the setting: ${(error as Error).message}`)
+    }
+    if (on && desktopSupport && !desktopSupport.current.supported) desktopSupport.current = await probeDesktopSupport()
+    log(`per-agent desktops switched ${on ? 'on' : 'off'}`)
+    live.local?.update()
+    if (!on) await live.desktops?.stopAll('per-agent desktops switched off')
+  }
+  if (process.platform === 'darwin') await warnMissingMacPermissions(driver)
+  // Under launchd the .app asks for its own grants once; the dialogs appear on the Mac's screen.
+  if (process.platform === 'darwin' && appBundlePath() && !process.stdin.isTTY) {
+    const state = await macPermissions(driver).catch(() => undefined)
+    if (state) recordGrants(dir, state, false)
+    if (state && (!state.accessibility || !state.screenRecording)) {
+      void runSelf(['permissions', '--json', '--prompt'], 200_000).catch(() => undefined)
+    }
+    if (state && !state.accessibility) {
+      live.accessibility = watchAccessibility({
+        check: async () =>
+          (JSON.parse(await runSelf(['permissions', '--json'], 60_000)) as { accessibility?: boolean })
+            .accessibility === true,
+        restartDriver: () => driver.close(),
+        log
+      })
+    }
+  }
+  const releaseDisplay = config.keepAwake ? keepDisplayAwake(log) : () => undefined
+  const driverTools = await loadDriverTools(driver, config)
+  const consoleViewer = registration
+    ? (header: string | undefined) => viewerPrincipal(header, authority, () => registration.computerId)
+    : undefined
+  const advertiseAddress = config.webrtc ? await rtcAdvertiseAddress(config, undefined, log) : undefined
+  const mainViewer = buildViewer(
+    dir,
+    config,
+    computer,
+    () => authority.refusal(),
+    consoleViewer,
+    advertiseAddress,
+    // A first start downloads ffmpeg, so report the viewer then instead of at the next 30-minute doctor run.
+    () => live.channel?.refreshDoctor()
+  )
+  // With per-agent desktops the viewer also serves each desktop under /view/api/d/<id> (computer-use.md §3.9).
+  live.viewerRouter = live.desktops
+    ? createViewerRouter({
+        main: mainViewer,
+        desktops: () => live.desktops,
+        forDesktop: (desktop) =>
+          buildViewer(
+            dir,
+            config,
+            desktop.computer,
+            () => authority.refusal(),
+            consoleViewer,
+            advertiseAddress,
+            undefined,
+            desktop.display,
+            desktop.record.id
+          ),
+        authenticate: viewerAuthenticator(
+          (header) => consoleViewer?.(header),
+          (header) => authenticate(config, header),
+          null
+        ),
+        mainInfo: () => ({
+          name: String(computer.info().name),
+          status: computer.liveStatus(),
+          lease: computer.leaseActivity() ?? null
+        })
+      })
+    : undefined
+  const viewer = live.viewerRouter ?? mainViewer
+  live.viewer = viewer
+  // A registered desktop changes the mode through its Control Plane, which keeps the console and this menu in step.
+  const adminPromptsLocked = (): string | undefined =>
+    !registration || registration.revokedAt || live.channel?.client.servesAdminPrompts()
+      ? undefined
+      : 'Connect to the Control Plane to change this'
+  const keepAdminPrompts = (mode: ComputerAdminPromptMode | undefined): void => {
+    if (config.adminPrompts === mode) return
+    config.adminPrompts = mode
+    // Saved so the next start answers the same way before the Control Plane is reached.
+    try {
+      saveConfig({ ...loadConfig(dir), adminPrompts: mode }, dir)
+    } catch (error) {
+      log(`administrator prompts: could not save the setting: ${(error as Error).message}`)
+    }
+    void computer.adminPromptChanged()
+    live.local?.update()
+  }
+  const setAdminPrompts = async (mode: ComputerAdminPromptMode): Promise<void> => {
+    const client = live.channel?.client
+    if (registration && !registration.revokedAt) {
+      if (!client?.servesAdminPrompts()) throw new Error('the Control Plane is not connected')
+      keepAdminPrompts(await client.setAdminPrompts(mode))
+    } else keepAdminPrompts(mode)
+  }
+  // The indicator shows an agent working on any desktop; pause and resume reach every desktop through the main one.
+  const ownerView: LocallyControlled = {
+    liveStatus: () => {
+      const own = computer.liveStatus()
+      const busy = live.desktops?.runningDesktops().some((desktop) => desktop.computer.liveStatus() === 'busy')
+      return own === 'online' && busy ? 'busy' : own
+    },
+    pauseReason: () => computer.pauseReason(),
+    pause: (reason) => computer.pause(reason),
+    resume: () => computer.resume(),
+    noteHumanInput: () => computer.noteHumanInput(),
+    leaseActivity: () =>
+      computer.leaseActivity() ??
+      live.desktops
+        ?.runningDesktops()
+        .map((desktop) => desktop.computer.leaseActivity())
+        .find((lease) => lease !== undefined)
+  }
+  live.local = await startLocalControls({
+    computer: ownerView,
+    refusal: () => authority.refusal(),
+    stopHotkey: config.stopHotkey,
+    headless: sessionKind() === 'xvfb',
+    ...(desktopSupport
+      ? {
+          desktops: {
+            state: () => ({
+              on: config.perAgentDesktops,
+              available: desktopSupport.current.supported,
+              ...(desktopSupport.current.reason ? { note: desktopSupport.current.reason } : {})
+            }),
+            toggle: () => void setDesktops(!config.perAgentDesktops)
+          }
+        }
+      : {}),
+    ...(process.platform === 'darwin'
+      ? {
+          menuBar: {
+            helper: menuBarHelperPath(),
+            host: macMenuBarHost({
+              dir,
+              ffmpegPath: config.ffmpegPath,
+              appPath: appBundlePath(),
+              driver,
+              name: () => computer.info().name as string | undefined,
+              registration,
+              client: () => live.channel?.client,
+              // A non-zero exit makes launchd's KeepAlive start the daemon again; zero leaves it stopped.
+              shutdown: (code) => void shutdown(code),
+              onFfmpegInstalled: () => live.channel?.refreshDoctor(),
+              accessibilityGranted: () => live.accessibility?.now() ?? Promise.resolve(false),
+              log
+            })
+          }
+        }
+      : process.platform === 'win32'
+        ? {
+            menuBar: {
+              helper: windowsService.trayHelperPath(),
+              host: windowsMenuBarHost({
+                dir,
+                ffmpegPath: config.ffmpegPath,
+                driver,
+                name: () => computer.info().name as string | undefined,
+                registration,
+                client: () => live.channel?.client,
+                // The service host starts the daemon again after a non-zero exit and waits for the next sign-in after zero.
+                shutdown: (code) => void shutdown(code),
+                onFfmpegInstalled: () => live.channel?.refreshDoctor(),
+                onFirewallChanged: () => live.channel?.refreshDoctor(),
+                ...(adminPromptHelper
+                  ? {
+                      adminPrompts: {
+                        facts: () => {
+                          const locked = adminPromptsLocked()
+                          const pending = adminPromptHelper.pending()
+                          return {
+                            mode: computer.adminPromptMode(),
+                            editable: locked === undefined,
+                            ...(locked ? { locked } : {}),
+                            ...(pending ? { pending: pending.app ?? 'an app' } : {}),
+                            ...(adminPromptHelper.problem ? { problem: adminPromptHelper.problem } : {})
+                          }
+                        },
+                        set: setAdminPrompts
+                      }
+                    }
+                  : {}),
+                log
+              }),
+              spawnHelper: (path: string) => windowsService.spawnAsUser(path, [])
+            }
+          }
+        : {}),
+    log
+  })
+  // Linux: the form-fill extension's endpoint, when this install ships the extension and names its port (§8).
+  const formFill = await startFormFill(dir, config, live.desktops, log)
+  // A token's tier, narrowed by the policy pushed since it was signed.
+  const commandLineFor = (granted: McpPrincipal['commandLineGrant']): CommandLineAccess | undefined =>
+    commandLine && granted
+      ? {
+          runner: commandLine,
+          shell: () => narrowedCommandLine(granted, live.policy).shell,
+          files: () => narrowedCommandLine(granted, live.policy).files,
+          roots: () => live.policy?.fileRoots
+        }
+      : undefined
+  const createMcpServer = ({ client, viewOnly, agent, commandLineGrant: granted }: McpPrincipal): McpServer => {
+    // An agent's calls go to its own desktop while per-agent desktops are on; a local client token counts as one agent.
+    const key = agent ? agent.agentId : `client:${client}`
+    const label = agent ? agent.agentId : client
+    const desktops = live.desktops
+    const mine = desktops ? () => desktops.forKey(key, label) : undefined
+    const routed = (): Promise<Computer> =>
+      mine && desktops?.enabled() ? mine().then((desktop) => desktop.computer) : Promise.resolve(computer)
+    const tier = commandLineFor(granted)
+    const access = tier
+      ? {
+          ...tier,
+          env: () => (mine && desktops?.enabled() ? mine().then((desktop) => desktop.env) : Promise.resolve(undefined))
+        }
+      : undefined
+    const formTarget = async (): Promise<{ computer: Computer; desktop: string }> =>
+      mine && desktops?.enabled()
+        ? mine().then((desktop) => ({ computer: desktop.computer, desktop: desktop.record.id }))
+        : { computer, desktop: 'main' }
+    return createComputerMcpServer({
+      computer: routed,
+      client,
+      driverTools,
+      viewOnly,
+      ...(agent ? { agent } : {}),
+      ...(formFill ? { formFill: { service: formFill.service, target: formTarget } } : {}),
+      ...(adminPromptHelper ? { adminPrompts: true } : {}),
+      ...(access ? { commandLine: access } : {})
+    })
+  }
+  const server = await startHttpServer({
+    host: config.host,
+    port: config.port,
+    computer,
+    // A CP-issued session token also works directly, the same-network shortcut past the relay (§3.7).
+    authenticate: (header) => {
+      const channel = registration ? channelPrincipal(header, authority, () => registration.computerId) : undefined
+      if (channel) return channel
+      const client = authenticate(config, header)
+      return client ? { client, viewOnly: false } : undefined
+    },
+    createMcpServer,
+    log,
+    viewer,
+    localChecks: () => [...(live.local?.checks() ?? []), ...(formFill ? [formFill.endpoint.check()] : [])],
+    ...(live.desktops
+      ? {
+          desktops: {
+            set: setDesktops,
+            describe: () => ({
+              on: Boolean(live.desktops?.enabled()),
+              switchedOn: config.perAgentDesktops,
+              max: live.desktops?.max(),
+              desktops: live.desktops?.list()
+            })
+          }
+        }
+      : {})
+  })
+  live.channel = startCpChannel({
+    dir,
+    config,
+    registration,
+    authority,
+    computer,
+    driver,
+    screenSize,
+    createMcpServer,
+    viewer,
+    local: () => live.local,
+    egress,
+    commandLine: commandLine !== undefined,
+    formFill: formFill !== undefined,
+    ...(formFill ? { liveChecks: () => [formFill.endpoint.check()] } : {}),
+    onPolicy: (policy) => {
+      live.policy = policy
+      keepAdminPrompts(policy.approvals.adminPrompts)
+      live.desktops?.setShareBrowserLogins(policy.shareBrowserLogins !== false)
+    },
+    desktops: () => live.desktops,
+    // Not saved: the Control Plane says it again on every connect, and the allocation never changes.
+    onArrangement: (on) => {
+      if (config.perAgentDesktops === on) return
+      config.perAgentDesktops = on
+      log(
+        `per-agent desktops ${on ? 'on' : 'off'}: this managed computer ${on ? 'is shared by agents' : 'serves one agent'}`
+      )
+      live.local?.update()
+      if (!on) void live.desktops?.stopAll('this managed computer serves one agent')
+    },
+    onDesktopLeases: (leases) => {
+      live.desktopLeases = new Map(leases.flatMap((lease) => (lease.desktop ? [[lease.desktop, lease]] : [])))
+      for (const desktop of live.desktops?.runningDesktops() ?? [])
+        desktop.computer.applyControlLease(live.desktopLeases.get(desktop.record.key) ?? null)
+    }
+  })
+  // Behind NAT the local addresses mean nothing to a client, so only the public one is printed.
+  const publicBase = publicBaseUrl(config)
+  const urls = publicBase
+    ? [`${publicBase}/mcp`]
+    : isWildcardHost(config.host)
+      ? [server.url, ...lanAddresses().map((ip) => `http://${ip}:${config.port}/mcp`)]
+      : [server.url]
+  const clients = config.clients.map((client) => client.name).join(', ')
+  log(`MCP endpoint ${urls.join(' , ')} (${clients ? `clients: ${clients}` : 'Control Plane session tokens only'})`)
+  log(
+    `Remote desktop viewer ${urls.map((url) => url.replace(/\/mcp$/, '/view')).join(' , ')} (sign in with a client token)`
+  )
+  if (!isLoopbackHost(config.host)) {
+    log(
+      `WARNING: listening on ${config.host} over plain HTTP; anyone with a token on this network can control this desktop`
+    )
+  }
+  if (driverTools.length) log(`exposing ${driverTools.length} raw Cua Driver tools as cua_*`)
+  installConsoleControls(computer)
+
+  let stopping = false
+  const shutdown = async (exitCode = 0): Promise<void> => {
+    if (stopping) return
+    stopping = true
+    log('shutting down')
+    computer.pause('daemon shutting down')
+    auditReport?.stop()
+    screenshotStore?.stop()
+    await auditReport?.flush()
+    live.channel?.stop()
+    live.local?.close()
+    adminPromptHelper?.close()
+    live.accessibility?.stop()
+    authority.close()
+    releaseDisplay()
+    await live.desktops?.close().catch(() => undefined)
+    await Promise.allSettled([server.close(), driver.close(), egress?.stop(), formFill?.endpoint.close()])
+    process.exit(exitCode)
+  }
+  process.once('SIGINT', () => void shutdown())
+  process.once('SIGTERM', () => void shutdown())
+  // The systemd service lives as long as the desktop session it was started for (computer-use.md §3.3).
+  const session = process.env[linuxService.SESSION_ENV]
+  if (process.platform === 'linux' && process.env.INVOCATION_ID && session) {
+    log(`following desktop session ${session}`)
+    linuxService.watchSession({
+      session,
+      onIgnored: log,
+      onEnded: (exitCode, reason) => {
+        log(reason)
+        void shutdown(exitCode)
+      }
+    })
+  }
+}
+
+// macOS grants Accessibility and Screen Recording to the app that started us (Terminal), never to an SSH session.
+async function warnMissingMacPermissions(driver: CuaDriver): Promise<void> {
+  const state = await macPermissions(driver).catch(() => undefined)
+  if (!state) return
+  const missing = [!state.accessibility && 'Accessibility', !state.screenRecording && 'Screen Recording'].filter(
+    Boolean
+  )
+  if (missing.length === 0) return
+  log(
+    `WARNING: macOS ${missing.join(' and ')} not granted to ${process.env.TERM_PROGRAM ?? 'the app running this daemon'}`
+  )
+  log(`  run \`${selfCommand()} setup\` in Terminal on this Mac, then \`doctor\` to verify`)
+}
+
+const controlFetch = async (config: DaemonConfig, path: string, timeoutMs: number): Promise<Response> =>
+  fetch(`${controlBaseUrl(config)}${path}`, {
+    headers: { [CONTROL_HEADER]: '1' },
+    signal: AbortSignal.timeout(timeoutMs)
+  })
+
+async function daemonDoctor(
+  config: DaemonConfig,
+  captureMs = 15_000
+): Promise<(Check[] & { host?: string }) | undefined> {
+  const response = await controlFetch(
+    config,
+    `/control/doctor?captureTimeoutMs=${captureMs}`,
+    captureMs + 120_000
+  ).catch(() => undefined)
+  if (!response?.ok) return undefined
+  const checks: Check[] & { host?: string } = localizeChecks((await response.json()) as Check[])
+  checks.host = ((detail) => /host app (.+)$/.exec(detail)?.[1] ?? (detail || 'the daemon'))(
+    checks.find((check) => check.name === 'session')?.detail ?? ''
+  )
+  return checks
+}
+
+async function waitForDaemon(config: DaemonConfig, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const ok = await controlFetch(config, '/control/status', 2000)
+      .then((response) => response.ok)
+      .catch(() => false)
+    if (ok) return true
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  return false
+}
+
+interface Grants {
+  accessibility: boolean
+  screenRecording: boolean
+}
+
+// The app's Node runs the store's stable entry, so an upgrade moves `current` and never touches the app or its grants.
+const macServiceProgram = (): string[] => [process.execPath, serviceEntry()]
+
+// .app mode: launchd starts the daemon in the GUI session, the app asks for its own grants, setup waits and restarts it.
+async function setupMacApp(dir: string, config: DaemonConfig): Promise<Check[]> {
+  const app = basename(appBundlePath()!)
+  if (!installService(macServiceProgram(), join(dir, 'daemon.log'))) {
+    throw new Error(
+      `installed LaunchAgent ${plistPath()}, but nobody is logged in to this Mac's desktop: log in (in person or through Screen Sharing) to answer the permission prompts, then run: ${selfCommand()} setup`
+    )
+  }
+  console.log(`Installed LaunchAgent ${plistPath()} and started ${app}.`)
+  // The prompts belong to the app launchd started, so they appear on the Mac's screen even when setup runs over SSH.
+  if (overSsh()) console.log(`The permission prompts appear on the Mac's own screen; answer them there.`)
+  if (!(await waitForDaemon(config, 60_000)))
+    throw new Error(`the service did not come up; see ${join(dir, 'daemon.log')}`)
+
+  const grants = async (prompt: boolean): Promise<Grants> =>
+    (await (await controlFetch(config, `/control/permissions${prompt ? '?prompt=1' : ''}`, 210_000)).json()) as Grants
+  let state = await grants(false)
+  const initiallyMissingScreen = !state.screenRecording
+  if (!state.accessibility || !state.screenRecording) {
+    console.log(
+      `Requesting Accessibility and Screen Recording for ${app}: answer the macOS dialogs on this Mac's screen.`
+    )
+    state = await grants(true).catch(() => state)
+    open(state.accessibility ? MAC_PANES.screenRecording : MAC_PANES.accessibility)
+    console.log(`In System Settings switch on ${app} (Accessibility is "Device Control and Data Access" on macOS 27).`)
+    const interactive = process.stdin.isTTY
+    if (interactive) console.log('Waiting for the grants (press Enter to stop waiting)...')
+    let skipped = false
+    const rl = interactive ? createInterface({ input: process.stdin }) : undefined
+    rl?.once('line', () => (skipped = true))
+    const deadline = Date.now() + 10 * 60_000
+    let screenPaneOpened = state.accessibility
+    let lastRestart = Date.now()
+    try {
+      while (!skipped && Date.now() < deadline && !(state.accessibility && state.screenRecording)) {
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+        // A Screen Recording grant only shows in a freshly started app, so keep restarting the service while waiting.
+        if (state.accessibility && Date.now() - lastRestart > 20_000) {
+          lastRestart = Date.now()
+          restartService()
+          await waitForDaemon(config, 60_000)
+        }
+        const next = await grants(false).catch(() => state)
+        if (next.accessibility && !state.accessibility) console.log(`Accessibility granted to ${app}.`)
+        if (next.screenRecording && !state.screenRecording) console.log(`Screen Recording granted to ${app}.`)
+        state = next
+        if (state.accessibility && !state.screenRecording && !screenPaneOpened) {
+          screenPaneOpened = true
+          open(MAC_PANES.screenRecording)
+          console.log(`Now switch on Screen & System Audio Recording for ${app}.`)
+        }
+      }
+    } finally {
+      rl?.close()
+    }
+  }
+  if (initiallyMissingScreen && state.screenRecording) {
+    console.log(`Restarting ${app} so the Screen Recording grant takes effect...`)
+    restartService()
+    await waitForDaemon(config, 60_000)
+  }
+  console.log(`Checking from inside ${app} (if macOS asks to let it bypass the window picker, click Allow):`)
+  return (await daemonDoctor(config, 120_000)) ?? doctor(setupContext(dir, config))
+}
+
+async function serviceCommand(
+  dir: string,
+  config: DaemonConfig,
+  action: string | undefined,
+  purge: boolean
+): Promise<void> {
+  if (process.platform === 'linux') return linuxServiceCommand(dir, config, action)
+  if (process.platform === 'win32') return windowsServiceCommand(dir, config, action, purge)
+  if (process.platform !== 'darwin') throw new Error('service is only implemented for macOS, Linux and Windows')
+  if (action === 'install' || action === 'start' || action === 'restart') {
+    if (!appBundlePath())
+      throw new Error('run this from the AgentConnect Computer.app binary (…/Contents/MacOS/agentconnect-computer)')
+  }
+  if (action === 'install') installService(macServiceProgram(), join(dir, 'daemon.log'))
+  else if (action === 'uninstall') uninstallService()
+  else if (action === 'start') startService()
+  else if (action === 'stop') stopService()
+  else if (action === 'restart') restartService()
+  else if (action !== 'status') throw new Error('usage: service install | uninstall | start | stop | restart | status')
+  const status = serviceStatus()
+  console.log(
+    JSON.stringify(
+      { ...status, plist: plistPath(), log: join(dir, 'daemon.log'), port: config.port, app: hostApp() },
+      null,
+      2
+    )
+  )
+}
+
+function linuxServiceCommand(dir: string, config: DaemonConfig, action: string | undefined): void {
+  if (action === 'install') linuxService.installService(dir, serviceEntry(), Boolean(managedEntry()))
+  else if (action === 'uninstall') linuxService.uninstallService()
+  else if (action === 'start') linuxService.startService()
+  else if (action === 'stop') linuxService.stopService()
+  else if (action === 'restart') linuxService.restartService()
+  else if (action !== 'status') throw new Error('usage: service install | uninstall | start | stop | restart | status')
+  console.log(
+    JSON.stringify(
+      {
+        ...linuxService.serviceStatus(),
+        unit: linuxService.unitPath(),
+        log: `journalctl --user -u ${linuxService.UNIT}`,
+        port: config.port
+      },
+      null,
+      2
+    )
+  )
+}
+
+// Runs elevated for install and uninstall (main asks for approval first).
+async function windowsServiceCommand(
+  dir: string,
+  config: DaemonConfig,
+  action: string | undefined,
+  purge: boolean
+): Promise<void> {
+  const say = (line: string): void => console.error(line)
+  if (action === 'install') await installWindowsService(dir, config, say)
+  else if (action === 'uninstall') windowsService.uninstallService(windowsServiceHome(), purge, say)
+  else if (action === 'start') windowsService.startService()
+  else if (action === 'stop') windowsService.stopService()
+  else if (action === 'restart') windowsService.restartService()
+  else if (action !== 'status')
+    throw new Error('usage: service install | uninstall [--purge] | start | stop | restart | status')
+  console.log(
+    JSON.stringify(
+      {
+        ...windowsService.serviceStatus(),
+        service: windowsService.SERVICE_NAME,
+        home: dir,
+        log: join(dir, 'daemon.log'),
+        port: config.port
+      },
+      null,
+      2
+    )
+  )
+}
+
+// Copies this bundle and its Node into Program Files, so what SYSTEM runs is the administrators' to change.
+async function installWindowsService(dir: string, config: DaemonConfig, log: (line: string) => void): Promise<void> {
+  windowsService.installService({ entry: serviceEntry(), node: process.execPath, home: dir, log })
+  const installedNode = join(windowsService.installDir(), 'node.exe')
+  await setupWindowsFirewall({ ...setupContext(dir, config), log }, installedNode)
+}
+
+// Windows: the service runs the daemon as SYSTEM in the signed-in session; doctor then checks from inside it.
+async function setupWindowsService(dir: string, config: DaemonConfig): Promise<Check[]> {
+  await installWindowsService(dir, config, (line) => console.log(line))
+  if (!(await waitForDaemon(config, 90_000))) {
+    console.log(`The service did not come up; see ${join(dir, 'daemon.log')}`)
+    return doctor(setupContext(dir, config))
+  }
+  console.log('\nChecking from inside the service:')
+  return (await daemonDoctor(config)) ?? doctor(setupContext(dir, config))
+}
+
+// Linux: approvals ran in this process (tokens land in files the service reuses); then the session service takes over.
+async function setupLinuxService(dir: string, config: DaemonConfig): Promise<Check[] | undefined> {
+  const running = await waitForDaemon(config, 1000)
+  if (running && !linuxService.serviceStatus().loaded) {
+    console.log(`A daemon started by hand is already on port ${config.port}; stop it so the service can take over.`)
+    return undefined
+  }
+  linuxService.installService(dir, serviceEntry(), Boolean(managedEntry()))
+  console.log(`Installed and started the systemd user service ${linuxService.unitPath()}.`)
+  if (!(await waitForDaemon(config, 60_000))) {
+    console.log(`The service did not come up; see: journalctl --user -u ${linuxService.UNIT}`)
+    return undefined
+  }
+  return daemonDoctor(config)
+}
+
+function setupContext(dir: string, config: DaemonConfig): SetupContext {
+  return {
+    dir,
+    config,
+    driverCommand: resolveDriverPath(dir, config.driverPath),
+    ffmpeg: resolveFfmpegPath(dir, config.ffmpegPath),
+    log: (line) => console.log(line)
+  }
+}
+
+// One-time install: downloads, a person's approvals, then doctor; with CP registration no local token is minted.
+async function setup(
+  dir: string,
+  initial: DaemonConfig,
+  clientName: string | undefined,
+  withService: boolean
+): Promise<void> {
+  let config = initial
+  let token: string | undefined
+  if (clientName && !config.clients.some((client) => client.name === clientName)) {
+    ;({ config, token } = issueClientToken(config, clientName))
+  }
+  saveConfig(config, dir)
+  console.log(`Config: ${configPath(dir)}`)
+  await installDriver(dir)
+  if (config.webrtc && !config.ffmpegPath && !ffmpegAvailable(resolveFfmpegPath(dir)) && canInstallFfmpeg()) {
+    await installFfmpeg(dir).catch((error: Error) => console.log(`ffmpeg install failed: ${error.message}`))
+  }
+  // With per-agent desktops on and only packages missing, setup offers to install them (§3.9).
+  if (process.platform === 'linux' && config.perAgentDesktops) {
+    await offerDesktopInstall(await probeDesktopSupport(), { log: (line) => console.log(line) })
+    // On by default even on a person's own desktop, so setup says what that changes and how to undo it (§3.9).
+    if ((await probeDesktopSupport()).supported) console.log(desktopsNotice(selfCommand()))
+  }
+  console.log('')
+  let checks: Check[]
+  if (process.platform === 'darwin' && appBundlePath()) {
+    checks = await setupMacApp(dir, config)
+  } else if (process.platform === 'win32' && withService) {
+    checks = await setupWindowsService(dir, config)
+  } else if (process.platform === 'linux' && withService && !linuxService.inGraphicalSession()) {
+    // Over SSH there is no display to check or approve against; the session's autostart entry starts the service.
+    linuxService.installService(dir, serviceEntry(), Boolean(managedEntry()))
+    console.log(`Installed the systemd user service ${linuxService.unitPath()}.`)
+    console.log('No graphical session in this shell: the service starts when you next log in to the desktop.')
+    console.log(`Then check it there with: ${selfCommand()} doctor`)
+    if (token && clientName) printClientSetup(config, clientName, token)
+    return
+  } else {
+    await setupPermissions(setupContext(dir, config))
+    const serviceChecks = process.platform === 'linux' && withService ? await setupLinuxService(dir, config) : undefined
+    console.log(serviceChecks ? '\nChecking from inside the service:' : '\nChecking the installation:')
+    checks = serviceChecks ?? (await doctor(setupContext(dir, config)))
+  }
+  const ok = printChecks(checks)
+  if (token && clientName) printClientSetup(config, clientName, token)
+  const serviceRunning =
+    process.platform === 'darwin'
+      ? serviceStatus().loaded
+      : process.platform === 'win32'
+        ? windowsService.serviceStatus().loaded
+        : process.platform === 'linux' && linuxService.serviceStatus().loaded
+  console.log(
+    !ok
+      ? `Fix the failed checks, then run: ${selfCommand()} doctor`
+      : withService && serviceRunning
+        ? `The daemon runs as a background service: ${selfCommand()}${managedEntry() ? '' : ' service'} status | restart | stop`
+        : `Start the daemon with: ${selfCommand()} run`
+  )
+  if (!ok) process.exitCode = 1
+}
+
+// Console window as the prototype's tray: p = pause (emergency stop), r = resume, Ctrl+C = quit.
+function installConsoleControls(computer: Computer): void {
+  if (!process.stdin.isTTY) return
+  log('console controls: [p] pause all agent input   [r] resume   [s] status   [Ctrl+C] quit')
+  process.stdin.setRawMode(true)
+  process.stdin.resume()
+  process.stdin.on('data', (data: Buffer) => {
+    const key = data.toString('utf8')
+    if (key === '\u0003') return void process.emit('SIGINT')
+    if (key === 'p') computer.pause(DAEMON_CONSOLE_STOP_REASON)
+    else if (key === 'r') computer.resume()
+    else if (key === 's') console.error(JSON.stringify(computer.info(), null, 2))
+  })
+}
+
+async function stdio(dir: string, config: DaemonConfig): Promise<void> {
+  // A registered desktop acts only under its Control Plane channel, which stdio mode does not hold.
+  const registration = loadRegistration(dir)
+  const refusal = registration
+    ? () =>
+        registration.revokedAt
+          ? 'this computer was revoked; register it again'
+          : 'this computer is registered with a Control Plane; use the running daemon instead of stdio'
+    : undefined
+  const { driver, computer } = buildComputer(dir, config, undefined, refusal)
+  const driverTools = await loadDriverTools(driver, config)
+  const server = createComputerMcpServer({ computer, client: 'stdio', driverTools })
+  await server.connect(new StdioServerTransport())
+  const shutdown = async (): Promise<void> => {
+    await Promise.allSettled([server.close(), driver.close()])
+    process.exit(0)
+  }
+  process.stdin.once('end', () => void shutdown())
+  process.once('SIGTERM', () => void shutdown())
+}
+
+// Flips the per-agent desktops switch in the config and says what it means on this machine (computer-use.md §3.9).
+async function desktopsCommand(dir: string, action: string | undefined): Promise<void> {
+  if (action !== undefined && !['on', 'off', 'status'].includes(action))
+    throw new Error('usage: desktops [on | off | status]')
+  let config = loadConfig(dir)
+  if (action === 'on' || action === 'off') {
+    config = { ...config, perAgentDesktops: action === 'on' }
+    saveConfig(config, dir)
+  }
+  let support = await probeDesktopSupport()
+  if (action === 'on') support = await offerDesktopInstall(support, { log: (line) => console.log(line) })
+  console.log(`Per-agent desktops: ${describeDesktops(config.perAgentDesktops, support)}`)
+  if (!support.supported && support.fix && !installable(support)) console.log(`  → ${support.fix}`)
+  // A running daemon switches at once; otherwise the saved config applies at its next start.
+  const response = await fetch(
+    `${controlBaseUrl(config)}/control/desktops${action === 'on' || action === 'off' ? `?on=${action === 'on' ? 1 : 0}` : ''}`,
+    {
+      method: action === 'on' || action === 'off' ? 'POST' : 'GET',
+      headers: { [CONTROL_HEADER]: '1' },
+      signal: AbortSignal.timeout(5000)
+    }
+  ).catch(() => undefined)
+  if (response?.ok) {
+    const running = (await response.json()) as {
+      on: boolean
+      desktops?: { id: string; label: string; display?: string }[]
+    }
+    console.log(`The running daemon has them ${running.on ? 'on' : 'off'}.`)
+    for (const desktop of running.desktops ?? [])
+      console.log(`  ${desktop.id}  ${desktop.label}${desktop.display ? `  running on ${desktop.display}` : ''}`)
+  } else if (action === 'on' || action === 'off')
+    console.log('No daemon is running here; the setting applies at its next start.')
+}
+
+async function controlCommand(config: DaemonConfig, command: 'status' | 'pause' | 'resume'): Promise<void> {
+  const response = await fetch(`${controlBaseUrl(config)}/control/${command}`, {
+    method: command === 'status' ? 'GET' : 'POST',
+    headers: { [CONTROL_HEADER]: '1' }
+  })
+  console.log(await response.text())
+  if (!response.ok) process.exitCode = 1
+}
+
+main().catch((error: Error) => {
+  console.error(error.message)
+  process.exit(1)
+})

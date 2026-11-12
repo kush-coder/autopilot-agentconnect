@@ -1,0 +1,202 @@
+import { describe, expect, it } from 'vitest'
+import {
+  catalogModelFor,
+  chatApprovalsAllowed,
+  chatSettingsAllowed,
+  runtimePickerState,
+  sessionAfterModelSelection,
+  sessionEffortAfterModelChange,
+  sessionEffortChoices,
+  sessionEffortChoicesForSelection,
+  sessionPermissionChoices,
+  sessionPermissionSelection,
+  sessionRuntimeChangesEnabled
+} from '@/lib/session-runtime-controls'
+import type { DaemonRow, RuntimeModelCatalog } from '@/lib/data'
+
+const catalog: RuntimeModelCatalog = {
+  models: [
+    {
+      id: 'sol',
+      efforts: [
+        { value: 'high', name: 'High' },
+        { value: 'max', name: 'Max' }
+      ],
+      defaultEffort: 'max'
+    },
+    {
+      id: 'terra',
+      efforts: [{ value: 'high', name: 'High' }],
+      defaultEffort: 'high'
+    }
+  ],
+  defaultModel: 'sol',
+  permissionModes: [
+    { value: 'default', name: 'Ask' },
+    { value: 'full-access', name: 'Full Access' }
+  ],
+  defaultPermissionMode: 'default',
+  source: 'acp',
+  observedAt: '2026-07-25T00:00:00.000Z'
+}
+
+const daemon = {
+  runtimeModels: [{ runtime: 'codex', version: '1.0.0', models: ['sol', 'terra'], modelCatalog: catalog }]
+} satisfies Pick<DaemonRow, 'runtimeModels'>
+
+describe('session runtime controls', () => {
+  it('allows a fresh Playground to stage runtime changes before its first turn', () => {
+    const settings = { chatActions: 'settings' as const }
+    expect(sessionRuntimeChangesEnabled(settings, { platform: 'playground' })).toBe(true)
+    expect(sessionRuntimeChangesEnabled(settings, { platform: 'playground', realSessionId: 'session-1' })).toBe(true)
+    expect(sessionRuntimeChangesEnabled(settings, { platform: 'webchat' })).toBe(true)
+    expect(sessionRuntimeChangesEnabled(settings, { platform: 'slack' })).toBe(false)
+    expect(sessionRuntimeChangesEnabled({ chatActions: 'talk' }, { platform: 'webchat' })).toBe(false)
+  })
+
+  it('offers runtime changes only when people in chat may also change settings', () => {
+    expect(sessionRuntimeChangesEnabled({ chatActions: 'approve' }, { platform: 'webchat' })).toBe(false)
+    expect(sessionRuntimeChangesEnabled(undefined, { platform: 'webchat' })).toBe(false)
+    expect(chatSettingsAllowed({ chatActions: 'settings' })).toBe(true)
+    expect(chatSettingsAllowed({ chatActions: 'approve' })).toBe(false)
+    expect(chatSettingsAllowed({ chatActions: 'talk' })).toBe(false)
+  })
+
+  it('offers them in webchat to the agent’s editors and the conversation’s owner, and keeps them while the owner is unknown', () => {
+    const viewer = { chatActions: 'settings' as const, canEdit: false }
+    expect(sessionRuntimeChangesEnabled(viewer, { platform: 'webchat' }, true)).toBe(true)
+    expect(sessionRuntimeChangesEnabled(viewer, { platform: 'webchat' }, false)).toBe(false)
+    expect(sessionRuntimeChangesEnabled(viewer, { platform: 'webchat' }, undefined)).toBe(true)
+    expect(sessionRuntimeChangesEnabled({ ...viewer, canEdit: true }, { platform: 'webchat' }, false)).toBe(true)
+    expect(chatApprovalsAllowed({ chatActions: 'approve' })).toBe(true)
+    expect(chatApprovalsAllowed({ chatActions: 'settings' })).toBe(true)
+    expect(chatApprovalsAllowed({ chatActions: 'talk' })).toBe(false)
+  })
+
+  it('preserves a live permission list, including an explicit empty list', () => {
+    expect(sessionPermissionChoices('codex', catalog, [])).toEqual([])
+    expect(sessionPermissionChoices('codex', catalog, ['full-access'])).toEqual([
+      { v: 'full-access', l: 'Full Access' }
+    ])
+    expect(sessionPermissionChoices('codex', catalog, undefined)).toHaveLength(2)
+  })
+
+  it('resolves the selected permission from a narrowed live list', () => {
+    expect(sessionPermissionSelection('codex', catalog, ['default'], 'full-access')).toBe('default')
+    expect(sessionPermissionSelection('codex', catalog, [], 'full-access')).toBe('full-access')
+    expect(sessionPermissionSelection('codex', catalog, [], '')).toBe('default')
+  })
+
+  it('shows the runtime permission default when no override is stored', () => {
+    expect(sessionPermissionSelection('codex', catalog, undefined, '')).toBe('default')
+    expect(sessionPermissionSelection('codex', undefined, undefined, '')).toBe('agent')
+  })
+
+  it('offers exactly the Codex modes the catalog and the live session report', () => {
+    const codexCatalog: RuntimeModelCatalog = {
+      ...catalog,
+      permissionModes: [
+        { value: 'read-only', name: 'Ask for approval' },
+        { value: 'agent', name: 'Approve for me' },
+        { value: 'agent-full-access', name: 'Full access' }
+      ],
+      defaultPermissionMode: 'agent'
+    }
+    expect(sessionPermissionChoices('codex', codexCatalog, undefined).map((choice) => choice.v)).toEqual([
+      'read-only',
+      'agent',
+      'agent-full-access'
+    ])
+    expect(sessionPermissionSelection('codex', codexCatalog, undefined, 'agent')).toBe('agent')
+    expect(sessionPermissionChoices('codex', codexCatalog, ['read-only', 'agent', 'agent-full-access'])).toEqual([
+      { v: 'read-only', l: 'Ask for approval' },
+      { v: 'agent', l: 'Approve for me' },
+      { v: 'agent-full-access', l: 'Full access' }
+    ])
+    expect(sessionPermissionSelection('codex', codexCatalog, ['read-only', 'agent-full-access'], 'agent')).toBe(
+      'read-only'
+    )
+  })
+
+  it('moves an unavailable effort to the selected model default', () => {
+    expect(sessionEffortAfterModelChange('codex', daemon, 'terra', 'max')).toBe('high')
+  })
+
+  it('drops the previous model live efforts while a model change is pending', () => {
+    const next = sessionAfterModelSelection({ model: 'sol', availableEfforts: ['high', 'max'] }, 'terra')
+
+    expect(next).toEqual({ model: 'terra', availableEfforts: undefined })
+    expect(sessionEffortChoices('codex', daemon, next.model, next.availableEfforts)).toEqual([
+      { value: 'high', label: 'High' }
+    ])
+    expect(sessionEffortChoicesForSelection('codex', daemon, 'terra', 'sol', ['high', 'max'])).toEqual([
+      { value: 'high', label: 'High' }
+    ])
+  })
+})
+
+describe('catalogModelFor', () => {
+  const aliases: RuntimeModelCatalog = {
+    models: [
+      { id: 'default', name: 'Default (recommended)' },
+      { id: 'opus', name: 'Opus 5.5' },
+      { id: 'claude-fable-5-1[1m]', name: 'Fable 5.1' },
+      { id: 'haiku', name: 'Haiku 5.5' }
+    ],
+    source: 'acp',
+    observedAt: '2026-11-06T00:00:00.000Z'
+  }
+  const offered = aliases.models.map((model) => model.id)
+
+  it('names the entry a reported concrete id resolves to', () => {
+    expect(catalogModelFor('claude-haiku-5-5', aliases, offered)).toBe('haiku')
+    expect(catalogModelFor('claude-opus-5-5', aliases, offered)).toBe('opus')
+    expect(catalogModelFor('claude-fable-5-1', aliases, offered)).toBe('claude-fable-5-1[1m]')
+  })
+
+  it('keeps an offered id and an id no entry names', () => {
+    expect(catalogModelFor('haiku', aliases, offered)).toBe('haiku')
+    expect(catalogModelFor('claude-sonnet-5-5', aliases, offered)).toBe('claude-sonnet-5-5')
+    expect(catalogModelFor('claude-opus-5', aliases, offered)).toBe('claude-opus-5')
+  })
+
+  it('names only an entry the session offers', () => {
+    expect(catalogModelFor('claude-haiku-5-5', aliases, ['default', 'opus'])).toBe('claude-haiku-5-5')
+  })
+})
+
+describe('runtimePickerState', () => {
+  it('selects the catalog entry a session reported by its concrete id, with no extra row', () => {
+    const models = ['default', 'opus', 'haiku']
+    const owningDaemon = {
+      runtimeModels: [
+        {
+          runtime: 'claude-acp',
+          version: '1.0.0',
+          models,
+          modelCatalog: {
+            models: [
+              { id: 'default', name: 'Default (recommended)' },
+              { id: 'opus', name: 'Opus 5.5' },
+              { id: 'haiku', name: 'Haiku 5.5' }
+            ],
+            source: 'acp',
+            observedAt: '2026-11-06T00:00:00.000Z'
+          }
+        }
+      ]
+    } as unknown as DaemonRow
+    const state = runtimePickerState({
+      session: { model: 'claude-haiku-5-5' },
+      owner: undefined,
+      owningDaemon,
+      agentRuntime: 'claude-acp',
+      beforeFirstTurn: false,
+      runtimeUnresolved: false,
+      permissionT: (key: string) => key
+    })
+
+    expect(state.pgModel).toBe('haiku')
+    expect(state.pgModelOptions).toEqual(models)
+  })
+})

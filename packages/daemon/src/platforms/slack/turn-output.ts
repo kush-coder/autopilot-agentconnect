@@ -1,0 +1,729 @@
+// Slack owns native task views, chrome and reply rendering; core callers retain their platform guards.
+import type { SlackConnection, SlackPostOptions, SlackStatusOptions, SlackTurnStream } from '../../slack/connection.js'
+import type { SlackAction } from '../../slack/render.js'
+import { startCodeDiff, type CodeDiffHost, type CodeDiffOutput } from './code-diff.js'
+import { TaskDiffUnavailable, type TaskDiff } from '../../workspace/task-diff.js'
+
+// Slack owns its task diff, native chrome stream and pending footer edits.
+export interface SlackTurnState {
+  codeDiff?: CodeDiffOutput
+  // Retry failed footer removals on the next body section and at finalization.
+  staleReplyFooters?: { ts: string; text: string }[]
+  // Retain the stream until Slack confirms settlement so failed stops can be retried.
+  stream?: SlackTurnStream
+  /** Coalescing timer for stream appends (§3.5), the Slack analogue of Feishu's. */
+  streamTimer?: NodeJS.Timeout
+  // Fall back to in-place progress for this turn without opening a replacement stream.
+  streamDegraded?: boolean
+  // A settled stream receives no further appends, stops or replacement messages.
+  streamDead?: boolean
+  // Cards name this human recipient, or the bot itself when no person started the turn.
+  recipient?: string
+}
+
+export async function startSlackCodeDiff(
+  turn: SlackTurn,
+  state: SlackTurnState,
+  host: Pick<CodeDiffHost, 'open' | 'authorize' | 'active' | 'mask' | 'notice' | 'debug'> & {
+    keepStart?: () => Promise<void>
+    // The notice this channel last showed for its task; a failure that persists across turns is reported once.
+    lastNotice?: { get(): string | undefined; set(text: string | undefined): void }
+  }
+): Promise<string | undefined> {
+  if (!turn.conn || turn.plan.isDm) return undefined
+  // A task may move into a code channel it makes later, so its turn elsewhere keeps a start for a repository without a base branch (auto-session-mode.md §6.8).
+  if (turn.plan.statusThread !== turn.plan.channel) {
+    await host.keepStart?.().catch(() => {})
+    return undefined
+  }
+  const conn = turn.conn as SlackConnection
+  let hasPublished = false
+  try {
+    const channel = await conn.codeChannel(turn.plan.channel)
+    if (!channel.code || !channel.owners.includes(conn.botUserId)) return undefined
+    const existing = (await conn.codeChannelApi('listViews', { channel_id: turn.plan.channel })) as {
+      views?: { view_id?: string }[]
+    }
+    hasPublished = existing.views?.some((view) => view.view_id === 'code') === true
+  } catch {
+    if (host.active())
+      await host
+        .notice('Code diff is not updating. Slack could not confirm this code channel and its views.')
+        .catch(() => {})
+    return undefined
+  }
+  let source: TaskDiff | undefined
+  state.codeDiff = await startCodeDiff({
+    ...host,
+    open: async () => (source = await host.open()),
+    notice: async (text) => {
+      if (host.lastNotice?.get() === text) return
+      host.lastNotice?.set(text)
+      await host.notice(text)
+    },
+    hasPublished,
+    publish: async (content, signal) => {
+      try {
+        const bases = new Set(source?.repositories.map((repository) => repository.base ?? 'Task start'))
+        if (content)
+          await conn.codeChannelApi(
+            'setView',
+            {
+              channel_id: turn.plan.channel,
+              type: 'diff',
+              content,
+              base_branch: bases.size === 1 ? [...bases][0] : 'Base branches',
+              head_branch: 'Current workspace'
+            },
+            signal
+          )
+        else await conn.codeChannelApi('removeView', { channel_id: turn.plan.channel, view_id: 'code' }, signal)
+        host.lastNotice?.set(undefined)
+      } catch (error) {
+        const code =
+          error instanceof Error
+            ? /^Slack agents\.conversations\.(?:setView|removeView) failed: ([a-z0-9._:-]{1,64})$/i.exec(
+                error.message
+              )?.[1]
+            : undefined
+        throw new TaskDiffUnavailable(
+          code ? `Slack rejected the update (${code}).` : 'Slack did not confirm the update.'
+        )
+      }
+    }
+  })
+  if (!state.codeDiff || !source) return undefined
+  const repositories = new Intl.ListFormat('en').format(
+    source.repositories.map(({ title, base }) => `${title} (against ${base ?? 'where this task started'})`)
+  )
+  return `The platform maintains the Code diff of ${repositories}, including uncommitted changes and commits. Work there: changes anywhere else, including a repository you clone yourself, do not appear in it. Do not call setSlackCodeView(type: diff) for this task or overwrite its Code view. HTML and PR views remain available.`
+}
+
+/** The core turn, as Slack's applier sees it. `Pending` satisfies it structurally.
+ *
+ *  Wider than the other three surfaces because Slack's output anchors (progress/plan/
+ *  reasoning rows, status bar, attribution footer) are still core
+ *  fields — see the module header. Read this list as the inventory for that
+ *  follow-up, not as the port Slack wants. */
+export interface SlackTurn {
+  conn?: unknown
+  /** The turn's readonly decisions — its coordinates and identity. */
+  plan: SlackTurnPlan
+  /** The in-place message anchors this applier edits rather than re-posts. */
+  chrome: {
+    /** Stored session title awaiting the turn's first registering write (status/stream). */
+    sessionTitleToPush?: string
+    progressTs?: string
+    progressAttempted?: boolean
+    planTs?: string
+    planAttempted?: boolean
+    reasoningTs?: string
+    reasoningAttempted?: boolean
+    statusBarTs?: string
+    statusBarAttempted?: boolean
+  }
+  /** What the turn has posted so far, and the id of the logical response it belongs to. */
+  reply: {
+    /** The message currently owning the footer. */
+    lastReply?: { ts: string; text: string; footerKey?: string }
+    /** send-message-routing-rework.md §5.1: the ONE logical response this turn produces.
+     *  Every physical message of a long answer carries it, so a peer deduplicates on
+     *  (responseId, target agent) and activates exactly once. */
+    responseId?: string
+    /** The LAST agent-authored body posted this turn, with the text it currently shows —
+     *  what finalization re-stamps as `delivery_state: 'final'` (§5.5). The text is carried
+     *  because chat.update REPLACES content, so closing the response means re-sending what
+     *  is already displayed. */
+    lastResponse?: { ts: string; text: string }
+    /** ts of the FIRST agent-authored body posted this turn, the message a getting-to-know task's cards thread under. */
+    firstResponse?: string
+    /** Routing facts of the COMPLETE response, resolved by the host before the final body
+     *  flush (§5.5): the recipient set, the addressed-anyone bit, whether any peer agent
+     *  shares this conversation at all, and whether one of them posts as the SAME bot —
+     *  a shared-bot peer's ingress admits only the closing edit past its self-echo filter,
+     *  so a born-final fresh post would never reach it. Lets a terminal section be BORN
+     *  `final` when no peer shares the sending bot. */
+    finalRouting?: {
+      mentionedAgentIds: string[]
+      addressedAnyone: boolean
+      hasPeers: boolean
+      peerSharesBot: boolean
+    }
+    /** ts of the body message that was born `final` — set only after Slack accepted a
+     *  terminal post carrying the closing metadata, so finalization can skip its edit. */
+    finalStamped?: string
+  }
+  /** The turn's finalized attribution footer, and a key identifying its content so
+   *  a re-post can tell "same footer" from "footer changed". */
+  attribution?: { blocks: unknown[]; key: string }
+}
+
+/** The planned facts Slack's applier reads. The option builders take this alone, so a
+ *  non-turn caller (a failure notice) can supply the same four fields without a turn. */
+export interface SlackTurnPlan {
+  channel: string
+  thread?: string
+  statusThread: string
+  sessionThread: string
+  transcriptChannel: string
+  agentId: string
+  agentName: string
+  iconUrl?: string
+  sessionKey: string
+  platform: string
+  isDm: boolean
+  /** The author's own trusted turn depth (§4.1). A human/root turn is 0; each routing
+   *  edge adds one. Read-only here — the model can neither set nor reset it. */
+  sourceHopCount?: number
+  /** Compound shared-bot addresses this conversation can contain, which a split must
+   *  never cut in half (§5.3). */
+  protectedAddresses?: readonly string[]
+}
+
+/** The host capabilities this applier needs.
+ *
+ *  Three groups, each a genuine core resource rather than a Slack shape: the two
+ *  every surface needs (reply recording, transcript append), the SESSION-SCOPED
+ *  status-bar anchor (Slack owns the post-once/edit-in-place/drop-dead-ts policy;
+ *  core owns the store the anchor survives in), and the logger. */
+export interface SlackTurnHost<TTurn> {
+  recordReplySegment(turn: TTurn, text: string): void | Promise<void>
+  appendTranscript(row: {
+    channel: string
+    thread: string
+    /** The session the row is admitted into (message-intake.md §4.2). */
+    admission: { agentId: string; sessionKey: string }
+    ts: string
+    sender: string
+    kind: 'text'
+    text: string
+  }): void | Promise<void | string>
+  /** Persisted anchor for the session's one interactive status line. Survives the
+   *  turn, so it cannot live in the per-turn state slot. */
+  getStatusBarTs(sessionKey: string): Promise<string | undefined>
+  setStatusBarTs(sessionKey: string, ts: string): void | Promise<void>
+  clearStatusBarTs(sessionKey: string): void | Promise<void>
+  /** Monotonic transcript timestamp — core owns ordering across surfaces. */
+  monotonicTs(): string
+  debug(message: string): void
+}
+
+/** The ONE identity policy for Slack rows: the agent's name and icon, on every surface —
+ *  channel and DM, body and chrome alike. A DM exemption used to exist for chrome rows and
+ *  produced a mixed DM (decorated bodies beside app-identity chrome) plus a broken stream
+ *  (an undecorated `chat.startStream` renders a placeholder avatar, no fallback). A
+ *  customize-less workspace still degrades per send via the connection's cooldown. */
+export function slackAgentIdentityOptions(
+  p: Pick<SlackTurnPlan, 'platform' | 'agentName' | 'iconUrl'>
+): SlackPostOptions | undefined {
+  if (p.platform !== 'slack') return undefined
+  return { username: p.agentName, ...(p.iconUrl ? { icon_url: p.iconUrl } : {}) }
+}
+
+/** Agent-authored conversation messages add a stable author id to Slack metadata.
+ *  Peer daemons use it during thread backfill, so shared/custom bot ids never replace
+ *  the Agent's name and icon in the Console transcript. */
+export function slackAgentPostOptions(
+  p: Pick<SlackTurnPlan, 'platform' | 'agentId' | 'agentName' | 'iconUrl'> &
+    Partial<Pick<SlackTurnPlan, 'sourceHopCount'>> & { responseId?: string },
+  /** §5.5: closing metadata for a TERMINAL section posted at finalization, when the
+   *  complete response is already known — the post is born `final`, needing no re-stamp. */
+  closure?: { mentionedAgentIds: string[]; addressedAnyone: boolean }
+): SlackPostOptions | undefined {
+  const identity = slackAgentIdentityOptions(p)
+  if (!identity) return undefined
+  return {
+    ...identity,
+    agentAuthorId: p.agentId,
+    // send-message-routing-rework.md §5.4: every agent-authored body carries this turn's
+    // STREAMING response block, so a peer can tell a finished answer from a prefix. The
+    // recipient set stays empty until finalization resolves it from the COMPLETE response
+    // — routing a prefix would prompt the target with a half-written message.
+    //
+    // No `responseId` ⇒ this post is not part of an agent's logical response at all (the
+    // cron/hook trigger anchor takes this path): authorship for the transcript, but it
+    // closes no response and must never be routed as one.
+    ...(p.responseId
+      ? {
+          response: closure
+            ? {
+                responseId: p.responseId,
+                deliveryState: 'final' as const,
+                hopCount: p.sourceHopCount ?? 0,
+                mentionedAgentIds: closure.mentionedAgentIds,
+                ...(closure.addressedAnyone ? { addressedAnyone: true } : {})
+              }
+            : {
+                responseId: p.responseId,
+                deliveryState: 'streaming' as const,
+                hopCount: p.sourceHopCount ?? 0,
+                mentionedAgentIds: []
+              }
+        }
+      : {})
+  }
+}
+
+/** The Slack user the chrome stream is addressed to; undefined (the bot names itself) when no Slack user started the turn. A console continuation's sender is a console principal, so it names the author's linked Slack member or nobody. */
+export function slackStreamRecipient(msg: {
+  source: string
+  headless?: boolean
+  adoptedSession?: boolean
+  senderMemberId?: string
+  sender: { id: string; isBot?: boolean }
+}): string | undefined {
+  if (msg.source !== 'user' || msg.headless || msg.sender.isBot) return undefined
+  return msg.adoptedSession ? msg.senderMemberId : msg.sender.id
+}
+
+/** Keep the working indicator visually owned by the same agent as its reply. */
+export function slackStatusOptions(
+  platform: string,
+  agentName: string,
+  iconUrl?: string,
+  /** Recorded by the connection as the slot's displayed owner — the turn a native Stop targets. */
+  sessionKey?: string
+): SlackStatusOptions | undefined {
+  if (platform !== 'slack') return undefined
+  return {
+    username: agentName,
+    ...(iconUrl ? { icon_url: iconUrl } : {}),
+    ...(sessionKey ? { sessionKey } : {})
+  }
+}
+
+/**
+ * Close this turn's logical response (send-message-routing-rework.md §5.5): re-stamp the
+ * last delivered message as the single `final` event, carrying the recipients resolved
+ * from the COMPLETE response.
+ *
+ * Why the recipient set is computed at turn end rather than per post: a streamed answer
+ * may put its `@mention` in section one and finish in section three. Reparsing only the
+ * last physical message would lose the mention entirely; carrying the whole set on the
+ * final event is what lets a peer be selected once, with complete context, wherever in
+ * the answer it was addressed (§5.2/§5.7).
+ *
+ * Best-effort throughout. A turn with no conversational body has no response to close; a
+ * failed edit leaves the message `streaming`, which means UNROUTED — the safe direction,
+ * since the alternative is routing an answer never confirmed complete.
+ */
+export async function finalizeSlackResponse(
+  conn: SlackConnection,
+  p: SlackTurn,
+  /** Agents addressed by the complete response, already resolved against the
+   *  conversation directory and with the author removed (§2.3: an author cannot activate
+   *  itself, and stating that here is clearer than shipping a recipient to discard). */
+  mentionedAgentIds: string[],
+  /** Did the COMPLETE response mention anyone at all — humans and other apps included?
+   *  The final event's own text cannot answer this once an answer has been split, and
+   *  §2.3 makes any address binding, so it travels with the recipient set. */
+  addressedAnyone: boolean,
+  debug: (message: string) => void
+): Promise<void> {
+  const body = p.reply.lastResponse
+  if (p.plan.platform !== 'slack' || !body || !p.reply.responseId) return
+  // Born-final (§5.5): the terminal section already carried the closing metadata on its
+  // own post, so the response is closed — a re-stamp would only re-mark it "(edited)".
+  if (p.reply.finalStamped !== undefined && p.reply.finalStamped === body.ts) return
+  // Duck-typed adaptor/test connections implement only the subset they need. Closing the
+  // response is additive metadata, not delivery — a connection that cannot do it must not
+  // fail the turn whose answer was already delivered.
+  if (typeof conn.finalizeResponse !== 'function') return
+  // Re-supply exactly what the message already shows: chat.update REPLACES content, and
+  // the footer belongs to this message only while `lastReply` still points at it.
+  const ownsFooter = p.reply.lastReply?.ts === body.ts && p.reply.lastReply.footerKey !== undefined
+  const blocks = [{ type: 'markdown', text: body.text }, ...(ownsFooter && p.attribution ? p.attribution.blocks : [])]
+  try {
+    await conn.finalizeResponse(p.plan.channel, body.ts, blocks, body.text, p.plan.agentId, {
+      responseId: p.reply.responseId,
+      deliveryState: 'final',
+      hopCount: p.plan.sourceHopCount ?? 0,
+      mentionedAgentIds,
+      ...(addressedAnyone ? { addressedAnyone } : {})
+    })
+  } catch (err) {
+    // The real connection normalizes API failures to `false`; this guard covers a
+    // throwing adaptor. Degrading to `streaming` means unrouted, never mis-routed.
+    debug(`slack: response finalization failed (${(err as Error).message})`)
+  }
+}
+
+/** Remove attribution blocks from older body sections. Slack edits are best-effort,
+ *  so retain failed rows for the next body post and the finalization retry. Test fakes
+ *  historically return void; only an explicit `false` means the update failed. */
+export async function clearStaleSlackReplyFooters<TTurn extends SlackTurn>(
+  host: Pick<SlackTurnHost<TTurn>, 'debug'>,
+  conn: SlackConnection,
+  p: TTurn,
+  state: SlackTurnState,
+  additional: { ts: string; text: string }[] = []
+): Promise<void> {
+  const pending = [...(state.staleReplyFooters ?? []), ...additional]
+  if (pending.length === 0) return
+  delete state.staleReplyFooters
+  const failed: { ts: string; text: string }[] = []
+  for (const reply of new Map(pending.map((item) => [item.ts, item])).values()) {
+    try {
+      const updated = await conn.updateBlocks(
+        p.plan.channel,
+        reply.ts,
+        [{ type: 'markdown', text: reply.text }],
+        undefined,
+        false,
+        p.plan.agentId
+      )
+      if (updated === false) failed.push(reply)
+    } catch (err) {
+      // Real SlackConnection normalizes API/queue failures to false. Keep this guard
+      // for duck-typed test/adaptor connections so turn cleanup can never be stranded.
+      failed.push(reply)
+      host.debug(
+        `slack: stale footer cleanup failed (${reply.ts}): ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
+  }
+  if (failed.length > 0) state.staleReplyFooters = failed
+}
+
+/** Does this row's text look like a rendered status bar? A Slack-shaped test: the
+ *  bar's leading chart glyph, in either the `:shortcode:` or the literal-emoji form
+ *  Slack may echo back. Also consulted by thread backfill, which must not replay a
+ *  peer's status bar as conversation. */
+export function isSlackStatusBarText(text: string): boolean {
+  return text.startsWith(':bar_chart:') || text.startsWith('📊')
+}
+
+/** Adopt this agent's own chrome-marked status bar already in the thread when no ts was persisted, rather than post a second. */
+async function findExistingSlackStatusBarTs(conn: SlackConnection, p: SlackTurn): Promise<string | undefined> {
+  const getThreadReplies = (conn as { getThreadReplies?: SlackConnection['getThreadReplies'] }).getThreadReplies
+  if (!getThreadReplies || !p.plan.thread) return undefined
+  const own = new Set([conn.botId, conn.botUserId].filter(Boolean))
+  if (own.size === 0) return undefined
+  const replies = await getThreadReplies.call(conn, p.plan.channel, p.plan.thread)
+  return replies.find(
+    (m) =>
+      m.isBot &&
+      own.has(m.sender) &&
+      m.chrome &&
+      m.chromeOwnerAgentId === p.plan.agentId &&
+      isSlackStatusBarText(m.text)
+  )?.ts
+}
+
+/** Shared reply-message boundary for every output mode. The new message is born with
+ *  the current footer; only after that post succeeds do we strip the footer from the
+ *  previous reply owner and move the pointer. */
+async function postSlackReply<TTurn extends SlackTurn>(
+  host: SlackTurnHost<TTurn>,
+  conn: SlackConnection,
+  p: TTurn,
+  state: SlackTurnState,
+  text: string,
+  trackReply = true,
+  /** §5.5: this is the response's LAST section, posted at finalization — when the host
+   *  has prepared the closing routing facts, stamp it `final` at birth so the response
+   *  needs no closing chat.update (which would mark the reply "(edited)"). */
+  terminal = false
+): Promise<string | undefined> {
+  const previous = trackReply ? p.reply.lastReply : undefined
+  const attribution = trackReply ? p.attribution : undefined
+  // A shared-bot peer sees fresh own-bot posts filtered as self-echo — only the closing
+  // edit is admitted past that filter — so those conversations keep the re-stamp.
+  const routing = terminal ? p.reply.finalRouting : undefined
+  const closure = routing && !routing.peerSharesBot ? routing : undefined
+  const agentPostOptions = slackAgentPostOptions({ ...p.plan, responseId: p.reply.responseId }, closure)
+  const options = attribution ? { ...agentPostOptions, trailingBlocks: attribution.blocks } : agentPostOptions
+  const ts = await conn.postMessage(p.plan.channel, text, p.plan.thread, options as SlackPostOptions | undefined)
+  // Remember the newest conversational body so finalization knows which message closes
+  // the response (§5.5). Tracked for every agent-authored body, including `attributed:
+  // false` sections: "last posted" is a fact about ordering, not about footer ownership.
+  if (ts) p.reply.lastResponse = { ts, text }
+  if (ts && p.reply.firstResponse === undefined) p.reply.firstResponse = ts
+  // Record the born-final ts only when the closing metadata actually rode the post.
+  if (ts && closure && agentPostOptions?.response) p.reply.finalStamped = ts
+  if (ts && trackReply) {
+    if (attribution)
+      await clearStaleSlackReplyFooters(
+        host,
+        conn,
+        p,
+        state,
+        previous?.footerKey ? [{ ts: previous.ts, text: previous.text }] : []
+      )
+    p.reply.lastReply = {
+      ts,
+      text,
+      ...(attribution ? { footerKey: attribution.key } : {})
+    }
+  }
+  return ts
+}
+
+/** Push the stored session title once the status or stream write that just landed registered the thread (an earlier rename is refused). */
+async function flushSessionTitle(conn: SlackConnection, p: SlackTurn): Promise<void> {
+  const title = p.chrome.sessionTitleToPush
+  if (!title) return
+  p.chrome.sessionTitleToPush = undefined
+  await conn.setTitle(p.plan.channel, p.plan.statusThread, title)
+}
+
+/** The single in-place tool-activity message: post once, then edit. Shared by the legacy
+ *  `progress` action and by a streaming turn whose stream never opened. If the first post
+ *  rejects or returns no ts, mark it attempted and skip later edits rather than duplicating. */
+async function applySlackProgress(
+  conn: SlackConnection,
+  p: SlackTurn,
+  chromeOptions: SlackPostOptions,
+  text: string
+): Promise<void> {
+  if (p.chrome.progressTs) await conn.updateMessage(p.plan.channel, p.chrome.progressTs, text, true)
+  else if (!p.chrome.progressAttempted) {
+    p.chrome.progressAttempted = true
+    p.chrome.progressTs = await conn.postMessage(p.plan.channel, text, p.plan.thread, chromeOptions)
+  }
+}
+
+/** Apply one converger action against the turn's Slack connection.
+ *
+ *  Also the CORE surface: webchat / hook / dream turns arrive here with no
+ *  connection (headless) or with Slack-shaped fakes, which is why the no-`conn`
+ *  path still records the reply into the transcript. */
+export async function applySlackAction<TTurn extends SlackTurn>(
+  host: SlackTurnHost<TTurn>,
+  p: TTurn,
+  state: SlackTurnState,
+  action: SlackAction
+): Promise<void> {
+  if (action.kind === 'post' && action.recordOnly) {
+    await host.recordReplySegment(p, action.text)
+    return
+  }
+  // enqueueApply routes here only for non-telegram platforms, so p.conn is a Slack
+  // connection (or a test fake with the same shape) — cast rather than instanceof so
+  // duck-typed fakes work. Headless (no conn) no-ops.
+  const conn = p.conn as SlackConnection | undefined
+  if (!conn) {
+    // Headless fires have no platform-send boundary, but their agent reply should
+    // still be readable in the session transcript.
+    if (action.kind === 'post') {
+      await host.appendTranscript({
+        channel: p.plan.transcriptChannel,
+        thread: p.plan.statusThread,
+        admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
+        ts: host.monotonicTs(),
+        sender: p.plan.agentId,
+        kind: 'text',
+        text: action.text
+      })
+    }
+    return
+  }
+  const identity = slackAgentIdentityOptions(p.plan)
+  // Chrome variant of the identity: marks status/progress/plan/reasoning/notice/card
+  // messages so a peer daemon's thread backfill skips them (they are not conversation).
+  const chromeOptions: SlackPostOptions = { ...(identity ?? {}), chrome: true }
+  if (
+    (action.kind === 'status-bar' || action.kind === 'clear-status-bar') &&
+    action.info &&
+    !p.plan.isDm &&
+    p.plan.statusThread === p.plan.channel
+  ) {
+    const native = await conn.updateCodeContext(p.plan.channel, { info: action.info }).catch(() => {
+      host.debug('slack: native session controls update failed')
+      return false
+    })
+    if (native) action = { kind: 'clear-status-bar' }
+  }
+  switch (action.kind) {
+    case 'set-status':
+      if (p.plan.thread) {
+        await conn.setStatus(p.plan.channel, p.plan.statusThread, action.text, {
+          ...slackStatusOptions(p.plan.platform, p.plan.agentName, p.plan.iconUrl, p.plan.sessionKey),
+          ...(action.lifecycle ? { lifecycle: action.lifecycle } : {})
+        })
+        await flushSessionTitle(conn, p)
+      }
+      return
+    case 'set-title':
+      // A live runtime title supersedes any stored title still waiting on its first status.
+      p.chrome.sessionTitleToPush = undefined
+      if (p.plan.thread) await conn.setTitle(p.plan.channel, p.plan.statusThread, action.text)
+      return
+    case 'post': {
+      const trackReply = action.attributed !== false
+      // The latest reply is born with its linked context footer, so unfurls are
+      // disabled at the supported chat.postMessage boundary. Once that succeeds,
+      // strip the footer from this turn's previous section and move the pointer.
+      const ts = await postSlackReply(host, conn, p, state, action.text, trackReply, action.terminal === true)
+      await host.appendTranscript({
+        channel: p.plan.transcriptChannel,
+        thread: p.plan.statusThread,
+        admission: { agentId: p.plan.agentId, sessionKey: p.plan.sessionKey },
+        ts: ts ?? `local-${Date.now()}`,
+        sender: p.plan.agentId,
+        kind: 'text',
+        text: action.text
+      })
+      return
+    }
+    case 'notice':
+    case 'tool-output':
+      // Both post to the thread but are NOT recorded into the transcript — notices are
+      // system chrome, and tool output is captured independently by the recorder.
+      await conn.postMessage(p.plan.channel, action.text, p.plan.thread, chromeOptions)
+      return
+    case 'attribution':
+      // Final metadata normally matches the footer the latest section was born with, so this
+      // only retries stale-footer cleanup unless the runtime changed session metadata mid-prompt.
+      p.attribution = { blocks: action.blocks, key: JSON.stringify(action.blocks) }
+      await clearStaleSlackReplyFooters(host, conn, p, state)
+      return
+    case 'progress':
+      await applySlackProgress(conn, p, chromeOptions, action.text)
+      return
+    case 'stream-start': {
+      if (state.stream || state.streamDead || state.streamDegraded) return
+      if (p.plan.thread) {
+        // Same identity as every row — an undecorated stream has no app-profile fallback.
+        state.stream = await conn.startTurnStream(p.plan.channel, p.plan.thread, {
+          isDm: p.plan.isDm,
+          ...(state.recipient ? { recipientUserId: state.recipient } : {}),
+          ...(identity ? { identity } : {})
+        })
+        if (state.stream) {
+          // The stream registered the thread, so the stored title can land now too.
+          await flushSessionTitle(conn, p)
+          return
+        }
+      }
+      // The stream could not open, so this turn's chrome falls back to today's in-place
+      // message. Chrome degrades ALONE — the body never rode the stream, so nothing moves.
+      state.streamDegraded = true
+      return
+    }
+    case 'stream-append': {
+      if (state.streamDead || action.chunks.length === 0) return
+      if (state.streamDegraded || !state.stream) {
+        // Task chunks are never rendered as prose: only the legacy rendering this batch
+        // carries reaches the channel, and a thinking-only batch carries none.
+        if (action.progressText) await applySlackProgress(conn, p, chromeOptions, action.progressText)
+        return
+      }
+      const outcome = await conn.appendTurnStream(state.stream, action.chunks)
+      // `refused` drops this card update and keeps the handle — chrome is lossy-tolerant, and
+      // the settling stop still has a message to land on.
+      if (outcome !== 'stopped') return
+      state.streamDead = true
+      state.stream = undefined
+      return
+    }
+    case 'stream-stop': {
+      if (state.streamDead) return
+      if (!state.stream) {
+        // Degraded before the stream ever opened: the terminal batch still owes the channel
+        // its legacy rendering, exactly as a non-streaming turn's last `progress` edit would.
+        if (state.streamDegraded && action.progressText)
+          await applySlackProgress(conn, p, chromeOptions, action.progressText)
+        return
+      }
+      const stream = state.stream
+      // The handle is retired HERE, whatever Slack answers: the connection owns the settle+stop
+      // from this point (it retries after the turn is gone), and the turn must not race it.
+      state.stream = undefined
+      state.streamDead = true
+      await conn.settleAndStop(stream, action.settle, { chromeOwnerAgentId: p.plan.agentId })
+      return
+    }
+    case 'plan':
+      // A code channel keeps its lifecycle and Plan tab on the channel, independent of the reply target.
+      if (p.plan.statusThread === p.plan.channel) conn.writePlanCanvas(p.plan.channel, action.markdown)
+      // Block Kit, not text: the checklist is a native checkbox list (slack/render.ts
+      // renderPlan). Same post-once/edit-thereafter contract as `progress` — `action.text`
+      // rides along as the notification/fallback string only.
+      if (p.chrome.planTs) await conn.updateBlocks(p.plan.channel, p.chrome.planTs, action.blocks, action.text, true)
+      else if (!p.chrome.planAttempted) {
+        p.chrome.planAttempted = true
+        p.chrome.planTs = await conn.postBlocks(
+          p.plan.channel,
+          action.blocks,
+          action.text,
+          p.plan.thread,
+          chromeOptions
+        )
+      }
+      return
+    case 'reasoning':
+      // The single in-place reasoning block (high mode): post once, then edit — same
+      // post-once/edit-thereafter contract as `progress`. Not recorded into the
+      // transcript; the TranscriptRecorder captures reasoning rows independently.
+      if (p.chrome.reasoningTs) await conn.updateMessage(p.plan.channel, p.chrome.reasoningTs, action.text, true)
+      else if (!p.chrome.reasoningAttempted) {
+        p.chrome.reasoningAttempted = true
+        p.chrome.reasoningTs = await conn.postMessage(p.plan.channel, action.text, p.plan.thread, chromeOptions)
+      }
+      return
+    case 'clear-status-bar': {
+      const ts = p.chrome.statusBarTs ?? (await host.getStatusBarTs(p.plan.sessionKey))
+      if (!ts) return
+      p.chrome.statusBarTs = ts
+      const deleted = await conn.deleteMessage(p.plan.channel, ts)
+      // Duck-typed test connections historically return void; only an explicit false
+      // means Slack rejected the cleanup and the persisted ts should be retried later.
+      if (deleted !== false) {
+        p.chrome.statusBarTs = undefined
+        await host.clearStatusBarTs(p.plan.sessionKey)
+      }
+      return
+    }
+    case 'status-bar': {
+      // Session-scoped interactive status line: the first post's ts is stored on the
+      // session, and every later turn updates that topmost line in place. Serialized by
+      // applyChain; not recorded into the transcript (live chrome).
+      let ts = p.chrome.statusBarTs ?? (await host.getStatusBarTs(p.plan.sessionKey))
+      if (!ts && !p.chrome.statusBarAttempted) {
+        ts = await findExistingSlackStatusBarTs(conn, p)
+        if (ts) {
+          p.chrome.statusBarTs = ts
+          await host.setStatusBarTs(p.plan.sessionKey, ts)
+        }
+      }
+      if (ts) {
+        p.chrome.statusBarTs = ts
+        const updated = await conn.updateBlocks(
+          p.plan.channel,
+          ts,
+          action.blocks,
+          action.text,
+          true,
+          undefined,
+          p.plan.agentId
+        )
+        // Duck-typed test connections historically return void; only an explicit
+        // false means Slack rejected the edit — typically cant_update_message on a
+        // bar another Slack app authored (a foreign ts persisted by the
+        // pre-provenance adoption path). Drop the dead ts so the next status emit
+        // re-resolves — provenance-filtered adoption or a fresh own post — instead
+        // of hammering an uneditable message on every usage tick. A transient
+        // failure costs at most one duplicate bar; a foreign ts never heals.
+        if (updated === false) {
+          p.chrome.statusBarTs = undefined
+          await host.clearStatusBarTs(p.plan.sessionKey)
+        }
+      } else if (!p.chrome.statusBarAttempted) {
+        p.chrome.statusBarAttempted = true
+        // The session status line represents the selected agent, so keep its author
+        // identity aligned with the native loading state and the eventual reply.
+        const posted = await conn.postBlocks(p.plan.channel, action.blocks, action.text, p.plan.thread, {
+          ...(identity ?? {}),
+          chrome: true,
+          chromeOwnerAgentId: p.plan.agentId
+        })
+        if (posted) {
+          p.chrome.statusBarTs = posted
+          await host.setStatusBarTs(p.plan.sessionKey, posted)
+        }
+      }
+      return
+    }
+  }
+}

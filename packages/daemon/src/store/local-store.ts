@@ -1,0 +1,11505 @@
+import {
+  MEMORY_CONTINUATION_SCHEMA,
+  MEMORY_CONTINUATION_SLOTS,
+  MEMORY_CONTINUATION_MAX_BYTES
+} from '../memory/entries/state.js'
+import { randomUUID } from 'node:crypto'
+import { AHP_STATE_SCHEMA, AhpStateStore, type AhpCheckpointWrite } from './ahp-state.js'
+import { ASSISTANT_DRAFT_SCHEMA, AssistantDraftLedger } from './assistant-drafts.js'
+import { ASSISTANT_ITEM_SCHEMA, AssistantItemLedger } from './assistant-items.js'
+import { ASSISTANT_CHECK_SCHEMA, AssistantCheckLedger } from './assistant-checks.js'
+import { ASSISTANT_REMINDER_SCHEMA, AssistantReminderLedger } from './assistant-reminders.js'
+import { ASSISTANT_ONBOARDING_SCHEMA, AssistantOnboardingLedger } from './assistant-onboarding.js'
+import {
+  ASSISTANT_SUBSESSION_SCHEMA,
+  ASSISTANT_SUBSESSION_THREAD_SCHEMA,
+  ASSISTANT_TASK_OPENED_SCHEMA,
+  AssistantSubsessionIndex
+} from './assistant-subsessions.js'
+import { CLOSE_TASK } from './closed-tasks.js'
+import {
+  ASSISTANT_TASK_OBSERVATION_SCHEMA,
+  AssistantWatchTasks,
+  WATCH_TASK_COLUMN_TYPES
+} from './assistant-watch-tasks.js'
+import { PLACE_TIME_ZONE_SCHEMA, PlaceTimeZones } from './place-time-zones.js'
+import { WORK_CANVAS_SCHEMA, WorkCanvases } from './work-canvases.js'
+import { newSessionMessageId, SESSION_MESSAGE_SCHEMA, SessionMessages } from './session-messages.js'
+import { CAPABILITY_CARD_SCHEMA, CapabilityCardLedger } from './capability-cards.js'
+import {
+  APPEND_COORDINATE_PREFIX,
+  COORDINATOR_COORDINATE_PREFIX,
+  coordinateKind,
+  isAppendCoordinate,
+  nextAppendCoordinate,
+  COORDINATOR_PROTOCOL,
+  type ConversationCoordinateKind
+} from '../session/append-coordinate.js'
+import { GETTING_TO_KNOW_COORDINATE_PREFIX, checkCoordinate } from '../session/subsession-coordinate.js'
+import { monotonicTs } from './monotonic-ts.js'
+import type { SQLInputValue } from 'node:sqlite'
+import { chmodSync, mkdirSync, statSync } from 'node:fs'
+import { dirname } from 'node:path'
+import {
+  ManagedMemoryHome,
+  QuotedMessageSchema,
+  SessionImageAttachment as SessionImageAttachmentSchema,
+  SharedImage as SharedImageSchema,
+  UserTurnBody,
+  type UploadedFileReference,
+  type SharedImage,
+  type CronReport,
+  type DecisionRuntimeTarget,
+  type DecisionModelEvaluationRecord,
+  type DecisionModelEvaluationRecordDetail,
+  type DecisionEvaluationRecord,
+  type DecisionEvaluationRecordDetail,
+  type DreamInfo,
+  type ExternalSessionOrigin,
+  type QuotedMessage,
+  type SessionImageAttachment,
+  type SessionStayedHomeReason
+} from '@agentconnect.md/protocol'
+import type { NoteProjectionOutcome, NoteProjectionPhase, NoteProjectionRow } from '../gitlab/note-projection.js'
+import type { ReviewIntentRow } from '../gitlab/review-adapter.js'
+import { SESSION_TITLE_TOOL_TITLES } from '../mcp/session-title-tool.js'
+import type { ScheduleRun } from '../scheduler/scheduler.js'
+import { isControlCommandText, queuePromptText } from '../commands/commands.js'
+import { AsyncMutex } from './async-mutex.js'
+import { STORE_RETENTION_SCAN_LIMIT, type StoreRetentionCandidate, type StoreRetentionRule } from './retention.js'
+import { DECISION_VERDICT_PENDING_STATES, DECISION_VERDICT_TERMINAL_STATES, sqlStates } from './decision-states.js'
+import {
+  parseSelectedRepositories,
+  selectedRepoIdentity,
+  type SelectedRepository
+} from '../decisions/repo-selection.js'
+import {
+  ClusterSkillLedgerSchema,
+  type ClusterSkillLedger,
+  type ClusterSkillLedgerRecord,
+  type ClusterSkillReconcileAuthority
+} from './cluster-skill-ledger.js'
+import { SqliteAsyncDatabase } from './sqlite-async-database.js'
+import {
+  parseSourceCacheObjectKey,
+  type ParsedSourceCacheObjectKey,
+  type SourceCacheClass,
+  type SourceCacheShape
+} from '../source-cache/keys.js'
+import type { StoreBatchResult, StoreBatchStatement, StoreDatabase, StoreTx } from './store-database.js'
+
+/** Per-tool-row rawInput budget in the mining prompt — enough for a command
+ *  line or path, short enough that N tool rows can't crowd out the store. */
+const DREAM_TOOL_INPUT_CHARS = 300
+
+// node:sqlite binds named params as a generic Record and returns rows as
+// Record<string, SQLOutputValue>; our row interfaces map by column name but have
+// no index signature, so we widen at the DB boundary.
+type SqlParams = Record<string, SQLInputValue>
+
+export type { StoreBatchResult, StoreBatchStatement, StoreDatabase } from './store-database.js'
+
+/** One statement bound to its SQL, over the async seam. A call-site convenience, not a cache:
+ *  `query` is the seam, and statement caching is an adapter's business. */
+export interface StoreStatement {
+  run(...params: unknown[]): Promise<{ changes: number }>
+  get(...params: unknown[]): Promise<unknown>
+  all(...params: unknown[]): Promise<unknown[]>
+}
+
+/** The statement surface every LocalStore method uses: the async seam plus `prepare`. */
+interface StoreAccess extends StoreTx {
+  prepare(sql: string): StoreStatement
+}
+
+/** Bind `prepare` onto a statement runner — the backend itself, or a transaction's pinned tx. */
+function accessOf(tx: StoreTx): StoreAccess {
+  return {
+    exec: (sql) => tx.exec(sql),
+    query: (sql, params) => tx.query(sql, params),
+    batch: (statements) => tx.batch(statements),
+    prepare: (sql) => ({
+      run: async (...params) => ({ changes: (await tx.query(sql, params)).changes }),
+      get: async (...params) => (await tx.query(sql, params)).rows[0],
+      all: async (...params) => (await tx.query(sql, params)).rows
+    })
+  }
+}
+
+/** Abandon a transaction without failing the call: `transaction()` rolls back on a throw, and
+ *  a site whose guard simply did not hold answers its caller instead of propagating. */
+class RollbackSignal extends Error {}
+
+async function rollbackAs<T>(run: Promise<T>, value: T): Promise<T> {
+  try {
+    return await run
+  } catch (error) {
+    if (error instanceof RollbackSignal) return value
+    throw error
+  }
+}
+
+/** The facade every LocalStore method uses: draining the coalescing buffer before each
+ *  statement is what makes it invisible — no read reaches the database without passing here. */
+function drainPendingWritesFirst(backend: StoreDatabase, drain: () => Promise<void>): StoreAccess {
+  const access = accessOf(backend)
+  const drained = <T>(run: () => Promise<T>): Promise<T> => drain().then(run)
+  return {
+    exec: (sql) => drained(() => access.exec(sql)),
+    query: (sql, params) => drained(() => access.query(sql, params)),
+    batch: (statements) => drained(() => access.batch(statements)),
+    prepare: (sql) => {
+      const statement = access.prepare(sql)
+      return {
+        run: (...params) => drained(() => statement.run(...params)),
+        get: (...params) => drained(() => statement.get(...params)),
+        all: (...params) => drained(() => statement.all(...params))
+      }
+    }
+  }
+}
+
+/** One coalesced streaming tool-call write, already fenced: `orgId` was resolved when the
+ *  update was enqueued, from the same agent the unbuffered write would have resolved it from. */
+interface PendingToolWrite {
+  orgId: string
+  channel: string
+  thread: string
+  agentId: string
+  /** The session whose row this updates — the only handle an `append` session's live view has. */
+  sessionKey: string
+  toolCallId: string
+  title: string
+  body: string
+  bytes: number
+}
+
+/** The partition a coalesced write lands in — its notification and revision scope. */
+const threadKeyOf = (write: PendingToolWrite): string => [write.orgId, write.channel, write.thread].join('\0')
+
+/** The buffer slot one tool call owns: latest-wins, one entry per call in flight. Keyed exactly
+ *  as the row is identified, session included — two sessions at one physical thread reusing an
+ *  ACP tool id own two rows, and one slot would collapse their updates onto whichever wrote last. */
+const writeKeyOf = (write: PendingToolWrite): string =>
+  [write.orgId, write.channel, write.thread, write.agentId, write.sessionKey, write.toolCallId].join('\0')
+
+/** How long a streaming tool-call body may sit unwritten. Short enough that a crash loses at
+ *  most this much of an in-flight tool body, long enough to swallow a chunk burst. */
+const TOOL_WRITE_FLUSH_MS = 200
+
+/** Rows the coalescing buffer may hold — one per tool call in flight — before it flushes early. */
+const MAX_PENDING_TOOL_WRITES = 64
+
+/** The bound that actually caps memory: a single body may reach 1 MiB, so counting rows alone
+ *  would let 64 of them buffer far more than this. Reaching it flushes early, same as the count. */
+const MAX_PENDING_TOOL_WRITE_BYTES = 4 * 1024 * 1024
+
+/** The daemon's agent registry, projected to the org that owns one agent. */
+export type OrgForAgent = (agentId: string) => string | undefined
+
+export type LocalStoreSource =
+  string | { database: StoreDatabase; shared?: boolean; ownerId?: string; orgForAgent?: OrgForAgent }
+
+/** Transcript org partition of a store no pool shares: it holds exactly one daemon's
+ *  threads, so it owns one partition forever, the way `cacheOwnerId` owns one. */
+const LOCAL_TRANSCRIPT_ORG = ''
+
+/** How long a shared-store claim survives without renewal. A pool member renews on
+ *  every drain attempt, so a lapsed claim means its owner is gone and a peer may take
+ *  the row over. Local (single-owner) stores never lease. */
+const SHARED_OUTBOX_LEASE_MS = 2 * 60 * 1_000
+
+/** Every column dreamToRow produces must appear here: node:sqlite rejects a bound parameter the
+ *  statement never references. triggerKind/createdAt are immutable in practice but are still
+ *  assigned, so the row shape and the SQL can't drift apart. */
+const DREAM_UPDATE_SET = `status = @status, triggerKind = @triggerKind, sessionIds = @sessionIds,
+  snapshotDigest = @snapshotDigest, executionSessionId = @executionSessionId, runtime = @runtime,
+  model = @model, stopReason = @stopReason, snapshotWrites = @snapshotWrites, instructions = @instructions,
+  skills = @skills, organizationSuggestions = @organizationSuggestions, usage = @usage, error = @error,
+  createdAt = @createdAt, endedAt = @endedAt, ownerId = @ownerId`
+
+/** The `roots` view's narrowing of a session page (webchat-threads.md §6.1): a coordinator's posts in threads stay in their threads. */
+function rootsViewSql(view: 'roots' | undefined): string {
+  return view === 'roots' ? `\n               AND NOT ${THREAD_POST_SQL}` : ''
+}
+
+/** {@link THREAD_RECORD_SQL}'s binds for one session reading one thread. */
+function threadRecordBinds(scope: TranscriptSessionScope, rootId: string): string[] {
+  return [rootId, scope.coordinate, scope.agentId, scope.sessionKey, scope.agentId, rootId, rootId, rootId]
+}
+
+function idScope(column: string, values: readonly string[] | undefined): { sql: string; params: SqlParams } {
+  if (values === undefined) return { sql: '', params: {} }
+  if (values.length === 0) return { sql: ' AND 0 = 1', params: {} }
+  const params = Object.fromEntries(values.map((value, index) => [`scopeId${index}`, value])) as SqlParams
+  return { sql: ` AND ${column} IN (${values.map((_value, index) => `@scopeId${index}`).join(', ')})`, params }
+}
+
+/**
+ * Normalize the timestamp forms stored in transcript rows onto one epoch-microsecond
+ * axis for chronological Slack history reads:
+ *
+ * - Slack text rows: decimal epoch seconds with up to microsecond precision.
+ * - daemon-local activity/replies: integer epoch milliseconds (optionally `local-`).
+ * - hook rows: epoch milliseconds with a deterministic `|delivery-id` suffix.
+ * - legacy/synthetic integer seconds and ISO timestamps.
+ *
+ * Unknown/unsafe values fall back to 0. They remain stable via the `seq` tie-breaker
+ * and sort before real timestamps instead of blocking an in-place store migration.
+ */
+export function transcriptEventTimeUs(ts: string | null | undefined): number {
+  let raw = ts?.trim() ?? ''
+  if (!raw) return 0
+  const local = raw.startsWith('local-')
+  if (local) raw = raw.slice('local-'.length)
+  raw = raw.split('|', 1)[0] ?? ''
+
+  const decimal = /^(\d+)\.(\d+)$/.exec(raw)
+  if (decimal) {
+    const seconds = BigInt(decimal[1]!)
+    const micros = BigInt(decimal[2]!.slice(0, 6).padEnd(6, '0'))
+    return safeEventTimeUs(seconds * 1_000_000n + micros)
+  }
+
+  if (/^\d+$/.test(raw)) {
+    const value = BigInt(raw)
+    // Match the console parser: 10-digit-era values are epoch seconds; modern
+    // 13-digit values (and every explicit `local-` value) are epoch milliseconds.
+    const micros = local || value >= 10_000_000_000n ? value * 1_000n : value * 1_000_000n
+    return safeEventTimeUs(micros)
+  }
+
+  const parsed = Date.parse(raw)
+  return Number.isFinite(parsed) && Number.isSafeInteger(parsed * 1_000) ? parsed * 1_000 : 0
+}
+
+function safeEventTimeUs(value: bigint): number {
+  return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : 0
+}
+
+export interface SessionRecord {
+  key: string
+  agentId: string
+  platform: string
+  channel: string
+  thread: string
+  /** Identity boundary for transcript/session isolation: a physical chat account or a code-host repository. */
+  transportScope?: string | null
+  /** What the RUNTIME knows this session by, used on the ACP hop alone (§1.1). Null until it exists. */
+  acpSessionId: string | null
+  // The Decision-selected model (including a fallback), pinned for this logical session.
+  decisionModel?: string | null
+  /** The session's OUTWARD identity (§1.1), minted when the slot resolves — so it exists before
+   *  the runtime does. Null only on a pre-v12 row that had no ACP id to backfill from. */
+  sessionId?: string | null
+  // §7.3 session lifecycle. `prompting` ⇒ a turn is in flight; `cancelling` ⇒
+  // a `!stop` was issued and we're awaiting the agent (with a force backstop);
+  // `resuming` ⇒ re-attaching a persisted session after a restart/host eviction;
+  // `closed` ⇒ TTL-expired (no activity past agentIdleTimeoutMs).
+  state: 'idle' | 'prompting' | 'cancelling' | 'resuming' | 'closed'
+  lastDeliveredTs: string | null
+  updatedAt: number
+  // `!stop` thread mute: 1 ⇒ implicit routing (thread affinity / keyword / auto)
+  // must not auto-dispatch this session's thread to the agent; only an explicit
+  // @mention clears it. SQLite boolean (0/1); NULL on legacy rows.
+  muted?: number | null
+  // First message sender's platform ID, first-wins; display names are resolved separately.
+  triggeredBy?: string | null
+  /** JSON initiator snapshot pinned when this logical session is created, inherited by delegated work. */
+  initiator?: string | null
+  // Human-facing session title: the ingress title (or the first-message fallback) the
+  // session is born with, then whatever the runtime pushes (ACP `session_info_update`).
+  title?: string | null
+  // Platform-native link to the source message/thread. First non-null wins so
+  // later messages in the same logical session cannot move the title link.
+  threadUrl?: string | null
+  // Slack-only chrome: the current in-thread status-bar message ts. One per session
+  // so later turns edit the same status line instead of posting duplicates.
+  statusBarTs?: string | null
+  memoryProvider?: 'none' | 'native' | 'managed' | 'external' | null
+  /** Workspace choice pinned when the logical session is created. A manual
+   * Playground override is therefore session-local and survives daemon restarts. */
+  workspaceIsolation?: 'shared' | 'session' | null
+  conversationKind?: 'dm' | 'group_dm' | 'channel' | null
+  // Immutable trusted source binding for supported shared input. These fields
+  // are metadata only and are echoed on every event/session milestone.
+  externalProvider?: string | null
+  externalRealmKey?: string | null
+  externalResourceKind?: string | null
+  externalResourceKey?: string | null
+  externalIntegrationId?: string | null
+  /** Provider-specific proof retained only so a later event/session retry can
+   * re-present the exact direct origin to the CP. */
+  externalOriginJson?: string | null
+  // Null is legacy/unknown. New rows pin either an external shared input or a
+  // non-external origin so a later turn cannot silently change audiences.
+  sourceBindingKind?: 'local' | 'external' | null
+  /** 1 when this session's coordinates are its own conversation, so a parent link is
+   *  lineage only and the CP must not inherit the parent's audience (§4.2). */
+  directDestination?: number | null
+  // The session that created this one, written once with the row; a record only, never read for replies (send-message-guide.md §9.6).
+  originSessionId?: string | null
+  /** The first parent link's output snapshot; JSON null records an explicitly private return route. */
+  originCodeHostReplyTarget?: string | null
+  // Outcome of the LAST completed turn of this session: 'done' when the turn ended cleanly,
+  // 'failed' when it ended in a problem phase (agent start failure, ACP/prompt rejection, loop
+  // protection). NULL until the session has completed a turn. `state` still decides whether a
+  // turn is in flight; this only distinguishes a finished-well from a finished-badly session —
+  // it is what `viewSessionStatus` reports as `failed`.
+  lastTurnOutcome?: 'done' | 'failed' | null
+  // Pre-message-id sticky reply request, read only by the v52 migration and status; obligations are per message now (§9.5).
+  needsParentReply?: number | null
+  // The platform module's standing block (`NormalizedMessage.standingContext`), persisted with the
+  // logical session (first-wins) so a cold resume or a continuation that reconstructs its message
+  // without the bag still re-asserts it. NULL on rows from before it existed and on platforms without one.
+  platformStanding?: string | null
+  // Birth verdict (session-executors.md §7), written by `setSessionExecutor`: the executing daemon, or why the session stayed with its holder.
+  executorDaemonId?: string | null
+  stayedHomeReason?: SessionStayedHomeReason | null
+  // 1 once the runtime was handed an on-demand clone directory (multi-repository-workspaces.md decision 20), written by `markSessionOnDemandClones`, so retention judges it whatever the agent's rows say later.
+  onDemandClones?: number | null
+  // The strategy the session was born with (§5); null on a verdict from before it was recorded.
+  birthStrategy?: string | null
+  // The repositories the selector chose for this session (multi-repository-workspaces.md decision 19), a JSON array pinned once by `pinSelectedRepos`; null until then and on a session born before the selector.
+  selectedRepos?: string | null
+  // The latest turn's delivery target, independent of the session's stable coordinates.
+  replyChannel?: string | null
+  replyThread?: string | null
+  // A digest of the standing context its model last received (session-concept.md §2.3), written by `setSessionStandingDigest`; null on a session from before it was recorded.
+  standingDigest?: string | null
+  // The digests of the tool definitions its model last received, a JSON object written by `setSessionToolDigests`; null on a session from before it was recorded.
+  toolDigests?: string | null
+  // When the retention sweep last kept this expired session, and when it may judge it again; written by `markSessionRetentionKept`.
+  retentionKeptAt?: number | null
+  retentionRecheckAt?: number | null
+  // When retention reclaimed its workspace and sandbox while keeping the row; written by `markSessionWorkspaceReclaimed`.
+  workspaceReclaimedAt?: number | null
+}
+
+/** A session's birth verdict (session-executors.md §5, §7): where it executes or why it stayed home, and the strategy it was born with. */
+export type SessionExecutorVerdict = ({ executorDaemonId: string } | { stayedHomeReason: SessionStayedHomeReason }) & {
+  birthStrategy?: string
+}
+
+export type PermissionRequestStatus = 'pending' | 'allowed' | 'denied' | 'expired'
+
+/** Secret-masked editor approval metadata. The live ACP resolver stays in memory;
+ * this bounded daemon-local row only powers the Agent page request history. */
+export interface PermissionRequestRecord {
+  id: string
+  agentId: string
+  sessionId: string
+  createdAt: number
+  requesterId: string | null
+  requesterName: string | null
+  command: string
+  status: PermissionRequestStatus
+  resolvedAt: number | null
+  // Who decided (slack-approval-dm.md §6.1): `user:<id>` / `slack:<teamId>:<userId>`.
+  resolvedBy?: string | null
+  resolvedByName?: string | null
+  /** A join confirmation's channel and call, as JSON (#2979); null for any other request. */
+  joinAsk?: string | null
+}
+
+/** A pending approval's posted DM card — the §5.4 handle an orphan rewrite needs. */
+export interface PermissionNoticeRow {
+  id: string
+  agentId: string
+  /** The runtime session it was asked in. */
+  sessionId: string
+  status: PermissionRequestStatus
+  command: string
+  resolvedByName: string | null
+  notifyChannel: string
+  notifyTs: string
+  joinAsk: string | null
+}
+
+/** A settled request whose neutral notice in its conversation was never rewritten (assistant-mode.md §5.6). */
+export interface SubsessionNoticeRow {
+  id: string
+  agentId: string
+  /** The sub-session's ACP session id. */
+  sessionId: string
+  status: PermissionRequestStatus
+  noticeChannel: string
+  noticeTs: string
+  /** `turn` for the turn's own editor-path notice; null for a sub-session's. */
+  noticeKind: 'turn' | null
+}
+
+/**
+ * Per-session token accounting, folded from the agent's ACP usage stream (mirrors
+ * the protocol `SessionUsage`). Token counts are cumulative across turns; context
+ * and cost are the latest snapshot. Persisted as JSON in `sessions.usage`.
+ */
+export interface StoredUsage {
+  totalTokens?: number
+  inputTokens?: number
+  outputTokens?: number
+  thoughtTokens?: number
+  cachedReadTokens?: number
+  cachedWriteTokens?: number
+  contextUsed?: number
+  contextSize?: number
+  costAmount?: number
+  costCurrency?: string
+}
+
+/** The token counts from `PromptResponse.usage`. Adapter semantics differ: most
+ *  runtimes report a session snapshot, while codex-acp currently reports a turn delta. */
+export type TokenCounts = Pick<
+  StoredUsage,
+  'totalTokens' | 'inputTokens' | 'outputTokens' | 'thoughtTokens' | 'cachedReadTokens' | 'cachedWriteTokens'
+>
+
+/** Context-window + cost snapshot (from a `usage_update`), latest-wins. */
+export type UsageSnapshot = Pick<StoredUsage, 'contextUsed' | 'contextSize' | 'costAmount' | 'costCurrency'>
+
+/** `{}` for an unrecorded or unreadable blob — an unparseable one is not worth failing a turn over. */
+function parseUsage(raw: string | null): StoredUsage {
+  if (!raw) return {}
+  try {
+    return JSON.parse(raw) as StoredUsage
+  } catch {
+    return {}
+  }
+}
+
+/** CAS attempts before the usage merge writes blind. One session has one writer plus, at most, a
+ *  handover peer, so losing four in a row means something other than contention is going on. */
+const USAGE_MERGE_ATTEMPTS = 5
+
+/** A session row as read back for `session/list`, carrying the raw usage JSON. */
+export interface SessionListRow extends SessionRecord {
+  usage: string | null
+}
+
+/**
+ * What an entry captures:
+ *  - `text`      — a conversational message (human inbound, or an agent reply/result
+ *                  posted to the platform). Carries the platform message `ts`, and is
+ *                  the ONLY kind replayed as cross-agent context (§8.5).
+ *  - `tool`      — an agent tool invocation (label). Audit/UI only.
+ *  - `reasoning` — an agent's coalesced thinking block. Audit/UI only.
+ *  - `plan`      — the turn's task list (one upserted row, `Plan · n/m` label). Audit/UI only.
+ *  - `elicit`    — the agent's structured question and how it ended (one upserted row, the
+ *                  `ElicitBody` in `body`). Audit/UI only, and deliberately so: the runtime
+ *                  already received the answer as the ACP response, so re-feeding the card as
+ *                  conversation on catch-up would ask it again (#1794).
+ *  - `app`       — one MCP App card minus its template and how it ended (one upserted row, the
+ *                  `McpAppBody` in `body`). Audit/UI only, for the same reason `elicit` is.
+ * Every one of these is recorded for EVERY turn regardless of the agent's Slack output mode —
+ * output mode only gates what reaches the platform, never the transcript.
+ * Only `text` and `tool` rows ever rebuild model context; the rest are read-only history.
+ */
+export type TranscriptKind = 'text' | 'tool' | 'reasoning' | 'plan' | 'elicit' | 'app' | 'capability' | 'fill'
+
+/** One elicitation card's row identity in the shared `tool_call_id` column, namespaced so it
+ *  cannot be an ACP tool id. Keyed by the card's minted `ts`, not its request id: request ids
+ *  restart with the daemon, and a reused one would rewrite an older card's row. */
+function elicitRowId(ts: string): string {
+  return `elicit:${ts}`
+}
+
+/** The same trick for an MCP App card's row, keyed by the card's own `appId` — a fresh uuid per
+ *  card, never reused across restarts, and the one name a reloaded view knows itself by. Keying
+ *  on it is what lets the daemon find a card's record from an RPC that carries nothing else. */
+function appRowId(appId: string): string {
+  return `app:${appId}`
+}
+
+/** A webchat capability card's row, keyed by its request (capability-requests.md §4.4.2): one per request in a conversation. */
+function capabilityRowId(requestId: string): string {
+  return `capability:${requestId}`
+}
+
+/** A Fill card's row (computer-form-fill-and-vault.md §6), keyed by its request: descriptors and an outcome, never a value. */
+function fillRowId(requestId: string): string {
+  return `fill:${requestId}`
+}
+
+/** A card row keyed by its request: where it sits, who wrote it, and what it shows. */
+export interface KeyedCardRow {
+  channel: string
+  thread: string
+  ts: string
+  sender: string
+  requestId: string
+  text: string
+  body: string
+  admission: TranscriptAdmission
+}
+
+/** The session a row is admitted into (message-intake.md §4.2). Absent ⇒ the row is an observation. */
+export interface TranscriptAdmission {
+  agentId: string
+  /** The LOCAL `sessions.key` — `sessionKey(platform, channel, coordinate, agentId, transportScope)`. */
+  sessionKey: string
+}
+
+export interface TranscriptEntry {
+  channel: string
+  /** The PHYSICAL platform thread, never a session coordinate; absent ⇒ unknown (§4.1). */
+  thread?: string
+  /** The session that took this row in; its absence makes the row an observation (§4.2). */
+  admission?: TranscriptAdmission
+  // Platform message ts for `text`; a daemon wall-clock stamp for internal events
+  // (`tool`/`reasoning`). Slack console history normalizes both forms onto eventTimeUs;
+  // prompt replay still compares the original platform `ts`.
+  ts: string
+  sender: string
+  /** Canonical webchat post id (merged-conversation-view.md §6): minted once at
+   *  origin, identical on every participant's copy regardless of a
+   *  collision-bumped `ts`. Text rows only; absent everywhere else. */
+  postId?: string
+  /** Provider-authoritative event time (epoch µs) for the normalized
+   *  chronological axis — platforms whose message ids carry no time
+   *  (Telegram/Feishu) supply it from the message's own send time. Computed
+   *  from `ts` when absent. */
+  eventTimeUs?: number
+  /** True only when the daemon verified that this Slack history row came from an
+   *  AgentConnect-managed bot identity. Legacy rows and all other platforms omit it. */
+  trustedAgentBot?: boolean
+  /** This arrival carries the message's FINAL text and may overwrite an earlier row on
+   *  the same coordinates.
+   *
+   *  A streamed reply is posted before it is finished, so the post that lands first can
+   *  hold a prefix; the closing edit is the same Slack message (same `ts`, so the same
+   *  row) and is the authoritative version. Without this the plain INSERT OR IGNORE would
+   *  keep the prefix forever, since a text row has no other update path. */
+  authoritative?: boolean
+  kind: TranscriptKind
+  text: string
+  /** JSON `UserTurnBody` on a text row — the model prompt when it differs from `text`, plus the
+   *  platform facts the console formats. Tool and plan rows write their own bodies elsewhere. */
+  body?: string | null
+  /** Bounded inline webchat images. Persisted daemon-side; never provider-backed files. */
+  attachments?: SessionImageAttachment[]
+  /** A published shared image (webchat-generated-images.md §6): preview + original descriptor, never model input. */
+  sharedImage?: SharedImage
+  /** Bounded provider-supplied reply source used only when rebuilding model context.
+   *  It is stored beside the conversational row but never exposed as transcript text. */
+  quoted?: QuotedMessage
+  /** Durable SQLite representation populated on reads. Callers should normally write
+   *  `quoted`; retaining this field on read-back entries makes replay/reconciliation
+   *  preserve the sidecar without adding it to the user-visible message contract. */
+  quoteJson?: string | null
+  /** First-delivery provenance only; `admission` is the authority on who may see the row. */
+  recipient?: string
+  /** Names the org that owns this row when neither `sender` nor `recipient` is an agent —
+   *  an inbound observed before routing picks one. Attribution only: never a column, and
+   *  never a delivery, so it cannot widen any agent's scoped view. */
+  orgAgentId?: string
+}
+
+/** A transcript row as read back (raw `SELECT *`), including its insertion-order sequence.
+ *  `thread` reads back NULL on a row the v24 migration rewrote from an `append:*` coordinate. */
+export interface TranscriptRow extends Omit<TranscriptEntry, 'thread'> {
+  thread: string | null
+  seq: number
+  /** Monotonic mutation watermark; changes when a stable row is updated in place. */
+  revision: number
+  /** Normalized epoch microseconds used by chronological Slack history pagination. */
+  eventTimeUs: number
+  tool_call_id?: string | null // the one snake_case column; readers never alias it. NULL off tool rows
+  attachmentsJson?: string | null // JSON.stringify(SessionImageAttachment[]); inline webchat only
+  sharedImageJson?: string | null // JSON.stringify(SharedImage); shared-image rows only
+  handedTo?: string | null // the thread a webchat root was handed into, where it reads as a reply (webchat-threads.md §5.1)
+}
+
+/** A row's shared image, or undefined when absent or unreadable — a corrupt sidecar never breaks a page. */
+export function parseSharedImageJson(raw: string | null | undefined): SharedImage | undefined {
+  if (!raw) return undefined
+  try {
+    const parsed = SharedImageSchema.safeParse(JSON.parse(raw))
+    return parsed.success ? parsed.data : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The text the model reads for a transcript row: the persisted prompt behind a text row when it
+ *  carries one, else the row's own text. Fail-closed like the quote sidecar — a malformed body
+ *  from an older schema or a corrupt store must never turn arbitrary JSON into prompt context. */
+export function transcriptPromptText(entry: Pick<TranscriptEntry, 'kind' | 'text' | 'body'>): string {
+  // A persisted prompt is already stripped — the turn was dispatched with the stripped payload.
+  if (entry.kind !== 'text' || !entry.body) return queuePromptText(entry.text)
+  try {
+    const parsed: unknown = JSON.parse(entry.body)
+    const body = UserTurnBody.safeParse(parsed)
+    const prompt = (parsed as { prompt?: unknown } | null)?.prompt
+    const text = typeof prompt === 'string' ? prompt : queuePromptText(entry.text)
+    const uploads = body.success
+      ? body.data.uploads?.map((file) => `Uploaded file: ${file.name}; uploadId=${file.uploadId}`)
+      : undefined
+    return uploads?.length ? `${text}\n${uploads.join('\n')}` : text
+  } catch {
+    // fall through — the row's text stands
+  }
+  return queuePromptText(entry.text)
+}
+
+/** Decode daemon-private quote metadata fail-closed. Local DB corruption or a row from
+ * an older schema must never turn arbitrary JSON into prompt context. */
+export function transcriptQuoted(entry: Pick<TranscriptEntry, 'quoted' | 'quoteJson'>): QuotedMessage | undefined {
+  if (entry.quoted?.text) return entry.quoted
+  if (!entry.quoteJson) return undefined
+  try {
+    const parsed = QuotedMessageSchema.safeParse(JSON.parse(entry.quoteJson))
+    return parsed.success && parsed.data.text ? parsed.data : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export interface TranscriptEventCursor {
+  eventTimeUs: number
+  seq: number
+}
+
+export interface TranscriptMutation {
+  channel: string
+  thread: string
+  agentIds: string[]
+  /** Session keys the mutation was admitted into — the only handle an `append` session has. */
+  sessionKeys: string[]
+  revision: number
+}
+
+/** One session's transcript read scope: the org partition, the conversation, the session's own
+ *  coordinate, its key, and the agent whose visibility applies. */
+export interface TranscriptSessionScope {
+  transcriptChannel: string
+  /** The session coordinate (`sessions.thread`) — a physical thread, or an `append:*` coordinate. */
+  coordinate: string
+  /** `sessions.key`. */
+  sessionKey: string
+  agentId: string
+  /** CP-supplied partition for a BFF read; omitted ⇒ resolved from `agentId`. */
+  orgId?: string
+}
+
+/** What the CP classifies a session's visibility from (session-visibility.md §4.1). */
+export interface SessionClassification {
+  conversationKind?: string
+  tenantScope?: string
+  launchCorrelationId?: string
+  externalProvider?: string
+  externalRealmKey?: string
+  externalResourceKind?: string
+  externalResourceKey?: string
+  externalIntegrationId?: string
+  externalOrigin?: ExternalSessionOrigin
+  sourceBindingKind?: 'local' | 'external'
+  directDestination?: boolean
+}
+
+const CLASSIFICATION_SELECT = `SELECT conversationKind, tenantScope, launchCorrelationId,
+                externalProvider, externalRealmKey, externalResourceKind,
+                externalResourceKey, externalIntegrationId, externalOriginJson,
+                sourceBindingKind, directDestination`
+
+export function sessionKey(
+  platform: string,
+  channel: string,
+  thread: string,
+  agentId: string,
+  transportScope?: string | null
+): string {
+  const base = `${platform}:${channel}:${thread}:${agentId}`
+  return transportScope ? `${base}:${transportScope}` : base
+}
+
+/** Internal transcript namespace. Platform-visible coordinates remain raw on the
+ * session row and wire; only local transcript storage uses the physical-bot scope. */
+export function transcriptChannelKey(channel: string, transportScope?: string | null): string {
+  return transportScope ? `${channel}\u001f${transportScope}` : channel
+}
+
+/** The U+001F that {@link transcriptChannelKey} joins a channel to its physical-bot scope with. */
+export const TRANSCRIPT_SCOPE_SEPARATOR = '\u001f'
+
+// One session's rows, binding (coordinate, sessionKey); the thread disjunct stays for mid-turn refresh (message-intake.md §3), and backgroundSeqsForAdmission excludes exactly its rows.
+const SESSION_ROW_SCOPE_SQL = `(transcript.thread = ? OR EXISTS (
+        SELECT 1 FROM transcript_recipient tr_s
+        WHERE tr_s.seq = transcript.seq AND tr_s.sessionKey = ?))`
+
+// Whether one AGENT may see a row (§4.2): it sent it or admitted it; `recipient` is provenance only and the join on `seq` needs no kind guard. Binds (agentId, agentId).
+const AGENT_DELIVERY_SCOPE_SQL = `(sender = ? OR EXISTS (
+        SELECT 1 FROM transcript_recipient tr_a
+        WHERE tr_a.seq = transcript.seq AND tr_a.agentId = ?))`
+
+// isCaptureExcluded's verdict says open for the `sessions` row in scope: the CP-confirmed bit wins, then the local verdict; no gate row ⇒ excluded.
+const CAPTURE_OPEN_SQL = `COALESCE((
+        SELECT COALESCE(g.cpPrivate, g.localExcluded) FROM session_gates g
+        WHERE g.agentId = sessions.agentId AND g.sessionKey = sessions.key), 1) = 0`
+
+/** Retention floor (§8 rule 2): an unadmitted row survives while it is above the Nth-newest text
+ *  row. Deliberately separate from §9's read window, which happens to share the number today. */
+export const OBSERVATION_FLOOR_TEXT_ROWS = 100
+
+export { DECISION_VERDICT_PENDING_STATES, DECISION_VERDICT_TERMINAL_STATES }
+const PENDING_VERDICT_SQL = sqlStates(DECISION_VERDICT_PENDING_STATES)
+const TERMINAL_VERDICT_SQL = sqlStates(DECISION_VERDICT_TERMINAL_STATES)
+
+/** §8 rule 2's third clause: only the candidate row needs pinning, since its history is frozen into inputJson. */
+export const RETAINED_BY_PENDING_VERDICT_SQL = `SELECT 1 FROM decision_verdict v WHERE v.seq = transcript.seq AND v.state IN ${PENDING_VERDICT_SQL}`
+
+/** The threads of one conversation that keep their observations (webchat-threads.md §5.5): named by a root row and holding an admitted row. Binds (orgId, channel) twice. */
+const THREADS_AGENTS_TOOK_PART_IN_SQL = `SELECT t.thread FROM transcript t
+      JOIN transcript_recipient tr ON tr.seq = t.seq
+     WHERE t.orgId = ? AND t.channel = ?
+    INTERSECT
+    SELECT r.thread FROM transcript r
+     WHERE r.orgId = ? AND r.channel = ? AND r.kind = 'text' AND (r.ts = r.thread OR r.postId = r.thread)`
+
+// A coordinator's own post in a thread (`UserTurnBody.threadPost`): a message of the thread, not output of its turn (webchat-threads.md §6).
+const THREAD_POST_SQL = `(transcript.kind = 'text' AND COALESCE(transcript.body, '') LIKE '%"threadPost":true%')`
+
+// A row of the reading session's own turns in a thread other than its coordinate, which its page shows instead (§6.1). Binds (coordinate, agentId, sessionKey).
+const OWN_TURN_IN_THREAD_SQL = `(transcript.thread <> ? AND transcript.sender = ?
+        AND EXISTS (SELECT 1 FROM transcript_recipient tr_o WHERE tr_o.seq = transcript.seq AND tr_o.sessionKey = ?)
+        AND NOT ${THREAD_POST_SQL})`
+
+// One thread's record as a session reads it (§8): its root, its rows but the session's own turns and peers' work rows, and the roots handed into it. Binds (root, coordinate, agentId, sessionKey, agentId, root, root, root).
+const THREAD_RECORD_SQL = `((transcript.thread = ? AND NOT ${OWN_TURN_IN_THREAD_SQL} AND (transcript.kind = 'text' OR transcript.sender = ?))
+        OR (transcript.kind = 'text' AND (transcript.ts = ? OR transcript.postId = ?))
+        OR (transcript.kind = 'text' AND transcript.handedTo = ?))`
+
+// The thread a row reads in: the one a root was handed into (webchat-threads.md §5.1), else its own.
+const READ_THREAD_SQL = 'COALESCE(transcript.handedTo, transcript.thread)'
+
+/** A recorded root row as the thread reads see it: the ids it may be named by and its own thread. */
+export interface ThreadRootRow {
+  seq: number
+  ts: string | null
+  postId: string | null
+  thread: string | null
+  sender: string
+  text: string
+}
+
+/** One thread's reply aggregate for its summary (webchat-threads.md §5.3); senders newest first. */
+export interface ThreadReplyStats {
+  replies: number
+  lastEventTimeUs: number | null
+  latest?: { sender: string; text: string }
+  participants: string[]
+}
+
+/** Verdict bodies outlive their terminal transition this long, or until 20 newer terminal verdicts exist. */
+export const DECISION_BODY_RETENTION_MS = 24 * 3_600_000
+export const DECISION_BODY_RETAINED_VERDICTS = 20
+
+export interface DecisionModelEvaluationRow {
+  seq: number
+  summaryJson: string
+  detailJson: string | null
+  bodiesStrippedAt: number | null
+}
+
+export type DecisionApiGateEvaluationRow = DecisionModelEvaluationRow
+export type CoordinatorFilterEvaluationRow = DecisionModelEvaluationRow
+
+/** The step-1 row a delivery was recorded at (message-intake.md §3): the verdict's position. */
+export interface ChannelRecordRef {
+  seq: number
+  orgId: string
+  transcriptChannel: string
+  thread: string | null
+}
+
+export type DecisionVerdictState =
+  (typeof DECISION_VERDICT_PENDING_STATES)[number] | (typeof DECISION_VERDICT_TERMINAL_STATES)[number]
+
+/** One `decision_verdict` row (message-intake.md §4.3). */
+export interface DecisionVerdictRow {
+  seq: number
+  subject: string
+  orgId: string
+  channel: string
+  agentId: string
+  integrationId: string
+  decisionId: string
+  state: DecisionVerdictState
+  disposition: 'match' | 'skip' | 'unavailable' | null
+  unavailableReason: string | null
+  cancelReason: string | null
+  configJson: string
+  inputJson: string | null
+  answerJson: string | null
+  deliveryJson: string | null
+  suppliedSeqsJson: string | null
+  /** A router verdict's frozen target set with each target's disposition; null for a gate. */
+  targetsJson: string | null
+  requestedModel: string
+  actualModel: string | null
+  latencyMs: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  deadlineAt: number
+  ownerFence: string
+  createdAt: number
+  settledAt: number | null
+  finishedAt: number | null
+  bodiesStrippedAt: number | null
+}
+
+export type DecisionVerdictReservation = Pick<
+  DecisionVerdictRow,
+  | 'seq'
+  | 'subject'
+  | 'orgId'
+  | 'channel'
+  | 'agentId'
+  | 'integrationId'
+  | 'decisionId'
+  | 'configJson'
+  | 'deliveryJson'
+  | 'requestedModel'
+  | 'deadlineAt'
+  | 'ownerFence'
+  | 'createdAt'
+>
+
+/** How a verdict settled; `skip` is terminal at once, `match`/`unavailable` wait for release. */
+export interface DecisionSettlement {
+  disposition: 'match' | 'skip' | 'unavailable'
+  unavailableReason?: string
+  answerJson?: string
+  actualModel?: string
+  latencyMs?: number
+  inputTokens?: number
+  outputTokens?: number
+  /** A router's frozen target set, written in the same CAS as the answer and usage. */
+  targetsJson?: string
+  settledAt: number
+}
+
+/** One pending → terminal move of a router target (message-intake.md §4.3). */
+export interface RouterTargetUpdate {
+  agentId: string
+  disposition: 'pending' | 'admitted' | 'rejected' | 'unavailable'
+  reason?: string
+  backgroundSeqs?: number[]
+  retryUntil?: number
+  attempts?: number
+  daemonId?: string | null
+}
+
+/** Which consumer's rows a pending-verdict query reads: gate subjects are agent ids, router subjects `router:<botId>`; `hook-router:` rows are neither. */
+export type DecisionConsumer = 'gate' | 'router'
+const ROUTER_SUBJECT_LIKE = "subject LIKE 'router:%'"
+const GATE_SUBJECT_LIKE = "subject NOT LIKE 'router:%' AND subject NOT LIKE 'hook-router:%'"
+
+/** A text row as a Decision state or a background block reads it. */
+export type ChannelTextRow = Pick<
+  TranscriptRow,
+  'seq' | 'thread' | 'ts' | 'sender' | 'text' | 'body' | 'quoteJson' | 'eventTimeUs' | 'kind'
+>
+
+/** How many inserts into one conversation arm an observation sweep for it. */
+export const OBSERVATION_SWEEP_INSERTS = 32
+
+/**
+ * A durably-persisted admitted-but-not-yet-completed inbox message (§6.9 #353). Holds the
+ * bits needed to reconstruct a QueueEntry's DispatchContext on replay — everything EXCEPT
+ * the live `resolve`/`reject` (freshly minted by the replay `dispatch()`) and the webchat
+ * `sink` (non-persistable; webchat turns are never written here). `msg`/`callMeta` are JSON.
+ */
+export interface InboxRow {
+  /** Stable deliveryId/msgId (§6.3) — the row PK, idempotent against re-append/replay. */
+  id: string
+  sessionKey: string
+  agentId: string
+  /** JSON.stringify(NormalizedMessage). */
+  msg: string
+  integrationId?: string | null
+  /** JSON.stringify(CallMeta), or null for non-agent-call turns. */
+  callMeta?: string | null
+  /** JSON.stringify(HookDispatchContext), or null for ordinary turns. This is
+   * daemon-private trusted metadata; prompt excerpts remain in `msg`. */
+  hookContext?: string | null
+  /** The admitted turn's code-host output target, independent of hook lifecycle state. */
+  codeHostReplyTarget?: string | null
+  /** Single-attempt GitHub final-poster state, durable across daemon restart. */
+  posterPublishState?: 'not_started' | 'in_flight' | 'settled' | null
+  /** A redacted, metadata-only HookReport retained as the durable dedup receipt
+   * after the model turn finishes. Completed hook rows are never replayed. */
+  terminalReport?: string | null
+  /** Daemon entitled to emit the retained report — the dispatch the CP will accept
+   *  it from. NULL on a local store and on rows written before pool ownership. */
+  reportOwnerId?: string | null
+  /** Epoch (ms) the owner last renewed its claim; a lapsed claim is takeable. */
+  reportClaimedAt?: number | null
+  completedAt?: number | null
+  isQueueCmd?: number | null
+  /** 1 once this delivery no longer needs replay accounting (charged when applicable).
+   *  Legacy rows migrate as 0 and are upgraded on their first successful admission. */
+  loopGuardCounted?: number | null
+  /** Monotonic decimal string — FIFO order within a sessionKey. */
+  enqueuedAt: string
+}
+
+/** How long a terminal (admitted / transcript-only) rendezvous record is retained past
+ *  its expiry before being swept. Long enough that a late retry still reads back its
+ *  `childSessionId` instead of opening a second session, short enough that a busy
+ *  channel's table stays bounded. */
+
+/** One activation rendezvous record (send-message-routing-rework.md §8.6): only the wake's `callEnvelope` admits, so a platform-first record stays `pending`. */
+export interface ActivationRecord {
+  /** `platform + transportScope + platformMessageId + targetAgentId` — one logical
+   *  delivery to one target. Including the target is what lets a single visible post
+   *  addressing several agents admit each of them exactly once. */
+  activationKey: string
+  /** Daemon-minted pairing id from the visible half of a `toAgent + channel` send. */
+  agentCallDeliveryId?: string | null
+  /** The provider-authenticated visible observation, once seen. */
+  platformMessageId?: string | null
+  /** Transcript coordinates the visible observation was recorded at, so the later half
+   *  reconciles onto the SAME row instead of duplicating the hand-off. */
+  transcriptCoordinates?: string | null
+  /** JSON.stringify of the trusted call envelope (the internal wake's payload). Absent
+   *  until the authoritative half arrives; its presence is the admission precondition. */
+  callEnvelope?: string | null
+  /** `pending` — claimed, not dispatched. `admitted` — dispatched exactly once; retries
+   *  read back `childSessionId` rather than dispatching again. `transcript-only` — the
+   *  terminal state of a pairing whose envelope never arrived (§3.2): recorded and
+   *  reported as a delivery failure, never downgraded into an envelope-less child. */
+  state: 'pending' | 'admitted' | 'transcript-only'
+  childSessionId?: string | null
+  expiresAt: number
+}
+
+/** Durable conversation-wide loop guard. A non-null `trippedAt` is a latched
+ *  circuit: daemon restart must not silently re-open it. The two counters let the
+ *  daemon use a lower threshold for turns that did not originate from a verified
+ *  human while retaining a high, last-resort cap for every admission. */
+export interface LoopGuardRow {
+  scopeKey: string
+  windowStartedAt: number
+  totalCount: number
+  automaticWindowStartedAt: number
+  automaticCount: number
+  trippedAt?: number | null
+  reason?: string | null
+}
+
+export interface LoopGuardVerdict {
+  allowed: boolean
+  trippedNow: boolean
+  totalCount: number
+  automaticCount: number
+  reason?: string
+}
+
+/** One retention-GC receipt (#485) owed to the CP: this daemon deleted the
+ *  session's local content and the CP has not yet acknowledged the report. */
+export interface SessionPurgeRow {
+  agentId: string
+  /** The ACP session id — the only session identity the CP knows. */
+  sessionId: string
+  reason: string
+  purgedAt: number
+}
+
+/** One CP cron run's unacknowledged terminal outcome; `report` is the JSON `cron/report` payload. */
+export interface CronReportOutboxRow {
+  agentId: string
+  cronId: string
+  firedAt: string
+  report: string
+}
+
+/** One latest-wins session metadata snapshot awaiting the CP's commit ACK. */
+export interface SessionMetadataOutboxRow {
+  agentId: string
+  sessionId: string
+  revision: number
+  snapshot: string
+  queuedAt: number
+  failedAttempts: number
+  nextAttemptAt: number | null
+}
+
+/**
+ * One daemon-local external-memory capture. The conversation body never leaves
+ * this table except through the selected plugin data plane; CP frames and logs
+ * carry only metadata/facts. `operationId` is stable across restart/retry.
+ */
+export interface MemoryCaptureOutboxRow {
+  operationId: string
+  turnId: string
+  agentId: string
+  connectionId: string
+  /** Fences an old turn from a replacement backend/config at the same id. */
+  connectionRevision: number
+  pluginId: string
+  manifestDigest?: string | null
+  /** Non-secret connection config captured with the turn. */
+  config: string
+  scopeKey: string
+  sessionId?: string | null
+  input: string
+  output: string
+  /** Hash of the unredacted semantic payload, retained for body-free dedup. */
+  payloadHash: string
+  payloadBytes: number
+  idempotency: 'operation-id' | 'none'
+  state: 'pending' | 'sending' | 'accepted' | 'completed' | 'failed' | 'ambiguous'
+  attempts: number
+  backendOperationId?: string | null
+  reasonCode?: string | null
+  nextAttemptAt: number
+  createdAt: number
+  updatedAt: number
+}
+
+export interface MemoryCaptureOutboxStats {
+  activeCount: number
+  activeBytes: number
+  oldestActiveAt?: number
+}
+
+/** Durable, non-secret record of a CP remote webchat MCP grant authority held by
+ *  this daemon (no token material). `active` tracks a live descriptor; `revoking`
+ *  rows form a revocation outbox: a `webchat/mcp-grant/revoke` that could not
+ *  reach the CP must survive reconnects and restarts rather than leaving a
+ *  remotely usable credential to age out on its own. */
+export interface WebchatMcpGrantLedgerRow {
+  conversationId: string
+  agentId: string
+  authorityId: string
+  authorityGeneration: number
+  state: 'active' | 'revoking'
+  reason: string | null
+  attempts: number
+  nextAttemptAt: number | null
+  updatedAt: number
+  /** The daemon incarnation answerable for this row; NULL on an exclusively owned store. */
+  ownerId: string | null
+}
+
+/** The stored §16 run-projection write marker, as the column types present it. */
+interface CodeHostNoteProjectionRow {
+  projectionKey: string
+  projectionId: string
+  hookId: string
+  agentId: string
+  orgId: string | null
+  provider: string
+  projectId: string
+  mergeRequestIid: number
+  headSha: string
+  generation: string
+  writeMarker: string
+  state: string
+  body: string
+  noteId: string | null
+  credentialEpoch: string
+  phase: string
+  outcome: string | null
+  code: string | null
+  updatedAt: number
+  daemonId: string
+  ownerId: string | null
+}
+
+const NOTE_PROJECTION_PHASES: readonly NoteProjectionPhase[] = ['in_flight', 'settled_unreported', 'settled']
+const NOTE_PROJECTION_OUTCOMES: readonly NoteProjectionOutcome[] = ['written', 'skipped', 'failed']
+
+function toNoteProjectionRow(row: CodeHostNoteProjectionRow): NoteProjectionRow {
+  const outcome = NOTE_PROJECTION_OUTCOMES.find((o) => o === row.outcome)
+  return {
+    projectionKey: row.projectionKey,
+    projectionId: row.projectionId,
+    hookId: row.hookId,
+    agentId: row.agentId,
+    ...(row.orgId ? { orgId: row.orgId } : {}),
+    provider: row.provider,
+    projectId: row.projectId,
+    mergeRequestIid: row.mergeRequestIid,
+    headSha: row.headSha,
+    generation: row.generation,
+    writeMarker: row.writeMarker,
+    state: row.state as NoteProjectionRow['state'],
+    body: row.body,
+    ...(row.noteId ? { noteId: row.noteId } : {}),
+    credentialEpoch: row.credentialEpoch,
+    daemonId: row.daemonId,
+    // An unknown phase reads as fully settled: it can neither be rewritten nor replayed.
+    phase: NOTE_PROJECTION_PHASES.find((p) => p === row.phase) ?? 'settled',
+    ...(outcome ? { outcome } : {}),
+    ...(row.code ? { code: row.code } : {})
+  }
+}
+
+/** One upsert for both projection phases: the row is identical, only the phase and outcome differ. */
+const NOTE_PROJECTION_UPSERT = `INSERT INTO code_host_note_projection
+   (projectionKey, projectionId, hookId, agentId, orgId, provider, projectId, mergeRequestIid, headSha,
+    generation, writeMarker, state, body, noteId, credentialEpoch, phase, outcome, code, updatedAt,
+    daemonId, ownerId)
+ VALUES (@projectionKey, @projectionId, @hookId, @agentId, @orgId, @provider, @projectId, @mergeRequestIid,
+    @headSha, @generation, @writeMarker, @state, @body, @noteId, @credentialEpoch, @phase, @outcome, @code,
+    @now, @daemonId, @ownerId)
+ ON CONFLICT (projectionKey) DO UPDATE SET
+   projectionId = excluded.projectionId, hookId = excluded.hookId, agentId = excluded.agentId,
+   orgId = excluded.orgId, provider = excluded.provider, projectId = excluded.projectId,
+   mergeRequestIid = excluded.mergeRequestIid, headSha = excluded.headSha,
+   generation = excluded.generation, writeMarker = excluded.writeMarker, state = excluded.state,
+   body = excluded.body, noteId = excluded.noteId, credentialEpoch = excluded.credentialEpoch,
+   phase = excluded.phase, outcome = excluded.outcome, code = excluded.code,
+   updatedAt = excluded.updatedAt, daemonId = excluded.daemonId, ownerId = excluded.ownerId`
+
+function noteProjectionParams(row: NoteProjectionRow, now: number, ownerId: string | null): SqlParams {
+  return {
+    projectionKey: row.projectionKey,
+    projectionId: row.projectionId,
+    hookId: row.hookId,
+    agentId: row.agentId,
+    orgId: row.orgId ?? null,
+    provider: row.provider,
+    projectId: row.projectId,
+    mergeRequestIid: row.mergeRequestIid,
+    headSha: row.headSha,
+    generation: row.generation,
+    writeMarker: row.writeMarker,
+    state: row.state,
+    body: row.body,
+    noteId: row.noteId ?? null,
+    credentialEpoch: row.credentialEpoch,
+    now,
+    daemonId: row.daemonId,
+    ownerId
+  }
+}
+
+/** Runtime-level model-catalog metadata (runtime-model-catalog.md §4). `fingerprint`
+ *  is the discovery generation (runtime id + probed version + launch definition);
+ *  `complete` flips true only after one FULL successful discovery, so the §3.3
+ *  discovery gate can tell "never fully discovered" from "last-good on file". */
+export interface RuntimeCatalogMetaRecord {
+  runtimeId: string
+  fingerprint: string
+  source: 'native' | 'acp'
+  /** Resolved concrete default-model id (absent when only a literal "default" was seen). */
+  defaultModel?: string
+  /** Runtime-level (model-independent) permission modes from the probe session. */
+  permissionModes?: Array<{ value: string; name?: string; description?: string }>
+  /** The mode select's currentValue on a fresh probe session — the runtime's default. */
+  defaultPermissionMode?: string
+  complete: boolean
+  /** Hash of the probed models[] at the last complete discovery (gate rule 3). */
+  modelsHash?: string
+  observedAt: number
+}
+
+/** One model's cached capability row. `caps` stores only normalized RAW advertised
+ *  values — daemon-synthesized effort tiers are augmented at report time, never here. */
+export interface RuntimeModelCapRecord {
+  runtimeId: string
+  modelId: string
+  fingerprint: string
+  caps: {
+    name?: string
+    description?: string
+    efforts?: Array<{ value: string; name?: string; description?: string }>
+    defaultEffort?: string
+    fastMode?: boolean
+  }
+  observedAt: number
+}
+
+/**
+ * Narrow an existing path's mode, mirroring `cli/login.ts:protectCredentialsFile`.
+ * Best-effort by design: Windows has no enforceable POSIX mode semantics, and a
+ * path that vanished (WAL siblings appear lazily) is not an error worth failing a
+ * daemon boot over.
+ */
+function restrictPath(path: string, mode: number): void {
+  try {
+    if ((statSync(path).mode & 0o777) !== mode) chmodSync(path, mode)
+  } catch {
+    // absent, or a platform without POSIX modes — nothing to narrow
+  }
+}
+
+/**
+ * Schema version a freshly created database is stamped with. Bump it in the same
+ * change that edits a `CREATE TABLE` below, and append the matching step to
+ * {@link SCHEMA_MIGRATIONS}. Appending a step WITHOUT bumping this leaves the step
+ * unreachable — `upgradeSchema` stops at this number — so the column exists only on
+ * fresh databases and every established one fails at query time. `SCHEMA_MIGRATIONS`
+ * asserts the two stay in lockstep for exactly that reason.
+ */
+// Which agents are active in a PHYSICAL thread (channel-session-mode.md §6.4). The session
+// row answered this while a session WAS a thread; `append` puts a session at a coordinate
+// that is no thread's, so the question needs its own record. `sessionKey` is what the
+// affinity lookups join back to, so liveness stays the session's property, decided in one place.
+const THREAD_PARTICIPATION_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS thread_participation (
+        channel TEXT NOT NULL,
+        thread TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        transportScope TEXT NOT NULL DEFAULT '',
+        sessionKey TEXT NOT NULL,
+        updatedAt INTEGER,
+        PRIMARY KEY (channel, thread, agentId, transportScope)
+      );
+      CREATE INDEX IF NOT EXISTS thread_participation_session ON thread_participation (sessionKey);
+`
+
+// The coordinate in force for an `append` conversation (channel-session-mode.md §3.3). It
+// is the authoritative source, read on its own and never checked against the sessions table:
+// a reservation legitimately has no session during the window between resolve and the first
+// turn, so inferring staleness from a missing row would split two simultaneous first
+// deliveries — the exact case the reservation exists to join.
+const APPEND_RESERVATION_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS append_reservation (
+        agentId TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        transportScope TEXT NOT NULL DEFAULT '',
+        coordinate TEXT NOT NULL,
+        updatedAt INTEGER,
+        protocol INTEGER,
+        PRIMARY KEY (agentId, channel, transportScope)
+      );
+`
+
+// Seeds affinity from the sessions that predate the table. It must START with the INSERT:
+// the PostgreSQL rewrite converts `INSERT OR IGNORE` only when it opens the statement, so
+// folding this into the CREATE above would ship SQLite syntax to a pool store. The NOT NULL
+// filter makes both dialects skip the same legacy rows — SQLite's OR IGNORE swallows a NOT
+// NULL violation, PostgreSQL's ON CONFLICT covers only unique ones.
+export const THREAD_PARTICIPATION_BACKFILL = `
+      INSERT OR IGNORE INTO thread_participation (channel, thread, agentId, transportScope, sessionKey, updatedAt)
+      SELECT channel, thread, agentId, COALESCE(transportScope, ''), key, updatedAt FROM sessions
+      WHERE channel IS NOT NULL AND thread IS NOT NULL AND agentId IS NOT NULL
+`
+
+// §10 step 2: every pre-v24 row was written only while a session was live, so each is an admission.
+// The agent set is `recipient` ∪ the old delivery rows ∪ sender-if-agent; the JOIN on `sessions` IS
+// the "where it is an agent id" filter and supplies the key, so a row whose session is gone gets
+// none and is correctly an observation. Channel is rebuilt from the sessions side rather than split
+// off `transcript.channel`, because splitting on a separator in portable SQL is far uglier.
+export const TRANSCRIPT_ADMISSION_BACKFILL = `
+      INSERT OR IGNORE INTO transcript_recipient (seq, agentId, sessionKey)
+      SELECT a.seq, a.agentId, s.key
+      FROM (
+        SELECT t.seq AS seq, t.recipient AS agentId, t.channel AS channel, t.thread AS thread
+          FROM transcript t WHERE t.recipient IS NOT NULL
+        UNION
+        SELECT t.seq, l.agentId, t.channel, t.thread
+          FROM transcript t
+          JOIN transcript_recipient_legacy l
+            ON l.orgId = t.orgId AND l.channel = t.channel AND l.thread = t.thread AND l.ts = t.ts
+         WHERE t.kind = 'text'
+        UNION
+        SELECT t.seq, t.sender, t.channel, t.thread FROM transcript t
+      ) a
+      JOIN sessions s
+        ON s.agentId = a.agentId
+       AND s.thread = a.thread
+       AND a.channel = CASE WHEN COALESCE(s.transportScope, '') = '' THEN s.channel
+                            ELSE CONCAT(s.channel, '${TRANSCRIPT_SCOPE_SEPARATOR}', s.transportScope) END
+`
+
+// The Stage 1 gate's durable verdict and per-lane release cursor (message-intake.md §4.3, §5.1).
+const DECISION_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS decision_verdict (
+        seq INTEGER NOT NULL,
+        subject TEXT NOT NULL,
+        orgId TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        integrationId TEXT NOT NULL,
+        decisionId TEXT NOT NULL,
+        state TEXT NOT NULL,
+        disposition TEXT,
+        unavailableReason TEXT,
+        cancelReason TEXT,
+        configJson TEXT NOT NULL,
+        inputJson TEXT,
+        answerJson TEXT,
+        deliveryJson TEXT,
+        suppliedSeqsJson TEXT,
+        targetsJson TEXT,
+        requestedModel TEXT NOT NULL,
+        actualModel TEXT,
+        latencyMs INTEGER,
+        inputTokens INTEGER,
+        outputTokens INTEGER,
+        deadlineAt INTEGER NOT NULL,
+        ownerFence TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        settledAt INTEGER,
+        finishedAt INTEGER,
+        bodiesStrippedAt INTEGER,
+        PRIMARY KEY (seq, subject)
+      );
+      CREATE INDEX IF NOT EXISTS decision_verdict_lane ON decision_verdict (orgId, channel, subject, seq);
+      CREATE INDEX IF NOT EXISTS decision_verdict_state ON decision_verdict (state, agentId);
+      CREATE INDEX IF NOT EXISTS decision_verdict_integration ON decision_verdict (integrationId);
+      CREATE TABLE IF NOT EXISTS decision_model_evaluation (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        sessionId TEXT NOT NULL UNIQUE,
+        createdAt INTEGER NOT NULL,
+        decisionId TEXT,
+        summaryJson TEXT NOT NULL,
+        detailJson TEXT,
+        bodiesStrippedAt INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS decision_model_evaluation_agent ON decision_model_evaluation (orgId, agentId, seq);
+      CREATE INDEX IF NOT EXISTS decision_model_evaluation_decision ON decision_model_evaluation (orgId, agentId, decisionId, seq);
+      CREATE TABLE IF NOT EXISTS decision_api_gate_evaluation (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        protocol TEXT NOT NULL,
+        messageId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        decisionId TEXT NOT NULL,
+        summaryJson TEXT NOT NULL,
+        detailJson TEXT,
+        bodiesStrippedAt INTEGER,
+        UNIQUE (agentId, messageId)
+      );
+      CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_lane ON decision_api_gate_evaluation (orgId, agentId, protocol, seq);
+      CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_decision ON decision_api_gate_evaluation (orgId, agentId, protocol, decisionId, seq);
+      CREATE TABLE IF NOT EXISTS coordinator_filter_evaluation (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        messageId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        summaryJson TEXT NOT NULL,
+        detailJson TEXT,
+        bodiesStrippedAt INTEGER,
+        UNIQUE (agentId, messageId)
+      );
+      CREATE INDEX IF NOT EXISTS coordinator_filter_evaluation_agent ON coordinator_filter_evaluation (orgId, agentId, seq);
+      CREATE TABLE IF NOT EXISTS decision_release (
+        orgId TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        releasedSeq INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER,
+        PRIMARY KEY (orgId, channel, subject)
+      );
+`
+
+/** Source Cache accounting (source-cache.md §10): one row per bundle or pointer, plus the per-org usage row reservations lock. */
+export const SOURCE_CACHE_SCHEMA = `
+      CREATE TABLE IF NOT EXISTS source_cache_object (
+        orgId TEXT NOT NULL,
+        key TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('bundle', 'pointer')),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'committed')),
+        bytes INTEGER NOT NULL,           -- reserved while pending, actual once committed, 0 for a pointer
+        repoClass TEXT NOT NULL,
+        repoId TEXT NOT NULL,
+        refHash TEXT NOT NULL,
+        shape TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL,
+        expiresAt INTEGER,                -- pending reservations only
+        lastReadAt INTEGER,
+        targetKey TEXT,                   -- pointer only: the bundle it names, the one source of "referenced"
+        unpointedAt INTEGER,              -- committed bundle only: since when no pointer names it, NULL while named
+        claimedBy TEXT,
+        claimedAt INTEGER,
+        PRIMARY KEY (orgId, key)
+      );
+      CREATE INDEX IF NOT EXISTS source_cache_object_pending_org
+        ON source_cache_object (orgId, expiresAt) WHERE state = 'pending';
+      CREATE INDEX IF NOT EXISTS source_cache_object_unpointed
+        ON source_cache_object (unpointedAt) WHERE kind = 'bundle' AND state = 'committed';
+      CREATE INDEX IF NOT EXISTS source_cache_object_target ON source_cache_object (orgId, targetKey) WHERE kind = 'pointer';
+      CREATE INDEX IF NOT EXISTS source_cache_object_pointer_read
+        ON source_cache_object (COALESCE(lastReadAt, updatedAt)) WHERE kind = 'pointer';
+      CREATE TABLE IF NOT EXISTS source_cache_usage (
+        orgId TEXT PRIMARY KEY,
+        committedBytes INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL
+      );
+`
+
+export const SCHEMA_VERSION = 81
+
+/**
+ * Ordered in-place upgrades for a store created by an EARLIER daemon.
+ *
+ * This store lives on the user's machine and holds their transcripts, sessions and
+ * durable inbox — it is upgraded in place, never recreated, and a daemon is a
+ * long-lived install that can be several versions behind. `CREATE TABLE IF NOT
+ * EXISTS` never alters an existing table, so a schema change that ships without a
+ * step here leaves the new column missing on every pre-existing database and fails
+ * at query time rather than at boot.
+ *
+ * Step `i` upgrades a database at `user_version === i + 1` to `i + 2`; each runs
+ * exactly once, in order, inside one transaction, and all of them run BEFORE the
+ * constructor's `CREATE` block. A fresh database is stamped straight to
+ * {@link SCHEMA_VERSION} and skips the list, because the `CREATE` block always
+ * emits the current schema.
+ *
+ * A step only needs to reshape what already exists — add a column, rewrite a
+ * table, backfill. Plain `CREATE TABLE`/`CREATE INDEX` for anything new belongs
+ * in the `CREATE` block, which runs afterwards and is `IF NOT EXISTS`, so it
+ * covers fresh and upgraded stores from the one description.
+ */
+/** How long a probed image's published answer outlives its last publish. A rollback inside the
+ *  window costs nothing; past it, one member probes the image again. */
+const RUNTIME_IMAGE_PROBE_RETENTION_MS = 30 * 24 * 60 * 60_000
+
+const SCHEMA_MIGRATIONS: ((db: StoreTx, store: { shared: boolean; postgres: boolean }) => Promise<void>)[] = [
+  async (db) => await db.exec('ALTER TABLE permission_requests ADD COLUMN ownerId TEXT'),
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE session_metadata_outbox ADD COLUMN failedAttempts INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE session_metadata_outbox ADD COLUMN nextAttemptAt INTEGER;
+    `),
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE dreams ADD COLUMN ownerId TEXT;
+      ALTER TABLE webchat_mcp_grant_ledger ADD COLUMN ownerId TEXT;
+    `),
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE inbox ADD COLUMN reportOwnerId TEXT;
+      ALTER TABLE inbox ADD COLUMN reportClaimedAt INTEGER;
+    `),
+  // session_gates gains the owning agent in its key. Existing rows are attributed
+  // through the sessions row that holds the ACP id; a row no session claims is
+  // dropped, and an id several agents claim is rewritten to the fail-closed state
+  // because its stored verdict was never attributable to one of them.
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE session_gates_keyed (
+        agentId TEXT NOT NULL,
+        acpSessionId TEXT NOT NULL,
+        localExcluded INTEGER NOT NULL DEFAULT 1,
+        cpPrivate INTEGER,
+        cpRev INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER,
+        PRIMARY KEY (agentId, acpSessionId)
+      );
+      INSERT INTO session_gates_keyed (agentId, acpSessionId, localExcluded, cpPrivate, cpRev, updatedAt)
+      SELECT o.agentId, g.acpSessionId, g.localExcluded, g.cpPrivate, g.cpRev, g.updatedAt
+      FROM session_gates g
+      JOIN (
+        SELECT DISTINCT agentId, acpSessionId FROM sessions
+        WHERE agentId IS NOT NULL AND acpSessionId IS NOT NULL
+      ) o ON o.acpSessionId = g.acpSessionId;
+      UPDATE session_gates_keyed SET localExcluded = 1, cpPrivate = NULL, cpRev = 0
+      WHERE acpSessionId IN (
+        SELECT acpSessionId FROM session_gates_keyed GROUP BY acpSessionId HAVING COUNT(*) > 1
+      );
+      DROP TABLE session_gates;
+      ALTER TABLE session_gates_keyed RENAME TO session_gates;
+    `),
+  async (db) => await db.exec('ALTER TABLE cron_runs ADD COLUMN definition TEXT'),
+  // The catalog cache is re-keyed on its owning member (#1039): pre-owner rows name none, so
+  // they are dropped rather than misattributed and the CREATE block rebuilds both tables.
+  async (db) =>
+    await db.exec(`
+      DROP TABLE IF EXISTS runtime_catalog_meta;
+      DROP TABLE IF EXISTS runtime_model_catalog;
+    `),
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE session_purges ADD COLUMN ownerId TEXT;
+      ALTER TABLE session_purges ADD COLUMN claimedAt INTEGER;
+    `),
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE session_metadata_outbox ADD COLUMN ownerId TEXT;
+      ALTER TABLE session_metadata_outbox ADD COLUMN claimedAt INTEGER;
+    `),
+  // Transcripts gain the owning org in their key (#1041 item 7). A store no pool shares
+  // holds one daemon's threads, so every existing row belongs to its single partition and
+  // the added default IS the backfill. A shared store cannot attribute what it already
+  // holds: nothing here records an agent's org — the daemon learns it from the CP at
+  // runtime — so sessions → agent → org resolves to nothing at migration time and the rows
+  // are dropped rather than misfiled into one org's fenced reads. Only test data exists on
+  // any shared store today, which is why dropping is the accepted price of the fence.
+  // The recipient table is rebuilt rather than altered: its PRIMARY KEY gains the org, and
+  // the transcript indexes are dropped so the CREATE block re-emits them org-first.
+  async (db, store) => {
+    if (store.shared) await db.exec('DELETE FROM transcript; DELETE FROM transcript_recipient;')
+    await db.exec(`
+      ALTER TABLE transcript ADD COLUMN orgId TEXT NOT NULL DEFAULT '';
+      DROP INDEX IF EXISTS transcript_thread_seq;
+      DROP INDEX IF EXISTS transcript_text_ts;
+      DROP INDEX IF EXISTS transcript_agent_tool_call;
+      DROP INDEX IF EXISTS transcript_thread_event_time;
+      DROP INDEX IF EXISTS transcript_thread_revision;
+      CREATE TABLE transcript_recipient_orged (
+        orgId TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL, ts TEXT NOT NULL, agentId TEXT NOT NULL,
+        PRIMARY KEY (orgId, channel, thread, ts, agentId)
+      );
+      INSERT INTO transcript_recipient_orged (orgId, channel, thread, ts, agentId)
+      SELECT '', channel, thread, ts, agentId FROM transcript_recipient;
+      DROP TABLE transcript_recipient;
+      ALTER TABLE transcript_recipient_orged RENAME TO transcript_recipient;
+    `)
+  },
+  // The outward id (§1.1), split from the ACP hop's. Existing sessions are backfilled with the id
+  // they already answer to, so nothing the CP or the console knows changes name.
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE sessions ADD COLUMN sessionId TEXT;
+      UPDATE sessions SET sessionId = acpSessionId WHERE acpSessionId IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS session_outward_ids (
+        key TEXT PRIMARY KEY,
+        agentId TEXT,
+        sessionId TEXT NOT NULL,
+        mintedAt INTEGER NOT NULL
+      );
+    `),
+  // Whether a child session's coordinates are its OWN conversation (§4.2). Left null on
+  // existing rows: absent keeps the CP's ordinary child inheritance, which is what they got.
+  async (db) => await db.exec('ALTER TABLE sessions ADD COLUMN directDestination INTEGER'),
+  // Cluster skill tables are emitted by the current CREATE block after this step.
+  async () => undefined,
+  // Approval decisions record who decided, and a DM card's handle survives a restart
+  // so an orphaned card can be rewritten (slack-approval-dm.md §5.4/§6.1).
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE permission_requests ADD COLUMN resolvedBy TEXT;
+      ALTER TABLE permission_requests ADD COLUMN resolvedByName TEXT;
+      ALTER TABLE permission_requests ADD COLUMN notifyIntegrationId TEXT;
+      ALTER TABLE permission_requests ADD COLUMN notifyChannel TEXT;
+      ALTER TABLE permission_requests ADD COLUMN notifyTs TEXT;
+    `),
+  // The platform standing block travels with the logical session, not only the message that opened it.
+  async (db) => await db.exec('ALTER TABLE sessions ADD COLUMN platformStanding TEXT'),
+  // session_gates is keyed by the logical session: with one host per session, siblings of one agent can hold one ACP id.
+  async (db) =>
+    await db.exec(`
+      CREATE TABLE session_gates_by_key (
+        agentId TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        localExcluded INTEGER NOT NULL DEFAULT 1,
+        cpPrivate INTEGER,
+        cpRev INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER,
+        PRIMARY KEY (agentId, sessionKey)
+      );
+      INSERT INTO session_gates_by_key (agentId, sessionKey, localExcluded, cpPrivate, cpRev, updatedAt)
+      SELECT s.agentId, s.key, g.localExcluded, g.cpPrivate, g.cpRev, g.updatedAt
+      FROM session_gates g
+      JOIN sessions s ON s.agentId = g.agentId AND s.acpSessionId = g.acpSessionId;
+      UPDATE session_gates_by_key SET localExcluded = 1, cpPrivate = NULL, cpRev = 0
+      WHERE sessionKey IN (
+        SELECT s.key FROM sessions s
+        JOIN (
+          SELECT agentId, acpSessionId FROM sessions
+          WHERE acpSessionId IS NOT NULL GROUP BY agentId, acpSessionId HAVING COUNT(*) > 1
+        ) d ON d.agentId = s.agentId AND d.acpSessionId = s.acpSessionId
+      );
+      DROP TABLE session_gates;
+      ALTER TABLE session_gates_by_key RENAME TO session_gates;
+    `),
+  async (db) => {
+    await db.exec(MEMORY_CONTINUATION_SCHEMA)
+  },
+  // New integration tombstones are created by the shared CREATE block below.
+  async () => undefined,
+  // Where a spread session executes, or why it stayed with its holder (session-executors.md §7); null on every existing row.
+  async (db) =>
+    await db.exec(`
+      ALTER TABLE sessions ADD COLUMN executorDaemonId TEXT;
+      ALTER TABLE sessions ADD COLUMN stayedHomeReason TEXT;
+    `),
+  // Thread participation (channel-session-mode.md §6.4), backfilled from the session rows
+  // it replaces: an upgraded daemon must not lose continuity for every existing session.
+  async (db) => {
+    // Two execs on purpose: the PostgreSQL rewrite only converts `INSERT OR IGNORE` when
+    // it STARTS the statement, so folding this into the CREATE would ship SQLite syntax.
+    await db.exec(THREAD_PARTICIPATION_SCHEMA)
+    await db.exec(THREAD_PARTICIPATION_BACKFILL)
+  },
+  // Append reservations are minted when a conversation first receives a message in append mode.
+  async (db) => await db.exec(APPEND_RESERVATION_SCHEMA),
+  // Parent replies retain output coordinates without replaying a completed hook run.
+  async (db) => {
+    await db.exec('ALTER TABLE sessions ADD COLUMN originCodeHostReplyTarget TEXT')
+    await db.exec('ALTER TABLE inbox ADD COLUMN codeHostReplyTarget TEXT')
+  },
+  // message-intake.md §10: the transcript becomes a per-conversation channel record and
+  // transcript_recipient becomes the per-session admission. thread goes nullable and holds the
+  // PHYSICAL thread; the dedup index drops it; a tool row gains the sessionScope discriminator its
+  // identity now carries; admissions are backfilled from recipient, the old delivery rows and
+  // sender-if-agent, joined to sessions for the key a row's session was under.
+  async (db, store) => {
+    await db.exec('ALTER TABLE transcript_recipient RENAME TO transcript_recipient_legacy')
+    // SQLite cannot drop a NOT NULL in place, so `thread` goes nullable by copy-rename (the #1041
+    // shape); PostgreSQL alters instead, because its `seq` identity rejects an explicit-seq copy.
+    if (store.postgres)
+      await db.exec(`
+      ALTER TABLE transcript ALTER COLUMN thread DROP NOT NULL;
+      ALTER TABLE transcript ADD COLUMN IF NOT EXISTS sessionScope TEXT NOT NULL DEFAULT '';
+      DROP INDEX IF EXISTS transcript_thread_seq;
+      DROP INDEX IF EXISTS transcript_text_ts;
+      DROP INDEX IF EXISTS transcript_thread_event_time;
+      DROP INDEX IF EXISTS transcript_thread_revision;
+      DROP INDEX IF EXISTS transcript_agent_tool_call;
+    `)
+    else
+      await db.exec(`
+      CREATE TABLE transcript_rekeyed (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL, thread TEXT, ts TEXT,
+        sender TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+        tool_call_id TEXT, body TEXT, recipient TEXT, eventTimeUs INTEGER,
+        attachmentsJson TEXT, quoteJson TEXT, trustedAgentBot INTEGER, revision INTEGER NOT NULL DEFAULT 0,
+        postId TEXT,
+        sessionScope TEXT NOT NULL DEFAULT ''
+      );
+      INSERT INTO transcript_rekeyed
+        (seq, orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, recipient,
+         eventTimeUs, attachmentsJson, quoteJson, trustedAgentBot, revision, postId)
+      SELECT seq, orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, recipient,
+             eventTimeUs, attachmentsJson, quoteJson, trustedAgentBot, revision, postId
+      FROM transcript;
+      DROP TABLE transcript;
+      ALTER TABLE transcript_rekeyed RENAME TO transcript;
+    `)
+    await db.exec(`
+      CREATE TABLE transcript_recipient (
+        seq INTEGER NOT NULL,
+        agentId TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        PRIMARY KEY (seq, agentId)
+      );
+    `)
+    // Its own exec: the PostgreSQL rewrite converts `INSERT OR IGNORE` only when it STARTS the
+    // statement, and appends the conflict clause at the very end of the text.
+    await db.exec(TRANSCRIPT_ADMISSION_BACKFILL)
+    // A pre-upgrade tool row inherits its one session, so a scoped update in flight across the upgrade still finds it.
+    await db.exec(`
+      UPDATE transcript
+         SET sessionScope = (SELECT r.sessionKey FROM transcript_recipient r WHERE r.seq = transcript.seq)
+       WHERE kind = 'tool' AND sessionScope = ''
+         AND (SELECT COUNT(*) FROM transcript_recipient r WHERE r.seq = transcript.seq) = 1
+    `)
+    // §10 step 3: rows sharing (orgId, channel, ts) collapse onto the smallest seq. A mapping
+    // table, plus a DELETE that keeps only one agent's LOWEST-seq admission per merge group —
+    // repointing two admissions of one agent onto one (seq, agentId) would violate the PK.
+    await db.exec(`
+      CREATE TABLE transcript_merge_map (oldSeq INTEGER PRIMARY KEY, newSeq INTEGER NOT NULL);
+      INSERT INTO transcript_merge_map (oldSeq, newSeq)
+      SELECT t.seq, m.keepSeq
+        FROM transcript t
+        JOIN (SELECT orgId, channel, ts, MIN(seq) AS keepSeq
+                FROM transcript
+               WHERE kind = 'text' AND ts IS NOT NULL
+               GROUP BY orgId, channel, ts
+              HAVING COUNT(*) > 1) m
+          ON m.orgId = t.orgId AND m.channel = t.channel AND m.ts = t.ts
+       WHERE t.kind = 'text' AND t.seq <> m.keepSeq;
+      DELETE FROM transcript_recipient
+       WHERE EXISTS (
+         SELECT 1 FROM transcript_merge_map mm, transcript_recipient k
+          WHERE mm.oldSeq = transcript_recipient.seq
+            AND k.agentId = transcript_recipient.agentId
+            AND k.seq < transcript_recipient.seq
+            AND mm.newSeq = COALESCE((SELECT mm2.newSeq FROM transcript_merge_map mm2 WHERE mm2.oldSeq = k.seq), k.seq));
+      UPDATE transcript_recipient
+         SET seq = (SELECT mm.newSeq FROM transcript_merge_map mm WHERE mm.oldSeq = transcript_recipient.seq)
+       WHERE seq IN (SELECT oldSeq FROM transcript_merge_map);
+      DELETE FROM transcript WHERE seq IN (SELECT oldSeq FROM transcript_merge_map);
+      DROP TABLE transcript_merge_map;
+    `)
+    // §10 step 4: a former append coordinate was never a physical thread, so it reads back unknown.
+    await db.exec(`
+      UPDATE transcript SET thread = NULL WHERE thread LIKE '${APPEND_COORDINATE_PREFIX}%';
+      DROP TABLE transcript_recipient_legacy;
+    `)
+  },
+  async (db) => await db.exec('ALTER TABLE sessions ADD COLUMN decisionModel TEXT'),
+  // v26 adds decision_verdict and decision_release, which the CREATE block emits; the bump fences out older sweeps.
+  async () => undefined,
+  // v27: a router verdict's frozen target set (message-intake.md §4.3); a v25 store gets the column from the CREATE block.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE IF EXISTS decision_verdict ADD COLUMN IF NOT EXISTS targetsJson TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(decision_verdict)', [])).rows as { name: string }[]
+    if (columns.length > 0 && !columns.some((c) => c.name === 'targetsJson'))
+      await db.exec('ALTER TABLE decision_verdict ADD COLUMN targetsJson TEXT')
+  },
+  // v28: whether a session was handed an on-demand clone directory (multi-repository-workspaces.md decision 20); null on every existing row, added only where it is missing, as v27 does.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS onDemandClones INTEGER')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'onDemandClones'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN onDemandClones INTEGER')
+  },
+  // v29: the birth strategy beside the verdict (session-executors.md §5); the daemon fills existing verdicts at startup.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS birthStrategy TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'birthStrategy'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN birthStrategy TEXT')
+  },
+  // v30: the repositories the selector chose for a session (multi-repository-workspaces.md decision 19); null on every existing row, added only where it is missing, as v28 does.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS selectedRepos TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'selectedRepos'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN selectedRepos TEXT')
+  },
+  // v31: the runtime beside the observed model, so the pair never splits; null on rows observed earlier, added only where it is missing, as v30 does.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS observedRuntime TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'observedRuntime'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN observedRuntime TEXT')
+  },
+  // v32 creates the table before v33 widens it when upgrading a pre-v32 store.
+  async (db) =>
+    await db.exec(`CREATE TABLE IF NOT EXISTS decision_model_evaluation (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      orgId TEXT NOT NULL,
+      agentId TEXT NOT NULL,
+      sessionId TEXT NOT NULL UNIQUE,
+      createdAt INTEGER NOT NULL,
+      summaryJson TEXT NOT NULL,
+      detailJson TEXT,
+      bodiesStrippedAt INTEGER
+    )`),
+  // v33 indexes the root Decision used by model-selection history, including retained v32 rows.
+  async (db, store) => {
+    if (store.postgres) await db.exec('ALTER TABLE decision_model_evaluation ADD COLUMN IF NOT EXISTS decisionId TEXT')
+    else {
+      const columns = (await db.query('PRAGMA table_info(decision_model_evaluation)', [])).rows as { name: string }[]
+      if (!columns.some((column) => column.name === 'decisionId'))
+        await db.exec('ALTER TABLE decision_model_evaluation ADD COLUMN decisionId TEXT')
+    }
+    const rows = (await db.query('SELECT seq, summaryJson FROM decision_model_evaluation', [])).rows as Array<{
+      seq: number
+      summaryJson: string
+    }>
+    for (const row of rows) {
+      let decisionId: unknown
+      try {
+        decisionId = (JSON.parse(row.summaryJson) as { decisionId?: unknown }).decisionId
+      } catch {
+        continue
+      }
+      if (typeof decisionId === 'string')
+        await db.query('UPDATE decision_model_evaluation SET decisionId = ? WHERE seq = ?', [decisionId, row.seq])
+    }
+  },
+  // v34 records each chat API gate verdict (shared-bot-relay.md §10.4).
+  async (db) =>
+    await db.exec(`CREATE TABLE IF NOT EXISTS decision_api_gate_evaluation (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      orgId TEXT NOT NULL,
+      agentId TEXT NOT NULL,
+      protocol TEXT NOT NULL,
+      messageId TEXT NOT NULL,
+      createdAt INTEGER NOT NULL,
+      decisionId TEXT NOT NULL,
+      summaryJson TEXT NOT NULL,
+      detailJson TEXT,
+      bodiesStrippedAt INTEGER,
+      UNIQUE (agentId, messageId)
+    );
+    CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_lane
+      ON decision_api_gate_evaluation (orgId, agentId, protocol, seq);
+    CREATE INDEX IF NOT EXISTS decision_api_gate_evaluation_decision
+      ON decision_api_gate_evaluation (orgId, agentId, protocol, decisionId, seq);`),
+  // v35 adds the Source Cache tables, which the CREATE block emits; the bump fences out older members.
+  async (db) =>
+    await db.exec(`DROP INDEX IF EXISTS source_cache_object_pending;
+    DROP INDEX IF EXISTS source_cache_object_pointer;`),
+  // v36 drops the assistant item trust level (assistant-mode.md §5.3); a store that never had the ledger gets it from the CREATE block.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE IF EXISTS assistant_item DROP COLUMN IF EXISTS trust')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(assistant_item)', [])).rows as { name: string }[]
+    if (columns.some((c) => c.name === 'trust')) await db.exec('ALTER TABLE assistant_item DROP COLUMN trust')
+  },
+  // v37 adds the assistant draft and post-grant tables (assistant-mode.md §5.5), which the CREATE block emits; the bump fences out older members.
+  async () => {},
+  // v38 adds the assistant sub-session index (assistant-mode.md §5.6), which the CREATE block emits; the bump fences out older members.
+  async () => {},
+  // v39 marks patrol sub-sessions and adds the per-item patrol state (assistant-mode.md §5.9), which the CREATE block emits.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec(
+        "ALTER TABLE IF EXISTS assistant_subsession ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'delegation'"
+      )
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(assistant_subsession)', [])).rows as { name: string }[]
+    if (columns.length > 0 && !columns.some((c) => c.name === 'kind'))
+      await db.exec("ALTER TABLE assistant_subsession ADD COLUMN kind TEXT NOT NULL DEFAULT 'delegation'")
+  },
+  // v40 lets the approval record hold a patrol's proposed task (assistant-mode.md §5.10): its action and kind widen, and it gains the proposal and its sub-session.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec(`
+        ALTER TABLE IF EXISTS assistant_draft DROP CONSTRAINT IF EXISTS assistant_draft_action_check;
+        ALTER TABLE IF EXISTS assistant_draft DROP CONSTRAINT IF EXISTS assistant_draft_kind_check;
+        ALTER TABLE IF EXISTS assistant_draft ADD CONSTRAINT assistant_draft_action_check CHECK (action IN ('post', 'task'));
+        ALTER TABLE IF EXISTS assistant_draft ADD CONSTRAINT assistant_draft_kind_check
+          CHECK (kind IN ('reply', 'elsewhere', 'task'));
+        ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS sentence TEXT;
+        ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS why TEXT;
+        ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS itemId TEXT;
+        ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS itemVersion INTEGER;
+        ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS subsessionKey TEXT;
+      `)
+      return
+    }
+    // SQLite cannot widen a CHECK in place, so the table is rebuilt with every column it already has.
+    const columns = ((await db.query('PRAGMA table_info(assistant_draft)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    if (columns.length === 0 || columns.includes('subsessionKey')) return
+    const kept = columns.filter((c) => ASSISTANT_DRAFT_V40_COLUMNS.includes(c)).join(', ')
+    await db.exec(`
+      CREATE TABLE assistant_draft_v40 (
+        id TEXT PRIMARY KEY,
+        agentId TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('post', 'task')),
+        kind TEXT NOT NULL CHECK (kind IN ('reply', 'elsewhere', 'task')),
+        targetPlatform TEXT NOT NULL,
+        targetIntegrationId TEXT NOT NULL,
+        targetChannel TEXT NOT NULL,
+        targetThread TEXT,
+        targetExternal INTEGER NOT NULL DEFAULT 0,
+        targetDm INTEGER NOT NULL DEFAULT 0,
+        targetName TEXT,
+        targetUser TEXT,
+        targetLink TEXT,
+        text TEXT NOT NULL,
+        sourcePlatform TEXT,
+        sourceIntegrationId TEXT,
+        sourceChannel TEXT,
+        sourceThread TEXT,
+        sourceTransportScope TEXT,
+        sourceSessionKey TEXT,
+        sourceSessionId TEXT,
+        sourcePlace INTEGER NOT NULL DEFAULT 0,
+        approverKind TEXT,
+        approverIntegrationId TEXT,
+        approverChannel TEXT,
+        approverUserId TEXT,
+        approverTeamId TEXT,
+        approverConsoleUserId TEXT,
+        cardTs TEXT,
+        offerAlways INTEGER NOT NULL DEFAULT 0,
+        grantEpoch INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK (status IN ('awaiting_review', 'executing', 'succeeded', 'failed',
+          'outcome_unknown', 'denied', 'expired')),
+        hash TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        expiresAt INTEGER NOT NULL,
+        decidedAt INTEGER,
+        decidedBy TEXT,
+        decidedByName TEXT,
+        settledAt INTEGER,
+        messageId TEXT,
+        failure TEXT,
+        sentence TEXT,
+        why TEXT,
+        itemId TEXT,
+        itemVersion INTEGER,
+        subsessionKey TEXT
+      );
+      INSERT INTO assistant_draft_v40 (${kept}) SELECT ${kept} FROM assistant_draft;
+      DROP TABLE assistant_draft;
+      ALTER TABLE assistant_draft_v40 RENAME TO assistant_draft;
+    `)
+  },
+  // v41 adds the per-asker widened-session marks (assistant-mode.md §5.5), which the CREATE block emits; the bump fences out older members.
+  async () => {},
+  // v42 adds the assistant reminders (assistant-mode.md §5.9), which the CREATE block emits; the bump fences out older members.
+  async () => {},
+  // v43: a shared image's preview and original descriptor ride their text row (webchat-generated-images.md §6).
+  async (db, store) => {
+    if (store.postgres) await db.exec('ALTER TABLE transcript ADD COLUMN IF NOT EXISTS sharedImageJson TEXT')
+    else {
+      const columns = ((await db.query('PRAGMA table_info(transcript)', [])).rows as { name: string }[]).map(
+        (c) => c.name
+      )
+      if (!columns.includes('sharedImageJson')) await db.exec('ALTER TABLE transcript ADD COLUMN sharedImageJson TEXT')
+    }
+  },
+  // v44 holds a sub-session's failure report and its refused attempts until it is admitted (assistant-mode.md §5.7).
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec(`
+        ALTER TABLE IF EXISTS assistant_subsession ADD COLUMN IF NOT EXISTS endReport TEXT;
+        ALTER TABLE IF EXISTS assistant_subsession ADD COLUMN IF NOT EXISTS reportAttempts INTEGER NOT NULL DEFAULT 0;
+      `)
+      return
+    }
+    const columns = ((await db.query('PRAGMA table_info(assistant_subsession)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    if (columns.length === 0) return
+    if (!columns.includes('endReport')) await db.exec('ALTER TABLE assistant_subsession ADD COLUMN endReport TEXT')
+    if (!columns.includes('reportAttempts'))
+      await db.exec('ALTER TABLE assistant_subsession ADD COLUMN reportAttempts INTEGER NOT NULL DEFAULT 0')
+  },
+  // v45 keeps a sub-session's notice handle on its request, so a restart's sweep settles it (assistant-mode.md §5.6).
+  async (db, store) => {
+    const added = ['noticeIntegrationId', 'noticeChannel', 'noticeTs']
+    if (store.postgres) {
+      for (const column of added)
+        await db.exec(`ALTER TABLE permission_requests ADD COLUMN IF NOT EXISTS ${column} TEXT`)
+      return
+    }
+    const columns = ((await db.query('PRAGMA table_info(permission_requests)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    for (const column of added)
+      if (!columns.includes(column)) await db.exec(`ALTER TABLE permission_requests ADD COLUMN ${column} TEXT`)
+  },
+  // v46 records what a draft's card shows, so a reconnect rewrites one that missed its settlement (assistant-mode.md §5.10).
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE IF EXISTS assistant_draft ADD COLUMN IF NOT EXISTS cardShows TEXT')
+      return
+    }
+    const columns = ((await db.query('PRAGMA table_info(assistant_draft)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    if (columns.length > 0 && !columns.includes('cardShows'))
+      await db.exec('ALTER TABLE assistant_draft ADD COLUMN cardShows TEXT')
+  },
+  // v47 keeps the editor DM sent beside a stored card on its own handle, so a restart's sweep retires both.
+  async (db, store) => {
+    const added = ['besideIntegrationId', 'besideChannel', 'besideTs']
+    if (store.postgres) {
+      for (const column of added)
+        await db.exec(`ALTER TABLE permission_requests ADD COLUMN IF NOT EXISTS ${column} TEXT`)
+      return
+    }
+    const columns = ((await db.query('PRAGMA table_info(permission_requests)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    for (const column of added)
+      if (!columns.includes(column)) await db.exec(`ALTER TABLE permission_requests ADD COLUMN ${column} TEXT`)
+  },
+  // v48 keeps a join confirmation's channel and call, so a restart's sweep tells its session nothing was done (#2979).
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE permission_requests ADD COLUMN IF NOT EXISTS joinAsk TEXT')
+      return
+    }
+    const columns = ((await db.query('PRAGMA table_info(permission_requests)', [])).rows as { name: string }[]).map(
+      (c) => c.name
+    )
+    if (!columns.includes('joinAsk')) await db.exec('ALTER TABLE permission_requests ADD COLUMN joinAsk TEXT')
+  },
+  // v49 keeps where an appending session's latest turn replied, so a wake keyed by the session alone replies there too.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS replyThread TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'replyThread'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN replyThread TEXT')
+  },
+  // v50 keeps a digest of the standing context a session's model last received, so a resume can tell whether it changed.
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec('ALTER TABLE sessions ADD COLUMN IF NOT EXISTS standingDigest TEXT')
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(sessions)', [])).rows as { name: string }[]
+    if (!columns.some((c) => c.name === 'standingDigest'))
+      await db.exec('ALTER TABLE sessions ADD COLUMN standingDigest TEXT')
+  },
+  // v51 numbers a sub-session's work rounds, so a continued one reports and counts per round (send-message-guide.md §8.4).
+  async (db, store) => {
+    if (store.postgres) {
+      await db.exec(
+        'ALTER TABLE IF EXISTS assistant_subsession ADD COLUMN IF NOT EXISTS round INTEGER NOT NULL DEFAULT 1'
+      )
+      return
+    }
+    const columns = (await db.query('PRAGMA table_info(assistant_subsession)', [])).rows as { name: string }[]
+    if (columns.length > 0 && !columns.some((c) => c.name === 'round'))
+      await db.exec('ALTER TABLE assistant_subsession ADD COLUMN round INTEGER NOT NULL DEFAULT 1')
+  },
+  // v52 addresses replies to session messages: each session's origin becomes one received call (send-message-guide.md §9.6).
+  async (db, store) => await migrateOriginsToSessionMessages(db, store.postgres),
+  // v53 makes each open item a follow-up of its place (assistant-mode.md §5.12); closed items and followers go.
+  async (db, store) => await migrateItemsToFollowUps(db, store.postgres),
+  // v54 keeps the thread a follow-up was taken in, where its reports reply (assistant-mode.md §5.12).
+  async (db, store) => await addColumn(db, store.postgres, 'assistant_item', 'replyThread', 'TEXT'),
+  // v55 marks a place's getting-to-know task and counts the history each of its checks read (assistant-mode.md §5.13).
+  async (db, store) => {
+    await addColumn(db, store.postgres, 'assistant_item', 'firstLook', 'TEXT')
+    await addColumn(db, store.postgres, 'assistant_check', 'historyRead', 'INTEGER NOT NULL DEFAULT 0')
+  },
+  // v56 keeps a proposal's follow-up form, the getting-to-know task report round it was made in and whether its card waits for that round's reply (§5.13).
+  async (db, store) => {
+    for (const [column, type] of [
+      ['followUpTitle', 'TEXT'],
+      ['followUpDoneWhen', 'TEXT'],
+      ['followUpNextCheck', 'INTEGER'],
+      ['reportRound', 'TEXT'],
+      ['reportSeq', 'INTEGER'],
+      ['heldForReply', 'INTEGER NOT NULL DEFAULT 0'],
+      ['tookItemId', 'TEXT']
+    ] as const)
+      await addColumn(db, store.postgres, 'assistant_draft', column, type)
+  },
+  // v57 names patrols follow-up checks (assistant-mode.md §5.12): the check state's table and column, the rows' kind, the coordinates.
+  async (db, store) => await migratePatrolsToChecks(db, store.postgres),
+  // v58 binds known Telegram/Discord conversations before their next turn resumes the existing runtime.
+  async (db, store) => {
+    if (!(await tableExists(db, store.postgres, 'sessions'))) return
+    const rows = (
+      await db.query(
+        `SELECT key, platform, channel, thread, tenantScope FROM sessions
+      WHERE platform IN ('telegram', 'discord') AND externalProvider IS NULL
+        AND transportScope IS NOT NULL AND conversationKind IS NOT NULL
+        AND launchCorrelationId IS NULL AND (originSessionId IS NULL OR directDestination = 1)`,
+        []
+      )
+    ).rows
+    for (const row of rows as {
+      key: string
+      platform: string
+      channel: string
+      thread: string | null
+      tenantScope: string | null
+    }[]) {
+      const realConversation =
+        row.platform === 'telegram' ? /^-?[1-9]\d*$/.test(row.channel) : /^[1-9]\d*$/.test(row.channel)
+      if (!realConversation) continue
+      const realm = row.tenantScope && /^bot[1-9]\d*$/.test(row.tenantScope) ? row.tenantScope : null
+      const resource =
+        row.platform === 'discord' && row.thread && /^[1-9]\d*$/.test(row.thread) ? row.thread : row.channel
+      await db.query(
+        `UPDATE sessions SET externalProvider = platform, externalRealmKey = ?,
+        externalResourceKind = 'conversation', externalResourceKey = ?, sourceBindingKind = 'external'
+        WHERE key = ?`,
+        [realm, resource, row.key]
+      )
+    }
+    await db.exec(`WITH RECURSIVE audience AS (
+      SELECT key, sessionId, externalProvider, externalRealmKey, externalResourceKey FROM sessions
+      WHERE externalProvider IN ('telegram', 'discord')
+      UNION
+      SELECT c.key, c.sessionId, p.externalProvider, p.externalRealmKey, p.externalResourceKey
+      FROM sessions c JOIN audience p ON c.originSessionId = p.sessionId
+      WHERE c.externalProvider IS NULL AND COALESCE(c.directDestination, 0) = 0
+    ) UPDATE sessions SET
+      externalProvider = (SELECT externalProvider FROM audience a WHERE a.key = sessions.key),
+      externalRealmKey = (SELECT externalRealmKey FROM audience a WHERE a.key = sessions.key),
+      externalResourceKey = (SELECT externalResourceKey FROM audience a WHERE a.key = sessions.key),
+      externalResourceKind = 'conversation', sourceBindingKind = 'external'
+      WHERE externalProvider IS NULL AND key IN (SELECT key FROM audience)`)
+  },
+  // v59 binds existing Google Chat conversations without replacing their runtime or direct child audiences.
+  async (db, store) => await bindChatAudience(db, store, 'googlechat', /^spaces\/[A-Za-z0-9_-]+$/, /^[1-9]\d*$/),
+  // v60 keeps the thread of the turn that asked a task for work, where its round's report replies (assistant-mode.md §5.6).
+  async (db, store) => await addColumn(db, store.postgres, 'assistant_subsession', 'replyThread', 'TEXT'),
+  // v61 keeps what a follow-up watches, its waiting wake, what started each check and a proposal's watch (assistant-mode.md §5.14).
+  async (db, store) => {
+    for (const column of ['watchUrl', 'watchTarget', 'watchState', 'watchReason'])
+      await addColumn(db, store.postgres, 'assistant_item', column, 'TEXT')
+    for (const [column, type] of [
+      ['wakeId', 'INTEGER NOT NULL DEFAULT 0'],
+      ['wakeSubscription', 'INTEGER'],
+      ['wakeAt', 'INTEGER'],
+      ['wakeKinds', 'TEXT'],
+      ['wakeLatestAt', 'INTEGER'],
+      ['lastWokenAt', 'INTEGER'],
+      ['runningWake', 'TEXT']
+    ] as const)
+      await addColumn(db, store.postgres, 'assistant_check_state', column, type)
+    await addColumn(db, store.postgres, 'assistant_check', 'startedBy', 'TEXT')
+    await addColumn(db, store.postgres, 'assistant_check', 'events', 'TEXT')
+    await addColumn(db, store.postgres, 'assistant_draft', 'followUpWatch', 'TEXT')
+  },
+  // v62 keeps a watched object's repository id, which a check's code-host reads aim at (assistant-mode.md §5.14).
+  async (db, store) => await addColumn(db, store.postgres, 'assistant_item', 'watchRepoId', 'TEXT'),
+  // v63 names a first look a getting-to-know task (assistant-mode.md §5.13): its marker, onboarding's list and a queued report round.
+  async (db, store) => await migrateFirstLookToGettingToKnow(db, store.postgres),
+  // v64 keeps digests of the tool definitions a session's model last received, so a runtime that kept earlier ones is told the current ones.
+  async (db, store) => await addColumn(db, store.postgres, 'sessions', 'toolDigests', 'TEXT'),
+  // v65 drops the orchestration tables, unused since the orchestration tools were removed.
+  async (db) => {
+    await db.exec('DROP TABLE IF EXISTS orchestration_subtask')
+    await db.exec('DROP TABLE IF EXISTS orchestration')
+  },
+  // v66 stores derived AHP recovery state and durable host sequence allocation.
+  async () => {},
+  // v67 keeps the retention sweep's last keep of an expired session, so a kept one is not woken again every pass.
+  async (db, store) => {
+    await addColumn(db, store.postgres, 'sessions', 'retentionKeptAt', 'INTEGER')
+    await addColumn(db, store.postgres, 'sessions', 'retentionRecheckAt', 'INTEGER')
+  },
+  // v68 binds existing Microsoft Teams conversations to their bot's tenant, as v59 did for Google Chat.
+  async (db, store) =>
+    await bindChatAudience(
+      db,
+      store,
+      'msteams',
+      /^(?:19:[\w.@-]{1,190}|a:[\w-]{1,190})$/,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+    ),
+  // v69 tells the turn's own editor-path notice from a sub-session's, so a restart's sweep settles each in its own words.
+  async (db, store) => await addColumn(db, store.postgres, 'permission_requests', 'noticeKind', 'TEXT'),
+  // v70 records when retention reclaimed a finished session's workspace while keeping its row, so a pass does not judge it again.
+  async (db, store) => await addColumn(db, store.postgres, 'sessions', 'workspaceReclaimedAt', 'INTEGER'),
+  // v71 gives tasks a title, a summary and attached threads (auto-session-mode.md §6.1).
+  async (db, store) => await migrateTaskModel(db, store.postgres),
+  // v72 keeps the start of a task's opening message, which listTasks shows until it writes a summary (auto-session-mode.md §6.7).
+  async (db, store) => await addColumn(db, store.postgres, 'assistant_subsession', 'background', 'TEXT'),
+  // v73 records when a task's status or title last changed, the work board's order (assistant-mode.md §5.18).
+  async (db, store) => await addChangedAt(db, store.postgres),
+  // v74 makes follow-ups watch tasks in the task store, one id each, which keys their checks and proposals too (§5.18).
+  async (db, store) => await migrateFollowUpsToWatchTasks(db, store.postgres),
+  // v75 keeps a closed task's row for a window, with the message it was opened for and what it opened (§5.18 ④).
+  async (db, store) => await migrateRetainedTasks(db, store.postgres),
+  // v76 preserves delivery targets for session wakes, message replies and room reports.
+  async (db, store) => {
+    await addColumn(db, store.postgres, 'sessions', 'replyChannel', 'TEXT')
+    await addColumn(db, store.postgres, 'session_message_sent', 'replyChannel', 'TEXT')
+    await addColumn(db, store.postgres, 'session_message_sent', 'replyThread', 'TEXT')
+    await addColumn(db, store.postgres, 'assistant_subsession_thread', 'reportThread', 'TEXT')
+  },
+  // v77 pins the initiator independently of the session's routing identity.
+  async (db, store) => await addColumn(db, store.postgres, 'sessions', 'initiator', 'TEXT'),
+  // v78 records the thread a webchat root was handed into, where its task answers (webchat-threads.md §5.1).
+  async (db, store) => await addColumn(db, store.postgres, 'transcript', 'handedTo', 'TEXT'),
+  // v79 records the thread a proposal's card went in and the thread a getting-to-know task is shown with (auto-session-mode.md §6.9).
+  async (db, store) => {
+    await addColumn(db, store.postgres, 'assistant_draft', 'cardThread', 'TEXT')
+    await addColumn(db, store.postgres, 'assistant_subsession', 'shownThread', 'TEXT')
+  },
+  // v80 records each coordinator filter verdict (auto-session-mode.md §4.7).
+  async (db) =>
+    await db.exec(`CREATE TABLE IF NOT EXISTS coordinator_filter_evaluation (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      orgId TEXT NOT NULL,
+      agentId TEXT NOT NULL,
+      messageId TEXT NOT NULL,
+      createdAt INTEGER NOT NULL,
+      summaryJson TEXT NOT NULL,
+      detailJson TEXT,
+      bodiesStrippedAt INTEGER,
+      UNIQUE (agentId, messageId)
+    );
+    CREATE INDEX IF NOT EXISTS coordinator_filter_evaluation_agent ON coordinator_filter_evaluation (orgId, agentId, seq);`),
+  // v81 records the outcome protocol a coordinator's coordinate was minted under (auto-session-mode.md §4.2).
+  async (db, store) => await addColumn(db, store.postgres, 'append_reservation', 'protocol', 'INTEGER')
+]
+
+/** Tasks gain when they closed, the message they were opened for, what they opened and a getting-to-know task's marker; an ended watch task counts as closed when it last changed. */
+async function migrateRetainedTasks(db: StoreTx, postgres: boolean): Promise<void> {
+  await db.exec(ASSISTANT_TASK_OPENED_SCHEMA)
+  if (!(await tableExists(db, postgres, 'assistant_subsession'))) return
+  for (const [column, type] of [
+    ['closedAt', 'INTEGER'],
+    ['openedForPlace', 'TEXT'],
+    ['openedForMessage', 'TEXT'],
+    ['gettingToKnow', 'INTEGER NOT NULL DEFAULT 0']
+  ] as const)
+    await addColumn(db, postgres, 'assistant_subsession', column, type)
+  // A watch row without a schedule was a getting-to-know task's (§5.18 ⑤); it now says so.
+  await db.exec("UPDATE assistant_subsession SET gettingToKnow = 1 WHERE mode = 'watch' AND watchStatus IS NULL")
+  await db.exec(`UPDATE assistant_subsession SET closedAt = COALESCE(updatedAt, changedAt, createdAt)
+    WHERE mode = 'watch' AND watchStatus IN ('done', 'dropped') AND closedAt IS NULL`)
+}
+
+// What the item ledger's rows carried that a watch task keeps on its task row instead.
+const MOVED_ITEM_COLUMNS = ['watchUrl', 'watchTarget', 'watchState', 'watchReason', 'watchRepoId'] as const
+
+/** Follow-ups become watch tasks (§5.18): each item moves into its task row under its task key, which then keys its checks and the proposals naming it. */
+async function migrateFollowUpsToWatchTasks(db: StoreTx, postgres: boolean): Promise<void> {
+  if (!(await tableExists(db, postgres, 'assistant_subsession'))) return
+  await addColumn(db, postgres, 'assistant_subsession', 'mode', "TEXT NOT NULL DEFAULT 'work'")
+  for (const [column, type] of WATCH_TASK_COLUMN_TYPES)
+    await addColumn(db, postgres, 'assistant_subsession', column, type)
+  if (await columnExists(db, postgres, 'assistant_subsession', 'kind')) {
+    await db.exec("UPDATE assistant_subsession SET mode = 'watch' WHERE kind = 'follow-up'")
+    await db.exec('ALTER TABLE assistant_subsession DROP COLUMN kind')
+  }
+  await db.exec(ASSISTANT_TASK_OBSERVATION_SCHEMA)
+  if (!(await tableExists(db, postgres, 'assistant_item'))) return
+  const watched = await columnExists(db, postgres, 'assistant_item', 'watchUrl')
+  const items = (await db.query('SELECT * FROM assistant_item ORDER BY agentId, id', [])).rows as Record<
+    string,
+    unknown
+  >[]
+  for (const item of items) {
+    const agentId = String(item.agentId)
+    const place = [String(item.originPlatform), String(item.originChannel), String(item.originTransportScope ?? '')]
+    let taskKey = String(item.taskKey ?? '')
+    if (taskKey === '' && item.gettingToKnow == null) {
+      // A follow-up no step gave a session key gets one now, rather than being lost with the item ledger's follow-ups.
+      taskKey = sessionKey(place[0]!, place[1]!, checkCoordinate(monotonicTs()), agentId, place[2] || null)
+      await db.query('UPDATE assistant_item SET taskKey = ? WHERE agentId = ? AND id = ?', [
+        taskKey,
+        agentId,
+        String(item.id)
+      ])
+    }
+    if (item.gettingToKnow != null) {
+      // A getting-to-know task stays in the ledger; its index row learns its place, as a watch row's does.
+      await db.query(
+        `UPDATE assistant_subsession SET mode = 'watch', originPlatform = ?, originChannel = ?, originTransportScope = ?
+          WHERE agentId = ? AND childSessionKey = ?`,
+        [...place, agentId, taskKey]
+      )
+      continue
+    }
+    const indexed = (
+      await db.query('SELECT 1 AS found FROM assistant_subsession WHERE agentId = ? AND childSessionKey = ?', [
+        agentId,
+        taskKey
+      ])
+    ).rows[0]
+    if (!indexed) {
+      // An item no index row names gets one under its place's session, else none until its first check re-points it.
+      const owner = await placeSessionInMigration(db, agentId, place[0]!, place[1]!, place[2]!)
+      await db.query(
+        `INSERT INTO assistant_subsession (agentId, childSessionKey, parentSessionId, parentSessionKey, state, createdAt, mode)
+         VALUES (?, ?, ?, ?, 'done', ?, 'watch')`,
+        [agentId, taskKey, owner?.sessionId ?? '', owner?.key ?? '', Number(item.createdAt)]
+      )
+    }
+    const latest = (
+      await db.query(
+        `SELECT text, observedAt FROM assistant_item_observation WHERE agentId = ? AND itemId = ?
+          ORDER BY observationVersion DESC LIMIT 1`,
+        [agentId, String(item.id)]
+      )
+    ).rows[0] as { text: string; observedAt: number } | undefined
+    const updatedAt = Number(item.updatedAt)
+    await db.query(
+      `UPDATE assistant_subsession SET mode = 'watch', state = CASE WHEN state = 'open' THEN 'open' ELSE 'done' END,
+         title = ?, background = ?, summary = ?, summaryUpdatedAt = ?, nextAt = ?, watchStatus = ?, doneWhen = ?,
+         originPlatform = ?, originChannel = ?, originTransportScope = ?, asker = ?, shared = ?, replyThread = ?,
+         watchUrl = ?, watchTarget = ?, watchState = ?, watchReason = ?, watchRepoId = ?, observationVersion = ?,
+         version = ?, updatedAt = ?, changedAt = ?
+        WHERE agentId = ? AND childSessionKey = ?`,
+      [
+        String(item.title),
+        item.summary ? String(item.summary) : null,
+        latest ? cutSummary(latest.text) : null,
+        latest ? Number(latest.observedAt) : null,
+        item.nextCheck ?? null,
+        String(item.status),
+        item.doneWhen ?? null,
+        ...place,
+        item.asker ?? null,
+        Number(item.shared ?? 0),
+        item.replyThread ?? null,
+        ...(watched ? MOVED_ITEM_COLUMNS.map((column) => item[column] ?? null) : MOVED_ITEM_COLUMNS.map(() => null)),
+        Number(item.observationVersion ?? 0),
+        Number(item.version ?? 1),
+        updatedAt,
+        Number(item.changedAt ?? updatedAt),
+        agentId,
+        taskKey
+      ]
+    )
+    await db.query(
+      `INSERT INTO assistant_task_observation (agentId, taskKey, observationVersion, text, author, observedAt)
+       SELECT agentId, ?, observationVersion, text, author, observedAt FROM assistant_item_observation
+        WHERE agentId = ? AND itemId = ?`,
+      [taskKey, agentId, String(item.id)]
+    )
+  }
+  // Checks, and the proposals naming a follow-up or a getting-to-know task, are keyed by its task key from now on.
+  const ITEM_OF = (table: string, column: string) =>
+    `SELECT i.taskKey FROM assistant_item i WHERE i.agentId = ${table}.agentId AND i.id = ${table}.${column}`
+  for (const table of ['assistant_check_state', 'assistant_check'])
+    if (await columnExists(db, postgres, table, 'itemId')) {
+      await db.exec(`DELETE FROM ${table} WHERE NOT EXISTS (${ITEM_OF(table, 'itemId')})`)
+      await db.exec(`UPDATE ${table} SET itemId = (${ITEM_OF(table, 'itemId')})`)
+      await db.exec(`ALTER TABLE ${table} RENAME COLUMN itemId TO taskKey`)
+    }
+  for (const column of ['itemId', 'tookItemId'])
+    if (await columnExists(db, postgres, 'assistant_draft', column))
+      await db.exec(
+        `UPDATE assistant_draft SET ${column} = (${ITEM_OF('assistant_draft', column)})
+          WHERE ${column} IS NOT NULL AND EXISTS (${ITEM_OF('assistant_draft', column)})`
+      )
+  // The follow-ups leave the item ledger, and with them what only they carried.
+  const followUps = 'SELECT id FROM assistant_item WHERE gettingToKnow IS NULL'
+  for (const table of ['assistant_item_observation', 'assistant_item_link'])
+    if (await tableExists(db, postgres, table)) await db.exec(`DELETE FROM ${table} WHERE itemId IN (${followUps})`)
+  await db.exec('DELETE FROM assistant_item WHERE gettingToKnow IS NULL')
+  for (const column of MOVED_ITEM_COLUMNS)
+    if (await columnExists(db, postgres, 'assistant_item', column))
+      await db.exec(`ALTER TABLE assistant_item DROP COLUMN ${column}`)
+  // A watch row with neither a schedule nor a getting-to-know task behind it named an item that is gone.
+  await db.exec(
+    `DELETE FROM assistant_subsession WHERE mode = 'watch' AND watchStatus IS NULL
+       AND NOT EXISTS (SELECT 1 FROM assistant_item i WHERE i.agentId = assistant_subsession.agentId
+         AND i.taskKey = assistant_subsession.childSessionKey)`
+  )
+}
+
+// A task summary's length (auto-session-mode.md §6.7), which a watch task's last result is cut to.
+const cutSummary = (text: string): string => {
+  const chars = [...text.trim()]
+  return chars.length > 500 ? `${chars.slice(0, 499).join('')}…` : chars.join('')
+}
+
+/** Tasks gain a title, taken from their session's first-message title, a summary and the threads attached to them. */
+async function migrateTaskModel(db: StoreTx, postgres: boolean): Promise<void> {
+  await db.exec(ASSISTANT_SUBSESSION_THREAD_SCHEMA)
+  if (!(await tableExists(db, postgres, 'assistant_subsession'))) return
+  for (const [column, type] of [
+    ['title', 'TEXT'],
+    ['summary', 'TEXT'],
+    ['summaryUpdatedAt', 'INTEGER'],
+    ['turnsSinceSummary', 'INTEGER NOT NULL DEFAULT 0']
+  ] as const)
+    await addColumn(db, postgres, 'assistant_subsession', column, type)
+  if (!(await tableExists(db, postgres, 'sessions'))) return
+  await withTaskKind(db, postgres)
+  await db.exec(`UPDATE assistant_subsession
+    SET title = (SELECT s.title FROM sessions s WHERE s.key = assistant_subsession.childSessionKey)
+    WHERE title IS NULL AND kind = 'delegation'`)
+}
+
+/** A step written before v74 reads the task index's `kind`; a store reshaped from a newer schema gets it back, and v74 folds it into `mode`. */
+async function withTaskKind(db: StoreTx, postgres: boolean): Promise<void> {
+  await addColumn(db, postgres, 'assistant_subsession', 'kind', "TEXT NOT NULL DEFAULT 'delegation'")
+}
+
+// Binds a platform's recorded conversations to their tenant, then hands each conversation's audience to its inherited children.
+async function bindChatAudience(
+  db: StoreTx,
+  store: { postgres: boolean },
+  platform: 'googlechat' | 'msteams',
+  channel: RegExp,
+  realm: RegExp
+): Promise<void> {
+  if (!(await tableExists(db, store.postgres, 'sessions'))) return
+  const rows = (
+    await db.query(
+      `SELECT key, channel, tenantScope FROM sessions
+       WHERE platform = ? AND externalProvider IS NULL
+         AND transportScope IS NOT NULL AND conversationKind IS NOT NULL
+         AND launchCorrelationId IS NULL AND (originSessionId IS NULL OR directDestination = 1)`,
+      [platform]
+    )
+  ).rows as { key: string; channel: string; tenantScope: string | null }[]
+  for (const row of rows) {
+    if (!channel.test(row.channel)) continue
+    await db.query(
+      `UPDATE sessions SET externalProvider = ?, externalRealmKey = ?,
+       externalResourceKind = 'conversation', externalResourceKey = ?, sourceBindingKind = 'external'
+       WHERE key = ?`,
+      [platform, row.tenantScope && realm.test(row.tenantScope) ? row.tenantScope : null, row.channel, row.key]
+    )
+  }
+  await db.exec(`WITH RECURSIVE audience AS (
+    SELECT key, sessionId, externalRealmKey, externalResourceKey FROM sessions WHERE externalProvider = '${platform}'
+    UNION
+    SELECT c.key, c.sessionId, p.externalRealmKey, p.externalResourceKey
+    FROM sessions c JOIN audience p ON c.originSessionId = p.sessionId
+    WHERE c.externalProvider IS NULL AND COALESCE(c.directDestination, 0) = 0
+  ) UPDATE sessions SET
+    externalProvider = '${platform}',
+    externalRealmKey = (SELECT externalRealmKey FROM audience a WHERE a.key = sessions.key),
+    externalResourceKey = (SELECT externalResourceKey FROM audience a WHERE a.key = sessions.key),
+    externalResourceKind = 'conversation', sourceBindingKind = 'external'
+    WHERE externalProvider IS NULL AND key IN (SELECT key FROM audience)`)
+}
+
+/** Both task stores gain `changedAt`, seeded from the last activity each row already records. */
+async function addChangedAt(db: StoreTx, postgres: boolean): Promise<void> {
+  if (await tableExists(db, postgres, 'assistant_subsession')) {
+    await addColumn(db, postgres, 'assistant_subsession', 'changedAt', 'INTEGER')
+    await db.exec(`UPDATE assistant_subsession
+      SET changedAt = COALESCE((SELECT s.updatedAt FROM sessions s WHERE s.key = assistant_subsession.childSessionKey), createdAt)
+      WHERE changedAt IS NULL`)
+  }
+  if (await tableExists(db, postgres, 'assistant_item')) {
+    await addColumn(db, postgres, 'assistant_item', 'changedAt', 'INTEGER')
+    await db.exec('UPDATE assistant_item SET changedAt = updatedAt WHERE changedAt IS NULL')
+  }
+}
+
+/** Add a column a table lacks, on either dialect; a table that does not exist yet gets it from the CREATE block. */
+async function addColumn(db: StoreTx, postgres: boolean, table: string, column: string, type: string): Promise<void> {
+  if (postgres) {
+    await db.exec(`ALTER TABLE IF EXISTS ${table} ADD COLUMN IF NOT EXISTS ${column} ${type}`)
+    return
+  }
+  const columns = (await db.query(`PRAGMA table_info(${table})`, [])).rows as { name: string }[]
+  if (columns.length > 0 && !columns.some((c) => c.name === column))
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`)
+}
+
+/** Each active or waiting item becomes a follow-up with its own session; an in-flight patrol becomes that follow-up's check. */
+async function migrateItemsToFollowUps(db: StoreTx, postgres: boolean): Promise<void> {
+  if (!(await tableExists(db, postgres, 'assistant_item'))) return
+  await addColumn(db, postgres, 'assistant_item', 'taskKey', "TEXT NOT NULL DEFAULT ''")
+  await addColumn(db, postgres, 'assistant_item', 'asker', 'TEXT')
+  await addColumn(db, postgres, 'assistant_item', 'shared', 'INTEGER NOT NULL DEFAULT 0')
+  for (const [column, type] of [
+    ['runningCheck', 'INTEGER'],
+    ['runningSince', 'INTEGER'],
+    ['runningInput', 'TEXT'],
+    ['pendingMessages', 'TEXT']
+  ] as const)
+    await addColumn(db, postgres, 'assistant_patrol', column, type)
+  await db.exec(ASSISTANT_PATROL_SCHEMA_V53)
+  await db.exec(ASSISTANT_SUBSESSION_SCHEMA_V73)
+  await withTaskKind(db, postgres)
+  // A check log from a newer schema is keyed by task key already.
+  const checkKey = (await columnExists(db, postgres, 'assistant_check', 'itemId')) ? 'itemId' : 'taskKey'
+  // Done and dropped items are not carried.
+  const closed = "SELECT id FROM assistant_item WHERE status NOT IN ('active', 'waiting')"
+  for (const table of ['assistant_item_observation', 'assistant_item_link', 'assistant_patrol'])
+    await db.exec(`DELETE FROM ${table} WHERE itemId IN (${closed})`)
+  await db.exec("DELETE FROM assistant_item WHERE status NOT IN ('active', 'waiting')")
+  const followers = await tableExists(db, postgres, 'assistant_item_follower')
+  const items = (
+    await db.query(
+      `SELECT id, agentId, originPlatform, originChannel, originTransportScope, createdAt FROM assistant_item
+        WHERE taskKey = ''`,
+      []
+    )
+  ).rows as {
+    id: string
+    agentId: string
+    originPlatform: string
+    originChannel: string
+    originTransportScope: string
+    createdAt: number
+  }[]
+  for (const item of items) {
+    const { id, agentId } = item
+    const scope = item.originTransportScope
+    // The first follower is the person who asked; the others are dropped without being told.
+    const first = followers
+      ? ((
+          await db.query(
+            'SELECT identity FROM assistant_item_follower WHERE agentId = ? AND itemId = ? ORDER BY addedAt, identity LIMIT 1',
+            [agentId, id]
+          )
+        ).rows[0] as { identity: string } | undefined)
+      : undefined
+    // Only the latest observation is carried, as the handover a check reads.
+    const latest = (
+      await db.query(
+        'SELECT MAX(observationVersion) AS v FROM assistant_item_observation WHERE agentId = ? AND itemId = ?',
+        [agentId, id]
+      )
+    ).rows[0] as { v: number | null } | undefined
+    if (latest?.v != null)
+      await db.query(
+        'DELETE FROM assistant_item_observation WHERE agentId = ? AND itemId = ? AND observationVersion < ?',
+        [agentId, id, Number(latest.v)]
+      )
+    const patrol = (
+      await db.query('SELECT runningKey, updatedAt FROM assistant_patrol WHERE agentId = ? AND itemId = ?', [
+        agentId,
+        id
+      ])
+    ).rows[0] as { runningKey: string | null; updatedAt: number } | undefined
+    const running = patrol?.runningKey ?? undefined
+    const taskKey =
+      running ??
+      sessionKey(item.originPlatform, item.originChannel, checkCoordinate(monotonicTs()), agentId, scope || null)
+    await db.query('UPDATE assistant_item SET taskKey = ?, asker = ? WHERE agentId = ? AND id = ?', [
+      taskKey,
+      first?.identity ?? null,
+      agentId,
+      id
+    ])
+    if (running !== undefined) {
+      // A patrol in flight settles as this follow-up's first check.
+      const since = Number(patrol!.updatedAt)
+      await db.query(
+        'UPDATE assistant_patrol SET runningCheck = 1, runningSince = ? WHERE agentId = ? AND itemId = ?',
+        [since, agentId, id]
+      )
+      await db.query(
+        `INSERT OR IGNORE INTO assistant_check (agentId, ${checkKey}, checkNo, startedAt, reported) VALUES (?, ?, 1, ?, 0)`,
+        [agentId, checkKey === 'itemId' ? id : taskKey, since]
+      )
+      continue
+    }
+    const owner = await placeSessionInMigration(db, agentId, item.originPlatform, item.originChannel, scope)
+    if (owner)
+      await db.query(
+        `INSERT OR IGNORE INTO assistant_subsession
+           (agentId, childSessionKey, parentSessionId, parentSessionKey, state, createdAt, kind)
+         VALUES (?, ?, ?, ?, 'done', ?, 'patrol')`,
+        [agentId, taskKey, owner.sessionId, owner.key, Number(item.createdAt)]
+      )
+  }
+  // A finished patrol's own row names no follow-up any more.
+  await db.exec(
+    `DELETE FROM assistant_subsession WHERE kind = 'patrol'
+       AND childSessionKey NOT IN (SELECT taskKey FROM assistant_item WHERE assistant_item.agentId = assistant_subsession.agentId)`
+  )
+  await db.exec('DROP TABLE IF EXISTS assistant_item_follower')
+}
+
+// The task index as v53 created it, keyed by kind until v74 gave it a mode.
+const ASSISTANT_SUBSESSION_SCHEMA_V73 = ASSISTANT_SUBSESSION_SCHEMA.replace(
+  "mode TEXT NOT NULL DEFAULT 'work'",
+  "kind TEXT NOT NULL DEFAULT 'delegation'"
+)
+
+// v53 ran against the check state's names before v57 renamed them, and before v74 keyed them by task key.
+const ASSISTANT_PATROL_SCHEMA_V53 = ASSISTANT_CHECK_SCHEMA.replaceAll('taskKey', 'itemId')
+  .replace('assistant_check_state', 'assistant_patrol')
+  .replace('checkedNextCheck', 'patrolledNextCheck')
+
+/** Every column holding a check's coordinate, alone or inside a session key or a stored message, as v57 rewrites it. */
+const CHECK_COORDINATE_COLUMNS = [
+  ['sessions', 'key'],
+  ['sessions', 'thread'],
+  ['session_mutes', 'key'],
+  ['session_gates', 'sessionKey'],
+  ['session_outward_ids', 'key'],
+  ['session_metadata_outbox', 'snapshot'],
+  ['thread_participation', 'thread'],
+  ['thread_participation', 'sessionKey'],
+  ['transcript', 'thread'],
+  ['transcript', 'sessionScope'],
+  ['transcript_recipient', 'sessionKey'],
+  ['inbox', 'sessionKey'],
+  ['inbox', 'msg'],
+  ['session_message', 'recipientKey'],
+  ['assistant_item', 'taskKey'],
+  ['assistant_check_state', 'runningKey'],
+  ['assistant_subsession', 'childSessionKey'],
+  ['assistant_subsession_input', 'childSessionKey'],
+  ['assistant_draft', 'sourceThread'],
+  ['assistant_draft', 'sourceSessionKey']
+] as const
+
+/** Patrols became follow-up checks: the check state, the follow-up rows and every stored check coordinate take the new names. */
+async function migratePatrolsToChecks(db: StoreTx, postgres: boolean): Promise<void> {
+  if (await tableExists(db, postgres, 'assistant_patrol')) {
+    // The old table holds the state; a new one can only be an empty leftover of a store rebuilt from a newer schema.
+    await db.exec('DROP TABLE IF EXISTS assistant_check_state')
+    await db.exec('ALTER TABLE assistant_patrol RENAME TO assistant_check_state')
+    await db.exec('ALTER TABLE assistant_check_state RENAME COLUMN patrolledNextCheck TO checkedNextCheck')
+  }
+  if (await tableExists(db, postgres, 'assistant_subsession')) {
+    await withTaskKind(db, postgres)
+    await db.exec("UPDATE assistant_subsession SET kind = 'follow-up' WHERE kind = 'patrol'")
+  }
+  if (await tableExists(db, postgres, 'assistant_item_observation'))
+    await db.exec("UPDATE assistant_item_observation SET author = 'check' WHERE author = 'patrol'")
+  for (const [table, column] of CHECK_COORDINATE_COLUMNS)
+    if (await columnExists(db, postgres, table, column))
+      await db.exec(
+        `UPDATE ${table} SET ${column} = replace(${column}, 'subsession:patrol-', 'subsession:check-')
+          WHERE ${column} LIKE '%subsession:patrol-%'`
+      )
+}
+
+/** A first look became a getting-to-know task: the item marker, onboarding's running list and a queued report round's call meta take the new names. */
+async function migrateFirstLookToGettingToKnow(db: StoreTx, postgres: boolean): Promise<void> {
+  for (const [table, from, to] of [
+    ['assistant_item', 'firstLook', 'gettingToKnow'],
+    ['assistant_onboarding', 'firstLooks', 'gettingToKnowTasks']
+  ] as const) {
+    if (!(await columnExists(db, postgres, table, from))) continue
+    // Both exist only when an earlier step re-added the old column to a store already on the new schema; the old one is empty.
+    if (await columnExists(db, postgres, table, to)) await db.exec(`ALTER TABLE ${table} DROP COLUMN ${from}`)
+    else await db.exec(`ALTER TABLE ${table} RENAME COLUMN ${from} TO ${to}`)
+  }
+  if (await tableExists(db, postgres, 'inbox'))
+    await db.exec(
+      `UPDATE inbox SET callMeta = replace(callMeta, '"firstLookReport":', '"gettingToKnowReport":')
+        WHERE callMeta LIKE '%"firstLookReport":%'`
+    )
+}
+
+/** Whether a table has a column, on either dialect. */
+async function columnExists(db: StoreTx, postgres: boolean, table: string, column: string): Promise<boolean> {
+  if (postgres)
+    return (
+      (
+        await db.query(
+          `SELECT 1 AS found FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?`,
+          [table, column.toLowerCase()]
+        )
+      ).rows.length > 0
+    )
+  const columns = (await db.query(`PRAGMA table_info(${table})`, [])).rows as { name: string }[]
+  return columns.some((c) => c.name === column)
+}
+
+/** A place's long session as the store resolves it, read inside a migration: the append session, else the only other one. */
+async function placeSessionInMigration(
+  db: StoreTx,
+  agentId: string,
+  platform: string,
+  channel: string,
+  scope: string
+): Promise<{ key: string; sessionId: string } | undefined> {
+  const reserved = (
+    await db.query(
+      'SELECT coordinate FROM append_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?',
+      [agentId, channel, scope]
+    )
+  ).rows[0] as { coordinate: string } | undefined
+  const rows = reserved
+    ? ((
+        await db.query('SELECT key, sessionId FROM sessions WHERE key = ?', [
+          sessionKey(platform, channel, reserved.coordinate, agentId, scope || null)
+        ])
+      ).rows as { key: string; sessionId: string | null }[])
+    : ((
+        await db.query(
+          `SELECT key, sessionId FROM sessions WHERE agentId = ? AND platform = ? AND channel = ?
+             AND COALESCE(transportScope, '') = ? AND thread NOT LIKE 'subsession:%' LIMIT 2`,
+          [agentId, platform, channel, scope]
+        )
+      ).rows as { key: string; sessionId: string | null }[])
+  const [row] = rows
+  return rows.length === 1 && row?.sessionId ? { key: row.key, sessionId: row.sessionId } : undefined
+}
+
+/** Give every session created by another one a synthesized `call` from its origin, carrying an outstanding request. */
+async function migrateOriginsToSessionMessages(db: StoreTx, postgres: boolean): Promise<void> {
+  await db.exec(SESSION_MESSAGE_SCHEMA)
+  // Probed, never queried blind: a failed statement aborts a Postgres migration transaction.
+  const keptSources = await tableExists(db, postgres, 'session_reply_source')
+  const sessions = (
+    await db.query(
+      'SELECT key, agentId, originSessionId, originCodeHostReplyTarget, needsParentReply FROM sessions WHERE originSessionId IS NOT NULL',
+      []
+    )
+  ).rows as {
+    key: string
+    agentId: string
+    originSessionId: string
+    originCodeHostReplyTarget: string | null
+    needsParentReply: number | null
+  }[]
+  const now = Date.now()
+  for (const rec of sessions) {
+    if (!rec.agentId) continue
+    const local = (
+      (await db.query('SELECT agentId FROM sessions WHERE sessionId = ? LIMIT 1', [rec.originSessionId])).rows as {
+        agentId: string
+      }[]
+    )[0]
+    // A remote origin's agent and coordinates were only ever known from a recorded source, which an earlier build kept.
+    const source = local || !keptSources ? undefined : await legacyReplySource(db, rec.key, rec.originSessionId)
+    await db.query(
+      `INSERT OR IGNORE INTO session_message
+         (messageId, recipientKey, recipientAgentId, sourceSessionId, sourceAgentId, sourcePlatform, sourceChannel,
+          sourceThread, codeHostReplyTarget, kind, replyState, replyFailed, hopCount, legacy, createdAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'call', ?, 0, 0, 1, ?)`,
+      [
+        newSessionMessageId(),
+        rec.key,
+        rec.agentId,
+        rec.originSessionId,
+        local?.agentId ?? source?.sourceAgentId ?? '',
+        source?.sourcePlatform ?? null,
+        source?.sourceChannel ?? null,
+        source?.sourceThread ?? null,
+        rec.originCodeHostReplyTarget ?? null,
+        Number(rec.needsParentReply ?? 0) === 1 ? 'open' : 'none',
+        now
+      ]
+    )
+  }
+  await db.exec('DROP TABLE IF EXISTS session_reply_obligation')
+  await db.exec('DROP TABLE IF EXISTS session_reply_source')
+}
+
+/** Whether `table` exists in the store's schema. */
+async function tableExists(db: StoreTx, postgres: boolean, table: string): Promise<boolean> {
+  const sql = postgres
+    ? 'SELECT 1 AS found FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?'
+    : "SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ?"
+  return (await db.query(sql, [table])).rows.length > 0
+}
+
+/** A remote origin's route as an earlier build recorded it; the caller has checked that its table exists. */
+async function legacyReplySource(
+  db: StoreTx,
+  key: string,
+  sourceSessionId: string
+): Promise<
+  { sourceAgentId: string; sourcePlatform?: string; sourceChannel?: string; sourceThread?: string } | undefined
+> {
+  const row = (
+    await db.query(
+      'SELECT sourceAgentId, sourcePlatform, sourceChannel, sourceThread FROM session_reply_source WHERE sessionKey = ? AND sourceSessionId = ?',
+      [key, sourceSessionId]
+    )
+  ).rows[0] as Record<string, string | null> | undefined
+  if (!row?.sourceAgentId) return undefined
+  return {
+    sourceAgentId: row.sourceAgentId,
+    ...(row.sourcePlatform ? { sourcePlatform: row.sourcePlatform } : {}),
+    ...(row.sourceChannel ? { sourceChannel: row.sourceChannel } : {}),
+    ...(row.sourceThread ? { sourceThread: row.sourceThread } : {})
+  }
+}
+
+/** The approval record's columns as of v40, which the v40 rebuild copies across where the old table has them. */
+const ASSISTANT_DRAFT_V40_COLUMNS = [
+  'id',
+  'agentId',
+  'action',
+  'kind',
+  'targetPlatform',
+  'targetIntegrationId',
+  'targetChannel',
+  'targetThread',
+  'targetExternal',
+  'targetDm',
+  'targetName',
+  'targetUser',
+  'targetLink',
+  'text',
+  'sourcePlatform',
+  'sourceIntegrationId',
+  'sourceChannel',
+  'sourceThread',
+  'sourceTransportScope',
+  'sourceSessionKey',
+  'sourceSessionId',
+  'sourcePlace',
+  'approverKind',
+  'approverIntegrationId',
+  'approverChannel',
+  'approverUserId',
+  'approverTeamId',
+  'approverConsoleUserId',
+  'cardTs',
+  'offerAlways',
+  'grantEpoch',
+  'status',
+  'hash',
+  'createdAt',
+  'expiresAt',
+  'decidedAt',
+  'decidedBy',
+  'decidedByName',
+  'settledAt',
+  'messageId',
+  'failure'
+]
+
+// The list and the version are two halves of one fact: step `i` moves a database from
+// `user_version === i + 1` to `i + 2`, so the last step must land exactly on SCHEMA_VERSION.
+// A step appended without the bump is silently dead code — the failure mode that shipped
+// `directDestination` to fresh databases only, and broke every established one at query time.
+if (SCHEMA_MIGRATIONS.length !== SCHEMA_VERSION - 1) {
+  throw new Error(
+    `local store schema is inconsistent: ${SCHEMA_MIGRATIONS.length} migration step(s) cannot reach v${SCHEMA_VERSION}`
+  )
+}
+
+/** A router verdict's targetsJson, or undefined when it is absent or unreadable. */
+function parseTargets(
+  text: string | null | undefined
+): Array<Record<string, unknown> & { agentId: string; disposition: string; backgroundSeqs?: number[] }> | undefined {
+  if (!text) return undefined
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return Array.isArray(parsed) ? (parsed as never) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Keep `seq` numeric whichever backend read the row. */
+function normalizeVerdict(row: DecisionVerdictRow): DecisionVerdictRow {
+  return { ...row, seq: Number(row.seq) }
+}
+
+/** One Source Cache bundle or pointer as the accounting table holds it (source-cache.md §10). */
+export interface SourceCacheObjectRow {
+  orgId: string
+  key: string
+  kind: 'bundle' | 'pointer'
+  state: 'pending' | 'committed'
+  bytes: number
+  repoClass: SourceCacheClass
+  repoId: string
+  refHash: string
+  shape: SourceCacheShape
+  createdAt: number
+  updatedAt: number
+  expiresAt: number | null
+  lastReadAt: number | null
+  targetKey: string | null
+  unpointedAt: number | null
+  claimedBy: string | null
+  claimedAt: number | null
+}
+
+export type SourceCacheReserveResult =
+  | { admitted: true; committedBytes: number; pendingBytes: number }
+  | { admitted: false; reason: 'too-large' }
+  | { admitted: false; reason: 'over-quota' | 'duplicate'; committedBytes: number; pendingBytes: number }
+
+export type SourceCacheCommitResult =
+  | { committed: true; alreadyCommitted: boolean; bytes: number }
+  | { committed: false; reason: 'missing' | 'expired' | 'claimed' | 'size-exceeds-reservation' }
+
+export type SourceCachePointerResult =
+  | { set: true; previousBundleKey: string | undefined }
+  | { set: false; reason: 'bundle-not-committed' | 'bundle-mismatch' | 'bundle-claimed' | 'pointer-moved' }
+
+export type SourceCacheDeleteResult =
+  | { deleted: true; releasedBytes: number }
+  | { deleted: false; reason: 'missing' | 'claim-lost' | 'referenced' | 'changed' }
+
+/** The row fields a sweep read at its claim; a delete guarded by them refuses a row that moved since (`changed`). */
+export interface SourceCacheUnchangedGuard {
+  targetKey: string | null
+  updatedAt: number
+  lastReadAt: number | null
+}
+
+/** A sweep claim: `owner` holds the returned rows for `leaseMs`, after which another member may take them. */
+export interface SourceCacheClaimInput {
+  owner: string
+  now: number
+  leaseMs: number
+  limit: number
+}
+
+const SOURCE_CACHE_HASH_RE = /^[0-9a-f]{64}$/
+
+/** Parse a Source Cache key and require it to belong to `orgId` (and be of `kind`); a mismatch is a caller bug. */
+function sourceCacheKeyFor<K extends ParsedSourceCacheObjectKey['kind']>(
+  orgId: string,
+  key: string,
+  kind?: K
+): Extract<ParsedSourceCacheObjectKey, { kind: K }> {
+  const parsed = parseSourceCacheObjectKey(key)
+  if (!parsed) throw new Error('not a Source Cache object key')
+  if (parsed.orgId !== orgId) throw new Error('Source Cache key belongs to another org')
+  if (kind !== undefined && parsed.kind !== kind) throw new Error(`Source Cache key is not a ${kind} key`)
+  return parsed as Extract<ParsedSourceCacheObjectKey, { kind: K }>
+}
+
+const nullableNumber = (value: unknown): number | null => (value === null || value === undefined ? null : Number(value))
+
+/** Keep every numeric column a Number whichever backend read the row. */
+function normalizeSourceCacheObject(row: Record<string, unknown>): SourceCacheObjectRow {
+  return {
+    orgId: row.orgId as string,
+    key: row.key as string,
+    kind: row.kind as SourceCacheObjectRow['kind'],
+    state: row.state as SourceCacheObjectRow['state'],
+    bytes: Number(row.bytes),
+    repoClass: row.repoClass as SourceCacheClass,
+    repoId: row.repoId as string,
+    refHash: row.refHash as string,
+    shape: row.shape as SourceCacheShape,
+    createdAt: Number(row.createdAt),
+    updatedAt: Number(row.updatedAt),
+    expiresAt: nullableNumber(row.expiresAt),
+    lastReadAt: nullableNumber(row.lastReadAt),
+    targetKey: (row.targetKey as string | null | undefined) ?? null,
+    unpointedAt: nullableNumber(row.unpointedAt),
+    claimedBy: (row.claimedBy as string | null | undefined) ?? null,
+    claimedAt: nullableNumber(row.claimedAt)
+  }
+}
+
+export class LocalStore {
+  /** The backend as given. Only the tool-write flush uses it directly; everything else goes
+   *  through `db`, which drains that buffer first. */
+  private readonly backend: StoreDatabase
+  private readonly db: StoreAccess
+  /** The backend without the drain, for the transcript write path: that path holds the mutex a
+   *  flush also needs, so a statement inside it must never try to flush. */
+  private readonly lockedDb: StoreAccess
+  private readonly shared: boolean
+  /** True when the backend speaks PostgreSQL — only a migration step that cannot be portable reads it. */
+  private readonly postgres: boolean
+  private readonly ownerId: string | undefined
+  /** Partition key for per-member cache rows; a single-daemon store owns one partition forever. */
+  private readonly cacheOwnerId: string
+  /** Set only on a shared store, where transcript rows of several orgs share one table. */
+  private readonly orgForAgent: OrgForAgent | undefined
+  /** The assistant item ledger (assistant-mode.md §5.4 ①), over this store's own connection. */
+  readonly assistantItems: AssistantItemLedger
+  /** Assistant-mode drafts and "always allow" grants (assistant-mode.md §5.5). */
+  readonly assistantDrafts: AssistantDraftLedger
+  /** The parent–child index of assistant-mode sub-sessions (assistant-mode.md §5.6). */
+  readonly assistantSubsessions: AssistantSubsessionIndex
+  /** Follow-ups, the task index's watch-mode rows (assistant-mode.md §5.18). */
+  readonly assistantWatchTasks: AssistantWatchTasks
+  /** Each follow-up's check state and check log (assistant-mode.md §5.12). */
+  readonly assistantChecks: AssistantCheckLedger
+  /** Reminders the daemon posts at their time with no model turn (assistant-mode.md §5.9). */
+  readonly assistantReminders: AssistantReminderLedger
+  /** Each agent's onboarding conversation and organization research (assistant-mode.md §5.15). */
+  readonly assistantOnboarding: AssistantOnboardingLedger
+  /** The time zone last seen from a person in each place, for every agent (product-conventions.md "Local time"). */
+  readonly placeTimeZones: PlaceTimeZones
+  /** Each channel's Work page and each targeted cron's latest anchor (assistant-mode.md §5.19). */
+  readonly workCanvases: WorkCanvases
+  /** The messages each session received and sent, with their reply obligations (send-message-guide.md §9.3). */
+  readonly sessionMessages: SessionMessages
+  /** The capability cards this daemon posted, for their rewrite on settlement (capability-requests.md §4.4.6). */
+  readonly capabilityCards: CapabilityCardLedger
+  private readonly ahpState: AhpStateStore
+  private transcriptRevision = 0
+  private transcriptMutationListener?: (mutation: TranscriptMutation) => void | Promise<void>
+  /** Per-(orgId, channel) insert counter arming the §8 rule 2 sweep. */
+  private readonly observationSweepCounters = new Map<string, number>()
+  private readonly pendingToolWrites = new Map<string, PendingToolWrite>()
+  private pendingToolWriteBytes = 0
+  private toolWriteTimer?: ReturnType<typeof setTimeout>
+  /** Serializes the transcript write path. Async execution lets two turns interleave between a
+   *  method's statements, and these rows and the in-memory revision must stay in lockstep. */
+  private readonly transcriptMutex = new AsyncMutex()
+
+  private constructor(
+    backend: StoreDatabase,
+    options: { shared: boolean; ownerId: string | undefined; orgForAgent: OrgForAgent | undefined }
+  ) {
+    this.backend = backend
+    this.db = drainPendingWritesFirst(backend, () => this.drainToolCallWrites())
+    this.lockedDb = accessOf(backend)
+    this.shared = options.shared
+    this.postgres = backend.dialect === 'postgres'
+    this.ownerId = options.ownerId
+    this.orgForAgent = options.orgForAgent
+    this.cacheOwnerId = this.ownerId ?? ''
+    this.assistantItems = new AssistantItemLedger({
+      query: (sql, params) => this.db.query(sql, params),
+      transaction: (fn) => this.transaction(fn)
+    })
+    this.assistantDrafts = new AssistantDraftLedger({ query: (sql, params) => this.db.query(sql, params) })
+    this.assistantSubsessions = new AssistantSubsessionIndex({
+      query: (sql, params) => this.db.query(sql, params),
+      transaction: (fn) => this.transaction(fn)
+    })
+    this.assistantWatchTasks = new AssistantWatchTasks({
+      query: (sql, params) => this.db.query(sql, params),
+      transaction: (fn) => this.transaction(fn)
+    })
+    this.assistantChecks = new AssistantCheckLedger({
+      query: (sql, params) => this.db.query(sql, params),
+      transaction: (fn) => this.transaction(fn)
+    })
+    this.assistantReminders = new AssistantReminderLedger({ query: (sql, params) => this.db.query(sql, params) })
+    this.assistantOnboarding = new AssistantOnboardingLedger({ query: (sql, params) => this.db.query(sql, params) })
+    this.placeTimeZones = new PlaceTimeZones({ query: (sql, params) => this.db.query(sql, params) })
+    this.workCanvases = new WorkCanvases({ query: (sql, params) => this.db.query(sql, params) })
+    this.sessionMessages = new SessionMessages({ query: (sql, params) => this.db.query(sql, params) })
+    this.capabilityCards = new CapabilityCardLedger({ query: (sql, params) => this.db.query(sql, params) })
+    this.ahpState = new AhpStateStore({
+      query: (sql, params) => this.db.query(sql, params),
+      transaction: (fn) => this.transaction(fn)
+    })
+  }
+
+  /**
+   * Open a store and bring its schema to {@link SCHEMA_VERSION}. Two-phase construction because
+   * every step of that sequence is awaited now; the ordering it keeps is the load-bearing part.
+   */
+  static async open(source: LocalStoreSource): Promise<LocalStore> {
+    // This database holds every platform message body, agent reply, tool payload and
+    // durable inbox blob the daemon has seen — the same material the console serves
+    // behind authorization. Every other secret-bearing artifact the daemon writes is
+    // explicitly 0600/0700 (config.json, agent.json, materialized config-file secrets,
+    // runtime homes, evaluation artifacts); this one inherited the umask, so on a host
+    // where the root pre-exists group/other-readable — a container image `mkdir -p`, a
+    // systemd `StateDirectory=` (0755), an operator-created path — a second local
+    // account could read the lot. Restrict the directory and the database explicitly,
+    // and chmod after creation so a loose umask cannot widen either.
+    let store: LocalStore
+    if (typeof source === 'string') {
+      const dir = dirname(source)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      restrictPath(dir, 0o700)
+      store = new LocalStore(SqliteAsyncDatabase.open(source), {
+        shared: false,
+        ownerId: undefined,
+        orgForAgent: undefined
+      })
+      await store.db.exec('PRAGMA journal_mode = WAL')
+      // WAL mode publishes two siblings alongside the database; they carry the same
+      // rows, so restricting only the main file would leave the content readable.
+      for (const p of [source, `${source}-wal`, `${source}-shm`]) restrictPath(p, 0o600)
+    } else {
+      const shared = source.shared === true
+      if (shared && !source.ownerId) throw new Error('shared LocalStore requires an ownerId')
+      if (shared && !source.orgForAgent) throw new Error('shared LocalStore requires an orgForAgent resolver')
+      store = new LocalStore(source.database, {
+        shared,
+        ownerId: source.ownerId,
+        orgForAgent: source.orgForAgent
+      })
+    }
+    try {
+      await store.initializeSchema()
+    } catch (error) {
+      // A refused path keeps no handle open; a caller's database is the caller's to close.
+      if (typeof source === 'string') await store.backend.close().catch(() => undefined)
+      throw error
+    }
+    return store
+  }
+
+  reserveAhpSequenceBlock(orgId: string, agentId: string, size: number): Promise<{ start: number; end: number }> {
+    return this.ahpState.reserve(orgId, agentId, size)
+  }
+
+  loadAhpCheckpoint(orgId: string, agentId: string, sessionId: string): Promise<string | undefined> {
+    return this.ahpState.load(orgId, agentId, sessionId)
+  }
+
+  saveAhpCheckpoint(input: AhpCheckpointWrite): Promise<void> {
+    return this.ahpState.save(input)
+  }
+
+  ahpTurnPage(
+    orgId: string,
+    agentId: string,
+    sessionId: string,
+    cursorTurnId: string,
+    maxBytes?: number
+  ): Promise<{ values: string[]; nextCursor?: string }> {
+    return this.ahpState.page(orgId, agentId, sessionId, cursorTurnId, maxBytes)
+  }
+
+  private async initializeSchema(): Promise<void> {
+    // Decided BEFORE the CREATE block, which is what makes an empty file
+    // indistinguishable from an old one a moment later.
+    const freshDatabase =
+      ((await this.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'").get()) as { n: number })
+        .n === 0
+    await this.upgradeSchema(freshDatabase)
+    const schema = `
+      ${MEMORY_CONTINUATION_SCHEMA}
+      ${SOURCE_CACHE_SCHEMA}
+      ${ASSISTANT_ITEM_SCHEMA}
+      ${ASSISTANT_DRAFT_SCHEMA}
+      ${ASSISTANT_SUBSESSION_SCHEMA}
+      ${ASSISTANT_CHECK_SCHEMA}
+      ${ASSISTANT_REMINDER_SCHEMA}
+      ${ASSISTANT_ONBOARDING_SCHEMA}
+      ${PLACE_TIME_ZONE_SCHEMA}
+      ${WORK_CANVAS_SCHEMA}
+      ${SESSION_MESSAGE_SCHEMA}
+      ${CAPABILITY_CARD_SCHEMA}
+      ${AHP_STATE_SCHEMA}
+      CREATE TABLE IF NOT EXISTS sessions (
+        key TEXT PRIMARY KEY, agentId TEXT, platform TEXT, channel TEXT, thread TEXT,
+        transportScope TEXT, originCodeHostReplyTarget TEXT, acpSessionId TEXT, sessionId TEXT, state TEXT, lastDeliveredTs TEXT, updatedAt INTEGER,
+        usage TEXT, muted INTEGER, triggeredBy TEXT, initiator TEXT, title TEXT, threadUrl TEXT, modelOverride TEXT,
+        observedRuntime TEXT, observedModel TEXT, observedModelSet INTEGER NOT NULL DEFAULT 0, decisionModel TEXT,
+        effortOverride TEXT, permissionModeOverride TEXT, fastModeOverride INTEGER,
+        outputModeOverride TEXT, statusBarTs TEXT, memoryProvider TEXT, workspaceIsolation TEXT,
+        originSessionId TEXT, lastTurnOutcome TEXT, needsParentReply INTEGER,
+        externalProvider TEXT, externalRealmKey TEXT, externalResourceKind TEXT,
+        externalResourceKey TEXT, externalIntegrationId TEXT, externalOriginJson TEXT,
+        sourceBindingKind TEXT, directDestination INTEGER,
+        -- session-visibility.md §4.1: persisted so EVERY event/session re-emit
+        -- carries them, not just the one dispatch that knew the message.
+        conversationKind TEXT, tenantScope TEXT, launchCorrelationId TEXT,
+        platformStanding TEXT,
+        executorDaemonId TEXT, stayedHomeReason TEXT,
+        onDemandClones INTEGER, birthStrategy TEXT, selectedRepos TEXT, replyChannel TEXT, replyThread TEXT,
+        standingDigest TEXT, toolDigests TEXT, retentionKeptAt INTEGER, retentionRecheckAt INTEGER,
+        workspaceReclaimedAt INTEGER
+      );
+      -- A !stop can arrive while a cold session is still materializing, before the
+      -- sessions row exists. Keep the mute independently keyed so that stop survives a
+      -- daemon restart and is applied when the session row is eventually created.
+      CREATE TABLE IF NOT EXISTS session_mutes (
+        key TEXT PRIMARY KEY
+      );
+      -- Per-session memory-capture gate (session-visibility.md §5.1). Keyed by
+      -- (agentId, acpSessionId), NOT the logical session key: the CP addresses
+      -- sessions by the id it knows, and its push can arrive before (or after a
+      -- resume recreates) the sessions row — so this table stands alone, like
+      -- session_mutes. The agent is part of the key because ACP session ids are
+      -- runtime-local: on a pool's shared store every agent of every org can hold
+      -- an acp-1, and one org's push must never answer for another org's gate.
+      --   localExcluded: the daemon-local initial verdict (DM/webchat/launch/A2A).
+      --   cpPrivate    : the CP-confirmed bit; authoritative once it is set.
+      --   cpRev        : the CP's durable visibilityRev — the dedup/order key.
+      -- (localExcluded, not "excluded": SQLite's upsert pseudo-table owns that name.)
+      CREATE TABLE IF NOT EXISTS session_gates (
+        agentId TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        localExcluded INTEGER NOT NULL DEFAULT 1,
+        cpPrivate INTEGER,
+        cpRev INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER,
+        PRIMARY KEY (agentId, sessionKey)
+      );
+      ${THREAD_PARTICIPATION_SCHEMA}
+      ${DECISION_SCHEMA}
+      ${APPEND_RESERVATION_SCHEMA}
+      -- Latest-wins session metadata awaiting a correlated CP persistence ACK.
+      -- This is deliberately separate from sessions: an upgrade starts with an
+      -- empty outbox and never treats historical session rows as pending work.
+      -- On a shared pool store ownerId / claimedAt lease each snapshot to one
+      -- member the way inbox.reportOwnerId and session_purges.ownerId do.
+      CREATE TABLE IF NOT EXISTS session_metadata_outbox (
+        agentId TEXT NOT NULL,
+        sessionId TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        queuedAt INTEGER NOT NULL,
+        failedAttempts INTEGER NOT NULL DEFAULT 0,
+        nextAttemptAt INTEGER,
+        ownerId TEXT,
+        claimedAt INTEGER,
+        PRIMARY KEY (agentId, sessionId)
+      );
+      CREATE INDEX IF NOT EXISTS session_metadata_outbox_fifo
+        ON session_metadata_outbox (queuedAt);
+      CREATE INDEX IF NOT EXISTS session_metadata_outbox_attempt
+        ON session_metadata_outbox (nextAttemptAt, queuedAt);
+      -- Outward session ids minted BEFORE their session row exists — a credential is issued to
+      -- start the runtime, and the turn writes the session only once it dispatches (§1.1). The
+      -- insert adopts the mint, so this table holds only what has not become a session yet: an
+      -- in-flight slot, or an internal:* key (dream / memory / commit) that never will.
+      CREATE TABLE IF NOT EXISTS session_outward_ids (
+        key TEXT PRIMARY KEY,
+        agentId TEXT,
+        sessionId TEXT NOT NULL,
+        mintedAt INTEGER NOT NULL
+      );
+      -- Retention-GC receipts (#485): sessions this daemon has already deleted
+      -- locally, still owed to the CP as an event/session-purged report. Durable
+      -- because the local row is GONE — unlike every other D→C report, an
+      -- unacknowledged receipt cannot be re-derived from daemon state later, so
+      -- losing it would leave the console rendering a permanently empty transcript
+      -- with no explanation. Rows are dropped only on the CP's ACK.
+      -- Keyed by (agentId, sessionId): ACP session ids are runtime-local, so two
+      -- agents can both have purged an acp-1. On a shared pool store ownerId /
+      -- claimedAt lease each receipt to one member the way inbox.reportOwnerId does.
+      CREATE TABLE IF NOT EXISTS session_purges (
+        agentId TEXT NOT NULL,
+        sessionId TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        purgedAt INTEGER NOT NULL,
+        ownerId TEXT,
+        claimedAt INTEGER,
+        PRIMARY KEY (agentId, sessionId)
+      );
+      CREATE INDEX IF NOT EXISTS session_purges_fifo ON session_purges (purgedAt);
+      -- Removal tombstones survive unfinished cancellation and daemon restart.
+      CREATE TABLE IF NOT EXISTS removed_integrations (
+        agentId TEXT NOT NULL,
+        integrationId TEXT NOT NULL,
+        PRIMARY KEY (agentId, integrationId)
+      );
+      -- Minted durable tenant scopes for platforms that expose none (§2).
+      CREATE TABLE IF NOT EXISTS tenant_scopes (
+        integrationId TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        createdAt INTEGER
+      );
+      -- Platform id → human display name (Slack channel/user names, daemon-resolved
+      -- and cached here so session read-back can label ids without a Slack call).
+      CREATE TABLE IF NOT EXISTS display_names (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, updatedAt INTEGER
+      );
+      -- Platform id → public provider-hosted profile image. Kept separate from
+      -- display_names because a provider may expose an avatar without a name.
+      CREATE TABLE IF NOT EXISTS profile_avatars (
+        transportScope TEXT NOT NULL, id TEXT NOT NULL, url TEXT NOT NULL, updatedAt INTEGER,
+        PRIMARY KEY (transportScope, id)
+      );
+      -- Where a conversation id SITS: its enclosing channel (a Discord thread's parent
+      -- channel — a session keys on the thread id, so the reachable channel it belongs
+      -- to is otherwise unrecoverable) and its enclosing space (the Discord guild, whose
+      -- name a reported channel row carries so a bot in several servers stays legible).
+      -- Backs observed-channel collapsing: threads fold onto their channel, whose
+      -- snowflake is the uniqueness key of a reported row. isIm (1/0) records that the
+      -- conversation is a DM: the sessions table cannot tell a DM from a group, so
+      -- without it observed discovery reports a DM as a channel row named "@someone".
+      CREATE TABLE IF NOT EXISTS channel_scopes (
+        id TEXT PRIMARY KEY, parentId TEXT, spaceId TEXT, isIm INTEGER, updatedAt INTEGER
+      );
+      -- What one connection learned about a conversation it reaches (ids, endpoint, kind, names; never content), kept across restarts.
+      CREATE TABLE IF NOT EXISTS connection_conversations (
+        scope TEXT NOT NULL, id TEXT NOT NULL, facts TEXT NOT NULL, updatedAt INTEGER NOT NULL,
+        PRIMARY KEY (scope, id)
+      );
+      CREATE INDEX IF NOT EXISTS connection_conversations_recent ON connection_conversations (scope, updatedAt);
+      -- Conversations this daemon must stop REPORTING: the bot left, or an operator
+      -- forgot the row. Needed because the observed set of a platform that cannot
+      -- enumerate is derived from SESSION HISTORY, which knows nothing about leaving —
+      -- so without a durable marker the next refresh rebuilds the row from old
+      -- sessions and silently undoes the departure. Survives restart for the same
+      -- reason: the history it is suppressing is itself durable.
+      CREATE TABLE IF NOT EXISTS retracted_conversations (
+        integrationId TEXT NOT NULL, channelId TEXT NOT NULL, retractedAt INTEGER NOT NULL,
+        PRIMARY KEY (integrationId, channelId)
+      );
+      CREATE TABLE IF NOT EXISTS permission_requests (
+        id TEXT PRIMARY KEY,
+        agentId TEXT NOT NULL,
+        sessionId TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        requesterId TEXT,
+        requesterName TEXT,
+        command TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'allowed', 'denied', 'expired')),
+        resolvedAt INTEGER,
+        ownerId TEXT,
+        resolvedBy TEXT,
+        resolvedByName TEXT,
+        notifyIntegrationId TEXT,
+        notifyChannel TEXT,
+        notifyTs TEXT,
+        noticeIntegrationId TEXT,
+        noticeChannel TEXT,
+        noticeTs TEXT,
+        noticeKind TEXT,
+        besideIntegrationId TEXT,
+        besideChannel TEXT,
+        besideTs TEXT,
+        joinAsk TEXT
+      );
+      CREATE INDEX IF NOT EXISTS permission_requests_agent_created
+        ON permission_requests (agentId, createdAt DESC);
+      -- orgId fences every conversation on the org that owns it (#1041 item 7). thread is the
+      -- PHYSICAL platform thread, never a session coordinate; NULL means a row the v24 migration
+      -- rewrote from an append:* coordinate, reported as thread-unknown (message-intake.md §4.1).
+      CREATE TABLE IF NOT EXISTS transcript (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        orgId TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL, thread TEXT, ts TEXT,
+        sender TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+        tool_call_id TEXT, body TEXT, recipient TEXT, eventTimeUs INTEGER,
+        attachmentsJson TEXT, quoteJson TEXT, trustedAgentBot INTEGER, revision INTEGER NOT NULL DEFAULT 0,
+        postId TEXT,
+        sessionScope TEXT NOT NULL DEFAULT '',
+        sharedImageJson TEXT,
+        handedTo TEXT
+      );
+      CREATE INDEX IF NOT EXISTS transcript_channel_seq ON transcript (orgId, channel, seq);
+      -- One conversational message is one row per conversation, whoever admits it. Internal rows
+      -- (tool/reasoning/plan/elicit/app) carry no platform ts and are deliberately not deduped here.
+      CREATE UNIQUE INDEX IF NOT EXISTS transcript_text_ts
+        ON transcript (orgId, channel, ts) WHERE kind = 'text';
+      -- The admission record (message-intake.md §4.2): the row seq, the agent that took it in, and
+      -- the LOCAL sessions.key it joined. One per agent per row, INSERT OR IGNORE so two concurrent
+      -- admitters both succeed. The recipient column survives only as first-delivery provenance.
+      CREATE TABLE IF NOT EXISTS transcript_recipient (
+        seq INTEGER NOT NULL,
+        agentId TEXT NOT NULL,
+        sessionKey TEXT NOT NULL,
+        PRIMARY KEY (seq, agentId)
+      );
+      CREATE INDEX IF NOT EXISTS transcript_recipient_session ON transcript_recipient (sessionKey, seq);
+      -- ACP tool ids are session-local, so peers AND a successor session at the same physical
+      -- thread may legitimately reuse one; sessionScope is the row's own session discriminator
+      -- (sessions.key, '' where the kind does not carry one) and is what makes them distinct.
+      CREATE UNIQUE INDEX IF NOT EXISTS transcript_agent_tool_call
+        ON transcript (orgId, channel, thread, sender, sessionScope, tool_call_id) WHERE tool_call_id IS NOT NULL;
+      -- An MCP App card is found by its card id ALONE when a reloaded view names it (§8.1), and
+      -- the index above leads with the thread, so it cannot serve that. Partial on app rows: a
+      -- handful per conversation, so the write cost is paid only where the read happens.
+      CREATE INDEX IF NOT EXISTS transcript_app_card
+        ON transcript (tool_call_id) WHERE kind = 'app';
+      -- Chronological history key: the console reads in event-time order, seq breaks ties.
+      CREATE INDEX IF NOT EXISTS transcript_channel_event_time
+        ON transcript (orgId, channel, eventTimeUs DESC, seq DESC);
+      -- Stable-row updates need a cursor independent of insertion-order seq.
+      CREATE INDEX IF NOT EXISTS transcript_channel_revision
+        ON transcript (orgId, channel, revision);
+      -- Written ONLY by an exclusively owned store: a shared store's members would each
+      -- serialize their own map over this one row, so they do not persist here at all.
+      CREATE TABLE IF NOT EXISTS cp_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        routingEpoch INTEGER, assignments TEXT, globalRules TEXT
+      );
+      -- Authoritative last-run per cron (protocol §5.4 — missed-fire compensation).
+      -- key = "<agentId>:<cronId>" (cron defs themselves live in agent.json).
+      -- The definition column fingerprints the entry the stamp was written under (#1031): schedules are
+      -- edited in place, so a stamp is only comparable to a fire of the SAME definition. NULL on
+      -- rows written before it existed, which simply makes them ineligible for a catch-up.
+      CREATE TABLE IF NOT EXISTS cron_runs (
+        key TEXT PRIMARY KEY, lastRunAt INTEGER NOT NULL, definition TEXT
+      );
+      -- The dream half of cron_runs (#1031): a dream schedule's only durable last-fired, so a
+      -- handover can tell a swallowed occurrence from one that already ran. One row per agent.
+      CREATE TABLE IF NOT EXISTS dream_runs (
+        agentId TEXT PRIMARY KEY, lastRunAt INTEGER NOT NULL, definition TEXT
+      );
+      -- A CP cron run's terminal outcome, held until the CP ACKs it so a disconnect cannot lose it.
+      CREATE TABLE IF NOT EXISTS cron_report_outbox (
+        agentId TEXT NOT NULL,
+        cronId TEXT NOT NULL,
+        firedAt TEXT NOT NULL,
+        report TEXT NOT NULL,
+        queuedAt INTEGER NOT NULL,
+        PRIMARY KEY (agentId, cronId, firedAt)
+      );
+      CREATE INDEX IF NOT EXISTS cron_report_outbox_fifo ON cron_report_outbox (queuedAt);
+      -- §6.9 #353 durable inbox: an ADMITTED-but-QUEUED message persisted BEFORE the
+      -- admission ACK, so a hard kill / agent move can't lose a message the caller was
+      -- already told delivered:true. Replayed FIFO-by-sessionKey on startup and removed
+      -- on every terminal path (success / reject / cancel / gate-drop). The id column is the
+      -- message's STABLE deliveryId/msgId (§6.3) so re-append and replay are idempotent
+      -- against the existing admission-idempotency maps. Webchat turns are NOT persisted
+      -- here (their live sink can't be restored — see §6.9 #367). enqueuedAt is a
+      -- monotonic decimal string (fixed-width ⇒ string order == numeric order) driving
+      -- FIFO within a sessionKey.
+      CREATE TABLE IF NOT EXISTS inbox (
+        id TEXT PRIMARY KEY,
+        sessionKey TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        msg TEXT NOT NULL,
+        integrationId TEXT,
+        callMeta TEXT,
+        hookContext TEXT,
+        codeHostReplyTarget TEXT,
+        posterPublishState TEXT,
+        terminalReport TEXT,
+        reportOwnerId TEXT,
+        reportClaimedAt INTEGER,
+        completedAt INTEGER,
+        isQueueCmd INTEGER,
+        loopGuardCounted INTEGER NOT NULL DEFAULT 0,
+        enqueuedAt TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS inbox_fifo ON inbox (sessionKey, enqueuedAt);
+      -- External-memory capture is reply-after-delivery and eventually
+      -- consistent. Persist the bounded observation before any plugin call so a
+      -- daemon restart cannot lose it. Bodies stay daemon-local; CP sees only
+      -- body-free connection facts/metrics.
+      CREATE TABLE IF NOT EXISTS memory_capture_outbox (
+        operationId TEXT PRIMARY KEY,
+        turnId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        connectionId TEXT NOT NULL,
+        connectionRevision INTEGER NOT NULL CHECK (connectionRevision > 0),
+        pluginId TEXT NOT NULL,
+        manifestDigest TEXT,
+        config TEXT NOT NULL,
+        scopeKey TEXT NOT NULL,
+        sessionId TEXT,
+        input TEXT NOT NULL,
+        output TEXT NOT NULL,
+        payloadHash TEXT NOT NULL,
+        payloadBytes INTEGER NOT NULL CHECK (payloadBytes >= 0),
+        idempotency TEXT NOT NULL CHECK (idempotency IN ('operation-id', 'none')),
+        state TEXT NOT NULL CHECK (state IN ('pending', 'sending', 'accepted', 'completed', 'failed', 'ambiguous')),
+        attempts INTEGER NOT NULL CHECK (attempts >= 0),
+        backendOperationId TEXT,
+        reasonCode TEXT,
+        nextAttemptAt INTEGER NOT NULL,
+        createdAt INTEGER NOT NULL,
+        updatedAt INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS memory_capture_turn
+        ON memory_capture_outbox (agentId, connectionId, turnId);
+      CREATE INDEX IF NOT EXISTS memory_capture_due
+        ON memory_capture_outbox (state, nextAttemptAt, createdAt);
+      -- Remote webchat MCP grant authorities held by this daemon (non-secret —
+      -- token plaintext stays in process memory only). See WebchatMcpGrantLedgerRow.
+      CREATE TABLE IF NOT EXISTS webchat_mcp_grant_ledger (
+        conversationId TEXT PRIMARY KEY,
+        agentId TEXT NOT NULL,
+        authorityId TEXT NOT NULL,
+        authorityGeneration INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'revoking')),
+        reason TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        nextAttemptAt INTEGER,
+        updatedAt INTEGER NOT NULL,
+        ownerId TEXT                      -- daemon incarnation holding the grant; NULL on an exclusively owned store
+      );
+      CREATE INDEX IF NOT EXISTS webchat_mcp_grant_ledger_due
+        ON webchat_mcp_grant_ledger (state, nextAttemptAt);
+      -- send-message-routing-rework.md §8.6: the durable rendezvous that collapses the
+      -- internal wake and the visible platform echo of ONE paired agent-call delivery
+      -- into one admission. Durable rather than in-memory because the two halves may be
+      -- separated by a restart, and because an already-admitted key must keep answering
+      -- retries with the SAME childSessionId instead of opening a second session.
+      CREATE TABLE IF NOT EXISTS activation_rendezvous (
+        activationKey TEXT PRIMARY KEY,
+        agentCallDeliveryId TEXT,
+        platformMessageId TEXT,
+        transcriptCoordinates TEXT,
+        callEnvelope TEXT,
+        -- The durable inbox row id this claim's dispatch will write, recorded AT CLAIM
+        -- TIME so a crash in the dispatch window is reconcilable rather than guessable:
+        -- the sweep can ask whether the turn is durably queued instead of assuming.
+        dispatchId TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'admitted', 'transcript-only')),
+        childSessionId TEXT,
+        expiresAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS activation_rendezvous_expiry
+        ON activation_rendezvous (state, expiresAt);
+      -- Conversation-wide spam/feedback-loop circuit. Unlike the in-memory dedup
+      -- caches, this latch survives a daemon restart, so durable inbox replay cannot
+      -- re-ignite a conversation that was already stopped by loop protection.
+      CREATE TABLE IF NOT EXISTS loop_guard (
+        scopeKey TEXT PRIMARY KEY,
+        windowStartedAt INTEGER NOT NULL,
+        totalCount INTEGER NOT NULL,
+        automaticWindowStartedAt INTEGER NOT NULL,
+        automaticCount INTEGER NOT NULL,
+        trippedAt INTEGER,
+        reason TEXT
+      );
+      -- Messages already charged to a loop_guard window, so a fan-out to several agents counts once.
+      CREATE TABLE IF NOT EXISTS loop_guard_charge (
+        scopeKey TEXT NOT NULL,
+        messageKey TEXT NOT NULL,
+        chargedAt INTEGER NOT NULL,
+        PRIMARY KEY (scopeKey, messageKey)
+      );
+      -- Self-introduce-on-join (issue #536). channel_intro is the durable set of
+      -- channels an agent has already introduced itself into (or adopted as the
+      -- silent baseline), so an intro fires at most once per (agent, platform,
+      -- channel) across restarts. channel_intro_seed marks that an integration's
+      -- FIRST channel snapshot has been baselined — until then every listed channel
+      -- is adopted silently, so a restart / re-list never storms peers.
+      CREATE TABLE IF NOT EXISTS channel_intro (
+        agentId TEXT NOT NULL, platform TEXT NOT NULL, channel TEXT NOT NULL,
+        introducedAt INTEGER,
+        PRIMARY KEY (agentId, platform, channel)
+      );
+      CREATE TABLE IF NOT EXISTS channel_intro_seed (
+        integrationId TEXT PRIMARY KEY, seededAt INTEGER NOT NULL
+      );
+      -- Runtime model-catalog cache (runtime-model-catalog.md §4): last-good discovery
+      -- results, hydrated synchronously at boot so the first facts/daemon-runtimes frame
+      -- carries the previous models + capability matrix instead of an empty REPLACE.
+      -- Failures never clear rows; models are pruned only after a COMPLETE successful
+      -- discovery. complete stays 0 on phase-1 probe writes so the discovery gate
+      -- can tell "never fully discovered" from "last-good on file".
+      -- ownerId leads both keys (#1039): the cache describes an image, so on a store every
+      -- pool member shares, two rollout generations would re-probe and prune each other.
+      -- The last slash-command list each agent's runtime advertised (ACP
+      -- available_commands_update), so a daemon restart/upgrade does not blind the
+      -- console's skill picker until the next session happens to start.
+      CREATE TABLE IF NOT EXISTS runtime_commands (
+        agentId TEXT PRIMARY KEY,
+        sessionId TEXT NOT NULL,
+        updatedAt TEXT NOT NULL,          -- ISO timestamp of the advertisement
+        payload TEXT NOT NULL             -- JSON RuntimeCommand[]
+      );
+      CREATE TABLE IF NOT EXISTS runtime_catalog_meta (
+        ownerId TEXT NOT NULL DEFAULT '', -- the owning member; '' is the single-daemon store
+        runtimeId TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        source TEXT NOT NULL,             -- 'native' | 'acp'
+        defaultModel TEXT,
+        permissionModes TEXT,             -- JSON [{value, name?}]
+        defaultPermissionMode TEXT,       -- mode select currentValue on a fresh probe session
+        complete INTEGER NOT NULL DEFAULT 0,
+        modelsHash TEXT,                  -- hash of probed models[] at last complete discovery
+        observedAt INTEGER NOT NULL,
+        PRIMARY KEY (ownerId, runtimeId)
+      );
+      -- The pool-wide runtime probe's published answer, keyed on the runtime IMAGE it describes
+      -- (docs/designs/daemon-detailed-design.md §2.6). One member claims a key and probes; every
+      -- member reads the payload and advertises it, so a pool runs ONE probe sandbox rather than
+      -- one per replica. The image is the key because that is what the answer is about: a template
+      -- bump is a different row, and no member can be served a previous image's models.
+      CREATE TABLE IF NOT EXISTS runtime_image_probe (
+        imageRef TEXT PRIMARY KEY,
+        claimedBy TEXT,                   -- member currently probing; the claim goes stale on its own
+        claimedAt INTEGER,
+        probedAt INTEGER,                 -- when a payload landed; NULL while only claimed
+        payload TEXT                      -- JSON {table, results} — the image table and probe results
+      );
+      CREATE TABLE IF NOT EXISTS runtime_model_catalog (
+        ownerId TEXT NOT NULL DEFAULT '',
+        runtimeId TEXT NOT NULL,
+        modelId TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        capsJson TEXT NOT NULL,           -- JSON {name?, description?, efforts?: [{value,name?,description?}], defaultEffort?, fastMode?}
+        observedAt INTEGER NOT NULL,
+        PRIMARY KEY (ownerId, runtimeId, modelId)
+      );
+      -- Memory dream jobs (docs/designs/memory-dreaming.md §4). METADATA ONLY —
+      -- staged store bodies live on disk under <agent-root>/memory-dreams/ and
+      -- never enter this DB. Column shapes mirror protocol DreamInfo; the JSON
+      -- columns hold its array/object fields verbatim.
+      CREATE TABLE IF NOT EXISTS dreams (
+        dreamId TEXT PRIMARY KEY,
+        agentId TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN
+          ('pending', 'running', 'completed', 'failed', 'canceled', 'adopted', 'discarded', 'superseded')),
+        triggerKind TEXT NOT NULL,
+        sessionIds TEXT NOT NULL,         -- JSON string[]
+        snapshotDigest TEXT NOT NULL,
+        executionSessionId TEXT,
+        runtime TEXT,
+        model TEXT,
+        stopReason TEXT,
+        snapshotWrites TEXT,              -- JSON {total, nonDistill} write-ledger marks
+        instructions TEXT,
+        skills TEXT,                      -- JSON DreamSkillInfo[]
+        organizationSuggestions TEXT,     -- JSON DreamOrganizationSuggestionInfo[] (metadata only)
+        usage TEXT,                       -- JSON DreamUsage (tokens/cost + bounded byte counts)
+        error TEXT,                       -- JSON {type, message}
+        createdAt TEXT NOT NULL,
+        endedAt TEXT,
+        ownerId TEXT                      -- daemon incarnation running it; NULL on an exclusively owned store
+      );
+      CREATE INDEX IF NOT EXISTS dreams_agent_created ON dreams (agentId, createdAt DESC);
+      -- Monotonic shim-binding generation per agent. Durable and install-shared because a sandbox
+      -- pod outlives the daemon holding it: a member that restarted the count would dial below the
+      -- generation that pod already bound, which its shim refuses for the rest of the pod's life.
+      CREATE TABLE IF NOT EXISTS sandbox_generations (
+        agentId TEXT PRIMARY KEY,
+        generation INTEGER NOT NULL
+      );
+      -- The managed memory home this daemon last applied per agent: what a forced return is detected against on the first roster after a restart (memory-evolution.md §3.2.1).
+      CREATE TABLE IF NOT EXISTS memory_home_applied (
+        agentId TEXT PRIMARY KEY,
+        memoryHome TEXT NOT NULL          -- 'daemon' | 'control-plane'
+      );
+      CREATE TABLE IF NOT EXISTS duty_write_fence (
+        groupId TEXT PRIMARY KEY,
+        term TEXT NOT NULL,
+        daemonId TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS cluster_skill_ledger (
+        agentId TEXT NOT NULL,
+        workspaceIncarnation TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        ledger TEXT NOT NULL,
+        PRIMARY KEY (agentId, workspaceIncarnation)
+      );
+      CREATE TABLE IF NOT EXISTS cluster_skill_journal (
+        agentId TEXT NOT NULL,
+        workspaceIncarnation TEXT NOT NULL,
+        operationId TEXT NOT NULL,
+        groupId TEXT NOT NULL,
+        term TEXT NOT NULL,
+        daemonId TEXT NOT NULL,
+        priorRevision INTEGER NOT NULL,
+        desiredHash TEXT NOT NULL,
+        replayKey TEXT,
+        state TEXT NOT NULL CHECK (state IN ('applying', 'applied')),
+        resultLedger TEXT,
+        PRIMARY KEY (agentId, workspaceIncarnation)
+      );
+      -- gitlab-com-integration.md §16 run projection: the write marker this daemon persists BEFORE
+      -- every provider mutation. An 'in_flight' row surviving a restart is reconciled by listing the
+      -- merge request's notes and matching the hidden marker, never by replaying the write. A
+      -- 'settled_unreported' row holds a definite outcome the control plane has not acknowledged yet:
+      -- it is replayed until acked, so a dropped result cannot wedge the control plane's write mutex.
+      CREATE TABLE IF NOT EXISTS code_host_note_projection (
+        projectionKey TEXT PRIMARY KEY,
+        projectionId TEXT NOT NULL,
+        hookId TEXT NOT NULL,
+        agentId TEXT NOT NULL,
+        orgId TEXT,
+        provider TEXT NOT NULL,
+        projectId TEXT NOT NULL,
+        mergeRequestIid INTEGER NOT NULL,
+        headSha TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        writeMarker TEXT NOT NULL,
+        state TEXT NOT NULL,
+        body TEXT NOT NULL,
+        noteId TEXT,
+        credentialEpoch TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('in_flight', 'settled_unreported', 'settled')),
+        outcome TEXT,                     -- the definite outcome awaiting acknowledgement
+        code TEXT,                        -- its normalized reason code
+        updatedAt INTEGER NOT NULL,
+        -- The STABLE daemon identity the control plane dispatches to, not a process incarnation: a
+        -- restarted daemon must find its own unfinished writes, and the control plane keeps an
+        -- ambiguous marker on that identity, so no peer is ever dispatched to finish them.
+        daemonId TEXT NOT NULL,
+        ownerId TEXT                      -- process incarnation that started the write; informational only
+      );
+      CREATE INDEX IF NOT EXISTS code_host_note_projection_pending
+        ON code_host_note_projection (daemonId, phase, updatedAt);
+      -- Daemon-local secrets that must survive a restart. Nothing here authenticates to a peer:
+      -- the only entry today is the formal-review marker key, whose whole claim is "this daemon's
+      -- attempt authored this draft", so a key that changed every boot would make same-attempt
+      -- crash recovery unverifiable (gitlab-com-integration.md §15.1).
+      CREATE TABLE IF NOT EXISTS daemon_secret (
+        name TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        createdAt INTEGER NOT NULL
+      );
+      -- One iLink bot's poll cursor and latest reply token (wechat-integration.md §3.3, §4.5); never message content.
+      CREATE TABLE IF NOT EXISTS wechat_bot_state (
+        botId TEXT PRIMARY KEY,
+        pollCursor TEXT,
+        contextToken TEXT,
+        updatedAt INTEGER NOT NULL
+      );
+      -- Recent WeChat message texts by iLink message id, so a quote that names only an id resolves (wechat-integration.md §4.3).
+      CREATE TABLE IF NOT EXISTS wechat_message (
+        botId TEXT NOT NULL,
+        messageId TEXT NOT NULL,
+        text TEXT NOT NULL,
+        createdAt INTEGER NOT NULL,
+        PRIMARY KEY (botId, messageId)
+      );
+      -- gitlab-com-integration.md §15.1: control-plane frames a finished review still OWES. Both
+      -- the operation settle and the terminal result are idempotent REQs, so an unacknowledged one
+      -- is replayed verbatim until the control plane takes it; a lost ack must never leave an
+      -- operation record started forever or an outcome unreconciled.
+      CREATE TABLE IF NOT EXISTS code_host_review_intent (
+        intentId TEXT PRIMARY KEY,
+        daemonId TEXT NOT NULL,
+        attemptId TEXT NOT NULL,
+        orgId TEXT,
+        kind TEXT NOT NULL CHECK (kind IN ('operation', 'result')),
+        frame TEXT NOT NULL,              -- the exact payload replayed, verbatim
+        attempts INTEGER NOT NULL DEFAULT 0,
+        updatedAt INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS code_host_review_intent_pending
+        ON code_host_review_intent (daemonId, updatedAt);
+    `
+    // One transaction, not 58: a multi-statement script commits — and so flushes — each statement.
+    // The stamp joins it, so a creation that fails halfway leaves no schema to claim it is current.
+    // Creation only: an established store re-runs this block as pure IF NOT EXISTS, so it saves
+    // nothing there, and BEGIN IMMEDIATE held across 58 statements would collide with any peer
+    // holding the same file open — every boot, not just the first.
+    if (freshDatabase)
+      await this.transaction(async (tx) => {
+        await tx.exec(schema)
+        await tx.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      })
+    else await this.db.exec(schema)
+    // The revision counter is in-memory but the rows it numbers are durable, so it
+    // must resume from the database on every open — starting a restarted daemon back
+    // at 0 would hand already-issued revisions to new rows. Deliberately unfenced: it
+    // allocates across every org partition, so it must clear the highest of them all.
+    this.transcriptRevision = (
+      (await this.db.prepare('SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript').get()) as {
+        revision: number
+      }
+    ).revision
+    // Only an exclusively owned store proves that every old in-memory resolver died.
+    if (!this.shared) {
+      await this.db
+        .prepare(
+          "UPDATE permission_requests SET status = 'expired', resolvedAt = COALESCE(resolvedAt, ?) WHERE status = 'pending'"
+        )
+        .run(Date.now())
+    }
+  }
+
+  /**
+   * Bring a store written by an older daemon up to {@link SCHEMA_VERSION}.
+   *
+   * Runs BEFORE the constructor's `CREATE` block, and both halves of that
+   * ordering are load-bearing:
+   *
+   * - The `CREATE` block describes the CURRENT schema, so it may index a column
+   *   some future step introduces. Running it first would put that
+   *   `CREATE INDEX` against a table the step has not widened yet.
+   * - A store from a newer daemon must be refused having been left ALONE. The
+   *   `CREATE` block is `IF NOT EXISTS`, but on a newer database "not exists" is
+   *   itself the wrong question — it would add this version's objects to a store
+   *   whose shape this build cannot reason about, and only then reject it.
+   *
+   * Each step commits with the version it produced, so an interrupted upgrade
+   * resumes at the first unapplied step instead of replaying applied ones.
+   */
+  private async upgradeSchema(freshDatabase: boolean): Promise<void> {
+    // Nothing to upgrade, and nothing to refuse: the caller stamps the version
+    // once the `CREATE` block has emitted the current schema.
+    if (freshDatabase) return
+    // Databases created before versioning read 0; they carry the v1 schema.
+    let version = ((await this.db.prepare('PRAGMA user_version').get()) as { user_version: number }).user_version || 1
+    if (version > SCHEMA_VERSION)
+      throw new Error(
+        `local store schema v${version} is newer than this daemon understands (v${SCHEMA_VERSION}) — upgrade the daemon`
+      )
+    while (version < SCHEMA_VERSION) {
+      const step = SCHEMA_MIGRATIONS[version - 1]
+      if (!step) throw new Error(`local store is missing a migration step for schema v${version}`)
+      const upgraded = version + 1
+      await this.transaction(async (tx) => {
+        await step(tx, { shared: this.shared, postgres: this.postgres })
+        await tx.exec(`PRAGMA user_version = ${upgraded}`)
+      })
+      version = upgraded
+    }
+  }
+
+  /** One transaction on a pinned connection, with the tool-write buffer drained first: a flush
+   *  issued from inside the transaction would run on a different connection. */
+  private async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
+    await this.drainToolCallWrites()
+    return this.backend.transaction(fn)
+  }
+
+  async getSession(key: string): Promise<SessionRecord | undefined> {
+    return (await this.db.prepare('SELECT * FROM sessions WHERE key = ?').get(key)) as SessionRecord | undefined
+  }
+
+  async bindSessionOriginReplyTarget(key: string, originSessionId: string, target: string): Promise<void> {
+    await this.db
+      .prepare(
+        'UPDATE sessions SET originCodeHostReplyTarget = ? WHERE key = ? AND originSessionId = ? AND originCodeHostReplyTarget IS NULL'
+      )
+      .run(target, key, originSessionId)
+  }
+
+  /**
+   * The slot's OUTWARD session id (§1.1), minted on first ask and stable for the slot's life.
+   * Asked before a credential is issued — earlier than the runtime, so earlier than any ACP id,
+   * and usually earlier than the session ROW, which the turn writes only once it dispatches.
+   *
+   * A mint therefore lands in `session_outward_ids`, never in a half-built `sessions` row: the
+   * turn's own insert adopts it, and a key that never becomes a session — the pool also runs
+   * dream / memory / commit work under `internal:*` keys — leaves nothing behind that looks like
+   * one. Idempotent without depending on a driver's `changes`, since a pool's members share one
+   * store: each step is a no-op for the loser and the final read settles who won.
+   *
+   * THE SESSION ROW WINS. A full insert can land between the first read and the stage — its own
+   * id already generated, since the stage it would have adopted did not exist yet — and the
+   * adopting UPDATE below then finds nothing to fill. Answering with the stage there would split
+   * one session's identity in two: the credential under one name, its metadata and usage under
+   * another, which is the very failure this column exists to end. So the row is re-read after the
+   * UPDATE, and where it disagrees the stage is settled onto it.
+   */
+  async outwardSessionIdFor(key: string, agentId: string): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare(
+        `SELECT COALESCE(
+      (SELECT sessionId FROM sessions WHERE key = ? AND agentId = ?),
+      (SELECT sessionId FROM session_outward_ids WHERE key = ? AND agentId = ?)
+    ) AS sessionId`
+      )
+      .get(key, agentId, key, agentId)) as { sessionId: string | null }
+    return row.sessionId ?? undefined
+  }
+
+  async ensureOutwardSessionId(key: string, agentId?: string, now = Date.now()): Promise<string> {
+    const onSession = (
+      (await this.db.prepare('SELECT sessionId FROM sessions WHERE key = ?').get(key)) as
+        { sessionId: string | null } | undefined
+    )?.sessionId
+    if (onSession) return onSession
+    await this.db
+      .prepare('INSERT OR IGNORE INTO session_outward_ids (key, agentId, sessionId, mintedAt) VALUES (?, ?, ?, ?)')
+      .run(key, agentId ?? null, randomUUID(), now)
+    const minted = (
+      (await this.db.prepare('SELECT sessionId FROM session_outward_ids WHERE key = ?').get(key)) as
+        { sessionId: string } | undefined
+    )?.sessionId
+    if (!minted) throw new Error(`could not mint an outward session id for ${key}`)
+    // A session row written before this column existed adopts the mint rather than a second name.
+    await this.db.prepare('UPDATE sessions SET sessionId = ? WHERE key = ? AND sessionId IS NULL').run(minted, key)
+    const settled = (
+      (await this.db.prepare('SELECT sessionId FROM sessions WHERE key = ?').get(key)) as
+        { sessionId: string | null } | undefined
+    )?.sessionId
+    if (settled && settled !== minted) {
+      await this.db.prepare('UPDATE session_outward_ids SET sessionId = ? WHERE key = ?').run(settled, key)
+      return settled
+    }
+    return minted
+  }
+
+  async createPermissionRequest(record: PermissionRequestRecord): Promise<void> {
+    // node:sqlite rejects bound params the statement never names — new rows start undecided anyway.
+    const { resolvedBy: _rb, resolvedByName: _rn, ...row } = record
+    await this.db
+      .prepare(
+        `INSERT INTO permission_requests
+           (id, agentId, sessionId, createdAt, requesterId, requesterName, command, status, resolvedAt, ownerId, joinAsk)
+         VALUES
+           (@id, @agentId, @sessionId, @createdAt, @requesterId, @requesterName, @command, @status, @resolvedAt, @ownerId,
+            @joinAsk)`
+      )
+      .run({ ...row, joinAsk: row.joinAsk ?? null, ownerId: this.ownerId ?? null } as unknown as SqlParams)
+    await this.prunePermissionRequestHistory(record.agentId)
+  }
+
+  private async prunePermissionRequestHistory(agentId: string): Promise<void> {
+    // Keep all live resolvers addressable; cap only terminal history. A burst of
+    // concurrent requests must never disappear from the editor surface while the
+    // corresponding ACP promise is still waiting.
+    await this.db
+      .prepare(
+        `DELETE FROM permission_requests
+         WHERE agentId = ? AND status != 'pending' AND id NOT IN (
+           SELECT id FROM permission_requests
+           WHERE agentId = ? AND status != 'pending'
+           ORDER BY createdAt DESC LIMIT 100
+         )`
+      )
+      .run(agentId, agentId)
+  }
+
+  async listPermissionRequests(agentId: string, limit = 50): Promise<PermissionRequestRecord[]> {
+    return (await this.db
+      .prepare(
+        `SELECT * FROM permission_requests
+         WHERE agentId = ?
+         ORDER BY CASE WHEN status = 'pending' THEN 0 ELSE 1 END, createdAt DESC
+         LIMIT ?`
+      )
+      .all(agentId, Math.max(1, Math.min(100, limit)))) as unknown as PermissionRequestRecord[]
+  }
+
+  async resolvePermissionRequest(
+    agentId: string,
+    id: string,
+    status: Exclude<PermissionRequestStatus, 'pending'>,
+    resolvedAt: number,
+    by?: { resolvedBy: string | null; resolvedByName: string | null }
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE permission_requests SET status = @status, resolvedAt = @resolvedAt,
+           resolvedBy = @resolvedBy, resolvedByName = @resolvedByName
+         WHERE agentId = @agentId AND id = @id AND status = 'pending'`
+      )
+      .run({
+        status,
+        resolvedAt,
+        agentId,
+        id,
+        resolvedBy: by?.resolvedBy ?? null,
+        resolvedByName: by?.resolvedByName ?? null
+      })
+    const changed = Number(result.changes) === 1
+    if (changed) await this.prunePermissionRequestHistory(agentId)
+    return changed
+  }
+
+  /** Record a pending approval's DM card handle; false if the row already settled. */
+  async setPermissionRequestNotify(
+    agentId: string,
+    id: string,
+    integrationId: string,
+    channel: string,
+    ts: string
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE permission_requests SET notifyIntegrationId = ?, notifyChannel = ?, notifyTs = ?
+         WHERE agentId = ? AND id = ? AND status = 'pending'`
+      )
+      .run(integrationId, channel, ts, agentId, id)
+    return Number(result.changes) === 1
+  }
+
+  /** Drop the DM handle after its card has been rewritten to a terminal state. */
+  async clearPermissionRequestNotify(agentId: string, id: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE permission_requests SET notifyIntegrationId = NULL, notifyChannel = NULL, notifyTs = NULL
+         WHERE agentId = ? AND id = ?`
+      )
+      .run(agentId, id)
+  }
+
+  /** Record the editor DM sent beside a card whose own handle is the notify one; false if the row already settled. */
+  async setPermissionRequestBeside(
+    agentId: string,
+    id: string,
+    integrationId: string,
+    channel: string,
+    ts: string
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE permission_requests SET besideIntegrationId = ?, besideChannel = ?, besideTs = ?
+         WHERE agentId = ? AND id = ? AND status = 'pending'`
+      )
+      .run(integrationId, channel, ts, agentId, id)
+    return Number(result.changes) === 1
+  }
+
+  /** Drop the beside DM's handle after its card has been rewritten to a terminal state. */
+  async clearPermissionRequestBeside(agentId: string, id: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE permission_requests SET besideIntegrationId = NULL, besideChannel = NULL, besideTs = NULL
+         WHERE agentId = ? AND id = ?`
+      )
+      .run(agentId, id)
+  }
+
+  /** Settled rows whose DM or in-conversation card, or the DM beside one, was never rewritten (daemon died first) —
+   *  each returned once with its handle cleared, so a reconnect sweep rewrites each orphan exactly once. */
+  async takeOrphanedPermissionNotices(integrationId: string, limit = 20): Promise<PermissionNoticeRow[]> {
+    const bounded = Math.max(1, Math.min(100, limit))
+    const take = async (handle: 'notify' | 'beside'): Promise<PermissionNoticeRow[]> => {
+      const rows = (await this.db
+        .prepare(
+          `SELECT id, agentId, sessionId, status, command, resolvedByName, ${handle}Channel AS notifyChannel,
+             ${handle}Ts AS notifyTs, joinAsk
+           FROM permission_requests
+           WHERE ${handle}IntegrationId = ? AND ${handle}Ts IS NOT NULL AND status != 'pending'
+           ORDER BY resolvedAt DESC LIMIT ?`
+        )
+        .all(integrationId, bounded)) as unknown as PermissionNoticeRow[]
+      for (const row of rows)
+        if (handle === 'notify') await this.clearPermissionRequestNotify(row.agentId, row.id)
+        else await this.clearPermissionRequestBeside(row.agentId, row.id)
+      return rows
+    }
+    return [...(await take('notify')), ...(await take('beside'))]
+  }
+
+  /** Record a pending request's neutral notice handle in its conversation; false if the row already settled. */
+  async setPermissionRequestNotice(
+    agentId: string,
+    id: string,
+    integrationId: string,
+    channel: string,
+    ts: string,
+    kind?: 'turn'
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE permission_requests SET noticeIntegrationId = ?, noticeChannel = ?, noticeTs = ?, noticeKind = ?
+         WHERE agentId = ? AND id = ? AND status = 'pending'`
+      )
+      .run(integrationId, channel, ts, kind ?? null, agentId, id)
+    return Number(result.changes) === 1
+  }
+
+  /** Drop the notice handle once the notice says how the request settled. */
+  async clearPermissionRequestNotice(agentId: string, id: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE permission_requests SET noticeIntegrationId = NULL, noticeChannel = NULL, noticeTs = NULL, noticeKind = NULL
+         WHERE agentId = ? AND id = ?`
+      )
+      .run(agentId, id)
+  }
+
+  /** Settled rows whose neutral notice was never rewritten — returned once, handles cleared, like the DM cards' sweep. */
+  async takeOrphanedSubsessionNotices(integrationId: string, limit = 20): Promise<SubsessionNoticeRow[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT id, agentId, sessionId, status, noticeChannel, noticeTs, noticeKind
+         FROM permission_requests
+         WHERE noticeIntegrationId = ? AND noticeTs IS NOT NULL AND status != 'pending'
+         ORDER BY resolvedAt DESC LIMIT ?`
+      )
+      .all(integrationId, Math.max(1, Math.min(100, limit)))) as unknown as SubsessionNoticeRow[]
+    for (const row of rows) await this.clearPermissionRequestNotice(row.agentId, row.id)
+    return rows
+  }
+
+  /** Expire orphaned resolvers only after this process authoritatively takes ownership of their agents. */
+  async recoverPermissionRequests(agentIds: readonly string[], resolvedAt: number): Promise<number> {
+    if (!this.shared || agentIds.length === 0) return 0
+    const scope = idScope('agentId', agentIds)
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE permission_requests SET status = 'expired', resolvedAt = @resolvedAt
+           WHERE status = 'pending' AND (ownerId IS NULL OR ownerId != @ownerId)${scope.sql}`
+          )
+          .run({ resolvedAt, ownerId: this.ownerId!, ...scope.params })
+      ).changes
+    )
+  }
+
+  /** All sessions that have an ACP id (i.e. are addressable by sessionId), newest
+   *  first. Optionally scoped to one agent. Backs `session/list` read-back — the
+   *  `usage` column comes back as raw JSON (parsed by the reader). */
+  async listSessions(agentId?: string): Promise<SessionListRow[]> {
+    if (agentId !== undefined) {
+      return (await this.db
+        .prepare('SELECT * FROM sessions WHERE acpSessionId IS NOT NULL AND agentId = ? ORDER BY updatedAt DESC')
+        .all(agentId)) as unknown as SessionListRow[]
+    }
+    return (await this.db
+      .prepare('SELECT * FROM sessions WHERE acpSessionId IS NOT NULL ORDER BY updatedAt DESC')
+      .all()) as unknown as SessionListRow[]
+  }
+
+  /**
+   * Stop reporting these conversations for this integration — the bot left, or an
+   * operator forgot the row.
+   *
+   * This has to be durable, not in-memory, because the thing it suppresses is: the
+   * observed set of a non-enumerating platform is rebuilt from session history, so a
+   * restart (or merely the next refresh) would otherwise resurrect a conversation the
+   * bot demonstrably left. Sessions and transcripts are untouched — this hides the
+   * conversation from the console's channel list, it does not erase what happened.
+   */
+  async markRetractedConversations(integrationId: string, channelIds: readonly string[], now: number): Promise<void> {
+    const stmt = await this.db.prepare(
+      `INSERT INTO retracted_conversations (integrationId, channelId, retractedAt) VALUES (?, ?, ?)
+       ON CONFLICT (integrationId, channelId) DO UPDATE SET retractedAt = excluded.retractedAt`
+    )
+    for (const channelId of channelIds) await stmt.run(integrationId, channelId, now)
+  }
+
+  /** Integrations holding any suppression. The reconnect replay keys on this as well
+   *  as its in-memory snapshots: a restart before the first reconnect leaves the
+   *  tombstone on disk with no cached snapshot to replay it alongside. */
+  async retractedIntegrations(): Promise<string[]> {
+    const rows = (await this.db.prepare('SELECT DISTINCT integrationId FROM retracted_conversations').all()) as {
+      integrationId: string
+    }[]
+    return rows.map((r) => r.integrationId)
+  }
+
+  /** The conversations currently suppressed for one integration. */
+  async retractedConversations(integrationId: string): Promise<Set<string>> {
+    const rows = (await this.db
+      .prepare('SELECT channelId FROM retracted_conversations WHERE integrationId = ?')
+      .all(integrationId)) as { channelId: string }[]
+    return new Set(rows.map((r) => r.channelId))
+  }
+
+  /**
+   * Forget the suppression for one conversation — it is back.
+   *
+   * The trigger is a real inbound message: a platform only delivers those for a
+   * conversation the bot is actually in, so traffic is proof the departure has been
+   * undone (someone re-invited it). Self-healing, and it keeps a stale marker from
+   * hiding a conversation forever.
+   */
+  async clearRetractedConversation(integrationId: string, channelId: string): Promise<void> {
+    await this.db
+      .prepare('DELETE FROM retracted_conversations WHERE integrationId = ? AND channelId = ?')
+      .run(integrationId, channelId)
+  }
+
+  /** Distinct conversation targets this agent has been triggered in through one
+   *  physical bot, newest first, joined to their cached display name. Backs the
+   *  `listChannels` fallback for platforms whose bot API can't enumerate chats
+   *  (Telegram): only history from the current bot is reachable through it. */
+  async observedChannels(
+    agentId: string,
+    platform: string,
+    transportScope: string
+  ): Promise<{ id: string; name?: string }[]> {
+    return (await this.db
+      .prepare(
+        `SELECT s.channel AS id, d.name AS name
+         FROM (SELECT channel, MAX(updatedAt) AS updatedAt FROM sessions
+               WHERE agentId = ? AND platform = ? AND transportScope = ?
+                 AND channel IS NOT NULL AND channel <> ''
+               GROUP BY channel) s
+         LEFT JOIN display_names d ON d.id = s.channel
+         ORDER BY s.updatedAt DESC`
+      )
+      .all(agentId, platform, transportScope)) as { id: string; name?: string }[]
+  }
+
+  /** Distinct users this agent has been triggered by through one physical bot,
+   *  newest first, joined to their cached display name (present for Slack ids and
+   *  Telegram DM chats where chat id == user id; group senders are id-only). */
+  async observedUsers(
+    agentId: string,
+    platform: string,
+    transportScope: string
+  ): Promise<{ id: string; name?: string }[]> {
+    return (await this.db
+      .prepare(
+        `SELECT s.triggeredBy AS id, d.name AS name
+         FROM (SELECT triggeredBy, MAX(updatedAt) AS updatedAt FROM sessions
+               WHERE agentId = ? AND platform = ? AND transportScope = ?
+                 AND triggeredBy IS NOT NULL AND triggeredBy <> ''
+               GROUP BY triggeredBy) s
+         LEFT JOIN display_names d ON d.id = s.triggeredBy
+         ORDER BY s.updatedAt DESC`
+      )
+      .all(agentId, platform, transportScope)) as { id: string; name?: string }[]
+  }
+
+  /** The most recently active addressable session (has an ACP id) for an agent in a
+   *  channel, or undefined. Backs `/status` when the command message itself doesn't fall
+   *  in a session's thread (a bare Telegram `/status` keys to its own reply thread) — we
+   *  then report the channel's latest session rather than "nothing here". */
+  async latestSession(agentId: string, channel: string): Promise<SessionRecord | undefined> {
+    return (await this.db
+      .prepare(
+        'SELECT * FROM sessions WHERE agentId = ? AND channel = ? AND acpSessionId IS NOT NULL ORDER BY updatedAt DESC LIMIT 1'
+      )
+      .get(agentId, channel)) as SessionRecord | undefined
+  }
+
+  /** Latest addressable session for one physical platform bot. The explicit
+   * transport scope prevents equal Telegram chat ids on different bots from
+   * stealing command/callback targeting from one another. */
+  async latestSessionForTransport(
+    agentId: string,
+    channel: string,
+    transportScope?: string,
+    thread?: string
+  ): Promise<SessionRecord | undefined> {
+    const args: SQLInputValue[] = [agentId, channel, transportScope ?? '']
+    const threadClause = thread === undefined ? '' : ' AND thread = ?'
+    if (thread !== undefined) args.push(thread)
+    return (await this.db
+      .prepare(
+        `SELECT * FROM sessions
+         WHERE agentId = ? AND channel = ? AND COALESCE(transportScope, '') = ?
+           AND acpSessionId IS NOT NULL${threadClause}
+         ORDER BY updatedAt DESC LIMIT 1`
+      )
+      .get(...args)) as SessionRecord | undefined
+  }
+
+  /** The agent's session on one platform THREAD inside one channel. Exists for a platform
+   *  action that addresses a session by the provider's own session id (Linear's AgentSession):
+   *  unlike `latestSessionForTransport` it does not require an ACP id, so a stop still reaches
+   *  a turn that has not spawned yet. */
+  async latestSessionForThread(
+    agentId: string,
+    platform: string,
+    channel: string,
+    thread: string,
+    transportScope?: string
+  ): Promise<SessionRecord | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT * FROM sessions
+         WHERE agentId = ? AND platform = ? AND channel = ? AND thread = ?
+           AND COALESCE(transportScope, '') = ?
+         ORDER BY updatedAt DESC LIMIT 1`
+      )
+      .get(agentId, platform, channel, thread, transportScope ?? '')) as SessionRecord | undefined
+  }
+
+  /** The same, CHANNEL-BLIND: for a platform whose thread id is unique on its own — Linear's
+   *  AgentSession UUID, whose channel (the team, §4.5) no stop payload carries. */
+  async latestSessionForPlatformThread(
+    agentId: string,
+    platform: string,
+    thread: string,
+    transportScope?: string
+  ): Promise<SessionRecord | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT * FROM sessions
+         WHERE agentId = ? AND platform = ? AND thread = ?
+           AND COALESCE(transportScope, '') = ?
+         ORDER BY updatedAt DESC LIMIT 1`
+      )
+      .get(agentId, platform, thread, transportScope ?? '')) as SessionRecord | undefined
+  }
+
+  /** Whether any agent's session of `platform` in `channel` is still open (not closed). */
+  async hasOpenSessionInChannel(platform: string, channel: string): Promise<boolean> {
+    const row = await this.db
+      .prepare("SELECT 1 AS open FROM sessions WHERE platform = ? AND channel = ? AND state != 'closed' LIMIT 1")
+      .get(platform, channel)
+    return row !== undefined
+  }
+
+  /** The most recently active addressable session (has an ACP id) in a channel, across
+   *  ALL agents — or undefined. Used to resolve which agent a bare command targets when
+   *  routing can't (e.g. a group `/status@bot` with no mention entity / thread). */
+  async latestSessionInChannel(channel: string): Promise<SessionRecord | undefined> {
+    return (await this.db
+      .prepare('SELECT * FROM sessions WHERE channel = ? AND acpSessionId IS NOT NULL ORDER BY updatedAt DESC LIMIT 1')
+      .get(channel)) as SessionRecord | undefined
+  }
+
+  /** Lookup by ACP session id (the protocol-facing `sessionId`), or undefined. */
+  async getSessionByAcpId(acpSessionId: string): Promise<SessionRecord | undefined> {
+    return (await this.db.prepare('SELECT * FROM sessions WHERE acpSessionId = ?').get(acpSessionId)) as
+      SessionRecord | undefined
+  }
+
+  /** Agent-scoped ACP id lookup for callbacks from one runtime process. ACP ids
+   *  are runtime-owned and need not be globally unique across agents. */
+  async getSessionByAcpIdForAgent(agentId: string, acpSessionId: string): Promise<SessionRecord | undefined> {
+    return (await this.db
+      .prepare('SELECT * FROM sessions WHERE agentId = ? AND acpSessionId = ?')
+      .get(agentId, acpSessionId)) as SessionRecord | undefined
+  }
+
+  /** Resolve a slot from the id the OUTSIDE world addresses it by (session-concept.md §1.1).
+   *  Falls back to the ACP id so a caller still holding the runtime's name — and a control
+   *  plane that recorded one before the outward column existed — still lands on the session. */
+  /** An agent's session by its outward id alone, never an ACP id, which names a session only inside its runtime. */
+  async getSessionByOutwardIdOnly(sessionId: string, agentId: string): Promise<SessionRecord | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM sessions WHERE sessionId = ? AND agentId = ?')
+      .get(sessionId, agentId)) as SessionRecord | undefined
+    if (row) return row
+    const minted = (await this.db
+      .prepare('SELECT key FROM session_outward_ids WHERE sessionId = ? AND agentId = ?')
+      .get(sessionId, agentId)) as { key: string } | undefined
+    const rec = minted ? await this.getSession(minted.key) : undefined
+    return rec?.agentId === agentId ? rec : undefined
+  }
+
+  async getSessionByOutwardId(sessionId: string, agentId?: string): Promise<SessionRecord | undefined> {
+    const scope = agentId === undefined ? '' : ' AND agentId = @agentId'
+    const params = { sessionId, ...(agentId === undefined ? {} : { agentId }) }
+    return ((await this.db.prepare(`SELECT * FROM sessions WHERE sessionId = @sessionId${scope}`).get(params)) ??
+      (await this.db.prepare(`SELECT * FROM sessions WHERE acpSessionId = @sessionId${scope}`).get(params))) as
+      SessionRecord | undefined
+  }
+
+  /**
+   * The org partition one transcript read or write belongs to. A store no pool shares owns
+   * a single partition whatever the agent; a shared store resolves the agent's org through
+   * the daemon's registry and refuses a row it cannot attribute, since an unattributed one
+   * would be served to whichever org happened to reuse the same channel/thread ids.
+   */
+  private orgFor(agentId: string | undefined): string {
+    if (!this.shared) return LOCAL_TRANSCRIPT_ORG
+    const orgId = agentId ? this.orgForAgent?.(agentId) : undefined
+    if (!orgId) throw new Error(`cannot resolve the transcript organization for agent ${agentId ?? '(none)'}`)
+    return orgId
+  }
+
+  /** The org partition a CP-addressed READ belongs to. The reading CP names the org in the
+   *  frame, and that is the authoritative one: a pool member serves the transcripts of every
+   *  member of its store, including agents it does not hold and therefore cannot resolve
+   *  locally. Only a shared store has more than one partition to choose between. */
+  private orgForRead(agentId: string | undefined, orgId: string | undefined): string {
+    if (!this.shared) return LOCAL_TRANSCRIPT_ORG
+    return orgId ?? this.orgFor(agentId)
+  }
+
+  /** The org of a row written from a message rather than by an agent: its recipient or
+   *  sender when either names one, else an agent already holding a session in the thread —
+   *  an observed inbound is recorded before routing picks a recipient, and only a thread
+   *  with live work is recorded at all. */
+  private async transcriptOrg(
+    channel: string,
+    thread: string | undefined,
+    ...candidates: Array<string | undefined>
+  ): Promise<string> {
+    if (!this.shared) return LOCAL_TRANSCRIPT_ORG
+    for (const candidate of candidates) {
+      const orgId = candidate ? this.orgForAgent?.(candidate) : undefined
+      if (orgId) return orgId
+    }
+    return this.orgFor(thread === undefined ? undefined : await this.threadSessionAgent(channel, thread))
+  }
+
+  /** An agent holding a session in a transcript thread, for that fallback attribution. */
+  private async threadSessionAgent(channel: string, thread: string): Promise<string | undefined> {
+    const rows = (await this.db
+      .prepare(
+        'SELECT DISTINCT agentId, channel, transportScope FROM sessions WHERE thread = ? AND agentId IS NOT NULL'
+      )
+      .all(thread)) as { agentId: string; channel: string; transportScope: string | null }[]
+    return rows.find(
+      (row) => transcriptChannelKey(row.channel, row.transportScope) === channel && this.orgForAgent?.(row.agentId)
+    )?.agentId
+  }
+
+  /** The addressable (agent, session) pairs a mutation's session keys were admitted into — the only
+   *  handle an `append` session has, since its `sessions.thread` is a coordinate the row no longer
+   *  wears. The owning agent rides along because a row's SENDERS are not its admitters: pairing a
+   *  session with a mutation's agent ids would address it under a human, or under a peer agent. */
+  async sessionOwnersForKeys(keys: string[]): Promise<{ agentId: string; sessionId: string }[]> {
+    if (keys.length === 0) return []
+    return (await this.db
+      .prepare(
+        `SELECT DISTINCT agentId, COALESCE(sessionId, acpSessionId) AS sessionId FROM sessions
+         WHERE key IN (${keys.map(() => '?').join(', ')}) AND acpSessionId IS NOT NULL AND agentId IS NOT NULL`
+      )
+      .all(...keys)) as { agentId: string; sessionId: string }[]
+  }
+
+  /** Addressable session ids whose authorized transcript scope may have changed. */
+  async sessionIdsForTranscript(agentId: string, channel: string, thread: string): Promise<string[]> {
+    // Outward ids (§1.1): the only consumer is the CP's transcript-activity signal, and the CP
+    // invalidates by the id it filed the session under. A pre-v12 row answers with its ACP id.
+    const rows = (await this.db
+      .prepare(
+        `SELECT DISTINCT COALESCE(sessionId, acpSessionId) AS sessionId, channel, transportScope FROM sessions
+         WHERE agentId = ? AND thread = ? AND acpSessionId IS NOT NULL`
+      )
+      .all(agentId, thread)) as { sessionId: string; channel: string; transportScope: string | null }[]
+    return rows
+      .filter((row) => transcriptChannelKey(row.channel, row.transportScope) === channel)
+      .map((row) => row.sessionId)
+  }
+
+  async currentTranscriptRevision(agentId?: string, orgId?: string): Promise<number> {
+    const row = (await this.db
+      .prepare('SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript WHERE orgId = ?')
+      .get(this.orgForRead(agentId, orgId))) as { revision: number }
+    // The in-memory allocator spans every partition; only the answer is org-scoped.
+    this.transcriptRevision = Math.max(this.transcriptRevision, row.revision)
+    return row.revision
+  }
+
+  setTranscriptMutationListener(listener?: (mutation: TranscriptMutation) => void | Promise<void>): void {
+    this.transcriptMutationListener = listener
+  }
+
+  /**
+   * One newest-first page of a thread's user-visible transcript, for `session/history`.
+   * Daemon housekeeping is excluded at read time as well as write time so rows stored
+   * by an older daemon disappear after upgrade. Pages backward via `beforeSeq` (the
+   * lowest seq already seen; null ⇒ newest page). Over-fetches one row to detect
+   * `hasMore` without a second query. Rows stay seq DESC.
+   *
+   * `agentId` names the org partition only, never a delivery scope, and may be omitted on
+   * a store no pool shares — a shared store has no single partition to fall back on.
+   */
+  async transcriptPage(
+    channel: string,
+    thread: string,
+    beforeSeq: number | null,
+    limit: number,
+    agentId?: string
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean }> {
+    const orgId = this.orgFor(agentId)
+    const hiddenToolTitles = [...SESSION_TITLE_TOOL_TITLES]
+    const rows = (beforeSeq !== null
+      ? await this.db
+          .prepare(
+            `SELECT * FROM transcript
+             WHERE orgId = ? AND channel = ? AND thread = ? AND seq < ?
+               AND NOT (kind = 'tool' AND text IN (?, ?))
+             ORDER BY seq DESC LIMIT ?`
+          )
+          .all(orgId, channel, thread, beforeSeq, ...hiddenToolTitles, limit + 1)
+      : await this.db
+          .prepare(
+            `SELECT * FROM transcript
+             WHERE orgId = ? AND channel = ? AND thread = ?
+               AND NOT (kind = 'tool' AND text IN (?, ?))
+             ORDER BY seq DESC LIMIT ?`
+          )
+          .all(orgId, channel, thread, ...hiddenToolTitles, limit + 1)) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
+  /** Legacy seq-ordered/non-Slack history for ONE agent (the console session view),
+   *  scoped to what THAT agent received or produced. A row is included when the agent
+   *  SENT it (`sender`), was the row's
+   *  first-recorded recipient (`recipient`), OR the message was delivered to it per the
+   *  `transcript_recipient` table (which captures deliveries the text-row dedup would other-
+   *  wise drop when several co-daemon agents catch up on the same message). When agents share
+   *  a (channel, thread) on one daemon their rows live in one transcript, so an unscoped page
+   *  would leak a peer's PRIVATE reasoning/tool activity (sender = peer, no delivery to us);
+   *  this scoping shows every conversational message this agent actually received plus every-
+   *  thing it produced, excluding only peers' internal activity. Separate from the §8.5 model
+   *  catch-up (transcriptSince), which is unchanged. Slack's normal read path uses
+   *  transcriptPageForAgentByEventTime; this method remains for non-Slack platform ids
+   *  and numeric cursors issued by a pre-upgrade daemon. */
+  async transcriptPageForAgent(
+    scope: TranscriptSessionScope,
+    beforeSeq: number | null,
+    limit: number,
+    view?: 'roots'
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean }> {
+    const partition = this.orgForRead(scope.agentId, scope.orgId)
+    const session = [scope.coordinate, scope.sessionKey]
+    const agent = [scope.agentId, scope.agentId]
+    const hiddenToolTitles = [...SESSION_TITLE_TOOL_TITLES]
+    const roots = rootsViewSql(view)
+    const rows = (beforeSeq !== null
+      ? await this.db
+          .prepare(
+            `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND seq < ?
+               AND ${SESSION_ROW_SCOPE_SQL}
+               AND ${AGENT_DELIVERY_SCOPE_SQL}
+               AND NOT (kind = 'tool' AND text IN (?, ?))${roots}
+             ORDER BY seq DESC LIMIT ?`
+          )
+          .all(partition, scope.transcriptChannel, beforeSeq, ...session, ...agent, ...hiddenToolTitles, limit + 1)
+      : await this.db
+          .prepare(
+            `SELECT * FROM transcript WHERE orgId = ? AND channel = ?
+               AND ${SESSION_ROW_SCOPE_SQL}
+               AND ${AGENT_DELIVERY_SCOPE_SQL}
+               AND NOT (kind = 'tool' AND text IN (?, ?))${roots}
+             ORDER BY seq DESC LIMIT ?`
+          )
+          .all(
+            partition,
+            scope.transcriptChannel,
+            ...session,
+            ...agent,
+            ...hiddenToolTitles,
+            limit + 1
+          )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
+  /**
+   * One globally chronological page for a Slack session. Unlike `seq`, `eventTimeUs`
+   * remains correct when a warm-thread snapshot appends an older Slack row after the
+   * current trigger. The compound `(eventTimeUs, seq)` cursor gives equal timestamps a
+   * deterministic order and keeps page boundaries stable.
+   *
+   * Rows are returned newest-first; callers reverse one page for display. The same
+   * per-agent delivery scope as `transcriptPageForAgent` prevents peer-private activity
+   * from leaking into the session view.
+   */
+  async transcriptPageForAgentByEventTime(
+    scope: TranscriptSessionScope,
+    before: TranscriptEventCursor | null,
+    limit: number,
+    view?: 'roots'
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean }> {
+    const partition = this.orgForRead(scope.agentId, scope.orgId)
+    const session = [scope.coordinate, scope.sessionKey]
+    const agent = [scope.agentId, scope.agentId]
+    const hiddenToolTitles = [...SESSION_TITLE_TOOL_TITLES]
+    const roots = rootsViewSql(view)
+    const rows = (before !== null
+      ? await this.db
+          .prepare(
+            `SELECT * FROM transcript WHERE orgId = ? AND channel = ?
+               AND (eventTimeUs < ? OR (eventTimeUs = ? AND seq < ?))
+               AND ${SESSION_ROW_SCOPE_SQL}
+               AND ${AGENT_DELIVERY_SCOPE_SQL}
+               AND NOT (kind = 'tool' AND text IN (?, ?))${roots}
+             ORDER BY eventTimeUs DESC, seq DESC LIMIT ?`
+          )
+          .all(
+            partition,
+            scope.transcriptChannel,
+            before.eventTimeUs,
+            before.eventTimeUs,
+            before.seq,
+            ...session,
+            ...agent,
+            ...hiddenToolTitles,
+            limit + 1
+          )
+      : await this.db
+          .prepare(
+            `SELECT * FROM transcript WHERE orgId = ? AND channel = ?
+               AND ${SESSION_ROW_SCOPE_SQL}
+               AND ${AGENT_DELIVERY_SCOPE_SQL}
+               AND NOT (kind = 'tool' AND text IN (?, ?))${roots}
+             ORDER BY eventTimeUs DESC, seq DESC LIMIT ?`
+          )
+          .all(
+            partition,
+            scope.transcriptChannel,
+            ...session,
+            ...agent,
+            ...hiddenToolTitles,
+            limit + 1
+          )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
+  /**
+   * Forward mutation page for one authorized session view. Rows are revision-ordered,
+   * so inserts and same-seq tool updates share one lossless cursor. The returned
+   * cursor skips unrelated/global revisions only after this scope is fully drained.
+   */
+  async transcriptTailForAgent(
+    scope: TranscriptSessionScope,
+    afterRevision: number,
+    limit: number,
+    view?: 'roots'
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean; cursor: number }> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM transcript
+         WHERE orgId = ? AND channel = ? AND revision > ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND ${AGENT_DELIVERY_SCOPE_SQL}
+           AND NOT (kind = 'tool' AND text IN (?, ?))${rootsViewSql(view)}
+         ORDER BY revision ASC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        afterRevision,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId,
+        ...SESSION_TITLE_TOOL_TITLES,
+        limit + 1
+      )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    const kept = hasMore ? rows.slice(0, limit) : rows
+    return {
+      rows: kept,
+      hasMore,
+      cursor: hasMore
+        ? kept[kept.length - 1]!.revision
+        : await this.currentTranscriptRevision(scope.agentId, scope.orgId)
+    }
+  }
+
+  /** The text rows of one conversation recorded under any of `ids` as their ts or webchat postId: the roots those ids may name (webchat-threads.md §8). */
+  async threadRootRows(
+    scope: Pick<TranscriptSessionScope, 'transcriptChannel' | 'agentId' | 'orgId'>,
+    ids: readonly string[]
+  ): Promise<ThreadRootRow[]> {
+    if (ids.length === 0) return []
+    const marks = ids.map(() => '?').join(', ')
+    return (await this.db
+      .prepare(
+        `SELECT seq, ts, postId, thread, sender, text FROM transcript
+          WHERE orgId = ? AND channel = ? AND kind = 'text' AND (ts IN (${marks}) OR postId IN (${marks}))
+          ORDER BY seq`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        ...ids,
+        ...ids
+      )) as unknown as ThreadRootRow[]
+  }
+
+  /** The root row named `rootId`, when the session received it: it sits on the session's coordinate or was admitted into it, and its agent may see it. */
+  async threadRootInSession(scope: TranscriptSessionScope, rootId: string): Promise<ThreadRootRow | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT seq, ts, postId, thread, sender, text FROM transcript
+          WHERE orgId = ? AND channel = ? AND kind = 'text' AND (ts = ? OR postId = ?)
+            AND ${SESSION_ROW_SCOPE_SQL}
+            AND ${AGENT_DELIVERY_SCOPE_SQL}
+          ORDER BY seq LIMIT 1`
+      )
+      .get(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        rootId,
+        rootId,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId
+      )) as ThreadRootRow | undefined
+  }
+
+  /** Each thread's replies as its summary counts them (webchat-threads.md §3, §5.3): chat messages but the root and the reading session's own turns, roots handed into it included. */
+  async threadReplyStats(
+    scope: TranscriptSessionScope,
+    rootIds: readonly string[],
+    participantsMax: number
+  ): Promise<Map<string, ThreadReplyStats>> {
+    const stats = new Map<string, ThreadReplyStats>()
+    if (rootIds.length === 0) return stats
+    const partition = this.orgForRead(scope.agentId, scope.orgId)
+    const replies = `orgId = ? AND channel = ? AND kind = 'text'
+            AND (handedTo IS NOT NULL OR NOT (COALESCE(ts, '') = transcript.thread OR COALESCE(postId, '') = transcript.thread))
+            AND NOT ${OWN_TURN_IN_THREAD_SQL}`
+    const own = [scope.coordinate, scope.agentId, scope.sessionKey]
+    const marks = rootIds.map(() => '?').join(', ')
+    const counts = (await this.db
+      .prepare(
+        `SELECT ${READ_THREAD_SQL} AS thread, COUNT(*) AS n, MAX(eventTimeUs) AS last FROM transcript
+          WHERE ${READ_THREAD_SQL} IN (${marks}) AND ${replies}
+          GROUP BY ${READ_THREAD_SQL}`
+      )
+      .all(...rootIds, partition, scope.transcriptChannel, ...own)) as {
+      thread: string
+      n: number | string
+      last: number | string | null
+    }[]
+    for (const row of counts) {
+      const n = Number(row.n)
+      if (n < 1) continue
+      const latest = (await this.db
+        .prepare(
+          `SELECT sender, text FROM transcript WHERE ${READ_THREAD_SQL} = ? AND ${replies}
+            ORDER BY COALESCE(eventTimeUs, 0) DESC, seq DESC LIMIT 1`
+        )
+        .get(row.thread, partition, scope.transcriptChannel, ...own)) as { sender: string; text: string } | undefined
+      const senders = (await this.db
+        .prepare(
+          `SELECT sender FROM transcript WHERE ${READ_THREAD_SQL} = ? AND ${replies}
+            GROUP BY sender ORDER BY COALESCE(MAX(eventTimeUs), 0) DESC, MAX(seq) DESC LIMIT ?`
+        )
+        .all(row.thread, partition, scope.transcriptChannel, ...own, participantsMax)) as { sender: string }[]
+      stats.set(row.thread, {
+        replies: n,
+        lastEventTimeUs: row.last == null ? null : Number(row.last),
+        ...(latest ? { latest: { sender: latest.sender, text: latest.text } } : {}),
+        participants: senders.map((r) => r.sender)
+      })
+    }
+    return stats
+  }
+
+  /** The threads whose root the session received and whose rows changed in `(afterRevision, uptoRevision]`, by their newest change, oldest first (webchat-threads.md §8). */
+  async threadsChangedBetween(
+    scope: TranscriptSessionScope,
+    afterRevision: number,
+    uptoRevision: number,
+    limit: number
+  ): Promise<{ thread: string; revision: number }[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT ${READ_THREAD_SQL} AS thread, MAX(transcript.revision) AS n FROM transcript
+          WHERE orgId = ? AND channel = ? AND revision > ? AND revision <= ? AND ${READ_THREAD_SQL} IS NOT NULL
+            AND EXISTS (SELECT 1 FROM transcript r
+                         WHERE r.orgId = transcript.orgId AND r.channel = transcript.channel AND r.kind = 'text'
+                           AND (r.ts = ${READ_THREAD_SQL} OR r.postId = ${READ_THREAD_SQL})
+                           AND (r.thread = ? OR EXISTS (
+                             SELECT 1 FROM transcript_recipient tr_r WHERE tr_r.seq = r.seq AND tr_r.sessionKey = ?))
+                           AND (r.sender = ? OR EXISTS (
+                             SELECT 1 FROM transcript_recipient tr_g WHERE tr_g.seq = r.seq AND tr_g.agentId = ?)))
+          GROUP BY ${READ_THREAD_SQL}
+          ORDER BY MAX(transcript.revision), ${READ_THREAD_SQL} LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        afterRevision,
+        uptoRevision,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId,
+        limit
+      )) as { thread: string; n: number | string }[]
+    return rows.map((r) => ({ thread: r.thread, revision: Number(r.n) }))
+  }
+
+  /** One newest-first page of a thread's record as a session reads it (webchat-threads.md §8), in insertion order. */
+  async threadPageForAgent(
+    scope: TranscriptSessionScope,
+    rootId: string,
+    beforeSeq: number | null,
+    limit: number
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean }> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM transcript WHERE orgId = ? AND channel = ?${beforeSeq !== null ? ' AND seq < ?' : ''}
+           AND ${THREAD_RECORD_SQL}
+           AND NOT (kind = 'tool' AND text IN (?, ?))
+         ORDER BY seq DESC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        ...(beforeSeq !== null ? [beforeSeq] : []),
+        ...threadRecordBinds(scope, rootId),
+        ...SESSION_TITLE_TOOL_TITLES,
+        limit + 1
+      )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
+  /** {@link threadPageForAgent} in event-time order, for a platform whose ids order natively. */
+  async threadPageForAgentByEventTime(
+    scope: TranscriptSessionScope,
+    rootId: string,
+    before: TranscriptEventCursor | null,
+    limit: number
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean }> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM transcript WHERE orgId = ? AND channel = ?${
+          before !== null ? ' AND (eventTimeUs < ? OR (eventTimeUs = ? AND seq < ?))' : ''
+        }
+           AND ${THREAD_RECORD_SQL}
+           AND NOT (kind = 'tool' AND text IN (?, ?))
+         ORDER BY eventTimeUs DESC, seq DESC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        ...(before !== null ? [before.eventTimeUs, before.eventTimeUs, before.seq] : []),
+        ...threadRecordBinds(scope, rootId),
+        ...SESSION_TITLE_TOOL_TITLES,
+        limit + 1
+      )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    return { rows: hasMore ? rows.slice(0, limit) : rows, hasMore }
+  }
+
+  /** The forward mutation page of a thread's record, revision-ordered like {@link transcriptTailForAgent}. */
+  async threadTailForAgent(
+    scope: TranscriptSessionScope,
+    rootId: string,
+    afterRevision: number,
+    limit: number
+  ): Promise<{ rows: TranscriptRow[]; hasMore: boolean; cursor: number }> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND revision > ?
+           AND ${THREAD_RECORD_SQL}
+           AND NOT (kind = 'tool' AND text IN (?, ?))
+         ORDER BY revision ASC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        afterRevision,
+        ...threadRecordBinds(scope, rootId),
+        ...SESSION_TITLE_TOOL_TITLES,
+        limit + 1
+      )) as unknown as TranscriptRow[]
+    const hasMore = rows.length > limit
+    const kept = hasMore ? rows.slice(0, limit) : rows
+    return {
+      rows: kept,
+      hasMore,
+      cursor: hasMore
+        ? kept[kept.length - 1]!.revision
+        : await this.currentTranscriptRevision(scope.agentId, scope.orgId)
+    }
+  }
+
+  async upsertSession(rec: SessionRecord): Promise<void> {
+    // Bind mutable columns explicitly; read-back rows cannot overwrite usage or clear durable mutes.
+    // The routing opener and public initiator are first-wins across later turns.
+    await this.db
+      .prepare(
+        `INSERT INTO sessions
+           (key, sessionId, agentId, platform, channel, thread, transportScope, acpSessionId, state, lastDeliveredTs, updatedAt, muted, triggeredBy, initiator, threadUrl, memoryProvider, workspaceIsolation, originSessionId, needsParentReply,
+            externalProvider, externalRealmKey, externalResourceKind, externalResourceKey, externalIntegrationId,
+            externalOriginJson, sourceBindingKind, platformStanding)
+         VALUES
+           (@key, COALESCE((SELECT sessionId FROM session_outward_ids WHERE key = @key), @sessionId), @agentId, @platform, @channel, @thread, @transportScope, @acpSessionId, @state, @lastDeliveredTs, @updatedAt,
+            CASE WHEN EXISTS (SELECT 1 FROM session_mutes WHERE key = @key) THEN 1 ELSE NULL END,
+            @triggeredBy, @initiator, @threadUrl, @memoryProvider, @workspaceIsolation, @originSessionId, @needsParentReply,
+            @externalProvider, @externalRealmKey, @externalResourceKind, @externalResourceKey, @externalIntegrationId,
+            @externalOriginJson, @sourceBindingKind, @platformStanding)
+         ON CONFLICT(key) DO UPDATE SET
+           sessionId=COALESCE(sessions.sessionId, excluded.sessionId),
+           -- The key's own components. A row this daemon minted an outward id into before the
+           -- session existed (ensureOutwardSessionId) carries none of them, and they are immutable
+           -- once written, so COALESCE hydrates that skeleton exactly once and never rewrites a
+           -- real row. Without this the session could not be read back from its own coordinates.
+           platform=COALESCE(sessions.platform, excluded.platform),
+           channel=COALESCE(sessions.channel, excluded.channel),
+           thread=COALESCE(sessions.thread, excluded.thread),
+           acpSessionId=excluded.acpSessionId, state=excluded.state,
+           lastDeliveredTs=excluded.lastDeliveredTs, updatedAt=excluded.updatedAt,
+           transportScope=excluded.transportScope,
+           muted=CASE
+             WHEN EXISTS (SELECT 1 FROM session_mutes WHERE key = excluded.key) THEN 1
+             ELSE sessions.muted
+           END,
+           triggeredBy=COALESCE(sessions.triggeredBy, excluded.triggeredBy),
+           initiator=COALESCE(sessions.initiator, excluded.initiator),
+           threadUrl=COALESCE(sessions.threadUrl, excluded.threadUrl),
+           memoryProvider=excluded.memoryProvider,
+           workspaceIsolation=COALESCE(excluded.workspaceIsolation, sessions.workspaceIsolation),
+           externalProvider=COALESCE(sessions.externalProvider, excluded.externalProvider),
+           externalRealmKey=COALESCE(sessions.externalRealmKey, excluded.externalRealmKey),
+           externalResourceKind=COALESCE(sessions.externalResourceKind, excluded.externalResourceKind),
+           externalResourceKey=COALESCE(sessions.externalResourceKey, excluded.externalResourceKey),
+           -- Credential locator is not part of the immutable source tuple. A
+           -- Slack reinstall may replace the integration while the same
+           -- workspace/conversation remains the audience.
+           externalIntegrationId=COALESCE(excluded.externalIntegrationId, sessions.externalIntegrationId),
+           externalOriginJson=COALESCE(sessions.externalOriginJson, excluded.externalOriginJson),
+           sourceBindingKind=COALESCE(sessions.sourceBindingKind, excluded.sourceBindingKind),
+           -- Parent link is first-wins: set once when the session is spawned, never cleared by a
+           -- later (human-triggered) turn that carries no origin.
+           originSessionId=COALESCE(sessions.originSessionId, excluded.originSessionId),
+           -- The report-back directive is STICKY-TRUE: a parent that asked for a reply keeps it
+           -- for the session's lifetime, and an ordinary turn (which carries no flag) never
+           -- clears it. lastTurnOutcome is deliberately absent — setSessionTurnOutcome owns it.
+           needsParentReply=CASE
+             WHEN excluded.needsParentReply = 1 THEN 1
+             ELSE sessions.needsParentReply
+           END,
+           -- First-wins like the parent link: the block that opened the session is the session's.
+           platformStanding=COALESCE(sessions.platformStanding, excluded.platformStanding)`
+      )
+      .run({
+        key: rec.key,
+        sessionId: rec.sessionId ?? randomUUID(),
+        agentId: rec.agentId,
+        platform: rec.platform,
+        channel: rec.channel,
+        thread: rec.thread,
+        transportScope: rec.transportScope ?? null,
+        acpSessionId: rec.acpSessionId,
+        state: rec.state,
+        lastDeliveredTs: rec.lastDeliveredTs,
+        updatedAt: rec.updatedAt,
+        triggeredBy: rec.triggeredBy ?? null,
+        initiator: rec.initiator ?? null,
+        threadUrl: rec.threadUrl ?? null,
+        memoryProvider: rec.memoryProvider ?? null,
+        workspaceIsolation: rec.workspaceIsolation ?? null,
+        externalProvider: rec.externalProvider ?? null,
+        externalRealmKey: rec.externalRealmKey ?? null,
+        externalResourceKind: rec.externalResourceKind ?? null,
+        externalResourceKey: rec.externalResourceKey ?? null,
+        externalIntegrationId: rec.externalIntegrationId ?? null,
+        externalOriginJson: rec.externalOriginJson ?? null,
+        sourceBindingKind: rec.sourceBindingKind ?? null,
+        originSessionId: rec.originSessionId ?? null,
+        needsParentReply: rec.needsParentReply === 1 ? 1 : null,
+        platformStanding: rec.platformStanding ?? null
+      })
+    // Affinity is the PHYSICAL thread's. Where the session's coordinate IS one — every
+    // conversation on `createNew` — deriving it from the row just written is equivalent to
+    // the `sessions` lookup this replaces, for every writer. Where it is synthetic the
+    // session manager records the delivery thread instead, and a row here would name a
+    // thread nobody can post in. Not in one transaction with the row: this is the hot path,
+    // and a failure between the two costs a follow-up its routing until the next upsert.
+    if (isAppendCoordinate(rec.thread)) return
+    await this.recordThreadParticipation({
+      channel: rec.channel,
+      thread: rec.thread,
+      agentId: rec.agentId,
+      sessionKey: rec.key,
+      transportScope: rec.transportScope ?? null,
+      updatedAt: rec.updatedAt
+    })
+  }
+
+  /** The conversation coordinate in force, minted when there is none (channel-session-mode.md §3.3): insert-or-ignore then read back, so concurrent callers converge. */
+  async resolveAppendCoordinate(
+    agentId: string,
+    channel: string,
+    transportScope?: string | null,
+    now = Date.now(),
+    kind: ConversationCoordinateKind = 'append'
+  ): Promise<string> {
+    const scope = transportScope ?? ''
+    const minted = nextAppendCoordinate(undefined, now, kind)
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO append_reservation (agentId, channel, transportScope, coordinate, updatedAt, protocol)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(agentId, channel, scope, minted, now, kind === 'coordinator' ? COORDINATOR_PROTOCOL : null)
+    const row = (await this.db
+      .prepare('SELECT coordinate FROM append_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?')
+      .get(agentId, channel, scope)) as { coordinate: string } | undefined
+    // The read cannot miss: the insert either created the row or lost to one that exists.
+    const current = row?.coordinate ?? minted
+    // A switch between `append` and `auto` retires the other kind's session: it takes no new messages (auto-session-mode.md §3.5).
+    if (coordinateKind(current) === kind) return current
+    return await this.advanceAppendCoordinate(agentId, channel, current, scope, now, kind)
+  }
+
+  /** The coordinate in force WITHOUT minting one, for a reader that must not create a conversation by asking; with `kind`, the other kind's reads as none. */
+  async currentAppendCoordinate(
+    agentId: string,
+    channel: string,
+    transportScope?: string | null,
+    kind?: ConversationCoordinateKind
+  ): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare('SELECT coordinate FROM append_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?')
+      .get(agentId, channel, transportScope ?? '')) as { coordinate: string } | undefined
+    return row && (kind === undefined || coordinateKind(row.coordinate) === kind) ? row.coordinate : undefined
+  }
+
+  /** Whether the conversation's coordinator was minted under the outcome protocol in force (auto-session-mode.md §4.2); one from an earlier daemon reads as not. */
+  async coordinatorProtocolCurrent(agentId: string, channel: string, transportScope?: string | null): Promise<boolean> {
+    const row = (await this.db
+      .prepare('SELECT protocol FROM append_reservation WHERE agentId = ? AND channel = ? AND transportScope = ?')
+      .get(agentId, channel, transportScope ?? '')) as { protocol: number | null } | undefined
+    return Number(row?.protocol ?? 0) >= COORDINATOR_PROTOCOL
+  }
+
+  /** The agent's conversations whose coordinate in force is a coordinator's (auto-session-mode.md §3.5). */
+  async coordinatorReservations(
+    agentId: string
+  ): Promise<{ channel: string; transportScope?: string; coordinate: string }[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT channel, transportScope, coordinate FROM append_reservation WHERE agentId = ? AND coordinate LIKE ?
+          ORDER BY channel, transportScope`
+      )
+      .all(agentId, `${COORDINATOR_COORDINATE_PREFIX}%`)) as {
+      channel: string
+      transportScope: string
+      coordinate: string
+    }[]
+    return rows.map((row) => ({
+      channel: row.channel,
+      ...(row.transportScope ? { transportScope: row.transportScope } : {}),
+      coordinate: row.coordinate
+    }))
+  }
+
+  /** A conversation that left `auto` drops its coordinator unless it moved meanwhile, so a switch back mints a new one (auto-session-mode.md §3.5). */
+  async retireCoordinator(
+    agentId: string,
+    channel: string,
+    transportScope: string | null | undefined,
+    coordinate: string
+  ): Promise<boolean> {
+    const res = await this.db
+      .prepare(
+        'DELETE FROM append_reservation WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?'
+      )
+      .run(agentId, channel, transportScope ?? '', coordinate)
+    return Number(res.changes) > 0
+  }
+
+  /** A place's one long session (assistant-mode.md §5.2): the append session in force, else the place's only
+   *  session besides its sub-sessions; undefined when it has none, or several threads and no append session. */
+  async placeSession(
+    agentId: string,
+    platform: string,
+    channel: string,
+    transportScope?: string | null
+  ): Promise<SessionRecord | undefined> {
+    const coordinate = await this.currentAppendCoordinate(agentId, channel, transportScope)
+    if (coordinate !== undefined)
+      return await this.getSession(sessionKey(platform, channel, coordinate, agentId, transportScope))
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM sessions WHERE agentId = ? AND platform = ? AND channel = ? AND COALESCE(transportScope, '') = ?
+           AND thread NOT LIKE 'subsession:%' LIMIT 2`
+      )
+      .all(agentId, platform, channel, transportScope ?? '')) as SessionRecord[]
+    return rows.length === 1 ? rows[0] : undefined
+  }
+
+  /** Rotate a conversation onto its next coordinate (`!new`) by compare-and-set from the one the caller read; a loser reads the winner's rotation instead of rotating again. */
+  async advanceAppendCoordinate(
+    agentId: string,
+    channel: string,
+    from: string,
+    transportScope?: string | null,
+    now = Date.now(),
+    kind: ConversationCoordinateKind = coordinateKind(from)
+  ): Promise<string> {
+    const scope = transportScope ?? ''
+    const minted = nextAppendCoordinate(from, now, kind)
+    const res = await this.db
+      .prepare(
+        `UPDATE append_reservation SET coordinate = ?, updatedAt = ?, protocol = ?
+         WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+      )
+      .run(minted, now, kind === 'coordinator' ? COORDINATOR_PROTOCOL : null, agentId, channel, scope, from)
+    if (Number(res.changes) > 0) return minted
+    // Lost the CAS or nothing to rotate: the current value answers, read as-is so two opposite mode switches cannot rotate forever.
+    return (
+      (await this.currentAppendCoordinate(agentId, channel, scope)) ??
+      (await this.resolveAppendCoordinate(agentId, channel, scope, now, kind))
+    )
+  }
+
+  /**
+   * Clear a session's CONTEXT while it keeps its identity (channel-session-mode.md §7.2).
+   *
+   * The same two fields the memory-provider and workspace-isolation resets already write on
+   * an existing row, with one deliberate difference: those null `lastDeliveredTs`, which
+   * makes the next prompt replay the whole thread as catch-up — that RESTORES context. Here
+   * the cursor is set to the moment the clear ran, so the replay window starts there and the
+   * session resumes with nothing before it.
+   *
+   * The row keeps its key, coordinate, outward id and workspace, so the console entry and
+   * everything holding the session's identity survive. A TTL-`closed` session stays closed,
+   * as the two sibling resets leave it: clearing context is not a reason to read as live
+   * again. Returns false when the row is gone.
+   */
+  async clearSessionContext(
+    key: string,
+    cursorTs: string,
+    at: number,
+    expectAcpSessionId?: string | null
+  ): Promise<boolean> {
+    // Pinned on the runtime id the caller read, which narrows the check-then-act above it:
+    // a turn admitted in the window that MINTED a new id loses here. It does not cover a turn
+    // that kept the same id — that one has already read the row and its end-of-turn write
+    // restores what this clears — so the caller re-checks the gate afterwards and reports
+    // rather than claiming a success the user will not get.
+    const res = await this.db
+      .prepare(
+        `UPDATE sessions SET acpSessionId = NULL, lastDeliveredTs = ?,
+           state = CASE WHEN state = 'closed' THEN 'closed' ELSE 'idle' END, updatedAt = ?
+         WHERE key = ? AND acpSessionId IS ?`
+      )
+      .run(cursorTs, at, key, expectAcpSessionId ?? null)
+    return Number(res.changes) > 0
+  }
+
+  /** Drop a conversation's reservation, but only while it still names `coordinate` — a
+   *  reservation a concurrent `!new` has already rotated is left alone. */
+  private async clearAppendReservation(
+    tx: StoreAccess,
+    agentId: string,
+    channel: string,
+    transportScope: string | null | undefined,
+    coordinate: string
+  ): Promise<void> {
+    await tx
+      .prepare(
+        `DELETE FROM append_reservation
+         WHERE agentId = ? AND channel = ? AND transportScope = ? AND coordinate = ?`
+      )
+      .run(agentId, channel, transportScope ?? '', coordinate)
+  }
+
+  /** Note that an agent is active in a PHYSICAL thread (channel-session-mode.md §6.4). */
+  async recordThreadParticipation(p: {
+    channel: string
+    thread: string
+    agentId: string
+    sessionKey: string
+    transportScope?: string | null
+    updatedAt?: number
+  }): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO thread_participation (channel, thread, agentId, transportScope, sessionKey, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (channel, thread, agentId, transportScope)
+         DO UPDATE SET sessionKey = excluded.sessionKey, updatedAt = excluded.updatedAt`
+      )
+      .run(p.channel, p.thread, p.agentId, p.transportScope ?? '', p.sessionKey, p.updatedAt ?? Date.now())
+    // Hygiene, not correctness — the read fences on the session's own scope, so a row left
+    // here by a crash resolves nothing. This keeps a scope move from accumulating rows.
+    await this.db
+      .prepare('DELETE FROM thread_participation WHERE sessionKey = ? AND transportScope != ?')
+      .run(p.sessionKey, p.transportScope ?? '')
+  }
+
+  /** Save the latest turn's delivery target for continuations addressed only by session. */
+  async setSessionReplyTarget(key: string, channel: string, thread: string | null): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET replyChannel = ?, replyThread = ? WHERE key = ?')
+      .run(channel, thread, key)
+  }
+
+  /** The digest of the standing context this session's model holds, or null for none yet; compared when the session resumes. */
+  async setSessionStandingDigest(key: string, digest: string | null): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET standingDigest = ? WHERE key = ?').run(digest, key)
+  }
+
+  /** The digests of the tool definitions this session's model holds, or null for unknown; compared before each turn. */
+  async setSessionToolDigests(key: string, digests: string | null): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET toolDigests = ? WHERE key = ?').run(digests, key)
+  }
+
+  /** Record that retention kept this expired session, only while it is still the row that was judged; false when it moved on. */
+  async markSessionRetentionKept(key: string, updatedAt: number, keptAt: number, recheckAt: number): Promise<boolean> {
+    const res = await this.db
+      .prepare(
+        "UPDATE sessions SET retentionKeptAt = ?, retentionRecheckAt = ? WHERE key = ? AND updatedAt = ? AND state IN ('idle', 'closed')"
+      )
+      .run(keptAt, recheckAt, key, updatedAt)
+    return Number(res.changes) > 0
+  }
+
+  /** Record that retention reclaimed this session's workspace, only while it is still the row that was judged; false when it moved on. */
+  async markSessionWorkspaceReclaimed(key: string, updatedAt: number, reclaimedAt: number): Promise<boolean> {
+    const res = await this.db
+      .prepare(
+        "UPDATE sessions SET workspaceReclaimedAt = ? WHERE key = ? AND updatedAt = ? AND state IN ('idle', 'closed')"
+      )
+      .run(reclaimedAt, key, updatedAt)
+    return Number(res.changes) > 0
+  }
+
+  /** Record how the turn that just ended went (§7.3 companion of {@link setSessionState}):
+   *  'done' for a clean finish, 'failed' for a problem phase. Read back by
+   *  `viewSessionStatus` so a parent session can tell a finished child from a broken one.
+   *  No-op if the key is unknown (a turn that failed before the row existed). */
+  async setSessionTurnOutcome(key: string, outcome: 'done' | 'failed', updatedAt: number): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET lastTurnOutcome = ?, updatedAt = ? WHERE key = ?')
+      .run(outcome, updatedAt, key)
+  }
+
+  /** Record a session's birth verdict (session-executors.md §7): each write clears the other half, the first strategy recorded stays (§5), and an unknown key is a no-op. */
+  async setSessionExecutor(key: string, verdict: SessionExecutorVerdict): Promise<void> {
+    await this.db
+      .prepare(
+        'UPDATE sessions SET executorDaemonId = ?, stayedHomeReason = ?, birthStrategy = COALESCE(birthStrategy, ?) WHERE key = ?'
+      )
+      .run(
+        'executorDaemonId' in verdict ? verdict.executorDaemonId : null,
+        'stayedHomeReason' in verdict ? verdict.stayedHomeReason : null,
+        verdict.birthStrategy ?? null,
+        key
+      )
+  }
+
+  /** Record, once, that a session's runtime was handed an on-demand clone directory (multi-repository-workspaces.md decision 20); an unknown key is a no-op. */
+  async markSessionOnDemandClones(key: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET onDemandClones = 1 WHERE key = ? AND onDemandClones IS NULL').run(key)
+  }
+
+  /** The verdict on the shared row — how a successor holder finds a session's environment; undefined when none was recorded. */
+  async getSessionExecutor(key: string): Promise<SessionExecutorVerdict | undefined> {
+    const row = (await this.db
+      .prepare('SELECT executorDaemonId, stayedHomeReason, birthStrategy FROM sessions WHERE key = ?')
+      .get(key)) as
+      | {
+          executorDaemonId: string | null
+          stayedHomeReason: SessionStayedHomeReason | null
+          birthStrategy: string | null
+        }
+      | undefined
+    const strategy = row?.birthStrategy ? { birthStrategy: row.birthStrategy } : {}
+    if (row?.executorDaemonId) return { executorDaemonId: row.executorDaemonId, ...strategy }
+    return row?.stayedHomeReason ? { stayedHomeReason: row.stayedHomeReason, ...strategy } : undefined
+  }
+
+  /** Fill the birth strategy of an agent's verdicts recorded before it was (§5); a recorded strategy is never replaced. */
+  async backfillBirthStrategy(agentId: string, strategy: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE sessions SET birthStrategy = ? WHERE agentId = ? AND birthStrategy IS NULL
+         AND (executorDaemonId IS NOT NULL OR stayedHomeReason IS NOT NULL)`
+      )
+      .run(strategy, agentId)
+  }
+
+  /** Open `session`-isolated sessions of `agentIds` that execute here (session-executors.md §6): a placed one is its executor's to count. */
+  async listOwnIsolatedSessions(
+    agentIds: string[],
+    exceptKey?: string
+  ): Promise<Array<{ key: string; agentId: string; acpSessionId: string | null }>> {
+    const unique = [...new Set(agentIds)]
+    if (unique.length === 0) return []
+    return (await this.db
+      .prepare(
+        `SELECT key, agentId, acpSessionId FROM sessions WHERE state != 'closed' AND workspaceIsolation = 'session'
+         AND executorDaemonId IS NULL AND key != ? AND agentId IN (${unique.map(() => '?').join(',')})`
+      )
+      .all(exceptKey ?? '', ...unique)) as Array<{ key: string; agentId: string; acpSessionId: string | null }>
+  }
+
+  /** Targeted state transition for an existing session (§7.3), stamping `updatedAt`
+   *  so the change counts as activity for the TTL/idle clocks. No-op if the key is
+   *  unknown (the row is created by the SessionManager on first turn). */
+  async setSessionState(key: string, state: SessionRecord['state'], updatedAt: number): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET state = ?, updatedAt = ? WHERE key = ?').run(state, updatedAt, key)
+  }
+
+  /** `!stop` thread mute: the tombstone is written even before a session row exists,
+   *  then mirrored into sessions.muted for existing readers. An explicit @mention
+   *  clears both atomically. */
+  async setSessionMuted(key: string, muted: boolean): Promise<void> {
+    await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      if (muted) await tx.prepare('INSERT OR IGNORE INTO session_mutes (key) VALUES (?)').run(key)
+      else await tx.prepare('DELETE FROM session_mutes WHERE key = ?').run(key)
+      await tx.prepare('UPDATE sessions SET muted = ? WHERE key = ?').run(muted ? 1 : 0, key)
+    })
+  }
+
+  // ── memory-capture gate (session-visibility.md §5.1) ──────────────────────
+  // Two layers: the daemon-local verdict it can reach without a CP round-trip
+  // (DM / webchat / launch-correlated / A2A ⇒ excluded), and the CP-confirmed
+  // effective state, which supersedes it once it arrives. Unknown ⇒ excluded:
+  // a missed or delayed frame may only under-capture, never leak.
+
+  /** Seed the local verdict for a session the daemon just created. Never lowers
+   *  `cpRev`: a CP push that arrived first stays authoritative. */
+  async setLocalCaptureGate(agentId: string, sessionKey: string, localExcluded: boolean): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO session_gates (agentId, sessionKey, localExcluded, cpRev, updatedAt)
+         VALUES (?, ?, ?, 0, ?)
+         ON CONFLICT(agentId, sessionKey) DO UPDATE SET
+           localExcluded = excluded.localExcluded, updatedAt = excluded.updatedAt`
+      )
+      .run(agentId, sessionKey, localExcluded ? 1 : 0, Date.now())
+  }
+
+  /**
+   * Apply a CP `session/visibility` push. Idempotent by revision: a frame whose
+   * rev is at or below what we hold is NOT reapplied but IS still acknowledged
+   * (`superseded`) — "ignore" must never mean "don't ACK", or a lost ack leaves
+   * the CP retrying forever.
+   *
+   * The revision test is the upsert's own `WHERE`, not a prior `SELECT`: two members
+   * on the shared store otherwise interleave read and write and land the older rev last.
+   */
+  async applyCpCaptureGate(
+    agentId: string,
+    sessionKey: string,
+    isPrivate: boolean,
+    rev: number
+  ): Promise<'applied' | 'superseded'> {
+    // rev 0 is a legitimate first revision (a session ingested and never
+    // changed), so it applies once — but only while we hold nothing newer.
+    const changes = (
+      await this.db
+        .prepare(
+          `INSERT INTO session_gates (agentId, sessionKey, localExcluded, cpPrivate, cpRev, updatedAt)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(agentId, sessionKey) DO UPDATE SET
+           cpPrivate = excluded.cpPrivate, cpRev = excluded.cpRev, updatedAt = excluded.updatedAt
+         WHERE session_gates.cpRev < excluded.cpRev
+            OR (excluded.cpRev = 0 AND session_gates.cpRev = 0)`
+        )
+        .run(agentId, sessionKey, isPrivate ? 1 : 0, isPrivate ? 1 : 0, rev, Date.now())
+    ).changes
+    return Number(changes) > 0 ? 'applied' : 'superseded'
+  }
+
+  /** The one agent holding this ACP id locally, or undefined when none or several
+   *  do — how a push from a CP too old to name the agent is attributed. */
+  async soleAgentForAcpSession(sessionId: string): Promise<string | undefined> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT DISTINCT agentId FROM sessions
+         WHERE (sessionId = @sessionId OR acpSessionId = @sessionId) AND agentId IS NOT NULL LIMIT 2`
+      )
+      .all({ sessionId })) as { agentId: string }[]
+    return rows.length === 1 ? rows[0]!.agentId : undefined
+  }
+
+  /**
+   * Is memory capture excluded for this session? The CP-confirmed bit wins once
+   * we have one; otherwise the local verdict; otherwise excluded. An A2A child
+   * therefore starts closed and only a CP-confirmed `org` state opens it.
+   */
+  async isCaptureExcluded(agentId: string, sessionKey: string | undefined): Promise<boolean> {
+    if (!sessionKey) return true
+    // External-source binding (a Slack/Feishu channel = external identity domain)
+    // no longer forces memory exclusion: such channels behave like any other
+    // channel (Discord/Telegram already did), gated only by the local verdict and
+    // the CP-confirmed visibility below (#653 follow-up; session-visibility.md
+    // §5.1). DM / webchat / A2A / launch-correlated sessions stay private through
+    // those same layers.
+    const row = (await this.db
+      .prepare('SELECT localExcluded, cpPrivate FROM session_gates WHERE agentId = ? AND sessionKey = ?')
+      .get(agentId, sessionKey)) as { localExcluded: number; cpPrivate: number | null } | undefined
+    if (!row) return true
+    if (row.cpPrivate !== null) return row.cpPrivate === 1
+    return row.localExcluded === 1
+  }
+
+  // ── durable tenant scopes (session-visibility.md §2) ──────────────────────
+  // A platform with no durable tenant id of its own (Discord today) mints one
+  // per integration ONCE and keeps it: the credential-derived transportScope
+  // rotates with tokens, which would orphan historical identity matches.
+
+  /** The minted tenant scope for an integration, or undefined if never minted. */
+  async getMintedTenantScope(integrationId: string): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare('SELECT value FROM tenant_scopes WHERE integrationId = ?')
+      .get(integrationId)) as { value: string } | undefined
+    return row?.value
+  }
+
+  /** One WeChat bot's stored poll cursor and reply token; empty for a bot never polled here. */
+  async getWeChatBotState(botId: string): Promise<{ cursor?: string; contextToken?: string }> {
+    const row = (await this.db
+      .prepare('SELECT pollCursor, contextToken FROM wechat_bot_state WHERE botId = ?')
+      .get(botId)) as { pollCursor: string | null; contextToken: string | null } | undefined
+    return {
+      ...(row?.pollCursor ? { cursor: row.pollCursor } : {}),
+      ...(row?.contextToken ? { contextToken: row.contextToken } : {})
+    }
+  }
+
+  async setWeChatPollCursor(botId: string, cursor: string): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO wechat_bot_state (botId, pollCursor, updatedAt) VALUES (?, ?, ?)
+         ON CONFLICT (botId) DO UPDATE SET pollCursor = excluded.pollCursor, updatedAt = excluded.updatedAt`
+      )
+      .run(botId, cursor, Date.now())
+  }
+
+  async setWeChatContextToken(botId: string, token: string): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO wechat_bot_state (botId, contextToken, updatedAt) VALUES (?, ?, ?)
+         ON CONFLICT (botId) DO UPDATE SET contextToken = excluded.contextToken, updatedAt = excluded.updatedAt`
+      )
+      .run(botId, token, Date.now())
+  }
+
+  /** Keep one WeChat message's text under its iLink id, holding only the bot's newest `keep` rows. */
+  async rememberWeChatMessage(botId: string, messageId: string, text: string, keep: number): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO wechat_message (botId, messageId, text, createdAt) VALUES (?, ?, ?, ?)
+         ON CONFLICT (botId, messageId) DO NOTHING`
+      )
+      .run(botId, messageId, text, Date.now())
+    await this.db
+      .prepare(
+        `DELETE FROM wechat_message WHERE botId = ? AND messageId NOT IN
+           (SELECT messageId FROM wechat_message WHERE botId = ? ORDER BY createdAt DESC, messageId DESC LIMIT ?)`
+      )
+      .run(botId, botId, keep)
+  }
+
+  /** The text a WeChat message id was kept with; undefined once it aged out. */
+  async getWeChatMessageText(botId: string, messageId: string): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare('SELECT text FROM wechat_message WHERE botId = ? AND messageId = ?')
+      .get(botId, messageId)) as { text: string } | undefined
+    return row?.text
+  }
+
+  /** Mint-once: concurrent callers converge on the first stored value. */
+  async mintTenantScope(integrationId: string, value: string): Promise<string> {
+    await this.db
+      .prepare('INSERT OR IGNORE INTO tenant_scopes (integrationId, value, createdAt) VALUES (?, ?, ?)')
+      .run(integrationId, value, Date.now())
+    return (await this.getMintedTenantScope(integrationId)) ?? value
+  }
+
+  /** Persist a session's visibility-classification inputs so EVERY later
+   *  `event/session` re-emit carries them, not just the dispatch that knew the
+   *  originating message (session-visibility.md §4.1). First non-null wins. */
+  async setSessionClassification(
+    key: string,
+    c: {
+      conversationKind?: string
+      tenantScope?: string
+      launchCorrelationId?: string
+      externalProvider?: string
+      externalRealmKey?: string
+      externalResourceKind?: string
+      externalResourceKey?: string
+      externalIntegrationId?: string
+      externalOrigin?: ExternalSessionOrigin
+      sourceBindingKind?: 'local' | 'external'
+      directDestination?: boolean
+    }
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE sessions SET
+           conversationKind = COALESCE(conversationKind, ?),
+           tenantScope = COALESCE(tenantScope, ?),
+           launchCorrelationId = COALESCE(launchCorrelationId, ?),
+           externalProvider = COALESCE(externalProvider, ?),
+           externalRealmKey = COALESCE(externalRealmKey, ?),
+           externalResourceKind = COALESCE(externalResourceKind, ?),
+           externalResourceKey = COALESCE(externalResourceKey, ?),
+           -- Unlike the source tuple, the credential locator is replaceable.
+           externalIntegrationId = COALESCE(?, externalIntegrationId),
+           externalOriginJson = COALESCE(externalOriginJson, ?),
+           sourceBindingKind = COALESCE(sourceBindingKind, ?),
+           directDestination = COALESCE(directDestination, ?)
+         WHERE key = ?`
+      )
+      .run(
+        c.conversationKind ?? null,
+        c.tenantScope ?? null,
+        c.launchCorrelationId ?? null,
+        c.externalProvider ?? null,
+        c.externalRealmKey ?? null,
+        c.externalResourceKind ?? null,
+        c.externalResourceKey ?? null,
+        c.externalIntegrationId ?? null,
+        c.externalOrigin ? JSON.stringify(c.externalOrigin) : null,
+        c.sourceBindingKind ?? null,
+        c.directDestination === undefined ? null : c.directDestination ? 1 : 0,
+        key
+      )
+  }
+
+  /** Read them back by ACP session id, the key the telemetry emitter holds. */
+  /** The classification a logical session carries — the read for anything that knows which row it means. */
+  async getSessionClassificationByKey(key: string): Promise<SessionClassification | undefined> {
+    return this.classificationOf(`${CLASSIFICATION_SELECT} FROM sessions WHERE key = ?`, [key])
+  }
+
+  async getSessionClassification(agentId: string, acpSessionId: string): Promise<SessionClassification | undefined> {
+    return this.classificationOf(`${CLASSIFICATION_SELECT} FROM sessions WHERE agentId = ? AND acpSessionId = ?`, [
+      agentId,
+      acpSessionId
+    ])
+  }
+
+  private async classificationOf(sql: string, params: string[]): Promise<SessionClassification | undefined> {
+    const row = (await this.db.prepare(sql).get(...params)) as
+      | {
+          conversationKind: string | null
+          tenantScope: string | null
+          launchCorrelationId: string | null
+          externalProvider: string | null
+          externalRealmKey: string | null
+          externalResourceKind: string | null
+          externalResourceKey: string | null
+          externalIntegrationId: string | null
+          externalOriginJson: string | null
+          sourceBindingKind: 'local' | 'external' | null
+          directDestination: number | null
+        }
+      | undefined
+    if (!row) return undefined
+    return {
+      ...(row.conversationKind ? { conversationKind: row.conversationKind } : {}),
+      ...(row.tenantScope ? { tenantScope: row.tenantScope } : {}),
+      ...(row.launchCorrelationId ? { launchCorrelationId: row.launchCorrelationId } : {}),
+      ...(row.externalProvider ? { externalProvider: row.externalProvider } : {}),
+      ...(row.externalRealmKey ? { externalRealmKey: row.externalRealmKey } : {}),
+      ...(row.externalResourceKind ? { externalResourceKind: row.externalResourceKind } : {}),
+      ...(row.externalResourceKey ? { externalResourceKey: row.externalResourceKey } : {}),
+      ...(row.externalIntegrationId ? { externalIntegrationId: row.externalIntegrationId } : {}),
+      ...(row.externalOriginJson
+        ? { externalOrigin: JSON.parse(row.externalOriginJson) as ExternalSessionOrigin }
+        : {}),
+      ...(row.sourceBindingKind ? { sourceBindingKind: row.sourceBindingKind } : {}),
+      ...(row.directDestination ? { directDestination: true } : {})
+    }
+  }
+
+  /** Human-facing session title from ingress, ACP, or the AgentConnect title
+   *  tool (latest wins; null clears per ACP semantics). No-op on an unknown key. */
+  async setSessionTitle(key: string, title: string | null): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET title = ? WHERE key = ?').run(title, key)
+  }
+
+  /** Slack status-bar message ts for this session, if one has been posted already. */
+  async getStatusBarTs(key: string): Promise<string | undefined> {
+    const row = (await this.db.prepare('SELECT statusBarTs FROM sessions WHERE key = ?').get(key)) as
+      { statusBarTs: string | null } | undefined
+    return row?.statusBarTs ?? undefined
+  }
+
+  /** Remember the current Slack status-bar message so later turns edit it in place. */
+  async setStatusBarTs(key: string, ts: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET statusBarTs = ? WHERE key = ?').run(ts, key)
+  }
+
+  /** Forget a removed Slack status-bar message so a later enabled turn posts a fresh one. */
+  async clearStatusBarTs(key: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET statusBarTs = NULL WHERE key = ?').run(key)
+  }
+
+  async isSessionMuted(key: string): Promise<boolean> {
+    const row = (await this.db
+      .prepare(
+        `SELECT CASE
+           WHEN EXISTS (SELECT 1 FROM session_mutes WHERE key = ?)
+             OR EXISTS (SELECT 1 FROM sessions WHERE key = ? AND muted = 1)
+           THEN 1 ELSE 0
+         END AS muted`
+      )
+      .get(key, key)) as { muted: number }
+    return row.muted === 1
+  }
+
+  /** The session-scoped model override (set via the console's in-session model switch),
+   *  or undefined if the session runs on the agent's default. Sticky across turns and
+   *  restarts, re-applied to the ACP session on each dispatch. */
+  async getModelOverride(key: string): Promise<string | undefined> {
+    const row = (await this.db.prepare('SELECT modelOverride FROM sessions WHERE key = ?').get(key)) as
+      { modelOverride: string | null } | undefined
+    return row?.modelOverride ?? undefined
+  }
+
+  /** Last model the runtime actually exposed for this session. `null` is an
+   *  explicit opaque/default observation; undefined means no turn observed yet. */
+  async getObservedModel(key: string): Promise<string | null | undefined> {
+    const row = (await this.db
+      .prepare('SELECT observedModel, observedModelSet FROM sessions WHERE key = ?')
+      .get(key)) as { observedModel: string | null; observedModelSet: number } | undefined
+    if (!row || row.observedModelSet !== 1) return undefined
+    return row.observedModel
+  }
+
+  /** The runtime and model the session's last turn ran; a row observed before v31 carries no runtime. */
+  async getObservedTurn(key: string): Promise<{ runtime?: string; model: string | null } | undefined> {
+    const row = (await this.db
+      .prepare('SELECT observedRuntime, observedModel, observedModelSet FROM sessions WHERE key = ?')
+      .get(key)) as
+      { observedRuntime: string | null; observedModel: string | null; observedModelSet: number } | undefined
+    if (!row || row.observedModelSet !== 1) return undefined
+    return { ...(row.observedRuntime ? { runtime: row.observedRuntime } : {}), model: row.observedModel }
+  }
+
+  /** Persist a turn's runtime and observed model as one pair, kept across teardown for usage corrections and metadata re-emits. */
+  async setObservedTurn(key: string, runtime: string, model: string | null): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET observedRuntime = ?, observedModel = ?, observedModelSet = 1 WHERE key = ?')
+      .run(runtime, model, key)
+  }
+
+  /** Persist the session-scoped model override. No-op on an unknown key. */
+  async setModelOverride(key: string, model: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET modelOverride = ? WHERE key = ?').run(model, key)
+  }
+
+  async pinDecisionModel(key: string, target: DecisionRuntimeTarget): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET decisionModel = ? WHERE key = ? AND decisionModel IS NULL')
+      .run(JSON.stringify(target), key)
+  }
+
+  /** Pin the repositories the selector chose for a session (multi-repository-workspaces.md decision 19), first-wins like the model; an unknown key is a no-op. */
+  async pinSelectedRepos(key: string, repos: readonly SelectedRepository[]): Promise<void> {
+    await this.db
+      .prepare('UPDATE sessions SET selectedRepos = ? WHERE key = ? AND selectedRepos IS NULL')
+      .run(JSON.stringify(repos), key)
+  }
+
+  /** Every repository a session of the agent still holds by its snapshot, deduplicated — what the retire sweep must not treat as retired. */
+  async listSelectedRepos(agentId: string): Promise<SelectedRepository[]> {
+    const rows = (await this.db
+      .prepare('SELECT selectedRepos FROM sessions WHERE agentId = ? AND selectedRepos IS NOT NULL')
+      .all(agentId)) as { selectedRepos: string | null }[]
+    const held = new Map<string, SelectedRepository>()
+    for (const row of rows) {
+      for (const repo of parseSelectedRepositories(row.selectedRepos) ?? []) held.set(selectedRepoIdentity(repo), repo)
+    }
+    return [...held.values()]
+  }
+
+  /** The session-scoped reasoning-effort override (set via the status-bar effort picker),
+   *  or undefined if the session runs on the agent's default. Sticky across turns and
+   *  restarts, re-applied to the ACP session on each dispatch. */
+  async getEffortOverride(key: string): Promise<string | undefined> {
+    const row = (await this.db.prepare('SELECT effortOverride FROM sessions WHERE key = ?').get(key)) as
+      { effortOverride: string | null } | undefined
+    return row?.effortOverride ?? undefined
+  }
+
+  /** Persist the session-scoped reasoning-effort override. No-op on an unknown key. */
+  async setEffortOverride(key: string, effort: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET effortOverride = ? WHERE key = ?').run(effort, key)
+  }
+
+  /** The session-scoped permission preset (set via status bars), or undefined if the
+   *  session runs on the agent's default. Codex Auto is stored as AgentConnect's
+   *  composite preset and decomposed only when applied to ACP. Sticky across turns
+   *  and restarts. */
+  async getPermissionModeOverride(key: string): Promise<string | undefined> {
+    const row = (await this.db.prepare('SELECT permissionModeOverride FROM sessions WHERE key = ?').get(key)) as
+      { permissionModeOverride: string | null } | undefined
+    return row?.permissionModeOverride ?? undefined
+  }
+
+  /** Persist the session-scoped permission preset. No-op on an unknown key. */
+  async setPermissionModeOverride(key: string, preset: string): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET permissionModeOverride = ? WHERE key = ?').run(preset, key)
+  }
+
+  /** Revoke every chat-authored runtime override for an Agent. Output mode is
+   * delivery presentation, not a runtime setting, so it remains independent. */
+  async clearRuntimeConfigOverrides(agentId: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE sessions
+         SET modelOverride = NULL,
+             effortOverride = NULL,
+             permissionModeOverride = NULL,
+             fastModeOverride = NULL
+         WHERE agentId = ?`
+      )
+      .run(agentId)
+  }
+
+  /** Drop what each coordinator chat set for its own coordinator, so a new agent setting reaches them all (auto-session-mode.md §5.4). */
+  async clearCoordinatorRuntimeOverrides(agentId: string): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE sessions
+         SET modelOverride = NULL,
+             effortOverride = NULL,
+             fastModeOverride = NULL
+         WHERE agentId = ? AND thread LIKE ?`
+      )
+      .run(agentId, `${COORDINATOR_COORDINATE_PREFIX}%`)
+  }
+
+  /** The session-scoped fast-mode override (set via the status-bar fast toggle), or
+   *  undefined if the session runs on the agent's default. Stored as 0/1; sticky across
+   *  turns and restarts, re-applied to the ACP session on each dispatch. */
+  async getFastModeOverride(key: string): Promise<boolean | undefined> {
+    const row = (await this.db.prepare('SELECT fastModeOverride FROM sessions WHERE key = ?').get(key)) as
+      { fastModeOverride: number | null } | undefined
+    return row?.fastModeOverride === null || row?.fastModeOverride === undefined
+      ? undefined
+      : row.fastModeOverride === 1
+  }
+
+  /** Persist the session-scoped fast-mode override. No-op on an unknown key. */
+  async setFastModeOverride(key: string, fastMode: boolean): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET fastModeOverride = ? WHERE key = ?').run(fastMode ? 1 : 0, key)
+  }
+
+  /** The session-scoped Slack output-mode override (set via the status-bar output picker),
+   *  or undefined if the session uses the agent's default. Daemon-side rendering verbosity
+   *  (minimal/low/medium/high) — NOT an ACP setting; picked up by the next turn's OutputConverger. */
+  async getOutputModeOverride(key: string): Promise<'none' | 'minimal' | 'low' | 'medium' | 'high' | undefined> {
+    if (!key) return undefined // defensive: never bind an undefined key into SQL
+    const row = (await this.db.prepare('SELECT outputModeOverride FROM sessions WHERE key = ?').get(key)) as
+      { outputModeOverride: string | null } | undefined
+    const v = row?.outputModeOverride
+    return v === 'none' || v === 'minimal' || v === 'low' || v === 'medium' || v === 'high' ? v : undefined
+  }
+
+  /** Persist the session-scoped Slack output-mode override. No-op on an unknown key. */
+  async setOutputModeOverride(key: string, mode: 'none' | 'minimal' | 'low' | 'medium' | 'high'): Promise<void> {
+    await this.db.prepare('UPDATE sessions SET outputModeOverride = ? WHERE key = ?').run(mode, key)
+  }
+
+  /** Current token accounting for a session (parsed from the `usage` JSON column),
+   *  or `{}` if none has been recorded / the JSON is unreadable. */
+  async getUsage(key: string): Promise<StoredUsage> {
+    const row = (await this.db.prepare('SELECT usage FROM sessions WHERE key = ?').get(key)) as
+      { usage: string | null } | undefined
+    return parseUsage(row?.usage ?? null)
+  }
+
+  /**
+   * Read-merge-write `sessions.usage` under a compare-and-set on the value read, retried when a
+   * concurrent writer wins. `addTokenUsage` and `addCost` are genuinely additive, so a plain
+   * read-then-write drops the loser's increment; on a shared store two members touch one session
+   * across a handover. A relative UPDATE would be simpler but the column is one JSON blob and the
+   * two backends spell JSON mutation differently, whereas a CAS is plain SQL in both.
+   *
+   * `merge` runs again on every attempt, so it must be safe to repeat; returning undefined aborts.
+   */
+  private async mergeUsage(key: string, merge: (u: StoredUsage) => StoredUsage | undefined): Promise<void> {
+    for (let attempt = 1; attempt <= USAGE_MERGE_ATTEMPTS; attempt++) {
+      const row = (await this.db.prepare('SELECT usage FROM sessions WHERE key = ?').get(key)) as
+        { usage: string | null } | undefined
+      if (!row) return // unknown key: the row is created first (unchanged from the plain write)
+      const merged = merge(parseUsage(row.usage))
+      if (!merged) return
+      const next = JSON.stringify(merged)
+      // The last attempt writes unconditionally. Losing an increment is exactly the behavior this
+      // replaces, so it is the floor to degrade to rather than dropping the write entirely.
+      if (attempt === USAGE_MERGE_ATTEMPTS) {
+        await this.db.prepare('UPDATE sessions SET usage = ? WHERE key = ?').run(next, key)
+        return
+      }
+      // Two statements, not one NULL-safe comparison: `IS` / `IS NOT DISTINCT FROM` are spelled
+      // differently by the two backends, and which case applies is already known here.
+      const changes =
+        row.usage === null
+          ? (await this.db.prepare('UPDATE sessions SET usage = ? WHERE key = ? AND usage IS NULL').run(next, key))
+              .changes
+          : (
+              await this.db
+                .prepare('UPDATE sessions SET usage = ? WHERE key = ? AND usage = ?')
+                .run(next, key, row.usage)
+            ).changes
+      if (changes > 0) return
+    }
+  }
+
+  /** Record the latest token counts for a session when an adapter reports a
+   *  running session total. This is latest-wins over the token fields — never
+   *  additive. Only provided fields are updated; the context/cost snapshot is
+   *  left intact. No-op on an unknown key (the row is created first). */
+  async setTokenUsage(key: string, counts: TokenCounts): Promise<void> {
+    await this.mergeUsage(key, (u) => {
+      if (counts.totalTokens !== undefined) u.totalTokens = counts.totalTokens
+      if (counts.inputTokens !== undefined) u.inputTokens = counts.inputTokens
+      if (counts.outputTokens !== undefined) u.outputTokens = counts.outputTokens
+      if (counts.thoughtTokens !== undefined) u.thoughtTokens = counts.thoughtTokens
+      if (counts.cachedReadTokens !== undefined) u.cachedReadTokens = counts.cachedReadTokens
+      if (counts.cachedWriteTokens !== undefined) u.cachedWriteTokens = counts.cachedWriteTokens
+      return u
+    })
+  }
+
+  /** Add one turn's token counts to the session total. codex-acp currently maps
+   *  Codex's `last_token_usage` into PromptResponse.usage, so its values are a
+   *  per-turn delta even though other ACP adapters return a session snapshot. */
+  async addTokenUsage(key: string, counts: TokenCounts): Promise<void> {
+    await this.mergeUsage(key, (u) => {
+      const add = (field: keyof TokenCounts, value: number | undefined) => {
+        if (value !== undefined) u[field] = (u[field] ?? 0) + value
+      }
+      add('totalTokens', counts.totalTokens)
+      add('inputTokens', counts.inputTokens)
+      add('outputTokens', counts.outputTokens)
+      add('thoughtTokens', counts.thoughtTokens)
+      add('cachedReadTokens', counts.cachedReadTokens)
+      add('cachedWriteTokens', counts.cachedWriteTokens)
+      return u
+    })
+  }
+
+  /** Overwrite the session's context-window + cost snapshot (latest `usage_update`
+   *  wins). Only provided fields are updated. No-op on an unknown key. */
+  async setUsageSnapshot(key: string, snap: UsageSnapshot): Promise<void> {
+    await this.mergeUsage(key, (u) => {
+      if (snap.contextUsed !== undefined) u.contextUsed = snap.contextUsed
+      if (snap.contextSize !== undefined) u.contextSize = snap.contextSize
+      if (snap.costAmount !== undefined) u.costAmount = snap.costAmount
+      if (snap.costCurrency !== undefined) u.costCurrency = snap.costCurrency
+      return u
+    })
+  }
+
+  /** Add one turn's fallback cost to the session running total. Refuse to mix
+   *  currencies; a later ACP usage_update can still replace the total snapshot. */
+  async addCost(key: string, amount: number, currency: string): Promise<boolean> {
+    if (!Number.isFinite(amount) || amount <= 0 || !currency) return false
+    // Set at most once and only by the refusal branch, so repeating the merge cannot change it.
+    let mixedCurrency = false
+    await this.mergeUsage(key, (u) => {
+      if (u.costCurrency !== undefined && u.costCurrency !== currency) {
+        mixedCurrency = true
+        return undefined
+      }
+      u.costAmount = (u.costAmount ?? 0) + amount
+      u.costCurrency = currency
+      return u
+    })
+    return !mixedCurrency
+  }
+
+  /** Most-recent activity across an agent's non-closed sessions (epoch ms), or null
+   *  if it has none. Drives idle-host reaping (#111): a host with no recent session
+   *  activity AND no in-flight turn is past its idle window. */
+  async agentLastActivityTs(agentId: string): Promise<number | null> {
+    const row = (await this.db
+      .prepare("SELECT MAX(updatedAt) AS ts FROM sessions WHERE agentId = ? AND state != 'closed'")
+      .get(agentId)) as { ts: number | null } | undefined
+    return row?.ts ?? null
+  }
+
+  /** {@link agentLastActivityTs} over the agent's sessions that are not isolated — on a pool, the ones that run in the agent's own pod (k8s-daemon-pool §4). */
+  async agentSharedLastActivityTs(agentId: string): Promise<number | null> {
+    const row = (await this.db
+      .prepare(
+        "SELECT MAX(updatedAt) AS ts FROM sessions WHERE agentId = ? AND state != 'closed' AND (workspaceIsolation IS NULL OR workspaceIsolation != 'session')"
+      )
+      .get(agentId)) as { ts: number | null } | undefined
+    return row?.ts ?? null
+  }
+
+  /** Each non-closed session of the agent with its last activity, most recent first — for a clock that counts only the sessions one host serves (k8s-daemon-pool §4). */
+  async agentSessionActivity(agentId: string): Promise<Array<{ key: string; updatedAt: number }>> {
+    return (await this.db
+      .prepare("SELECT key, updatedAt FROM sessions WHERE agentId = ? AND state != 'closed' ORDER BY updatedAt DESC")
+      .all(agentId)) as Array<{ key: string; updatedAt: number }>
+  }
+
+  /** Every session key of the agent, open or closed — a row's existence is what keeps its session pod's claim (git-workspace-model §11). */
+  async sessionKeysForAgent(agentId: string): Promise<string[]> {
+    const rows = (await this.db.prepare('SELECT key FROM sessions WHERE agentId = ?').all(agentId)) as Array<{
+      key: string
+    }>
+    return rows.map((row) => row.key)
+  }
+
+  /** One session's own last activity (epoch ms), or null once closed or gone — reaps a session-bound host. */
+  async sessionLastActivityTs(key: string): Promise<number | null> {
+    const row = (await this.db
+      .prepare("SELECT updatedAt AS ts FROM sessions WHERE key = ? AND state != 'closed'")
+      .get(key)) as { ts: number | null } | undefined
+    return row?.ts ?? null
+  }
+
+  /** Close expired idle sessions unless daemon-side work exempts them. */
+  async closeIdleSessions(
+    now: number,
+    ttlMs: number,
+    // ACP ids need agent scope; the logical key also fences work admitted before durable prompting state.
+    isExempt?: (agentId: string, acpSessionId: string | null, key: string) => boolean | Promise<boolean>
+  ): Promise<
+    {
+      key: string
+      agentId: string
+      platform: string
+      channel: string
+      thread: string
+      acpSessionId: string | null
+    }[]
+  > {
+    const cutoff = now - ttlMs
+    const candidates = (await this.db
+      .prepare(
+        "SELECT key, agentId, platform, channel, thread, acpSessionId FROM sessions WHERE state = 'idle' AND updatedAt < ?"
+      )
+      .all(cutoff)) as {
+      key: string
+      agentId: string
+      platform: string
+      channel: string
+      thread: string
+      acpSessionId: string | null
+    }[]
+    // The exemption probe is awaited before the close transaction opens, never inside it.
+    const exempt = isExempt
+      ? await Promise.all(candidates.map((r) => isExempt(r.agentId, r.acpSessionId, r.key)))
+      : undefined
+    const rows = exempt ? candidates.filter((_, i) => !exempt[i]) : candidates
+    // Only the rows this call closed are reported: a candidate a new turn reopened meanwhile is not.
+    const closed: typeof rows = []
+    if (rows.length) {
+      await this.transaction(async (raw) => {
+        const close = accessOf(raw).prepare("UPDATE sessions SET state = 'closed' WHERE key = ? AND state = 'idle'")
+        for (const r of rows) if (Number((await close.run(r.key)).changes) === 1) closed.push(r)
+      })
+    }
+    return closed
+  }
+
+  /** Rows left mid-turn and untouched since `before` (#2245): candidates only — the caller proves no turn runs them. */
+  async listAbandonedTurnSessions(
+    before: number
+  ): Promise<{ key: string; agentId: string; platform: string; state: SessionRecord['state']; updatedAt: number }[]> {
+    return (await this.db
+      .prepare(
+        "SELECT key, agentId, platform, state, updatedAt FROM sessions WHERE state IN ('prompting', 'resuming', 'cancelling') AND updatedAt < ?"
+      )
+      .all(before)) as {
+      key: string
+      agentId: string
+      platform: string
+      state: SessionRecord['state']
+      updatedAt: number
+    }[]
+  }
+
+  /** Put an abandoned row back to `idle` only while it is still the row that was read; `updatedAt` stays its last activity. */
+  async releaseAbandonedTurnSession(key: string, state: SessionRecord['state'], updatedAt: number): Promise<boolean> {
+    const res = await this.db
+      .prepare("UPDATE sessions SET state = 'idle' WHERE key = ? AND state = ? AND updatedAt = ?")
+      .run(key, state, updatedAt)
+    return Number(res.changes) > 0
+  }
+
+  /** Retention-GC candidates (#485): sessions whose last activity (`updatedAt`)
+   *  is older than `cutoff` and that are not mid-turn. Unlike listSessions this
+   *  includes rows with no ACP id — a session that never bound one can still own
+   *  a worktree directory. Oldest first, so a bounded pass drains the backlog in
+   *  eviction order. `resuming`/`prompting`/`cancelling` rows are live by
+   *  definition and never candidates. */
+  async listExpiredSessions(cutoff: number): Promise<SessionRecord[]> {
+    return (await this.db
+      .prepare("SELECT * FROM sessions WHERE state IN ('idle', 'closed') AND updatedAt < ? ORDER BY updatedAt ASC")
+      .all(cutoff)) as unknown as SessionRecord[]
+  }
+
+  /** True when the session key still has PENDING durable inbox rows (admitted
+   *  work that has not reached a terminal state). The retention sweep treats such
+   *  a session as active and skips it. Completed rows — hook dedup receipts and
+   *  unacknowledged terminal reports — do NOT pin the session: a hook session
+   *  keeps its receipt forever, and counting it would exempt exactly the
+   *  review-agent sessions #485 exists to collect. */
+  async sessionHasPendingInboxRows(key: string): Promise<boolean> {
+    const row = (await this.db
+      .prepare('SELECT 1 AS present FROM inbox WHERE sessionKey = ? AND completedAt IS NULL LIMIT 1')
+      .get(key)) as { present: number } | undefined
+    return row !== undefined
+  }
+
+  /** The same question asked of a whole AGENT, for a decision about something every one of its
+   *  sessions shares — a retired workspace root. Completed rows are excluded for the same reason. */
+  async agentHasPendingInboxRows(agentId: string): Promise<boolean> {
+    const row = (await this.db
+      .prepare('SELECT 1 AS present FROM inbox WHERE agentId = ? AND completedAt IS NULL LIMIT 1')
+      .get(agentId)) as { present: number } | undefined
+    return row !== undefined
+  }
+
+  /** The session keys of an agent's PENDING inbox rows — admitted work that will run in those sessions, whether or not their rows exist yet; the per-session form of agentHasPendingInboxRows. */
+  async pendingInboxSessionKeys(agentId: string): Promise<string[]> {
+    const rows = (await this.db
+      .prepare('SELECT DISTINCT sessionKey FROM inbox WHERE agentId = ? AND completedAt IS NULL')
+      .all(agentId)) as Array<{ sessionKey: string }>
+    return rows.map((row) => row.sessionKey)
+  }
+
+  /** Retention-GC delete (#485): remove one session row and its dependent rows —
+   *  mute, memory-capture gate, durable inbox, permission-request history.
+   *  Two deliberate survivors:
+   *  - conversational transcript rows — they belong to the conversation, not the session, and stay
+   *    as observations (message-intake.md §8 rule 1) while this key's admissions and the internal
+   *    rows only they cover are removed below;
+   *  - unacknowledged terminal hook reports (`terminalReport IS NOT NULL`) — an
+   *    outbox the CP has not converged yet, preserved exactly like
+   *    removeInboxByAgentId does.
+   *  permission_requests and the capture gate are both scoped by agentId, so a
+   *  neighbour holding the same runtime-local `acp-1` keeps its own rows.
+   *  Returns false when the row is already gone (idempotent). */
+  async deleteSession(key: string, purge?: { reason: string; at: number; ownerId?: string }): Promise<boolean> {
+    const rec = await this.getSession(key)
+    if (!rec) return false
+    await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      // The CP-owed receipt is written in the SAME transaction as the delete: the
+      // fact "this session's content is gone" must not be able to exist without
+      // the report that carries it, in either direction. Only a session that bound
+      // an ACP id was ever reported to the CP, so only that one has a row to mark.
+      // How the CONTROL PLANE knows this session (§1.1): the id its receipt marks and its outbox
+      // row is keyed by. A pre-v12 row answers with its ACP id, which is what it was reported under.
+      const outward = rec.sessionId ?? rec.acpSessionId
+      // OR IGNORE keeps the FIRST stamp if a still-unacked receipt is somehow
+      // re-created for the same id — the console should show when the content
+      // actually went away, not when the daemon last retried.
+      if (purge && rec.acpSessionId) {
+        // Stamped to the deleting member on a shared store: its drain owns it.
+        await tx
+          .prepare(
+            `INSERT OR IGNORE INTO session_purges (agentId, sessionId, reason, purgedAt, ownerId, claimedAt)
+             VALUES (?, ?, ?, ?, ?, ?)`
+          )
+          .run(rec.agentId, outward, purge.reason, purge.at, purge.ownerId ?? null, purge.at)
+      }
+      await tx.prepare('DELETE FROM sessions WHERE key = ?').run(key)
+      // Its identity goes with it: the receipt just reported this id as purged, so the next
+      // session on the same slot must be a new one, not this one's name reused.
+      await tx.prepare('DELETE FROM session_outward_ids WHERE key = ?').run(key)
+      await tx.prepare('DELETE FROM session_mutes WHERE key = ?').run(key)
+      // The affinity record outlives nothing: its whole meaning is the session it names.
+      await tx.prepare('DELETE FROM thread_participation WHERE sessionKey = ?').run(key)
+      // §8 rule 1: the session's admissions go, and with them the internal rows only this session
+      // produced; conversational rows stay as observations for rule 2's floor to reclaim.
+      await tx
+        .prepare(
+          `DELETE FROM transcript
+            WHERE seq IN (
+              SELECT tr.seq FROM transcript_recipient tr
+                JOIN transcript t ON t.seq = tr.seq
+               WHERE tr.sessionKey = ? AND t.kind <> 'text'
+                 AND NOT EXISTS (SELECT 1 FROM transcript_recipient o
+                                  WHERE o.seq = tr.seq AND o.sessionKey <> ?))`
+        )
+        .run(key, key)
+      // An admitted verdict keeps its minimal metadata past its session, never its content (decisions.md §8.1).
+      await tx
+        .prepare(
+          `UPDATE decision_verdict
+              SET inputJson = NULL, answerJson = NULL, deliveryJson = NULL, suppliedSeqsJson = NULL, bodiesStrippedAt = ?
+            WHERE state = 'admitted' AND bodiesStrippedAt IS NULL
+              AND EXISTS (SELECT 1 FROM transcript_recipient tr
+                           WHERE tr.seq = decision_verdict.seq AND tr.agentId = decision_verdict.subject AND tr.sessionKey = ?)`
+        )
+        .run(Date.now(), key)
+      await tx.prepare('DELETE FROM transcript_recipient WHERE sessionKey = ?').run(key)
+      // A reservation that survived its session would hand the next message a coordinate
+      // whose transcript is still on disk — the inheritance the timestamp exists to prevent.
+      // Conditional, so a reservation a concurrent `!new` already rotated is left alone.
+      if (isAppendCoordinate(rec.thread))
+        await this.clearAppendReservation(tx, rec.agentId, rec.channel, rec.transportScope, rec.thread)
+      // A purged work task closes, its record kept for readTask (assistant-mode.md §5.18 ④); a follow-up's row is the task itself, and a getting-to-know task's goes with its session.
+      await tx
+        .prepare(
+          `UPDATE assistant_subsession SET ${CLOSE_TASK} WHERE agentId = ? AND childSessionKey = ? AND mode = 'work'`
+        )
+        .run(Date.now(), rec.agentId, key)
+      await tx
+        .prepare(`DELETE FROM assistant_subsession WHERE agentId = ? AND childSessionKey = ? AND gettingToKnow = 1`)
+        .run(rec.agentId, key)
+      await tx
+        .prepare('DELETE FROM assistant_subsession_input WHERE agentId = ? AND childSessionKey = ?')
+        .run(rec.agentId, key)
+      await tx
+        .prepare('DELETE FROM assistant_subsession_thread WHERE agentId = ? AND childSessionKey = ?')
+        .run(rec.agentId, key)
+      // A purged session neither answers nor is answered: its messages go with it (send-message-guide.md §9.3).
+      await tx.prepare('DELETE FROM session_message WHERE recipientKey = ?').run(key)
+      await tx.prepare('DELETE FROM session_message_sent WHERE senderKey = ?').run(key)
+      if (outward) await tx.prepare('DELETE FROM session_message WHERE sourceSessionId = ?').run(outward)
+      await tx.prepare('DELETE FROM inbox WHERE sessionKey = ? AND terminalReport IS NULL').run(key)
+      if (rec.acpSessionId) {
+        // Once the local session content is gone, creating a new CP metadata row
+        // from an unacknowledged snapshot would race its purge receipt. Drop the
+        // obsolete snapshot; an existing CP row is handled by session_purges.
+        await tx
+          .prepare('DELETE FROM session_metadata_outbox WHERE agentId = ? AND sessionId = ?')
+          .run(rec.agentId, outward)
+        await tx.prepare('DELETE FROM session_gates WHERE agentId = ? AND sessionKey = ?').run(rec.agentId, rec.key)
+        await tx
+          .prepare('DELETE FROM permission_requests WHERE agentId = ? AND sessionId = ?')
+          .run(rec.agentId, rec.acpSessionId)
+      }
+    })
+    return true
+  }
+
+  /**
+   * Save the latest metadata snapshot. Lifecycle milestones create an outbox
+   * row; enrichment-only updates merely coalesce into a row that is already
+   * pending, so startup name refreshes never backfill historical sessions.
+   * Returns the revision when a durable row exists after the write.
+   */
+  async saveSessionMetadataSnapshot(
+    agentId: string,
+    sessionId: string,
+    snapshot: string,
+    enqueue: boolean,
+    queuedAt: number,
+    ownerId?: string
+  ): Promise<number | undefined> {
+    // Stamped to the writing member: the daemon that produced the snapshot serves the
+    // agent, so it is the one that can scope the frame's organization right now.
+    const owner = ownerId ?? null
+    const row = enqueue
+      ? ((await this.db
+          .prepare(
+            `INSERT INTO session_metadata_outbox
+               (agentId, sessionId, revision, snapshot, queuedAt, failedAttempts, nextAttemptAt, ownerId, claimedAt)
+             VALUES (?, ?, 1, ?, ?, 0, NULL, ?, ?)
+             ON CONFLICT (agentId, sessionId) DO UPDATE SET
+               revision = session_metadata_outbox.revision + 1,
+               snapshot = excluded.snapshot,
+               queuedAt = excluded.queuedAt,
+               failedAttempts = 0,
+               nextAttemptAt = NULL,
+               ownerId = excluded.ownerId,
+               claimedAt = excluded.claimedAt
+             RETURNING revision`
+          )
+          .get(agentId, sessionId, snapshot, queuedAt, owner, queuedAt)) as { revision: number } | undefined)
+      : ((await this.db
+          .prepare(
+            `UPDATE session_metadata_outbox
+             SET revision = revision + 1, snapshot = ?, queuedAt = ?, failedAttempts = 0, nextAttemptAt = NULL,
+                 ownerId = ?, claimedAt = ?
+             WHERE agentId = ? AND sessionId = ?
+             RETURNING revision`
+          )
+          .get(snapshot, queuedAt, owner, queuedAt, agentId, sessionId)) as { revision: number } | undefined)
+    return row?.revision
+  }
+
+  async pendingSessionMetadataSnapshot(
+    agentId: string,
+    sessionId: string
+  ): Promise<SessionMetadataOutboxRow | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT agentId, sessionId, revision, snapshot, queuedAt, failedAttempts, nextAttemptAt
+         FROM session_metadata_outbox WHERE agentId = ? AND sessionId = ?`
+      )
+      .get(agentId, sessionId)) as unknown as SessionMetadataOutboxRow | undefined
+  }
+
+  /** The scope of the outbox this member may work on. A local store owns every row
+   *  outright. On a shared pool store a row is offered when this member owns it, or
+   *  when it is unowned / its owner's claim lapsed AND this member serves the agent.
+   *  Unlike the hook outbox, an unowned row is NOT offered install-wide: the frame
+   *  carries the agent's organization, which only a serving member can resolve, so a
+   *  parked snapshot must wait for that member instead of circling the pool (#1023). */
+  private sessionMetadataScope(
+    now: number,
+    ownerId?: string,
+    agentIds?: readonly string[]
+  ): { sql: string; params: SqlParams } {
+    if (!this.shared) return { sql: '', params: {} }
+    const scope = idScope('agentId', agentIds)
+    return {
+      sql: ` AND (ownerId = @ownerId OR ((ownerId IS NULL OR COALESCE(claimedAt, 0) <= @staleBefore)${scope.sql}))`,
+      params: { ownerId: ownerId ?? null, staleBefore: now - SHARED_OUTBOX_LEASE_MS, ...scope.params }
+    }
+  }
+
+  /** Everything this member is eventually answerable for: its own rows plus every row of
+   *  an agent it serves, whoever holds the claim right now. Wider than the claimable-now
+   *  scope on purpose — a peer's live claim on a served agent's row still has to arm this
+   *  member's wake, or nothing would run when that claim lapses. */
+  private sessionMetadataWorkScope(ownerId?: string, agentIds?: readonly string[]): { sql: string; params: SqlParams } {
+    if (!this.shared) return { sql: '', params: {} }
+    const scope = idScope('agentId', agentIds)
+    return {
+      sql: ` AND (ownerId = @ownerId OR 1 = 1${scope.sql})`,
+      params: { ownerId: ownerId ?? null, ...scope.params }
+    }
+  }
+
+  async nextSessionMetadataSnapshot(
+    now = Date.now(),
+    ownerId?: string,
+    agentIds?: readonly string[]
+  ): Promise<SessionMetadataOutboxRow | undefined> {
+    const scope = this.sessionMetadataScope(now, ownerId, agentIds)
+    return (await this.db
+      .prepare(
+        `SELECT agentId, sessionId, revision, snapshot, queuedAt, failedAttempts, nextAttemptAt
+         FROM session_metadata_outbox
+         WHERE (nextAttemptAt IS NULL OR nextAttemptAt <= @now)${scope.sql}
+         ORDER BY queuedAt ASC LIMIT 1`
+      )
+      .get({ now, ...scope.params })) as unknown as SessionMetadataOutboxRow | undefined
+  }
+
+  /** Take or renew this member's claim on one snapshot before emitting it. Local
+   *  stores never lease: the single owner claims everything. */
+  async claimSessionMetadataSnapshot(
+    agentId: string,
+    sessionId: string,
+    revision: number,
+    ownerId: string | undefined,
+    now: number
+  ): Promise<boolean> {
+    if (!this.shared) return true
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE session_metadata_outbox
+           SET ownerId = @ownerId, claimedAt = @now
+           WHERE agentId = @agentId AND sessionId = @sessionId AND revision = @revision
+             AND (ownerId IS NULL OR ownerId = @ownerId OR COALESCE(claimedAt, 0) <= @staleBefore)`
+          )
+          .run({
+            agentId,
+            sessionId,
+            revision,
+            ownerId: ownerId ?? null,
+            now,
+            staleBefore: now - SHARED_OUTBOX_LEASE_MS
+          })
+      ).changes === 1
+    )
+  }
+
+  /** Hand a snapshot this member cannot scope back to the pool: the claim is released
+   *  so the member serving the agent picks it up, the body and the failure count are
+   *  untouched, and the backoff keeps it out of this member's next pass. Returns false
+   *  on a local store, where there is no other member to park it for. */
+  async parkSessionMetadataSnapshot(
+    agentId: string,
+    sessionId: string,
+    revision: number,
+    retryAt: number
+  ): Promise<boolean> {
+    if (!this.shared) return false
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE session_metadata_outbox
+           SET ownerId = NULL, claimedAt = NULL, nextAttemptAt = @retryAt
+           WHERE agentId = @agentId AND sessionId = @sessionId AND revision = @revision`
+          )
+          .run({ agentId, sessionId, revision, retryAt })
+      ).changes === 1
+    )
+  }
+
+  /** Hand the snapshots of agents a member has just gained back to the pool: the parked
+   *  ones lose their backoff and a previous holder's claim — live or not — is released,
+   *  because the duty ledger has already proved that member no longer serves the agent.
+   *  This member's own claims are left alone; only it knows whether they are in flight. */
+  async reclaimSessionMetadataSnapshots(agentIds: readonly string[], ownerId?: string): Promise<number> {
+    if (!this.shared || agentIds.length === 0) return 0
+    const scope = idScope('agentId', agentIds)
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE session_metadata_outbox
+           SET ownerId = NULL, claimedAt = NULL, nextAttemptAt = NULL
+           WHERE (ownerId IS NULL OR ownerId <> @ownerId)${scope.sql}`
+          )
+          .run({ ownerId: ownerId ?? null, ...scope.params })
+      ).changes
+    )
+  }
+
+  /** Release every claim this member still holds, at shutdown: it will not emit again, so
+   *  a successor must not wait out the lease. Bodies, revisions and backoffs survive. */
+  async releaseOwnedSessionMetadataSnapshots(ownerId?: string): Promise<number> {
+    if (!this.shared) return 0
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE session_metadata_outbox
+           SET ownerId = NULL, claimedAt = NULL, nextAttemptAt = NULL
+           WHERE ownerId = @ownerId`
+          )
+          .run({ ownerId: ownerId ?? null })
+      ).changes
+    )
+  }
+
+  /** When the earliest row this member is answerable for becomes workable: its own backoff,
+   *  or — for a row a peer still holds — the later of that backoff and the moment the claim
+   *  lapses. Without the second half a graceful handoff leaves a live foreign claim with
+   *  nothing armed to outlast it. Written as one CASE rather than a two-argument `max()`: the
+   *  same statement text runs on the pool's PostgreSQL, where `MAX` is only an aggregate. */
+  async nextSessionMetadataAttemptAt(ownerId?: string, agentIds?: readonly string[]): Promise<number | undefined> {
+    const scope = this.sessionMetadataWorkScope(ownerId, agentIds)
+    const workableAt = this.shared
+      ? `CASE WHEN ownerId IS NOT NULL AND ownerId <> @ownerId
+                AND COALESCE(claimedAt, 0) + @lease > COALESCE(nextAttemptAt, 0)
+           THEN COALESCE(claimedAt, 0) + @lease ELSE COALESCE(nextAttemptAt, 0) END`
+      : 'COALESCE(nextAttemptAt, 0)'
+    const row = (await this.db
+      .prepare(`SELECT MIN(${workableAt}) AS attemptAt FROM session_metadata_outbox WHERE 1 = 1${scope.sql}`)
+      .get({ ...scope.params, ...(this.shared ? { lease: SHARED_OUTBOX_LEASE_MS } : {}) })) as
+      { attemptAt: number | null } | undefined
+    return row?.attemptAt === null || row?.attemptAt === undefined ? undefined : Number(row.attemptAt)
+  }
+
+  async recordSessionMetadataSnapshotFailure(
+    agentId: string,
+    sessionId: string,
+    revision: number,
+    nextAttemptAt: number | null,
+    ownerId?: string
+  ): Promise<Pick<SessionMetadataOutboxRow, 'failedAttempts' | 'nextAttemptAt'> | undefined> {
+    const fence = this.shared ? ' AND (ownerId IS NULL OR ownerId = @ownerId)' : ''
+    return (await this.db
+      .prepare(
+        `UPDATE session_metadata_outbox
+         SET failedAttempts = failedAttempts + 1, nextAttemptAt = @nextAttemptAt
+         WHERE agentId = @agentId AND sessionId = @sessionId AND revision = @revision${fence}
+         RETURNING failedAttempts, nextAttemptAt`
+      )
+      .get({ agentId, sessionId, revision, nextAttemptAt, ...(fence ? { ownerId: ownerId ?? null } : {}) })) as
+      Pick<SessionMetadataOutboxRow, 'failedAttempts' | 'nextAttemptAt'> | undefined
+  }
+
+  /** Any row this member is answerable for, workable now or once a peer's claim lapses. */
+  async hasPendingSessionMetadata(ownerId?: string, agentIds?: readonly string[]): Promise<boolean> {
+    const scope = this.sessionMetadataWorkScope(ownerId, agentIds)
+    return (
+      (await this.db
+        .prepare(`SELECT 1 AS pending FROM session_metadata_outbox WHERE 1 = 1${scope.sql} LIMIT 1`)
+        .get(scope.params)) !== undefined
+    )
+  }
+
+  /** Clear exactly the revision the CP ACKed. A newer coalesced snapshot wins. On a
+   *  shared store only the claim holder may drop a row — never a peer's. */
+  async acknowledgeSessionMetadataSnapshot(
+    agentId: string,
+    sessionId: string,
+    revision: number,
+    ownerId?: string
+  ): Promise<boolean> {
+    const fence = this.shared ? ' AND (ownerId IS NULL OR ownerId = @ownerId)' : ''
+    const result = await this.db
+      .prepare(
+        `DELETE FROM session_metadata_outbox
+         WHERE agentId = @agentId AND sessionId = @sessionId AND revision = @revision${fence}`
+      )
+      .run({ agentId, sessionId, revision, ...(fence ? { ownerId: ownerId ?? null } : {}) })
+    return result.changes === 1
+  }
+
+  /** Retention-GC receipts still owed to the CP, oldest purge first, bounded.
+   *  Grouped per agent by the caller: one `event/session-purged` frame reports one
+   *  agent, because the CP authorizes the report against that agent's placement.
+   *  A local store owns every receipt outright. On a shared pool store a row is
+   *  offered only when this member owns it, when it is unowned (pre-pool), or when
+   *  its owner's claim lapsed AND this member serves the agent — the same lease
+   *  the hook-completion outbox uses, so a live peer's receipt stays with its owner. */
+  async listSessionPurges(
+    limit: number,
+    now: number,
+    ownerId?: string,
+    agentIds?: readonly string[]
+  ): Promise<SessionPurgeRow[]> {
+    const columns = 'SELECT agentId, sessionId, reason, purgedAt FROM session_purges'
+    const order = ' ORDER BY purgedAt ASC LIMIT @limit'
+    if (!this.shared)
+      return (await this.db.prepare(`${columns}${order}`).all({ limit })) as unknown as SessionPurgeRow[]
+    const scope = idScope('agentId', agentIds)
+    return (await this.db
+      .prepare(
+        `${columns}
+         WHERE (ownerId IS NULL OR ownerId = @ownerId
+                OR (COALESCE(claimedAt, 0) <= @staleBefore${scope.sql}))${order}`
+      )
+      .all({
+        limit,
+        ownerId: ownerId ?? null,
+        staleBefore: now - SHARED_OUTBOX_LEASE_MS,
+        ...scope.params
+      })) as unknown as SessionPurgeRow[]
+  }
+
+  /** Take or renew this member's claim on the receipts of one frame before emitting
+   *  it, returning the session ids actually claimed — a row a peer took over between
+   *  the list and this CAS is left out. Local stores never lease: everything is claimed. */
+  async claimSessionPurges(
+    agentId: string,
+    sessionIds: readonly string[],
+    ownerId: string | undefined,
+    now: number
+  ): Promise<string[]> {
+    if (!this.shared) return [...sessionIds]
+    const staleBefore = now - SHARED_OUTBOX_LEASE_MS
+    const claimed: string[] = []
+    await this.transaction(async (raw) => {
+      const claim = accessOf(raw).prepare(
+        `UPDATE session_purges
+       SET ownerId = @ownerId, claimedAt = @now
+       WHERE agentId = @agentId AND sessionId = @sessionId
+         AND (ownerId IS NULL OR ownerId = @ownerId OR COALESCE(claimedAt, 0) <= @staleBefore)`
+      )
+      for (const sessionId of sessionIds) {
+        if ((await claim.run({ agentId, sessionId, ownerId: ownerId ?? null, now, staleBefore })).changes === 1)
+          claimed.push(sessionId)
+      }
+    })
+    return claimed
+  }
+
+  /** Settle receipts the CP has ACKed. Scoped by agent: the same ACP id may still
+   *  be owed for a different agent (ids are runtime-local). On a shared store only
+   *  the claim holder (or nobody) may release a row — never a peer. */
+  async acknowledgeSessionPurges(agentId: string, sessionIds: string[], ownerId?: string): Promise<void> {
+    if (sessionIds.length === 0) return
+    const fence = this.shared ? ' AND (ownerId IS NULL OR ownerId = @ownerId)' : ''
+    await this.transaction(async (raw) => {
+      const stmt = accessOf(raw).prepare(
+        `DELETE FROM session_purges WHERE agentId = @agentId AND sessionId = @sessionId${fence}`
+      )
+      for (const sessionId of sessionIds) {
+        await stmt.run({ agentId, sessionId, ...(fence ? { ownerId: ownerId ?? null } : {}) })
+      }
+    })
+  }
+
+  // ── retention (docs/designs/k8s-daemon-pool.md §4; the rule table in store/retention.ts) ──
+
+  /** True on a pool's shared data-plane store — the only place a row can outlive its writer. */
+  get isShared(): boolean {
+    return this.shared
+  }
+
+  /** The partition this process stamps its per-member cache rows with. The retention sweep
+   *  compares against it to tell its own rows from a departed writer's. */
+  get cacheOwner(): string {
+    return this.cacheOwnerId
+  }
+
+  /** Every row one retention rule is about, oldest first, with the clock it is judged by.
+   *  Reads only: which of these are collectable is policy and lives in the rule table. */
+  async listRetentionCandidates(rule: StoreRetentionRule, limit = 5_000): Promise<StoreRetentionCandidate[]> {
+    const columns = [
+      ...new Set([
+        ...rule.key,
+        ...(rule.agentColumn ? [rule.agentColumn] : []),
+        ...(rule.ownerColumn ? [rule.ownerColumn] : [])
+      ])
+    ]
+    const rows = (await this.db
+      .prepare(
+        `SELECT ${columns.join(', ')}, ${rule.clock} AS touchedAt FROM ${rule.table}
+         WHERE ${rule.where ?? '1 = 1'} ORDER BY ${rule.clock} ASC LIMIT @limit`
+      )
+      .all({ limit })) as unknown as Record<string, string | number | null>[]
+    return rows.map((row) => ({
+      key: Object.fromEntries(rule.key.map((column) => [column, row[column] as string | number])),
+      ...(rule.agentColumn && row[rule.agentColumn] != null ? { agentId: String(row[rule.agentColumn]) } : {}),
+      ...(rule.ownerColumn && row[rule.ownerColumn] != null ? { ownerId: String(row[rule.ownerColumn]) } : {}),
+      touchedAt: Number(row.touchedAt)
+    }))
+  }
+
+  /** Collect one row the sweeper decided is collectable. The clock it was judged on rides the
+   *  DELETE, so a row anything wrote between the read and here is left alone. */
+  async deleteRetentionRow(rule: StoreRetentionRule, candidate: StoreRetentionCandidate): Promise<boolean> {
+    const key = rule.key.map((column) => `${column} = @key_${column}`).join(' AND ')
+    const params = Object.fromEntries(rule.key.map((column) => [`key_${column}`, candidate.key[column]!]))
+    const result = await this.db
+      .prepare(
+        `DELETE FROM ${rule.table}
+         WHERE ${key} AND ${rule.clock} <= @touchedAt${rule.where ? ` AND ${rule.where}` : ''}`
+      )
+      .run({ ...params, touchedAt: candidate.touchedAt } as SqlParams)
+    return Number(result.changes) === 1
+  }
+
+  // ── memory dream jobs (docs/designs/memory-dreaming.md §4; DreamStorePort) ──
+
+  private dreamToRow(dream: DreamInfo): SqlParams {
+    return {
+      dreamId: dream.dreamId,
+      agentId: dream.agentId,
+      status: dream.status,
+      triggerKind: dream.trigger,
+      sessionIds: JSON.stringify(dream.sessionIds),
+      snapshotDigest: dream.snapshotDigest,
+      executionSessionId: dream.executionSessionId ?? null,
+      runtime: dream.runtime ?? null,
+      model: dream.model ?? null,
+      stopReason: dream.stopReason ?? null,
+      snapshotWrites: dream.snapshotWrites ? JSON.stringify(dream.snapshotWrites) : null,
+      instructions: dream.instructions ?? null,
+      skills: dream.skills ? JSON.stringify(dream.skills) : null,
+      organizationSuggestions: dream.organizationSuggestions ? JSON.stringify(dream.organizationSuggestions) : null,
+      usage: dream.usage ? JSON.stringify(dream.usage) : null,
+      error: dream.error ? JSON.stringify(dream.error) : null,
+      createdAt: dream.createdAt,
+      endedAt: dream.endedAt ?? null,
+      ownerId: this.ownerId ?? null
+    }
+  }
+
+  private dreamFromRow(row: Record<string, unknown>): DreamInfo {
+    return {
+      dreamId: row.dreamId as string,
+      agentId: row.agentId as string,
+      status: row.status as DreamInfo['status'],
+      trigger: row.triggerKind as DreamInfo['trigger'],
+      sessionIds: JSON.parse(row.sessionIds as string) as string[],
+      snapshotDigest: row.snapshotDigest as string,
+      ...(row.executionSessionId ? { executionSessionId: row.executionSessionId as string } : {}),
+      ...(row.runtime ? { runtime: row.runtime as string } : {}),
+      ...(row.model ? { model: row.model as string } : {}),
+      ...(row.stopReason ? { stopReason: row.stopReason as string } : {}),
+      ...(row.snapshotWrites
+        ? { snapshotWrites: JSON.parse(row.snapshotWrites as string) as DreamInfo['snapshotWrites'] }
+        : {}),
+      ...(row.instructions ? { instructions: row.instructions as string } : {}),
+      ...(row.skills ? { skills: JSON.parse(row.skills as string) as DreamInfo['skills'] } : {}),
+      ...(row.organizationSuggestions
+        ? {
+            organizationSuggestions: JSON.parse(
+              row.organizationSuggestions as string
+            ) as DreamInfo['organizationSuggestions']
+          }
+        : {}),
+      ...(row.usage ? { usage: JSON.parse(row.usage as string) as DreamInfo['usage'] } : {}),
+      ...(row.error ? { error: JSON.parse(row.error as string) as DreamInfo['error'] } : {}),
+      createdAt: row.createdAt as string,
+      ...(row.endedAt ? { endedAt: row.endedAt as string } : {})
+    }
+  }
+
+  async insertDream(dream: DreamInfo): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO dreams (dreamId, agentId, status, triggerKind, sessionIds, snapshotDigest,
+           executionSessionId, runtime, model, stopReason, snapshotWrites, instructions, skills, organizationSuggestions,
+           usage, error, createdAt, endedAt, ownerId)
+         VALUES (@dreamId, @agentId, @status, @triggerKind, @sessionIds, @snapshotDigest,
+           @executionSessionId, @runtime, @model, @stopReason, @snapshotWrites, @instructions, @skills,
+           @organizationSuggestions, @usage, @error, @createdAt, @endedAt, @ownerId)`
+      )
+      .run(this.dreamToRow(dream))
+  }
+
+  /** Whoever writes a dream row is the process running it, so every write re-stamps
+   *  ownership — a reclaimed dream never reads as its former owner's. */
+  async updateDream(dream: DreamInfo): Promise<void> {
+    await this.db
+      .prepare(`UPDATE dreams SET ${DREAM_UPDATE_SET} WHERE dreamId = @dreamId AND agentId = @agentId`)
+      .run(this.dreamToRow(dream))
+  }
+
+  /** Crash-recovery write, CAS'd on the open statuses so a losing race can never overwrite
+   *  the terminal outcome the dream's own runner recorded. */
+  async failOpenDream(dream: DreamInfo): Promise<boolean> {
+    return (
+      Number(
+        (
+          await this.db
+            .prepare(
+              `UPDATE dreams SET ${DREAM_UPDATE_SET}
+             WHERE dreamId = @dreamId AND agentId = @agentId AND status IN ('pending', 'running')`
+            )
+            .run(this.dreamToRow(dream))
+        ).changes
+      ) === 1
+    )
+  }
+
+  async getDream(agentId: string, dreamId: string): Promise<DreamInfo | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM dreams WHERE dreamId = ? AND agentId = ?')
+      .get(dreamId, agentId)) as Record<string, unknown> | undefined
+    return row ? this.dreamFromRow(row) : undefined
+  }
+
+  async listDreams(agentId: string, limit: number): Promise<DreamInfo[]> {
+    return (
+      (await this.db
+        .prepare('SELECT * FROM dreams WHERE agentId = ? ORDER BY createdAt DESC, dreamId DESC LIMIT ?')
+        .all(agentId, limit)) as Record<string, unknown>[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  async organizationSuggestionDreams(limit: number): Promise<DreamInfo[]> {
+    return (
+      (
+        (await this.db
+          .prepare(
+            `SELECT * FROM dreams WHERE organizationSuggestions LIKE '%"state":"proposed"%'
+             ORDER BY createdAt DESC, dreamId DESC LIMIT ?`
+          )
+          .all(limit)) as Record<string, unknown>[]
+      )
+        // The LIKE is only a bounded pre-filter. Decode and decide on the
+        // structured value so terminal rows can never consume the inventory.
+        .map((row) => this.dreamFromRow(row))
+        .filter((dream) => (dream.organizationSuggestions ?? []).some((suggestion) => suggestion.state === 'proposed'))
+    )
+  }
+
+  /** Dreams still holding an unreviewed skill candidate, newest first. Scanned
+   *  independently of the public history page: a proposal survives adoption and
+   *  discard until it is reviewed, so it must not age out behind newer runs. */
+  async pendingSkillDreams(agentId: string, limit: number): Promise<DreamInfo[]> {
+    return (
+      (
+        (await this.db
+          .prepare(
+            `SELECT * FROM dreams WHERE agentId = ? AND skills LIKE '%"state":"proposed"%'
+             ORDER BY createdAt DESC, dreamId DESC LIMIT ?`
+          )
+          .all(agentId, limit)) as Record<string, unknown>[]
+      )
+        // The LIKE is a cheap SUPERSET pre-filter pushed into the query so rows
+        // with no pending candidate (empty, or only accepted/dismissed) never
+        // consume the window — a bounded pre-scan filtered afterwards just moves
+        // the age-out boundary. The decode below is what actually decides.
+        .map((row) => this.dreamFromRow(row))
+        .filter((dream) => (dream.skills ?? []).some((skill) => skill.state === 'proposed'))
+    )
+  }
+
+  /** Non-terminal dreams this process is answerable for — the boot-time crash-recovery sweep. On a
+   *  shared store that is only what this incarnation started: a peer's in-flight dream is live work. */
+  async openDreams(): Promise<DreamInfo[]> {
+    const owned = this.shared ? ' AND ownerId = @ownerId' : ''
+    return (
+      (await this.db
+        .prepare(`SELECT * FROM dreams WHERE status IN ('pending', 'running')${owned}`)
+        .all(...(this.shared ? [{ ownerId: this.ownerId! }] : []))) as Record<string, unknown>[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  /** Non-terminal dreams left behind by a FORMER owner of these agents. Only the CP handing
+   *  this process the duty makes them recoverable — mirrors recoverPermissionRequests. */
+  async strandedDreams(agentIds: readonly string[]): Promise<DreamInfo[]> {
+    if (!this.shared || agentIds.length === 0) return []
+    const scope = idScope('agentId', agentIds)
+    return (
+      (await this.db
+        .prepare(
+          `SELECT * FROM dreams
+           WHERE status IN ('pending', 'running') AND (ownerId IS NULL OR ownerId != @ownerId)${scope.sql}`
+        )
+        .all({ ownerId: this.ownerId!, ...scope.params })) as Record<string, unknown>[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  async completedDreams(agentId: string): Promise<DreamInfo[]> {
+    return (
+      (await this.db.prepare("SELECT * FROM dreams WHERE agentId = ? AND status = 'completed'").all(agentId)) as Record<
+        string,
+        unknown
+      >[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  /** Every terminal dream of the agent that can still hold store staging, uncapped. */
+  async retirableDreams(agentId: string): Promise<DreamInfo[]> {
+    return (
+      (await this.db
+        .prepare("SELECT * FROM dreams WHERE agentId = ? AND status IN ('completed', 'failed', 'canceled')")
+        .all(agentId)) as Record<string, unknown>[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  /** Every dream id of the agent, whatever its status: each names a host that no session row does. */
+  async dreamIdsForAgent(agentId: string): Promise<string[]> {
+    const rows = (await this.db.prepare('SELECT dreamId FROM dreams WHERE agentId = ?').all(agentId)) as Array<{
+      dreamId: string
+    }>
+    return rows.map((row) => row.dreamId)
+  }
+
+  /** Store proposals reconciled as stale during upgrade. The runner removes
+   *  their daemon-local staging once agent directories are available. */
+  async supersededDreams(): Promise<DreamInfo[]> {
+    return (
+      (await this.db.prepare("SELECT * FROM dreams WHERE status = 'superseded'").all()) as Record<string, unknown>[]
+    ).map((row) => this.dreamFromRow(row))
+  }
+
+  /** Newest-first addressable sessions to mine as dream transcript sources, never a getting-to-know task's (assistant-mode.md §5.13); `skipPrivate` leaves out capture-excluded, DM and group-DM sessions and, with `places`, a place's session unless its conversation is open. */
+  async dreamSessionSources(
+    agentId: string,
+    limit: number,
+    opts: { skipPrivate?: boolean; places?: { platforms: readonly string[]; open: readonly string[] } } = {}
+  ): Promise<
+    {
+      sessionId: string
+      key: string
+      channel: string
+      thread: string
+      transportScope?: string | null
+      updatedAt: number
+    }[]
+  > {
+    const placePlatforms = opts.skipPrivate ? [...new Set(opts.places?.platforms ?? [])] : []
+    const open = placePlatforms.length > 0 ? [...new Set(opts.places?.open ?? [])] : []
+    const marks = (values: readonly string[]) => values.map(() => '?').join(',')
+    // A place's session stays only when its conversation is known open; an undetermined one is skipped.
+    const placeFilter =
+      placePlatforms.length === 0
+        ? ''
+        : open.length === 0
+          ? `AND platform NOT IN (${marks(placePlatforms)})`
+          : `AND (platform NOT IN (${marks(placePlatforms)}) OR channel IN (${marks(open)}))`
+    const rows = (await this.db
+      .prepare(
+        // Outward ids (§1.1) become the dream's durable provenance; a pre-v12 row answers with the ACP id it was reported under.
+        `SELECT COALESCE(sessionId, acpSessionId) AS sessionId, key, channel, thread, transportScope, updatedAt
+         FROM sessions
+         WHERE agentId = ? AND acpSessionId IS NOT NULL AND platform <> 'dream' AND COALESCE(thread, '') NOT LIKE ?
+         ${opts.skipPrivate ? `AND ${CAPTURE_OPEN_SQL} AND (conversationKind IS NULL OR conversationKind NOT IN ('dm', 'group_dm'))` : ''}
+         ${placeFilter}
+         ORDER BY updatedAt DESC LIMIT ?`
+      )
+      .all(agentId, `${GETTING_TO_KNOW_COORDINATE_PREFIX}%`, ...placePlatforms, ...open, limit)) as {
+      sessionId: string
+      key: string
+      channel: string
+      thread: string
+      transportScope: string | null
+      updatedAt: number
+    }[]
+    return rows.map(({ transportScope, ...row }) => (transportScope ? { ...row, transportScope } : row))
+  }
+
+  /** Chronological conversational text of one session, scoped like `transcriptPageForAgent`
+   *  (a peer's private rows never enter a dream). */
+  /**
+   * Rows for one session thread. `includeTools` additionally returns tool
+   * TITLES — the ACP `title` (e.g. `Bash(npm run deploy)`), which carries the
+   * command or path. It never returns the tool `body`: that holds rawOutput as
+   * well as rawInput, and raw output is where secrets and bulk noise live
+   * (design §4). Skill mining needs the trajectory, not the payloads.
+   */
+  /**
+   * A bounded, single-line summary of a tool row's `rawInput` — the command or
+   * path the agent ran. Reads ONLY `rawInput`: `rawOutput` and `content` are the
+   * bulk/secret-bearing halves of the body and never reach a prompt.
+   */
+  private static toolRawInput(body: string | null | undefined): string | undefined {
+    if (!body) return undefined
+    let parsed: { rawInput?: unknown }
+    try {
+      parsed = JSON.parse(body) as { rawInput?: unknown }
+    } catch {
+      return undefined
+    }
+    const raw = parsed.rawInput
+    if (raw === undefined || raw === null) return undefined
+    const text = typeof raw === 'string' ? raw : JSON.stringify(raw)
+    if (!text) return undefined
+    const flat = text.replace(/[\r\n]+/g, ' ').trim()
+    return flat.length > DREAM_TOOL_INPUT_CHARS ? `${flat.slice(0, DREAM_TOOL_INPUT_CHARS)}…` : flat
+  }
+
+  /** How many messages one session holds, people's and its agent's, and when its newest landed (epoch µs); scoped like `transcriptPageForAgent`. */
+  async sessionTextStats(scope: TranscriptSessionScope): Promise<{ count: number; lastEventTimeUs: number | null }> {
+    const row = (await this.db
+      .prepare(
+        `SELECT COUNT(*) AS n, MAX(eventTimeUs) AS last FROM transcript
+         WHERE orgId = ? AND channel = ? AND kind = 'text'
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND ${AGENT_DELIVERY_SCOPE_SQL}`
+      )
+      .get(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId
+      )) as { n: number | string | null; last: number | string | null } | undefined
+    const count = Number(row?.n ?? 0)
+    return { count, lastEventTimeUs: count > 0 && row?.last != null ? Number(row.last) : null }
+  }
+
+  async dreamTranscriptText(
+    scope: TranscriptSessionScope,
+    limit: number,
+    includeTools = false
+  ): Promise<{ sender: string; text: string; kind?: string; input?: string }[]> {
+    const rows = (await this.db
+      .prepare(
+        // SECURITY: a peer's private rows stay out because the admission names the session, not a
+        // shared (channel, thread, ts) slot — the join is on `seq`, which no two rows share.
+        `SELECT sender, text, kind, body FROM transcript
+         WHERE orgId = ? AND channel = ? AND kind ${includeTools ? "IN ('text','tool')" : "= 'text'"}
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND ${AGENT_DELIVERY_SCOPE_SQL}
+           AND NOT (kind = 'tool' AND text IN (?, ?))
+         ORDER BY seq DESC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId,
+        ...SESSION_TITLE_TOOL_TITLES,
+        limit
+      )) as {
+      sender: string
+      text: string
+      kind?: string
+      body?: string | null
+    }[]
+    // Tool rows carry the title plus a BOUNDED rawInput (the command or path),
+    // which a generic title like "Bash" would otherwise lose. rawOutput is never
+    // read: it is the bulk/secret-bearing half of the body (design §4).
+    return rows.reverse().map((row) => {
+      if (row.kind !== 'tool') return { sender: row.sender, text: row.text, kind: row.kind }
+      return { sender: row.sender, text: row.text, kind: row.kind, input: LocalStore.toolRawInput(row.body) }
+    })
+  }
+
+  /** The conversational text row occupying one exact `(channel, thread, ts)` slot,
+   *  if any — the probe behind webchat's canonical-timestamp collision bump:
+   *  `INSERT OR IGNORE` under the `transcript_text_ts` unique index would silently
+   *  drop a DIFFERENT post landing on an occupied millisecond, so writers check
+   *  the slot first and bump when it holds foreign content. */
+  /** Apply one revision-fenced change to every copy of a shared-image post in this conversation; returns the stored result. */
+  async updateTranscriptSharedImage(
+    channel: string,
+    postId: string,
+    next: (current: SharedImage) => SharedImage | undefined,
+    /** Only rows authored by this sender change. */
+    sender?: string
+  ): Promise<SharedImage | undefined> {
+    return await this.transcriptMutex.run(async () => {
+      const rows = (
+        (await this.lockedDb
+          .prepare(
+            `SELECT orgId, ts, thread, sender, sharedImageJson FROM transcript
+             WHERE channel = ? AND postId = ? AND kind = 'text' AND sharedImageJson IS NOT NULL`
+          )
+          .all(channel, postId)) as {
+          orgId: string
+          ts: string
+          thread: string | null
+          sender: string
+          sharedImageJson: string
+        }[]
+      ).filter((row) => sender === undefined || row.sender === sender) as {
+        orgId: string
+        ts: string
+        thread: string | null
+        sender: string
+        sharedImageJson: string
+      }[]
+      let stored: SharedImage | undefined
+      for (const row of rows) {
+        const current = parseSharedImageJson(row.sharedImageJson)
+        if (!current) continue
+        const updated = next(current)
+        if (!updated || updated.revision <= current.revision) {
+          stored ??= current
+          continue
+        }
+        const { changes, revision } = await this.writeTranscriptRows(row.orgId, channel, [
+          {
+            kind: 'run',
+            sql: `UPDATE transcript SET sharedImageJson = ?, revision = ?
+                  WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND sharedImageJson = ?`,
+            params: [
+              JSON.stringify(updated),
+              this.transcriptRevision + 1,
+              row.orgId,
+              channel,
+              row.ts,
+              row.sharedImageJson
+            ]
+          }
+        ])
+        if (changes[0] !== 1) continue
+        this.transcriptRevision = revision
+        stored = updated
+        const admitted = (await this.lockedDb
+          .prepare(
+            `SELECT tr.agentId AS agentId, tr.sessionKey AS sessionKey FROM transcript_recipient tr
+             JOIN transcript t ON t.seq = tr.seq
+             WHERE t.orgId = ? AND t.channel = ? AND t.ts = ? AND t.kind = 'text'`
+          )
+          .all(row.orgId, channel, row.ts)) as { agentId: string; sessionKey: string }[]
+        this.notifyTranscriptMutation(
+          channel,
+          row.thread ?? '',
+          [row.sender, ...admitted.map((r) => r.agentId)],
+          this.transcriptRevision,
+          admitted.map((r) => r.sessionKey)
+        )
+      }
+      return stored
+    })
+  }
+
+  /** Record that a webchat root post was handed into `thread`, which reads it as a reply while it stays at the root (webchat-threads.md §5.1); whether a row changed. */
+  async markTranscriptHanded(
+    scope: { transcriptChannel: string; agentId: string },
+    postId: string,
+    thread: string
+  ): Promise<boolean> {
+    const orgId = this.orgFor(scope.agentId)
+    const channel = scope.transcriptChannel
+    return await this.transcriptMutex.run(async () => {
+      const { changes, revision } = await this.writeTranscriptRows(orgId, channel, [
+        {
+          kind: 'run',
+          sql: `UPDATE transcript SET handedTo = ?, revision = ?
+                 WHERE orgId = ? AND channel = ? AND postId = ? AND kind = 'text' AND COALESCE(handedTo, '') <> ?`,
+          params: [thread, this.transcriptRevision + 1, orgId, channel, postId, thread]
+        }
+      ])
+      if ((changes[0] ?? 0) === 0) return false
+      this.transcriptRevision = revision
+      const admitted = (await this.lockedDb
+        .prepare(
+          `SELECT tr.agentId AS agentId, tr.sessionKey AS sessionKey FROM transcript_recipient tr
+           JOIN transcript t ON t.seq = tr.seq
+           WHERE t.orgId = ? AND t.channel = ? AND t.postId = ? AND t.kind = 'text'`
+        )
+        .all(orgId, channel, postId)) as { agentId: string; sessionKey: string }[]
+      this.notifyTranscriptMutation(
+        channel,
+        thread,
+        [scope.agentId, ...admitted.map((r) => r.agentId)],
+        this.transcriptRevision,
+        admitted.map((r) => r.sessionKey)
+      )
+      return true
+    })
+  }
+
+  /** The row carrying one cached original's attachment id in this conversation. */
+  async transcriptSharedImageByAttachment(
+    channel: string,
+    attachmentId: string
+  ): Promise<{ postId: string; sender: string; image: SharedImage } | undefined> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT postId, sender, sharedImageJson FROM transcript
+         WHERE channel = ? AND kind = 'text' AND postId IS NOT NULL AND sharedImageJson LIKE ?`
+      )
+      .all(channel, `%${attachmentId}%`)) as { postId: string; sender: string; sharedImageJson: string }[]
+    for (const row of rows) {
+      const image = parseSharedImageJson(row.sharedImageJson)
+      if (image?.original.kind === 'cache' && image.original.attachmentId === attachmentId)
+        return { postId: row.postId, sender: row.sender, image }
+    }
+    return undefined
+  }
+
+  /** The stored shared image of one post in this conversation, if any copy holds it. */
+  async transcriptSharedImage(channel: string, postId: string): Promise<SharedImage | undefined> {
+    const row = (await this.db
+      .prepare(
+        `SELECT sharedImageJson FROM transcript
+         WHERE channel = ? AND postId = ? AND kind = 'text' AND sharedImageJson IS NOT NULL LIMIT 1`
+      )
+      .get(channel, postId)) as { sharedImageJson: string } | undefined
+    return parseSharedImageJson(row?.sharedImageJson)
+  }
+
+  async transcriptTextAt(
+    channel: string,
+    ts: string,
+    row: { sender: string; recipient?: string }
+  ): Promise<{ sender: string; text: string; postId: string | null } | undefined> {
+    // Attributed exactly like the append it guards, or the probe would read a partition
+    // the write does not land in and every slot would look free.
+    const orgId = await this.transcriptOrg(channel, undefined, row.recipient, row.sender)
+    return (await this.db
+      .prepare(
+        `SELECT sender, text, postId FROM transcript
+         WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text'`
+      )
+      .get(orgId, channel, ts)) as { sender: string; text: string; postId: string | null } | undefined
+  }
+
+  async appendTranscript(e: TranscriptEntry): Promise<void> {
+    const {
+      attachments,
+      sharedImage,
+      trustedAgentBot,
+      quoted,
+      quoteJson,
+      authoritative,
+      orgAgentId,
+      admission,
+      ...entry
+    } = e
+    const durableQuoteJson = quoted?.text ? JSON.stringify(quoted) : (quoteJson ?? null)
+    // Attribution is a plain read, resolved before the lock the write path below holds.
+    const orgId = await this.transcriptOrg(e.channel, e.thread, admission?.agentId, e.recipient, e.sender, orgAgentId)
+    // The row, its admission, and the conversation revision the caller needs next, in one round
+    // trip. The admission is a different table, so its insert moving ahead of the in-place
+    // upgrades below changes nothing either statement can observe.
+    await this.transcriptMutex.run(() =>
+      this.appendTranscriptLocked(e, {
+        orgId,
+        entry,
+        attachments,
+        trustedAgentBot,
+        durableQuoteJson,
+        authoritative
+      })
+    )
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  /** The admission beside a row the same batch wrote — keyed by the row's own `seq`, looked up
+   *  rather than bound, because `INSERT OR IGNORE` may have dropped the row onto an existing one. */
+  private admissionStatement(
+    e: Pick<TranscriptEntry, 'channel' | 'ts' | 'sender' | 'kind'>,
+    orgId: string,
+    admission: TranscriptAdmission
+  ): StoreBatchStatement {
+    return e.kind === 'text'
+      ? {
+          kind: 'run',
+          sql: `INSERT OR IGNORE INTO transcript_recipient (seq, agentId, sessionKey)
+                SELECT t.seq, ?, ? FROM transcript t
+                 WHERE t.orgId = ? AND t.channel = ? AND t.ts = ? AND t.kind = 'text'`,
+          params: [admission.agentId, admission.sessionKey, orgId, e.channel, e.ts]
+        }
+      : {
+          kind: 'run',
+          sql: `INSERT OR IGNORE INTO transcript_recipient (seq, agentId, sessionKey)
+                SELECT t.seq, ?, ? FROM transcript t
+                 WHERE t.orgId = ? AND t.channel = ? AND t.ts = ? AND t.kind = ? AND t.sender = ?
+                 ORDER BY t.seq DESC LIMIT 1`,
+          params: [admission.agentId, admission.sessionKey, orgId, e.channel, e.ts, e.kind, e.sender]
+        }
+  }
+
+  /** The admission for a card/tool row, found by the identity its own upsert dedups on. */
+  private cardAdmissionStatement(
+    e: { channel: string; sender: string },
+    orgId: string,
+    kind: string,
+    cardId: string,
+    admission: TranscriptAdmission
+  ): StoreBatchStatement {
+    return {
+      kind: 'run',
+      sql: `INSERT OR IGNORE INTO transcript_recipient (seq, agentId, sessionKey)
+            SELECT t.seq, ?, ? FROM transcript t
+             WHERE t.orgId = ? AND t.channel = ? AND t.sender = ? AND t.tool_call_id = ? AND t.kind = ?`,
+      params: [admission.agentId, admission.sessionKey, orgId, e.channel, e.sender, cardId, kind]
+    }
+  }
+
+  /** The transcript write itself, under {@link transcriptMutex}: its statements and the
+   *  in-memory revision they allocate from must not interleave with another turn's. */
+  private async appendTranscriptLocked(
+    e: TranscriptEntry,
+    ctx: {
+      orgId: string
+      entry: Omit<
+        TranscriptEntry,
+        | 'attachments'
+        | 'sharedImage'
+        | 'trustedAgentBot'
+        | 'quoted'
+        | 'quoteJson'
+        | 'authoritative'
+        | 'orgAgentId'
+        | 'admission'
+      >
+      attachments: SessionImageAttachment[] | undefined
+      trustedAgentBot: boolean | undefined
+      durableQuoteJson: string | null
+      authoritative: boolean | undefined
+    }
+  ): Promise<void> {
+    const { orgId, entry, attachments, trustedAgentBot, durableQuoteJson, authoritative } = ctx
+    const admission = e.admission
+    const { changes, revision } = await this.writeTranscriptRows(orgId, e.channel, [
+      {
+        kind: 'run',
+        sql: `INSERT OR IGNORE INTO transcript
+           (orgId, channel, thread, ts, sender, kind, text, body, recipient, eventTimeUs, attachmentsJson, quoteJson, trustedAgentBot, revision, postId, sharedImageJson)
+         VALUES
+           (@orgId, @channel, @thread, @ts, @sender, @kind, @text, @body, @recipient, @eventTimeUs, @attachmentsJson, @quoteJson, @trustedAgentBot, @revision, @postId, @sharedImageJson)`,
+        params: [
+          {
+            ...entry,
+            orgId,
+            body: e.body ?? null,
+            recipient: e.recipient ?? null,
+            postId: e.postId ?? null,
+            eventTimeUs: e.eventTimeUs ?? transcriptEventTimeUs(e.ts),
+            attachmentsJson: attachments?.length ? JSON.stringify(attachments) : null,
+            sharedImageJson: e.sharedImage ? JSON.stringify(e.sharedImage) : null,
+            quoteJson: durableQuoteJson,
+            trustedAgentBot: trustedAgentBot ? 1 : null,
+            revision: this.transcriptRevision + 1
+          } as unknown as SqlParams
+        ]
+      },
+      // Written beside the row so it survives that dedup: the same message admitted by a second
+      // agent leaves this daemon one row and two admissions (message-intake.md §4.2).
+      ...(admission ? [this.admissionStatement(e, orgId, admission)] : [])
+    ])
+    const inserted = changes[0] ?? 0
+    const delivered = admission ? (changes[1] ?? 0) : 0
+    if (inserted === 1) this.transcriptRevision = revision
+    // The closing edit of a streamed reply lands on the row its own post created, so the
+    // text is refreshed in place rather than lost to INSERT OR IGNORE. Scoped to text
+    // rows on identical coordinates, and only ever toward the authoritative version.
+    if (inserted === 0 && authoritative && e.kind === 'text') {
+      const refreshed = await this.writeTranscriptRows(orgId, e.channel, [
+        {
+          kind: 'run',
+          sql: `UPDATE transcript SET text = ?, revision = ?
+           WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND text IS NOT ?`,
+          params: [e.text, this.transcriptRevision + 1, orgId, e.channel, e.ts, e.text]
+        }
+      ])
+      if (refreshed.changes[0] === 1) {
+        this.transcriptRevision = refreshed.revision
+        this.notifyTranscriptMutation(
+          e.channel,
+          e.thread ?? '',
+          [e.recipient, admission?.agentId],
+          this.transcriptRevision,
+          [admission?.sessionKey]
+        )
+      }
+    }
+    // A row may predate this column and later be re-observed in an authoritative Slack
+    // snapshot. Upgrade only toward trusted=true; an untrusted replay can never clear or
+    // manufacture provenance, and the stable text-row coordinates keep this scoped.
+    const provenanceUpgraded =
+      inserted === 0 && trustedAgentBot
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET trustedAgentBot = 1
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text'
+                 AND COALESCE(trustedAgentBot, 0) = 0`
+            )
+            .run(orgId, e.channel, e.ts)
+        : undefined
+    // The same canonical post can be recorded first by a pre-upgrade write (no
+    // postId column value) and re-observed by a copy that carries it. Upgrade in
+    // place; an identity can be added but never changed or cleared.
+    const postIdUpgraded =
+      inserted === 0 && e.postId
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET postId = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND postId IS NULL`
+            )
+            .run(e.postId, orgId, e.channel, e.ts)
+        : undefined
+    // The observer often wins the INSERT race against the ingest that carries the turn body, so
+    // the body upgrades in place like the post id: added once, never changed or cleared.
+    const bodyUpgraded =
+      inserted === 0 && e.body && e.kind === 'text'
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET body = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND body IS NULL`
+            )
+            .run(e.body, orgId, e.channel, e.ts)
+        : undefined
+    // A later duplicate can be the first copy that carries the AUTHORITATIVE
+    // provider send time (an early observer wrote the row with the derived
+    // axis). Explicit values only — two derived computations must never flap.
+    const eventTimeUpgraded =
+      inserted === 0 && e.eventTimeUs
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET eventTimeUs = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND eventTimeUs IS NOT ?`
+            )
+            .run(e.eventTimeUs, orgId, e.channel, e.ts, e.eventTimeUs)
+        : undefined
+    // The observer often wins the INSERT race against SessionManager's authoritative
+    // append, and only that append has fetched the image bytes — upgrade the row in
+    // place instead of leaving attachmentsJson pinned to NULL (the console would then
+    // show only the `[attached: …]` label).
+    const attachmentsUpgraded =
+      inserted === 0 && attachments?.length
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET attachmentsJson = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND attachmentsJson IS NULL`
+            )
+            .run(JSON.stringify(attachments), orgId, e.channel, e.ts)
+        : undefined
+    // A copy recorded before its image (a text-only observer) gains it once; later state changes go through updateTranscriptSharedImage.
+    const sharedImageUpgraded =
+      inserted === 0 && e.sharedImage && e.kind === 'text'
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET sharedImageJson = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text' AND sharedImageJson IS NULL`
+            )
+            .run(JSON.stringify(e.sharedImage), orgId, e.channel, e.ts)
+        : undefined
+    // A later duplicate can be the first copy that carries provider reply metadata
+    // (or a corrected selected passage). Upgrade it without ever clearing a quote when
+    // a provider snapshot subsequently re-appends the same text row without metadata.
+    const quoteUpgraded =
+      inserted === 0 && durableQuoteJson !== null
+        ? await this.lockedDb
+            .prepare(
+              `UPDATE transcript SET quoteJson = ?
+               WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text'
+                 AND COALESCE(quoteJson, '') <> ?`
+            )
+            .run(durableQuoteJson, orgId, e.channel, e.ts, durableQuoteJson)
+        : undefined
+    if (inserted === 1) {
+      this.notifyTranscriptMutation(
+        e.channel,
+        e.thread ?? '',
+        [e.sender, e.recipient, admission?.agentId],
+        this.transcriptRevision,
+        [admission?.sessionKey]
+      )
+    } else if (
+      Number(provenanceUpgraded?.changes ?? 0) === 1 ||
+      Number(attachmentsUpgraded?.changes ?? 0) === 1 ||
+      Number(sharedImageUpgraded?.changes ?? 0) === 1 ||
+      Number(quoteUpgraded?.changes ?? 0) === 1 ||
+      Number(postIdUpgraded?.changes ?? 0) === 1 ||
+      Number(bodyUpgraded?.changes ?? 0) === 1 ||
+      Number(eventTimeUpgraded?.changes ?? 0) === 1 ||
+      delivered === 1
+    ) {
+      // An in-place upgrade mutates the SHARED row: every agent whose scoped
+      // view already contains it must be invalidated, not just this append's
+      // sender/recipient — a co-hosted participant delivered earlier would
+      // otherwise keep serving the stale copy until an unrelated mutation.
+      const bumped = await this.lockedDb.batch([
+        {
+          kind: 'run',
+          sql: "UPDATE transcript SET revision = ? WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text'",
+          params: [this.transcriptRevision + 1, orgId, e.channel, e.ts]
+        },
+        {
+          kind: 'read',
+          sql: 'SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript WHERE orgId = ? AND channel = ?',
+          params: [orgId, e.channel]
+        },
+        {
+          kind: 'read',
+          sql: `SELECT tr.agentId AS agentId, tr.sessionKey AS sessionKey FROM transcript_recipient tr
+                JOIN transcript t ON t.seq = tr.seq
+                WHERE t.orgId = ? AND t.channel = ? AND t.ts = ? AND t.kind = 'text'`,
+          params: [orgId, e.channel, e.ts]
+        }
+      ])
+      this.transcriptRevision = Number((bumped[1]?.rows[0] as { revision: number } | undefined)?.revision ?? 0)
+      const admitted = bumped[2]?.rows as { agentId: string; sessionKey: string }[]
+      this.notifyTranscriptMutation(
+        e.channel,
+        e.thread ?? '',
+        [e.sender, e.recipient, ...admitted.map((r) => r.agentId)],
+        this.transcriptRevision,
+        admitted.map((r) => r.sessionKey)
+      )
+    }
+  }
+
+  /** Write one elicitation card's row (the question in `text`, the serialized `ElicitBody` in
+   *  `body`). An upsert on the card's own `ts`, which the caller mints once and keeps for the
+   *  life of the request: the ask claims the row and the settlement rewrites it in place, so the
+   *  card holds the position in the turn where it was actually asked rather than reappearing
+   *  below the reply that followed it. `ts` comes from the monotonic internal-event clock, so
+   *  two cards in one thread never share a row. Shares the tool row's `tool_call_id` column as
+   *  its identity, exactly as {@link upsertPlan} does — the value is namespaced and both
+   *  statements are fenced on kind, so a real tool id can never collide with one. */
+  async upsertElicit(e: {
+    channel: string
+    thread: string
+    ts: string
+    sender: string
+    text: string
+    body: string
+    admission: TranscriptAdmission
+  }): Promise<void> {
+    const orgId = this.orgFor(e.sender)
+    await this.transcriptMutex.run(() => this.upsertElicitLocked(e, orgId))
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  /** The upsert itself, under {@link transcriptMutex} — see {@link appendTranscriptLocked}. */
+  private async upsertElicitLocked(
+    e: {
+      channel: string
+      thread: string
+      ts: string
+      sender: string
+      text: string
+      body: string
+      admission: TranscriptAdmission
+    },
+    orgId: string
+  ): Promise<void> {
+    const revision = this.transcriptRevision + 1
+    const written = await this.writeTranscriptRows(orgId, e.channel, [
+      {
+        kind: 'run',
+        sql: `INSERT OR IGNORE INTO transcript
+           (orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, eventTimeUs, revision)
+         VALUES (@orgId, @channel, @thread, @ts, @sender, 'elicit', @text, @cardId, @body, @eventTimeUs, @revision)`,
+        params: [
+          {
+            orgId,
+            channel: e.channel,
+            thread: e.thread,
+            ts: e.ts,
+            sender: e.sender,
+            text: e.text,
+            cardId: elicitRowId(e.ts),
+            body: e.body,
+            eventTimeUs: transcriptEventTimeUs(e.ts),
+            revision
+          }
+        ]
+      },
+      {
+        kind: 'run',
+        sql: `UPDATE transcript SET text = ?, body = ?, revision = ?
+         WHERE orgId = ? AND channel = ? AND thread = ? AND sender = ? AND tool_call_id = ? AND kind = 'elicit'
+           AND (text IS NOT ? OR body IS NOT ?)`,
+        params: [e.text, e.body, revision, orgId, e.channel, e.thread, e.sender, elicitRowId(e.ts), e.text, e.body]
+      },
+      this.cardAdmissionStatement(e, orgId, 'elicit', elicitRowId(e.ts), e.admission)
+    ])
+    // An unchanged re-write changes neither statement and must not bump the revision a live
+    // console polls on — the same rule the plan upsert follows.
+    if (written.changes.some((changed) => changed > 0)) {
+      this.transcriptRevision = written.revision
+      this.notifyTranscriptMutation(e.channel, e.thread, [e.sender], this.transcriptRevision, [e.admission.sessionKey])
+    }
+  }
+
+  /** Write (or rewrite) a webchat capability card's row, so a reloaded conversation shows it and how it settled. */
+  async upsertCapabilityCard(e: KeyedCardRow): Promise<void> {
+    await this.upsertKeyedCard('capability', capabilityRowId(e.requestId), e)
+  }
+
+  /** Write (or rewrite) a Fill card's row, so a task's thread and a reloaded page show it and how it settled. */
+  async upsertFillCard(e: KeyedCardRow): Promise<void> {
+    await this.upsertKeyedCard('fill', fillRowId(e.requestId), e)
+  }
+
+  // One card per request id in a thread: inserted once, rewritten in place when its text or body changes.
+  private async upsertKeyedCard(kind: 'capability' | 'fill', cardId: string, e: KeyedCardRow): Promise<void> {
+    const orgId = this.orgFor(e.sender)
+    await this.transcriptMutex.run(async () => {
+      const revision = this.transcriptRevision + 1
+      const written = await this.writeTranscriptRows(orgId, e.channel, [
+        {
+          kind: 'run',
+          sql: `INSERT OR IGNORE INTO transcript
+             (orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, eventTimeUs, revision)
+           VALUES (@orgId, @channel, @thread, @ts, @sender, @kind, @text, @cardId, @body, @eventTimeUs, @revision)`,
+          params: [
+            {
+              orgId,
+              channel: e.channel,
+              thread: e.thread,
+              ts: e.ts,
+              sender: e.sender,
+              kind,
+              text: e.text,
+              cardId,
+              body: e.body,
+              eventTimeUs: transcriptEventTimeUs(e.ts),
+              revision
+            }
+          ]
+        },
+        {
+          kind: 'run',
+          sql: `UPDATE transcript SET text = ?, body = ?, revision = ?
+           WHERE orgId = ? AND channel = ? AND thread = ? AND sender = ? AND tool_call_id = ? AND kind = ?
+             AND (text IS NOT ? OR body IS NOT ?)`,
+          params: [e.text, e.body, revision, orgId, e.channel, e.thread, e.sender, cardId, kind, e.text, e.body]
+        },
+        this.cardAdmissionStatement(e, orgId, kind, cardId, e.admission)
+      ])
+      if (written.changes.some((changed) => changed > 0)) {
+        this.transcriptRevision = written.revision
+        this.notifyTranscriptMutation(e.channel, e.thread, [e.sender], this.transcriptRevision, [
+          e.admission.sessionKey
+        ])
+      }
+    })
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  /**
+   * Write (or rewrite) one MCP App card's transcript row — the peer of {@link upsertElicit}, and
+   * the thing that makes a card survive a reload (webchat-mcp-apps.md §8).
+   *
+   * `body` is a {@link McpAppBody}: the WHOLE card, template included, so a reloaded reader gets
+   * the interface back. Keeping it out of transcript PAGES is the history projection's job — it
+   * strips the template and the console fetches the full body on demand.
+   */
+  async upsertApp(e: {
+    channel: string
+    thread: string
+    ts: string
+    sender: string
+    appId: string
+    text: string
+    body: string
+    admission: TranscriptAdmission
+  }): Promise<void> {
+    const orgId = this.orgFor(e.sender)
+    await this.transcriptMutex.run(() => this.upsertAppLocked(e, orgId))
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  private async upsertAppLocked(
+    e: {
+      channel: string
+      thread: string
+      ts: string
+      sender: string
+      appId: string
+      text: string
+      body: string
+      admission: TranscriptAdmission
+    },
+    orgId: string
+  ): Promise<void> {
+    const revision = this.transcriptRevision + 1
+    const written = await this.writeTranscriptRows(orgId, e.channel, [
+      {
+        kind: 'run',
+        sql: `INSERT OR IGNORE INTO transcript
+           (orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, eventTimeUs, revision)
+         VALUES (@orgId, @channel, @thread, @ts, @sender, 'app', @text, @cardId, @body, @eventTimeUs, @revision)`,
+        params: [
+          {
+            orgId,
+            channel: e.channel,
+            thread: e.thread,
+            ts: e.ts,
+            sender: e.sender,
+            text: e.text,
+            cardId: appRowId(e.appId),
+            body: e.body,
+            eventTimeUs: transcriptEventTimeUs(e.ts),
+            revision
+          }
+        ]
+      },
+      {
+        kind: 'run',
+        sql: `UPDATE transcript SET text = ?, body = ?, revision = ?
+         WHERE orgId = ? AND channel = ? AND thread = ? AND sender = ? AND tool_call_id = ? AND kind = 'app'
+           AND (text IS NOT ? OR body IS NOT ?)`,
+        params: [e.text, e.body, revision, orgId, e.channel, e.thread, e.sender, appRowId(e.appId), e.text, e.body]
+      },
+      this.cardAdmissionStatement(e, orgId, 'app', appRowId(e.appId), e.admission)
+    ])
+    // An unchanged re-write must not bump the revision a live console polls on — the same rule
+    // the elicit and plan upserts follow.
+    if (written.changes.some((changed) => changed > 0)) {
+      this.transcriptRevision = written.revision
+      this.notifyTranscriptMutation(e.channel, e.thread, [e.sender], this.transcriptRevision, [e.admission.sessionKey])
+    }
+  }
+
+  /**
+   * One MCP App card's persisted row, by the `appId` a reloaded view names itself with — what a
+   * card is rebuilt from once the process that opened it is gone (webchat-mcp-apps.md §8).
+   *
+   * Looked up by card id ALONE, and deliberately so: the row carries the conversation the card was
+   * opened in, and the caller fences the reader's own routed conversation against that. A lookup
+   * scoped by channel here would answer the same question twice and get the second one wrong for
+   * a conversation whose transcript channel is scoped.
+   */
+  async getAppCard(
+    appId: string
+  ): Promise<
+    { channel: string; thread: string; ts: string; sender: string; sessionKey: string; body: string } | undefined
+  > {
+    // The admission carries the session; a migrated append row reads its thread back as NULL,
+    // which the card only ever uses as the rewrite target, so '' stands in for it.
+    const row = (await this.db
+      .prepare(
+        `SELECT t.channel AS channel, t.thread AS thread, t.ts AS ts, t.sender AS sender, t.body AS body,
+                tr.sessionKey AS sessionKey
+           FROM transcript t
+           LEFT JOIN transcript_recipient tr ON tr.seq = t.seq AND tr.agentId = t.sender
+          WHERE t.tool_call_id = ? AND t.kind = 'app' LIMIT 1`
+      )
+      .get(appRowId(appId))) as
+      | {
+          channel: string
+          thread: string | null
+          ts: string
+          sender: string
+          sessionKey: string | null
+          body: string | null
+        }
+      | undefined
+    return row?.body
+      ? {
+          channel: row.channel,
+          thread: row.thread ?? '',
+          ts: row.ts,
+          sender: row.sender,
+          sessionKey: row.sessionKey ?? '',
+          body: row.body
+        }
+      : undefined
+  }
+
+  /** Write this turn's plan row (summary in `text`, the serialized PlanBody in `body`).
+   *  An ACP plan update replaces the WHOLE list, so this is an upsert rather than an append:
+   *  the insert claims the row on first sight and the update overwrites it on every later
+   *  one, keeping `seq`/`ts` at their first-seen values so the plan holds its place in the
+   *  turn. Shares the tool row's `tool_call_id` column as its identity — `planId` is minted
+   *  per turn and namespaced, and both statements are fenced on kind so a tool id can never
+   *  collide with one. */
+  async upsertPlan(e: {
+    channel: string
+    thread: string
+    ts: string
+    sender: string
+    planId: string
+    title: string
+    body: string
+    admission: TranscriptAdmission
+  }): Promise<void> {
+    const orgId = this.orgFor(e.sender)
+    await this.transcriptMutex.run(() => this.upsertPlanLocked(e, orgId))
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  /** The upsert itself, under {@link transcriptMutex} — see {@link appendTranscriptLocked}. */
+  private async upsertPlanLocked(
+    e: {
+      channel: string
+      thread: string
+      ts: string
+      sender: string
+      planId: string
+      title: string
+      body: string
+      admission: TranscriptAdmission
+    },
+    orgId: string
+  ): Promise<void> {
+    const revision = this.transcriptRevision + 1
+    const written = await this.writeTranscriptRows(orgId, e.channel, [
+      {
+        kind: 'run',
+        sql: `INSERT OR IGNORE INTO transcript
+           (orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, eventTimeUs, revision)
+         VALUES (@orgId, @channel, @thread, @ts, @sender, 'plan', @text, @planId, @body, @eventTimeUs, @revision)`,
+        params: [
+          {
+            orgId,
+            channel: e.channel,
+            thread: e.thread,
+            ts: e.ts,
+            sender: e.sender,
+            text: e.title,
+            planId: e.planId,
+            body: e.body,
+            eventTimeUs: transcriptEventTimeUs(e.ts),
+            revision
+          }
+        ]
+      },
+      {
+        kind: 'run',
+        sql: `UPDATE transcript SET text = ?, body = ?, revision = ?
+         WHERE orgId = ? AND channel = ? AND thread = ? AND sender = ? AND tool_call_id = ? AND kind = 'plan'
+           AND (text IS NOT ? OR body IS NOT ?)`,
+        params: [e.title, e.body, revision, orgId, e.channel, e.thread, e.sender, e.planId, e.title, e.body]
+      },
+      this.cardAdmissionStatement(e, orgId, 'plan', e.planId, e.admission)
+    ])
+    // Either statement changing a row means this thread moved; an unchanged re-send changes
+    // neither and must not bump the revision a live console polls on.
+    if (written.changes.some((changed) => changed > 0)) {
+      this.transcriptRevision = written.revision
+      this.notifyTranscriptMutation(e.channel, e.thread, [e.sender], this.transcriptRevision, [e.admission.sessionKey])
+    }
+  }
+
+  /** First sight of a tool call: insert its kind='tool' row (title in `text`, the serialized
+   *  ToolBody in `body`). INSERT OR IGNORE so a re-fired first update is a no-op — the partial
+   *  unique index on (channel, thread, sender, sessionScope, tool_call_id) dedups within one
+   *  agent's session, so a successor session reusing an id gets its own row rather than losing the
+   *  insert to the retired one. `seq` stays stable across later updates. */
+  async insertToolCall(e: {
+    channel: string
+    thread: string
+    ts: string
+    sender: string
+    toolCallId: string
+    title: string
+    body: string
+    admission: TranscriptAdmission
+  }): Promise<void> {
+    const orgId = this.orgFor(e.sender)
+    await this.transcriptMutex.run(() => this.insertToolCallLocked(e, orgId))
+    this.armObservationSweep(orgId, e.channel)
+  }
+
+  /** The insert itself, under {@link transcriptMutex} — see {@link appendTranscriptLocked}. */
+  private async insertToolCallLocked(
+    e: {
+      channel: string
+      thread: string
+      ts: string
+      sender: string
+      toolCallId: string
+      title: string
+      body: string
+      admission: TranscriptAdmission
+    },
+    orgId: string
+  ): Promise<void> {
+    const { changes, revision } = await this.writeTranscriptRows(orgId, e.channel, [
+      {
+        kind: 'run',
+        sql: `INSERT OR IGNORE INTO transcript
+           (orgId, channel, thread, ts, sender, kind, text, tool_call_id, body, eventTimeUs, revision, sessionScope)
+         VALUES (@orgId, @channel, @thread, @ts, @sender, 'tool', @text, @toolCallId, @body, @eventTimeUs, @revision,
+                 @sessionScope)`,
+        params: [
+          {
+            orgId,
+            channel: e.channel,
+            thread: e.thread,
+            ts: e.ts,
+            sender: e.sender,
+            text: e.title,
+            toolCallId: e.toolCallId,
+            body: e.body,
+            eventTimeUs: transcriptEventTimeUs(e.ts),
+            revision: this.transcriptRevision + 1,
+            sessionScope: e.admission.sessionKey
+          }
+        ]
+      },
+      this.cardAdmissionStatement(e, orgId, 'tool', e.toolCallId, e.admission)
+    ])
+    if (changes[0] === 1) {
+      this.transcriptRevision = revision
+      this.notifyTranscriptMutation(e.channel, e.thread, [e.sender], this.transcriptRevision, [e.admission.sessionKey])
+    }
+  }
+
+  /** Later update for one agent's tool call, scoped to the session that inserted the row: ACP tool
+   *  ids are session-local, so a peer OR a successor session at the same physical thread may reuse
+   *  one, and only `sessionKey` tells the two rows apart (`''` names no session and matches either
+   *  way, as before Stage 1). `seq`/`ts` keep their first-seen values. The store's highest-frequency
+   *  writer, and every write is a full latest-wins overlay of the merged ToolBody rather than an
+   *  append — so the burst is coalesced per row, and writing only its last state leaves exactly
+   *  the row the per-chunk path left. Flushed before any other statement, on
+   *  {@link TOOL_WRITE_FLUSH_MS}, at either buffer bound, at turn end, and on drain. */
+  async updateToolCall(
+    channel: string,
+    thread: string,
+    agentId: string,
+    toolCallId: string,
+    patch: { title: string; body: string },
+    sessionKey = ''
+  ): Promise<void> {
+    // Resolved here, not at flush time: the org fence must reject an unattributable agent at
+    // the same call, with the same inputs, as the per-chunk write it replaces.
+    const orgId = this.orgFor(agentId)
+    const write = { orgId, channel, thread, agentId, sessionKey, toolCallId, bytes: 0, ...patch }
+    const key = writeKeyOf(write)
+    this.pendingToolWriteBytes -= this.pendingToolWrites.get(key)?.bytes ?? 0
+    const bytes = patch.title.length + patch.body.length
+    this.pendingToolWrites.set(key, { ...write, bytes })
+    this.pendingToolWriteBytes += bytes
+    if (this.pendingToolWrites.size >= MAX_PENDING_TOOL_WRITES) return await this.flushToolCallWrites()
+    if (this.pendingToolWriteBytes >= MAX_PENDING_TOOL_WRITE_BYTES) return await this.flushToolCallWrites()
+    this.armToolWriteFlush()
+  }
+
+  /** Write every buffered streaming tool-call update, plus the post-write revision of each
+   *  thread they touched, in one round trip — so buffered content is durable before a shutdown
+   *  and never outlives the turn that produced it. Entries survive a failed flush, and the timer
+   *  is re-armed, so a retry re-applies them. */
+  async flushToolCallWrites(): Promise<void> {
+    if (this.pendingToolWrites.size === 0) return
+    // Queuing on the mutex is what awaits a flush already in flight; this pass then writes
+    // whatever was buffered while that one ran, so a joiner never returns ahead of its own entry.
+    return this.transcriptMutex.run(() => this.flushPendingToolCallWrites())
+  }
+
+  /** Drain before another statement runs. Taking the mutex only when there is something to
+   *  write keeps ordinary traffic off the transcript lock. */
+  private drainToolCallWrites(): Promise<void> {
+    return this.pendingToolWrites.size === 0 ? Promise.resolve() : this.flushToolCallWrites()
+  }
+
+  private async flushPendingToolCallWrites(): Promise<void> {
+    if (this.pendingToolWrites.size === 0) return
+    this.clearToolWriteFlush()
+    const pending = [...this.pendingToolWrites.values()]
+    // Distinct threads in write order, so each one's revision read rides the same round trip.
+    const threads = new Map<string, PendingToolWrite>()
+    for (const write of pending) threads.set(threadKeyOf(write), write)
+    const threadList = [...threads.values()]
+    let results: StoreBatchResult[]
+    try {
+      results = await this.backend.batch([
+        ...pending.map((write, index) => ({
+          kind: 'run' as const,
+          sql: `UPDATE transcript SET text = ?, body = ?, revision = ?
+         WHERE orgId = ? AND channel = ? AND thread = ? AND sender = ? AND tool_call_id = ?
+           AND (sessionScope = ? OR ? = '')
+           AND (text IS NOT ? OR body IS NOT ?)`,
+          params: [
+            write.title,
+            write.body,
+            this.transcriptRevision + index + 1,
+            write.orgId,
+            write.channel,
+            write.thread,
+            write.agentId,
+            write.toolCallId,
+            write.sessionKey,
+            write.sessionKey,
+            write.title,
+            write.body
+          ]
+        })),
+        ...threadList.map((write) => ({
+          kind: 'read' as const,
+          sql: 'SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript WHERE orgId = ? AND channel = ?',
+          params: [write.orgId, write.channel]
+        }))
+      ])
+    } catch (error) {
+      // Nothing is dropped: the entries stay buffered and the timer comes back, so a store that
+      // goes quiet after the failure still lands them instead of holding them until the next call.
+      this.armToolWriteFlush()
+      throw error
+    }
+    // Only what this pass actually wrote is dropped: an update buffered while the batch was in
+    // flight is a NEWER state of the same row, and clearing the map would lose it outright.
+    for (const write of pending) {
+      const key = writeKeyOf(write)
+      if (this.pendingToolWrites.get(key) !== write) continue
+      this.pendingToolWrites.delete(key)
+      this.pendingToolWriteBytes -= write.bytes
+    }
+    this.armToolWriteFlush()
+    const revisions = new Map<string, number>()
+    for (const [index, write] of threadList.entries()) {
+      const row = results[pending.length + index]?.rows[0] as { revision: number } | undefined
+      revisions.set(threadKeyOf(write), Number(row?.revision ?? 0))
+    }
+    // The allocator spans every partition, so it takes the highest revision any thread now
+    // carries — a thread whose write was a no-op must never pull it back below one already issued.
+    this.transcriptRevision = Math.max(this.transcriptRevision, ...revisions.values())
+    // One notification per thread that actually changed, carrying that thread's own revision —
+    // the per-chunk path emitted one per write, and every intermediate one is now superseded.
+    const changed = new Map<string, { agentIds: string[]; sessionKeys: string[] }>()
+    for (const [index, write] of pending.entries()) {
+      if (Number(results[index]?.changes ?? 0) !== 1) continue
+      const key = threadKeyOf(write)
+      const entry = changed.get(key) ?? { agentIds: [], sessionKeys: [] }
+      entry.agentIds.push(write.agentId)
+      if (write.sessionKey) entry.sessionKeys.push(write.sessionKey)
+      changed.set(key, entry)
+    }
+    for (const write of threadList) {
+      const key = threadKeyOf(write)
+      const entry = changed.get(key)
+      if (entry)
+        this.notifyTranscriptMutation(
+          write.channel,
+          write.thread,
+          entry.agentIds,
+          revisions.get(key) ?? 0,
+          entry.sessionKeys
+        )
+    }
+  }
+
+  private armToolWriteFlush(): void {
+    if (this.toolWriteTimer || this.pendingToolWrites.size === 0) return
+    this.toolWriteTimer = setTimeout(() => {
+      this.toolWriteTimer = undefined
+      // The backend reported this through its own failure channel and the entries are still
+      // buffered; an idempotent latest-wins overlay is always safe to re-apply.
+      void this.flushToolCallWrites().catch(() => this.armToolWriteFlush())
+    }, TOOL_WRITE_FLUSH_MS)
+    this.toolWriteTimer.unref?.()
+  }
+
+  private clearToolWriteFlush(): void {
+    if (!this.toolWriteTimer) return
+    clearTimeout(this.toolWriteTimer)
+    this.toolWriteTimer = undefined
+  }
+
+  /** §8 rule 2: reclaim unadmitted rows under the newest {@link OBSERVATION_FLOOR_TEXT_ROWS} text rows, outside the threads agents took part in (a NULL floor is a no-op). */
+  async sweepObservations(orgId: string, channel: string): Promise<number> {
+    // Drain OUTSIDE the mutex: the flush takes it too, and it is not reentrant.
+    await this.drainToolCallWrites()
+    return await this.transcriptMutex.run(() => this.sweepObservationsLocked(orgId, channel))
+  }
+
+  /** The sweep itself, under {@link transcriptMutex} — see {@link appendTranscriptLocked}. */
+  private async sweepObservationsLocked(orgId: string, channel: string): Promise<number> {
+    const held = RETAINED_BY_PENDING_VERDICT_SQL ? `AND NOT EXISTS (${RETAINED_BY_PENDING_VERDICT_SQL})` : ''
+    const result = await this.lockedDb.query(
+      `DELETE FROM transcript
+        WHERE orgId = ? AND channel = ?
+          AND NOT EXISTS (SELECT 1 FROM transcript_recipient tr WHERE tr.seq = transcript.seq)
+          ${held}
+          AND seq < (SELECT MIN(floor.seq) FROM (
+                SELECT seq FROM transcript
+                 WHERE orgId = ? AND channel = ? AND kind = 'text'
+                 ORDER BY seq DESC LIMIT ?) floor)
+          AND (thread IS NULL OR thread NOT IN (${THREADS_AGENTS_TOOK_PART_IN_SQL}))`,
+      [orgId, channel, orgId, channel, OBSERVATION_FLOOR_TEXT_ROWS, orgId, channel, orgId, channel]
+    )
+    return Number(result.changes)
+  }
+
+  /** Every conversation this store holds, swept in one bounded idle pass. */
+  async sweepAllObservations(limit = STORE_RETENTION_SCAN_LIMIT): Promise<number> {
+    const conversations = (await this.db
+      .prepare('SELECT DISTINCT orgId, channel FROM transcript LIMIT ?')
+      .all(limit)) as { orgId: string; channel: string }[]
+    let deleted = 0
+    for (const row of conversations) deleted += await this.sweepObservations(row.orgId, row.channel)
+    return deleted
+  }
+
+  // ── decision verdicts (message-intake.md §4.3, §5.1; decisions.md §8.3) ──
+
+  /** The step-1 row a delivery was recorded at, found by its dedup key so a redelivery names the same row. */
+  async channelRecordRef(
+    transcriptChannel: string,
+    ts: string,
+    orgAgentId: string
+  ): Promise<ChannelRecordRef | undefined> {
+    const orgId = await this.transcriptOrg(transcriptChannel, undefined, orgAgentId)
+    const row = (await this.db
+      .prepare(`SELECT seq, thread FROM transcript WHERE orgId = ? AND channel = ? AND ts = ? AND kind = 'text'`)
+      .get(orgId, transcriptChannel, ts)) as { seq: number; thread: string | null } | undefined
+    return row ? { seq: Number(row.seq), orgId, transcriptChannel, thread: row.thread } : undefined
+  }
+
+  /** Reserve a verdict at a recorded row; a swept row cannot be reserved, and a second reserve reads the first. */
+  async reserveDecisionVerdict(
+    r: DecisionVerdictReservation
+  ): Promise<{ created: boolean; verdict: DecisionVerdictRow | undefined }> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const inserted = await tx
+        .prepare(
+          `INSERT OR IGNORE INTO decision_verdict
+             (seq, subject, orgId, channel, agentId, integrationId, decisionId, state, configJson, deliveryJson,
+              requestedModel, deadlineAt, ownerFence, createdAt)
+           SELECT t.seq, @subject, @orgId, @channel, @agentId, @integrationId, @decisionId, 'reserved', @configJson,
+                  @deliveryJson, @requestedModel, CAST(@deadlineAt AS INTEGER), @ownerFence, CAST(@createdAt AS INTEGER)
+             FROM transcript t WHERE t.seq = @seq AND t.orgId = @orgId AND t.channel = @channel AND t.kind = 'text'`
+        )
+        .run({ ...r })
+      await tx
+        .prepare(
+          'INSERT OR IGNORE INTO decision_release (orgId, channel, subject, releasedSeq, updatedAt) VALUES (?, ?, ?, 0, ?)'
+        )
+        .run(r.orgId, r.channel, r.subject, r.createdAt)
+      const verdict = (await tx
+        .prepare('SELECT * FROM decision_verdict WHERE seq = ? AND subject = ?')
+        .get(r.seq, r.subject)) as DecisionVerdictRow | undefined
+      return { created: inserted.changes === 1, verdict: verdict ? normalizeVerdict(verdict) : undefined }
+    })
+  }
+
+  async getDecisionVerdict(seq: number, subject: string): Promise<DecisionVerdictRow | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM decision_verdict WHERE seq = ? AND subject = ?')
+      .get(seq, subject)) as DecisionVerdictRow | undefined
+    return row ? normalizeVerdict(row) : undefined
+  }
+
+  /** One lane's verdicts newest-first for Recent evaluations, each with its row's platform ts; one extra row signals more. */
+  async listDecisionVerdicts(filter: {
+    orgId: string
+    integrationId: string
+    /** Absent reads every channel of the lane's integration, as a hook's lane does. */
+    channel?: string
+    subject: string
+    decisionId?: string
+    before?: number
+    seq?: number
+    limit: number
+  }): Promise<Array<DecisionVerdictRow & { ts: string | null }>> {
+    const params: unknown[] = [this.orgForRead(filter.subject, filter.orgId), filter.subject, filter.integrationId]
+    let bound = ''
+    if (filter.channel !== undefined) {
+      bound += ' AND v.channel = ?'
+      params.push(filter.channel)
+    }
+    if (filter.decisionId !== undefined) {
+      bound += ' AND v.decisionId = ?'
+      params.push(filter.decisionId)
+    }
+    if (filter.seq !== undefined) {
+      bound += ' AND v.seq = ?'
+      params.push(filter.seq)
+    } else if (filter.before !== undefined) {
+      bound += ' AND v.seq < ?'
+      params.push(filter.before)
+    }
+    const rows = (await this.db
+      .prepare(
+        `SELECT v.*, t.ts AS ts FROM decision_verdict v LEFT JOIN transcript t ON t.seq = v.seq
+          WHERE v.orgId = ? AND v.subject = ? AND v.integrationId = ?${bound}
+          ORDER BY v.seq DESC LIMIT ?`
+      )
+      .all(...params, filter.limit + 1)) as Array<DecisionVerdictRow & { ts: string | null }>
+    return rows.map((row) => ({ ...normalizeVerdict(row), ts: row.ts ?? null }))
+  }
+
+  /** A bot router's verdicts newest-first across channels; a router lane is not per install, so no integration filter. */
+  async listRouterVerdicts(filter: {
+    orgId: string
+    subject: string
+    channels: readonly string[]
+    decisionId?: string
+    before?: number
+    seq?: number
+    limit: number
+  }): Promise<Array<DecisionVerdictRow & { ts: string | null }>> {
+    if (filter.channels.length === 0) return []
+    const params: unknown[] = [this.orgForRead(filter.subject, filter.orgId), filter.subject, ...filter.channels]
+    let bound = ''
+    if (filter.decisionId !== undefined) {
+      bound += ' AND v.decisionId = ?'
+      params.push(filter.decisionId)
+    }
+    if (filter.seq !== undefined) {
+      bound += ' AND v.seq = ?'
+      params.push(filter.seq)
+    } else if (filter.before !== undefined) {
+      bound += ' AND v.seq < ?'
+      params.push(filter.before)
+    }
+    const rows = (await this.db
+      .prepare(
+        `SELECT v.*, t.ts AS ts FROM decision_verdict v LEFT JOIN transcript t ON t.seq = v.seq
+          WHERE v.orgId = ? AND v.subject = ? AND v.channel IN (${filter.channels.map(() => '?').join(', ')})${bound}
+          ORDER BY v.seq DESC LIMIT ?`
+      )
+      .all(...params, filter.limit + 1)) as Array<DecisionVerdictRow & { ts: string | null }>
+    return rows.map((row) => ({ ...normalizeVerdict(row), ts: row.ts ?? null }))
+  }
+
+  /** reserved → evaluating under the owner fence, freezing the input the provider sees (and, for the router, its delivery). */
+  async beginDecisionEvaluation(
+    seq: number,
+    subject: string,
+    fence: string,
+    inputJson: string,
+    deliveryJson?: string
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE decision_verdict SET state = 'evaluating', inputJson = ?, deliveryJson = COALESCE(?, deliveryJson)
+          WHERE seq = ? AND subject = ? AND ownerFence = ? AND state = 'reserved'`
+      )
+      .run(inputJson, deliveryJson ?? null, seq, subject, fence)
+    return result.changes === 1
+  }
+
+  /** reserved|evaluating → settled, or straight to skipped (which advances the lane cursor at once). */
+  async settleDecisionVerdict(seq: number, subject: string, fence: string, s: DecisionSettlement): Promise<boolean> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const skip = s.disposition === 'skip'
+      const result = await tx
+        .prepare(
+          `UPDATE decision_verdict
+              SET state = @state, disposition = @disposition, unavailableReason = @unavailableReason,
+                  answerJson = @answerJson, actualModel = @actualModel, latencyMs = @latencyMs,
+                  inputTokens = @inputTokens, outputTokens = @outputTokens, settledAt = @settledAt,
+                  targetsJson = COALESCE(@targetsJson, targetsJson),
+                  finishedAt = @finishedAt, deliveryJson = CASE WHEN @skip = 1 THEN NULL ELSE deliveryJson END
+            WHERE seq = @seq AND subject = @subject AND ownerFence = @fence AND state IN ('reserved', 'evaluating')`
+        )
+        .run({
+          state: skip ? 'skipped' : 'settled',
+          disposition: s.disposition,
+          unavailableReason: s.unavailableReason ?? null,
+          answerJson: s.answerJson ?? null,
+          actualModel: s.actualModel ?? null,
+          latencyMs: s.latencyMs ?? null,
+          inputTokens: s.inputTokens ?? null,
+          outputTokens: s.outputTokens ?? null,
+          targetsJson: s.targetsJson ?? null,
+          settledAt: s.settledAt,
+          finishedAt: skip ? s.settledAt : null,
+          skip: skip ? 1 : 0,
+          seq,
+          subject,
+          fence
+        })
+      if (result.changes !== 1) return false
+      if (skip) await this.recomputeDecisionRelease(tx, seq, subject, s.settledAt)
+      return true
+    })
+  }
+
+  /** Any pending state → a terminal one; a null fence is the operator's (`!stop`, config cancel). */
+  async finishDecisionVerdict(
+    seq: number,
+    subject: string,
+    fence: string | null,
+    state: 'admitted' | 'canceled' | 'skipped',
+    cancelReason: string | null,
+    at: number
+  ): Promise<boolean> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const result = await tx
+        .prepare(
+          `UPDATE decision_verdict SET state = ?, cancelReason = ?, deliveryJson = NULL, finishedAt = ?
+            WHERE seq = ? AND subject = ? AND state IN ${PENDING_VERDICT_SQL}${fence === null ? '' : ' AND ownerFence = ?'}`
+        )
+        .run(state, cancelReason, at, seq, subject, ...(fence === null ? [] : [fence]))
+      if (result.changes !== 1) return false
+      await this.recomputeDecisionRelease(tx, seq, subject, at)
+      return true
+    })
+  }
+
+  /** The cursor passes only verdicts that are all terminal: up to the one just below the lane's pending head. */
+  private async recomputeDecisionRelease(tx: StoreAccess, seq: number, subject: string, at: number): Promise<void> {
+    const lane = (await tx
+      .prepare('SELECT orgId, channel FROM decision_verdict WHERE seq = ? AND subject = ?')
+      .get(seq, subject)) as { orgId: string; channel: string } | undefined
+    if (!lane) return
+    const head = (await tx
+      .prepare(
+        `SELECT MIN(seq) AS head FROM decision_verdict
+          WHERE orgId = ? AND channel = ? AND subject = ? AND state IN ${PENDING_VERDICT_SQL}`
+      )
+      .get(lane.orgId, lane.channel, subject)) as { head: number | null } | undefined
+    const target = (
+      head?.head != null
+        ? await tx
+            .prepare(
+              'SELECT MAX(seq) AS target FROM decision_verdict WHERE orgId = ? AND channel = ? AND subject = ? AND seq < ?'
+            )
+            .get(lane.orgId, lane.channel, subject, head.head)
+        : await tx
+            .prepare('SELECT MAX(seq) AS target FROM decision_verdict WHERE orgId = ? AND channel = ? AND subject = ?')
+            .get(lane.orgId, lane.channel, subject)
+    ) as { target: number | null } | undefined
+    if (target?.target == null) return
+    await tx
+      .prepare(
+        `UPDATE decision_release SET releasedSeq = ?, updatedAt = ?
+          WHERE orgId = ? AND channel = ? AND subject = ? AND releasedSeq < ?`
+      )
+      .run(target.target, at, lane.orgId, lane.channel, subject, target.target)
+  }
+
+  /** Move a pending verdict from a departed owner to this one; the old owner's late write then misses its fence. */
+  async adoptDecisionVerdict(seq: number, subject: string, fromFence: string, toFence: string): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE decision_verdict SET ownerFence = ?
+          WHERE seq = ? AND subject = ? AND ownerFence = ? AND state IN ${PENDING_VERDICT_SQL}`
+      )
+      .run(toFence, seq, subject, fromFence)
+    return result.changes === 1
+  }
+
+  /** The only verdict of a lane that may drain: its lowest pending one. */
+  async decisionLaneHead(orgId: string, channel: string, subject: string): Promise<DecisionVerdictRow | undefined> {
+    const row = (await this.db
+      .prepare(
+        `SELECT * FROM decision_verdict
+          WHERE orgId = ? AND channel = ? AND subject = ? AND state IN ${PENDING_VERDICT_SQL}
+          ORDER BY seq ASC LIMIT 1`
+      )
+      .get(orgId, channel, subject)) as DecisionVerdictRow | undefined
+    return row ? normalizeVerdict(row) : undefined
+  }
+
+  async decisionReleasedSeq(orgId: string, channel: string, subject: string): Promise<number | undefined> {
+    const row = (await this.db
+      .prepare('SELECT releasedSeq FROM decision_release WHERE orgId = ? AND channel = ? AND subject = ?')
+      .get(orgId, channel, subject)) as { releasedSeq: number } | undefined
+    return row ? Number(row.releasedSeq) : undefined
+  }
+
+  async listPendingDecisionVerdicts(
+    filter: {
+      agentIds?: readonly string[]
+      integrationId?: string
+      subject?: string
+      channel?: string
+      consumer?: DecisionConsumer
+    } = {}
+  ): Promise<DecisionVerdictRow[]> {
+    const where = [`state IN ${PENDING_VERDICT_SQL}`]
+    if (filter.consumer) where.push(filter.consumer === 'router' ? ROUTER_SUBJECT_LIKE : GATE_SUBJECT_LIKE)
+    const params: unknown[] = []
+    if (filter.agentIds) {
+      if (filter.agentIds.length === 0) return []
+      where.push(`agentId IN (${filter.agentIds.map(() => '?').join(', ')})`)
+      params.push(...filter.agentIds)
+    }
+    for (const column of ['integrationId', 'subject', 'channel'] as const) {
+      const value = filter[column]
+      if (value === undefined) continue
+      where.push(`${column} = ?`)
+      params.push(value)
+    }
+    const rows = (await this.db
+      .prepare(`SELECT * FROM decision_verdict WHERE ${where.join(' AND ')} ORDER BY seq ASC LIMIT ?`)
+      .all(...params, STORE_RETENTION_SCAN_LIMIT)) as DecisionVerdictRow[]
+    return rows.map(normalizeVerdict)
+  }
+
+  /** Cancel every pending verdict a `!stop` or a config change covers; returns the keys it moved. */
+  async cancelPendingDecisionVerdicts(
+    filter: ({ subject: string; channel: string } | { integrationId: string }) & { consumer?: DecisionConsumer },
+    reason: string,
+    at: number
+  ): Promise<{ seq: number; subject: string }[]> {
+    const pending = await this.listPendingDecisionVerdicts(filter)
+    const canceled: { seq: number; subject: string }[] = []
+    for (const row of pending) {
+      if (await this.finishDecisionVerdict(row.seq, row.subject, null, 'canceled', reason, at))
+        canceled.push({ seq: row.seq, subject: row.subject })
+    }
+    return canceled
+  }
+
+  /** First writer wins: a re-release after a crash reuses the background list the first release chose. */
+  async claimVerdictBackground(
+    seq: number,
+    subject: string,
+    seqs: readonly number[],
+    agentId?: string
+  ): Promise<number[]> {
+    // A router verdict freezes background per target, inside that target's targetsJson entry.
+    if (agentId !== undefined && subject.startsWith('router:'))
+      return await this.claimRouterBackground(seq, subject, seqs, agentId)
+    await this.db
+      .prepare(
+        'UPDATE decision_verdict SET suppliedSeqsJson = ? WHERE seq = ? AND subject = ? AND suppliedSeqsJson IS NULL'
+      )
+      .run(JSON.stringify(seqs), seq, subject)
+    const row = (await this.db
+      .prepare('SELECT suppliedSeqsJson FROM decision_verdict WHERE seq = ? AND subject = ?')
+      .get(seq, subject)) as { suppliedSeqsJson: string | null } | undefined
+    if (!row?.suppliedSeqsJson) return [...seqs]
+    try {
+      const parsed: unknown = JSON.parse(row.suppliedSeqsJson)
+      return Array.isArray(parsed) ? parsed.filter((n): n is number => typeof n === 'number') : [...seqs]
+    } catch {
+      return [...seqs]
+    }
+  }
+
+  private async claimRouterBackground(
+    seq: number,
+    subject: string,
+    seqs: readonly number[],
+    agentId: string
+  ): Promise<number[]> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      // Locked like updateRouterTargets: a plain read would let a concurrent target move be overwritten.
+      const lock = this.postgres ? ' FOR UPDATE' : ''
+      const row = (await tx
+        .prepare(`SELECT targetsJson FROM decision_verdict WHERE seq = ? AND subject = ?${lock}`)
+        .get(seq, subject)) as { targetsJson: string | null } | undefined
+      const targets = parseTargets(row?.targetsJson)
+      const target = targets?.find((t) => t.agentId === agentId)
+      if (!targets || !target) return [...seqs]
+      if (Array.isArray(target.backgroundSeqs)) return target.backgroundSeqs.filter((n) => typeof n === 'number')
+      target.backgroundSeqs = [...seqs]
+      await tx
+        .prepare('UPDATE decision_verdict SET targetsJson = ? WHERE seq = ? AND subject = ?')
+        .run(JSON.stringify(targets), seq, subject)
+      return [...seqs]
+    })
+  }
+
+  /** Move router targets pending → terminal under the owner fence while the verdict is settled; undefined when the CAS missed. */
+  async updateRouterTargets(
+    seq: number,
+    subject: string,
+    fence: string,
+    updates: readonly RouterTargetUpdate[]
+  ): Promise<Array<Record<string, unknown> & { agentId: string; disposition: string }> | undefined> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const lock = this.postgres ? ' FOR UPDATE' : ''
+      const row = (await tx
+        .prepare(
+          `SELECT targetsJson FROM decision_verdict WHERE seq = ? AND subject = ? AND ownerFence = ? AND state = 'settled'${lock}`
+        )
+        .get(seq, subject, fence)) as { targetsJson: string | null } | undefined
+      const targets = parseTargets(row?.targetsJson)
+      if (!targets) return undefined
+      for (const update of updates) {
+        const target = targets.find((t) => t.agentId === update.agentId)
+        // Only a pending target moves: a terminal disposition is never rewritten.
+        if (!target || target.disposition !== 'pending') continue
+        target.disposition = update.disposition
+        if (update.reason !== undefined) target.reason = update.reason
+        if (update.backgroundSeqs !== undefined) target.backgroundSeqs = update.backgroundSeqs
+        if (update.retryUntil !== undefined) target.retryUntil = update.retryUntil
+        if (update.attempts !== undefined) target.attempts = update.attempts
+        if (update.daemonId !== undefined) target.daemonId = update.daemonId
+      }
+      const written = await tx
+        .prepare(
+          `UPDATE decision_verdict SET targetsJson = ? WHERE seq = ? AND subject = ? AND ownerFence = ? AND state = 'settled'`
+        )
+        .run(JSON.stringify(targets), seq, subject, fence)
+      return written.changes === 1 ? targets : undefined
+    })
+  }
+
+  /** Earlier router verdicts of one physical thread (the root and its replies), newest first. */
+  async routerVerdictsInThread(input: {
+    orgId: string
+    channel: string
+    subject: string
+    thread: string
+    beforeSeq: number
+    limit?: number
+  }): Promise<Array<{ seq: number; state: DecisionVerdictState; targetsJson: string | null }>> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT v.seq AS seq, v.state AS state, v.targetsJson AS targetsJson FROM decision_verdict v
+           JOIN transcript t ON t.seq = v.seq
+          WHERE v.orgId = ? AND v.channel = ? AND v.subject = ? AND v.seq < ?
+            AND (t.thread = ? OR t.ts = ?)
+            AND v.state IN ('reserved', 'evaluating', 'settled', 'admitted')
+          ORDER BY v.seq DESC LIMIT ?`
+      )
+      .all(
+        input.orgId,
+        input.channel,
+        input.subject,
+        input.beforeSeq,
+        input.thread,
+        input.thread,
+        input.limit ?? 20
+      )) as Array<{ seq: number; state: DecisionVerdictState; targetsJson: string | null }>
+    return rows.map((row) => ({ ...row, seq: Number(row.seq) }))
+  }
+
+  /** Step-1 rows a routed forward carries from the host's window; INSERT OR IGNORE, and a no-op on a shared store. */
+  async recordObservations(
+    orgAgentId: string,
+    transcriptChannel: string,
+    rows: ReadonlyArray<{
+      ts: string
+      thread: string | null
+      sender: string
+      text: string
+      eventTimeUs?: number
+      quoted?: { sender?: string; text: string }
+    }>
+  ): Promise<void> {
+    if (this.shared) return
+    for (const row of rows) {
+      await this.appendTranscript({
+        channel: transcriptChannel,
+        ...(row.thread !== null ? { thread: row.thread } : {}),
+        ts: row.ts,
+        sender: row.sender,
+        kind: 'text',
+        text: row.text,
+        orgAgentId,
+        ...(row.eventTimeUs !== undefined ? { eventTimeUs: row.eventTimeUs } : {}),
+        ...(row.quoted ? { quoted: row.quoted } : {})
+      })
+    }
+  }
+
+  /** Integration removal on an exclusively owned store (decisions.md §8.1). */
+  async purgeDecisionVerdicts(filter: { integrationId: string }): Promise<number> {
+    const result = await this.db
+      .prepare('DELETE FROM decision_verdict WHERE integrationId = ?')
+      .run(filter.integrationId)
+    await this.deleteOrphanDecisionReleases()
+    return Number(result.changes)
+  }
+
+  private async deleteOrphanDecisionReleases(): Promise<void> {
+    await this.db
+      .prepare(
+        `DELETE FROM decision_release WHERE NOT EXISTS (
+           SELECT 1 FROM decision_verdict v
+            WHERE v.orgId = decision_release.orgId AND v.channel = decision_release.channel
+              AND v.subject = decision_release.subject)`
+      )
+      .run()
+  }
+
+  /** The state cut at a verdict's row (message-intake.md §9): the row, newest-first history, and gap evidence. */
+  async decisionWindow(
+    orgId: string,
+    channel: string,
+    seq: number,
+    limit = 100,
+    rootTsOf?: (thread: string) => string | undefined,
+    // A thread-scoped cut (a code-host subject): history is that thread's rows only, and a null thread has none.
+    scope?: { thread: string | null }
+  ): Promise<{ current: ChannelTextRow | undefined; history: ChannelTextRow[]; full: boolean; rootMissing: boolean }> {
+    const columns = 'seq, thread, ts, sender, text, body, quoteJson, eventTimeUs, kind'
+    const current = (await this.db
+      .prepare(`SELECT ${columns} FROM transcript WHERE seq = ? AND orgId = ? AND channel = ? AND kind = 'text'`)
+      .get(seq, orgId, channel)) as ChannelTextRow | undefined
+    if (scope) {
+      const threaded =
+        scope.thread === null
+          ? []
+          : ((await this.db
+              .prepare(
+                `SELECT ${columns} FROM transcript
+                  WHERE orgId = ? AND channel = ? AND thread = ? AND kind = 'text' AND seq < ? ORDER BY seq DESC LIMIT ?`
+              )
+              .all(orgId, channel, scope.thread, seq, limit + 1)) as ChannelTextRow[])
+      return {
+        current: current ? { ...current, seq: Number(current.seq) } : undefined,
+        history: threaded.slice(0, limit).map((row) => ({ ...row, seq: Number(row.seq) })),
+        full: threaded.length > limit,
+        rootMissing: false
+      }
+    }
+    const rows = (await this.db
+      .prepare(
+        `SELECT ${columns} FROM transcript
+          WHERE orgId = ? AND channel = ? AND kind = 'text' AND seq < ? ORDER BY seq DESC LIMIT ?`
+      )
+      .all(orgId, channel, seq, limit + 1)) as ChannelTextRow[]
+    const oldest = (await this.db
+      .prepare(
+        `SELECT ts, thread FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text' ORDER BY seq ASC LIMIT 1`
+      )
+      .get(orgId, channel)) as { ts: string | null; thread: string | null } | undefined
+    let rootMissing = false
+    if (oldest?.thread && oldest.thread !== oldest.ts) {
+      // The platform names the root; without it, only a conversation with some thread = ts row threads by root ts.
+      const rootTs = rootTsOf
+        ? rootTsOf(oldest.thread)
+        : (await this.db
+              .prepare(
+                `SELECT 1 FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text' AND thread = ts LIMIT 1`
+              )
+              .get(orgId, channel)) !== undefined
+          ? oldest.thread
+          : undefined
+      rootMissing =
+        rootTs !== undefined &&
+        rootTs !== oldest.ts &&
+        (await this.db
+          .prepare(`SELECT 1 FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text' AND ts = ?`)
+          .get(orgId, channel, rootTs)) === undefined
+    }
+    const history = rows.slice(0, limit).map((row) => ({ ...row, seq: Number(row.seq) }))
+    return {
+      current: current ? { ...current, seq: Number(current.seq) } : undefined,
+      history,
+      full: rows.length > limit,
+      rootMissing
+    }
+  }
+
+  /** §5.2 background for one admission: this conversation's rows since the session's last admitted row that it never received. */
+  async backgroundSeqsForAdmission(input: {
+    agentId: string
+    transcriptChannel: string
+    coordinate: string
+    sessionKey: string
+    currentSeq: number
+    limit: number
+    orgId?: string
+  }): Promise<number[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT t.seq AS seq, t.text AS text FROM transcript t
+          WHERE t.orgId = @org AND t.channel = @channel AND t.kind = 'text' AND t.seq < @cur
+            AND t.seq > COALESCE((SELECT MAX(tr.seq) FROM transcript_recipient tr JOIN transcript t2 ON t2.seq = tr.seq
+                                   WHERE tr.sessionKey = @key AND t2.kind = 'text' AND tr.seq < @cur), 0)
+            AND t.sender <> @agent
+            AND (t.thread IS NULL OR t.thread <> @coordinate)
+            AND NOT EXISTS (SELECT 1 FROM transcript_recipient r WHERE r.seq = t.seq AND r.sessionKey = @key)
+          ORDER BY t.seq DESC LIMIT @cap`
+      )
+      .all({
+        org: this.orgForRead(input.agentId, input.orgId),
+        channel: input.transcriptChannel,
+        cur: input.currentSeq,
+        key: input.sessionKey,
+        agent: input.agentId,
+        coordinate: input.coordinate,
+        cap: input.limit + 16
+      })) as { seq: number; text: string }[]
+    return rows
+      .filter((row) => !isControlCommandText(row.text))
+      .slice(0, input.limit)
+      .map((row) => Number(row.seq))
+      .reverse()
+  }
+
+  /** The persisted background of one admission, read back inside its own conversation only. */
+  async transcriptRowsBySeq(
+    scope: { agentId: string; transcriptChannel: string; orgId?: string },
+    seqs: readonly number[]
+  ): Promise<ChannelTextRow[]> {
+    if (seqs.length === 0) return []
+    const rows = (await this.db
+      .prepare(
+        `SELECT seq, thread, ts, sender, text, body, quoteJson, eventTimeUs, kind FROM transcript
+          WHERE kind = 'text' AND orgId = ? AND channel = ? AND seq IN (${seqs.map(() => '?').join(', ')})
+          ORDER BY seq ASC`
+      )
+      .all(this.orgForRead(scope.agentId, scope.orgId), scope.transcriptChannel, ...seqs)) as ChannelTextRow[]
+    return rows.map((row) => ({ ...row, seq: Number(row.seq) }))
+  }
+
+  /** decisions.md §8.1: terminal bodies go after 24 h or once 20 newer terminal verdicts share the lane. */
+  async stripDecisionVerdictBodies(now: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE decision_verdict
+            SET inputJson = NULL, answerJson = NULL, deliveryJson = NULL, suppliedSeqsJson = NULL, bodiesStrippedAt = @now
+          WHERE bodiesStrippedAt IS NULL AND state IN ${TERMINAL_VERDICT_SQL}
+            AND (COALESCE(finishedAt, createdAt) < @cutoff
+                 OR (SELECT COUNT(*) FROM decision_verdict n
+                      WHERE n.orgId = decision_verdict.orgId AND n.channel = decision_verdict.channel
+                        AND n.subject = decision_verdict.subject AND n.state IN ${TERMINAL_VERDICT_SQL}
+                        AND n.seq > decision_verdict.seq) >= @kept)`
+      )
+      .run({ now, cutoff: now - DECISION_BODY_RETENTION_MS, kept: DECISION_BODY_RETAINED_VERDICTS })
+    await this.deleteOrphanDecisionReleases()
+    return Number(result.changes)
+  }
+
+  async saveDecisionModelEvaluation(
+    agentId: string,
+    sessionId: string,
+    summary: Omit<DecisionModelEvaluationRecord, 'seq' | 'title' | 'detailsExpired'>,
+    detail: Pick<
+      DecisionModelEvaluationRecordDetail,
+      'selection' | 'question' | 'input' | 'fullAnswer' | 'chain' | 'steps' | 'rawRequest' | 'rawResponse'
+    >,
+    now: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO decision_model_evaluation
+      (orgId, agentId, sessionId, createdAt, decisionId, summaryJson, detailJson)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.orgForRead(agentId, undefined),
+        agentId,
+        sessionId,
+        now,
+        summary.decisionId,
+        JSON.stringify(summary),
+        JSON.stringify(detail)
+      )
+  }
+
+  async listDecisionModelEvaluations(
+    orgId: string,
+    agentId: string,
+    before: number | undefined,
+    limit: number,
+    decisionId?: string,
+    sessionId?: string
+  ): Promise<DecisionModelEvaluationRow[]> {
+    const params: unknown[] = [this.orgForRead(agentId, orgId), agentId, before ?? Number.MAX_SAFE_INTEGER]
+    const decisionFilter = decisionId ? ' AND decisionId = ?' : ''
+    if (decisionId) params.push(decisionId)
+    const sessionFilter = sessionId ? ' AND sessionId = ?' : ''
+    if (sessionId) params.push(sessionId)
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM decision_model_evaluation WHERE orgId = ? AND agentId = ? AND seq < ?${decisionFilter}${sessionFilter}
+      ORDER BY seq DESC LIMIT ?`
+      )
+      .all(...params, limit)) as DecisionModelEvaluationRow[]
+  }
+
+  async getDecisionModelEvaluation(
+    orgId: string,
+    agentId: string,
+    seq: number
+  ): Promise<DecisionModelEvaluationRow | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM decision_model_evaluation WHERE orgId = ? AND agentId = ? AND seq = ?`
+      )
+      .get(this.orgForRead(agentId, orgId), agentId, seq)) as DecisionModelEvaluationRow | undefined
+  }
+
+  async stripDecisionModelEvaluationBodies(now: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE decision_model_evaluation
+      SET detailJson = NULL, bodiesStrippedAt = @now
+      WHERE detailJson IS NOT NULL AND (createdAt < @cutoff OR
+        (SELECT COUNT(*) FROM decision_model_evaluation newer
+          WHERE newer.orgId = decision_model_evaluation.orgId
+            AND newer.agentId = decision_model_evaluation.agentId
+            AND newer.seq > decision_model_evaluation.seq) >= @kept)`
+      )
+      .run({
+        now,
+        cutoff: now - DECISION_BODY_RETENTION_MS,
+        kept: DECISION_BODY_RETAINED_VERDICTS
+      })
+    return Number(result.changes)
+  }
+
+  /** One coordinator filter verdict on a message (auto-session-mode.md §4.7); a replayed message keeps its first record. */
+  async saveCoordinatorFilterEvaluation(
+    agentId: string,
+    messageId: string,
+    summary: Omit<DecisionEvaluationRecord, 'seq' | 'title' | 'detailsExpired'>,
+    detail: Pick<DecisionEvaluationRecordDetail, 'snapshot' | 'input' | 'fullAnswer' | 'rawRequest' | 'rawResponse'>,
+    now: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO coordinator_filter_evaluation
+      (orgId, agentId, messageId, createdAt, summaryJson, detailJson)
+      VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.orgForRead(agentId, undefined),
+        agentId,
+        messageId,
+        now,
+        JSON.stringify(summary),
+        JSON.stringify(detail)
+      )
+  }
+
+  async listCoordinatorFilterEvaluations(
+    orgId: string,
+    agentId: string,
+    before: number | undefined,
+    limit: number
+  ): Promise<CoordinatorFilterEvaluationRow[]> {
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM coordinator_filter_evaluation WHERE orgId = ? AND agentId = ? AND seq < ?
+      ORDER BY seq DESC LIMIT ?`
+      )
+      .all(
+        this.orgForRead(agentId, orgId),
+        agentId,
+        before ?? Number.MAX_SAFE_INTEGER,
+        limit
+      )) as CoordinatorFilterEvaluationRow[]
+  }
+
+  async getCoordinatorFilterEvaluation(
+    orgId: string,
+    agentId: string,
+    seq: number
+  ): Promise<CoordinatorFilterEvaluationRow | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM coordinator_filter_evaluation WHERE orgId = ? AND agentId = ? AND seq = ?`
+      )
+      .get(this.orgForRead(agentId, orgId), agentId, seq)) as CoordinatorFilterEvaluationRow | undefined
+  }
+
+  /** A verdict's input and provider bodies go after a day or 20 newer verdicts of the same agent; its summary stays for retention. */
+  async stripCoordinatorFilterEvaluationBodies(now: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE coordinator_filter_evaluation
+      SET detailJson = NULL, bodiesStrippedAt = @now
+      WHERE detailJson IS NOT NULL AND (createdAt < @cutoff OR
+        (SELECT COUNT(*) FROM coordinator_filter_evaluation newer
+          WHERE newer.orgId = coordinator_filter_evaluation.orgId
+            AND newer.agentId = coordinator_filter_evaluation.agentId
+            AND newer.seq > coordinator_filter_evaluation.seq) >= @kept)`
+      )
+      .run({
+        now,
+        cutoff: now - DECISION_BODY_RETENTION_MS,
+        kept: DECISION_BODY_RETAINED_VERDICTS
+      })
+    return Number(result.changes)
+  }
+
+  async saveDecisionApiGateEvaluation(
+    agentId: string,
+    protocol: string,
+    messageId: string,
+    summary: Omit<DecisionEvaluationRecord, 'seq' | 'title' | 'detailsExpired'>,
+    detail: Pick<
+      DecisionEvaluationRecordDetail,
+      'snapshot' | 'input' | 'fullAnswer' | 'chain' | 'steps' | 'rawRequest' | 'rawResponse'
+    >,
+    now: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO decision_api_gate_evaluation
+      (orgId, agentId, protocol, messageId, createdAt, decisionId, summaryJson, detailJson)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.orgForRead(agentId, undefined),
+        agentId,
+        protocol,
+        messageId,
+        now,
+        summary.decisionId,
+        JSON.stringify(summary),
+        JSON.stringify(detail)
+      )
+  }
+
+  async listDecisionApiGateEvaluations(
+    orgId: string,
+    agentId: string,
+    protocol: string,
+    before: number | undefined,
+    limit: number,
+    decisionId?: string
+  ): Promise<DecisionApiGateEvaluationRow[]> {
+    const params: unknown[] = [this.orgForRead(agentId, orgId), agentId, protocol, before ?? Number.MAX_SAFE_INTEGER]
+    const decisionFilter = decisionId ? ' AND decisionId = ?' : ''
+    if (decisionId) params.push(decisionId)
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM decision_api_gate_evaluation WHERE orgId = ? AND agentId = ? AND protocol = ? AND seq < ?${decisionFilter}
+      ORDER BY seq DESC LIMIT ?`
+      )
+      .all(...params, limit)) as DecisionApiGateEvaluationRow[]
+  }
+
+  async getDecisionApiGateEvaluation(
+    orgId: string,
+    agentId: string,
+    protocol: string,
+    seq: number
+  ): Promise<DecisionApiGateEvaluationRow | undefined> {
+    return (await this.db
+      .prepare(
+        `SELECT seq, summaryJson, detailJson, bodiesStrippedAt
+      FROM decision_api_gate_evaluation WHERE orgId = ? AND agentId = ? AND protocol = ? AND seq = ?`
+      )
+      .get(this.orgForRead(agentId, orgId), agentId, protocol, seq)) as DecisionApiGateEvaluationRow | undefined
+  }
+
+  async stripDecisionApiGateEvaluationBodies(now: number): Promise<number> {
+    const result = await this.db
+      .prepare(
+        `UPDATE decision_api_gate_evaluation
+      SET detailJson = NULL, bodiesStrippedAt = @now
+      WHERE detailJson IS NOT NULL AND (createdAt < @cutoff OR
+        (SELECT COUNT(*) FROM decision_api_gate_evaluation newer
+          WHERE newer.orgId = decision_api_gate_evaluation.orgId
+            AND newer.agentId = decision_api_gate_evaluation.agentId
+            AND newer.protocol = decision_api_gate_evaluation.protocol
+            AND newer.seq > decision_api_gate_evaluation.seq) >= @kept)`
+      )
+      .run({
+        now,
+        cutoff: now - DECISION_BODY_RETENTION_MS,
+        kept: DECISION_BODY_RETAINED_VERDICTS
+      })
+    return Number(result.changes)
+  }
+
+  /** Arm a sweep for one conversation: every {@link OBSERVATION_SWEEP_INSERTS} inserts, from a
+   *  microtask so it never runs inside a caller's {@link transcriptMutex} hold, which is not
+   *  reentrant. A missed pass the idle {@link sweepAllObservations} takes. */
+  private armObservationSweep(orgId: string, channel: string): void {
+    const key = `${orgId}\u0000${channel}`
+    const count = (this.observationSweepCounters.get(key) ?? 0) + 1
+    if (count < OBSERVATION_SWEEP_INSERTS) {
+      this.observationSweepCounters.set(key, count)
+      return
+    }
+    this.observationSweepCounters.set(key, 0)
+    queueMicrotask(() => {
+      void this.sweepObservations(orgId, channel).catch(() => undefined)
+    })
+  }
+
+  /** One round trip for a transcript mutation plus the thread revision the caller needs next.
+   *  Each statement still commits on its own, so a failure leaves what the same sequence of
+   *  single-statement calls would have left. Callers hold {@link transcriptMutex}. */
+  private async writeTranscriptRows(
+    orgId: string,
+    channel: string,
+    statements: StoreBatchStatement[]
+  ): Promise<{ changes: number[]; revision: number }> {
+    const results = await this.lockedDb.batch([
+      ...statements,
+      {
+        kind: 'read',
+        sql: 'SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript WHERE orgId = ? AND channel = ?',
+        params: [orgId, channel]
+      }
+    ])
+    return {
+      changes: results.slice(0, -1).map((result) => Number(result.changes)),
+      revision: Number((results.at(-1)?.rows[0] as { revision: number } | undefined)?.revision ?? 0)
+    }
+  }
+
+  private notifyTranscriptMutation(
+    channel: string,
+    thread: string,
+    candidates: Array<string | undefined>,
+    revision: number,
+    sessionCandidates: Array<string | undefined> = []
+  ): void {
+    const agentIds = [...new Set(candidates.filter((candidate): candidate is string => !!candidate))]
+    const sessionKeys = [...new Set(sessionCandidates.filter((candidate): candidate is string => !!candidate))]
+    if (agentIds.length === 0 && sessionKeys.length === 0) return
+    if (!this.transcriptMutationListener) return
+    // Post-commit dispatch: the listener reads the store, so it must never run mid-write and
+    // observe a half-applied batch (or re-enter an open transaction). Re-read at dispatch so a
+    // listener detached during shutdown does not fire from a queued notice.
+    queueMicrotask(() => {
+      try {
+        // Listener may be async now; a rejected store read stays best-effort, never unhandled.
+        void Promise.resolve(
+          this.transcriptMutationListener?.({ channel, thread, agentIds, sessionKeys, revision })
+        ).catch(() => undefined)
+      } catch {
+        // Live-view invalidation is best-effort and must never fail a durable write.
+      }
+    })
+  }
+
+  /** One agent's full stored ToolBody JSON, or undefined if unknown/not owned. A reused tool id
+   *  leaves one row per session at the physical thread, so this session's own row wins; a row
+   *  written without a session (pre-Stage-1) still answers when nothing scoped matches. */
+  async getToolBodyForAgent(scope: TranscriptSessionScope, toolCallId: string): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare(
+        `SELECT body FROM transcript WHERE orgId = ? AND channel = ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND sender = ? AND tool_call_id = ?
+         ORDER BY (sessionScope = ?) DESC, seq DESC LIMIT 1`
+      )
+      .get(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        toolCallId,
+        scope.sessionKey
+      )) as { body: string | null } | undefined
+    return row?.body ?? undefined
+  }
+
+  /**
+   * §8.5 cross-agent catch-up: conversational (`text`) rows only — tool/reasoning rows
+   * are audit/UI data and must never be replayed back into an agent's prompt. Ordered by
+   * platform `ts` (every text row carries one), compared against the session marker.
+   */
+  async transcriptSince(scope: TranscriptSessionScope, sinceTs: string | null): Promise<TranscriptEntry[]> {
+    const orgId = this.orgForRead(scope.agentId, scope.orgId)
+    if (sinceTs === null) {
+      return (await this.db
+        .prepare(
+          `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text'
+             AND ${SESSION_ROW_SCOPE_SQL} ORDER BY ts ASC`
+        )
+        .all(orgId, scope.transcriptChannel, scope.coordinate, scope.sessionKey)) as unknown as TranscriptEntry[]
+    }
+    return (await this.db
+      .prepare(
+        `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text' AND ts > ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+         ORDER BY ts ASC`
+      )
+      .all(orgId, scope.transcriptChannel, sinceTs, scope.coordinate, scope.sessionKey)) as unknown as TranscriptEntry[]
+  }
+
+  /**
+   * `transcriptSince`, scoped to what ONE agent sent or received — the same
+   * delivery predicate the console session views use. For a synthetic pairwise
+   * `a2a:<caller>` thread (see `isSyntheticA2aChannel` in cp-collab-routes),
+   * every child of one caller shares the physical thread while each row is a
+   * private pairwise delivery: the §8.5 model catch-up must read only this
+   * pair's rows, or siblings see each other's private deliveries (#967).
+   */
+  async transcriptSinceForAgent(scope: TranscriptSessionScope, sinceTs: string | null): Promise<TranscriptEntry[]> {
+    const orgId = this.orgForRead(scope.agentId, scope.orgId)
+    if (sinceTs === null) {
+      return (await this.db
+        .prepare(
+          `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text'
+             AND ${SESSION_ROW_SCOPE_SQL}
+             AND ${AGENT_DELIVERY_SCOPE_SQL} ORDER BY ts ASC`
+        )
+        .all(
+          orgId,
+          scope.transcriptChannel,
+          scope.coordinate,
+          scope.sessionKey,
+          scope.agentId,
+          scope.agentId
+        )) as unknown as TranscriptEntry[]
+    }
+    return (await this.db
+      .prepare(
+        `SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text' AND ts > ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND ${AGENT_DELIVERY_SCOPE_SQL} ORDER BY ts ASC`
+      )
+      .all(
+        orgId,
+        scope.transcriptChannel,
+        sinceTs,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId
+      )) as unknown as TranscriptEntry[]
+  }
+
+  /** Whether a session was admitted a text row of one physical thread other than those at `exceptTs`: what tells a thread it has followed from one it meets part-way. */
+  async sessionHoldsThread(
+    scope: Pick<TranscriptSessionScope, 'transcriptChannel' | 'sessionKey' | 'agentId' | 'orgId'>,
+    thread: string,
+    exceptTs: readonly string[] = []
+  ): Promise<boolean> {
+    const except = exceptTs.length > 0 ? `AND ts NOT IN (${exceptTs.map(() => '?').join(', ')})` : ''
+    const row = await this.db
+      .prepare(
+        `SELECT seq FROM transcript WHERE orgId = ? AND channel = ? AND thread = ? AND kind = 'text' ${except}
+           AND EXISTS (
+             SELECT 1 FROM transcript_recipient tr_h
+             WHERE tr_h.seq = transcript.seq AND tr_h.sessionKey = ?)
+         LIMIT 1`
+      )
+      .get(this.orgForRead(scope.agentId, scope.orgId), scope.transcriptChannel, thread, ...exceptTs, scope.sessionKey)
+    return row !== undefined
+  }
+
+  /**
+   * Provider-neutral context fence for one physical conversation thread. Unlike
+   * `transcriptSince`, this never compares provider message ids from different
+   * ordering domains; it follows the daemon's monotonic observation revision.
+   */
+  async threadTranscriptRevision(scope: TranscriptSessionScope): Promise<number> {
+    const orgId =
+      scope.orgId !== undefined && this.shared
+        ? scope.orgId
+        : await this.transcriptOrg(scope.transcriptChannel, scope.coordinate, scope.agentId)
+    const row = (await this.db
+      .prepare(
+        `SELECT COALESCE(MAX(revision), 0) AS revision FROM transcript
+         WHERE orgId = ? AND channel = ? AND ${SESSION_ROW_SCOPE_SQL}`
+      )
+      .get(orgId, scope.transcriptChannel, scope.coordinate, scope.sessionKey)) as { revision: number }
+    return row.revision
+  }
+
+  /** Conversation and audit rows observed after a thread-local revision fence. */
+  async transcriptSinceRevision(scope: TranscriptSessionScope, afterRevision: number): Promise<TranscriptRow[]> {
+    return (await this.db
+      .prepare(
+        `SELECT * FROM transcript
+         WHERE orgId = ? AND channel = ? AND revision > ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+         ORDER BY revision ASC, seq ASC`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        afterRevision,
+        scope.coordinate,
+        scope.sessionKey
+      )) as unknown as TranscriptRow[]
+  }
+
+  /** `transcriptSinceRevision`, scoped to one agent's sent/received rows — the
+   *  turn-context refresh's read on a synthetic pairwise `a2a:<caller>` thread,
+   *  for the same reason as {@link transcriptSinceForAgent} (#967). */
+  async transcriptSinceRevisionForAgent(
+    scope: TranscriptSessionScope,
+    afterRevision: number
+  ): Promise<TranscriptRow[]> {
+    return (await this.db
+      .prepare(
+        `SELECT * FROM transcript
+         WHERE orgId = ? AND channel = ? AND revision > ?
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND ${AGENT_DELIVERY_SCOPE_SQL}
+         ORDER BY revision ASC, seq ASC`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        afterRevision,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId
+      )) as unknown as TranscriptRow[]
+  }
+
+  /** The earliest inbound (non-agent) `text` message in a thread — the triggering user
+   *  message. Used as a session-title fallback when neither ACP nor the title tool
+   *  supplied one. Before the first meaningful request, this avoids showing only
+   *  "Session <id>". Returns undefined when the thread holds no non-agent text row
+   *  yet. Indexed by (channel, thread, seq). */
+  async firstMessageText(scope: TranscriptSessionScope): Promise<string | undefined> {
+    // A small window rather than LIMIT 1: controls are recorded now (message-intake.md §5 step 2)
+    // and a thread opened with `!status` must not be titled by it.
+    const rows = (await this.db
+      .prepare(
+        `SELECT text FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text'
+           AND ${SESSION_ROW_SCOPE_SQL}
+           AND sender != ? ORDER BY seq ASC LIMIT 8`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId
+      )) as { text: string }[]
+    return rows.find((row) => !isControlCommandText(row.text))?.text
+  }
+
+  /** Full activity log for a thread (all kinds), in insertion order — for the Web UI.
+   *  `agentId` names the org partition only, and may be omitted on a store no pool shares. */
+  async threadTranscript(channel: string, thread: string, agentId?: string): Promise<TranscriptRow[]> {
+    return (await this.db
+      .prepare('SELECT * FROM transcript WHERE orgId = ? AND channel = ? AND thread = ? ORDER BY seq ASC')
+      .all(this.orgFor(agentId), channel, thread)) as unknown as TranscriptRow[]
+  }
+
+  /**
+   * The bytes of an inline transcript image in one thread, by the file NAME the agent read
+   * in its `[attached: …]` marker. Latest wins — the same name can legitimately recur.
+   *
+   * Backs forwarding a received file: the copy already kept for console replay is reused, so
+   * no second fetch hits the source platform and the bytes never pass through the model. That
+   * copy is BOUNDED (and may be a smaller rendition), so a forward can be lower-resolution
+   * than what arrived. Bounded scan depth for the same reason the copy is bounded.
+   */
+  async transcriptAttachmentByName(
+    scope: TranscriptSessionScope,
+    name: string
+  ): Promise<SessionImageAttachment | undefined> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT attachmentsJson FROM transcript
+          WHERE orgId = ? AND channel = ? AND attachmentsJson IS NOT NULL
+            AND ${SESSION_ROW_SCOPE_SQL}
+          ORDER BY seq DESC LIMIT 100`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        scope.coordinate,
+        scope.sessionKey
+      )) as unknown as { attachmentsJson: string }[]
+    for (const row of rows) {
+      let raw: unknown
+      try {
+        raw = JSON.parse(row.attachmentsJson)
+      } catch {
+        continue
+      }
+      const parsed = SessionImageAttachmentSchema.array().safeParse(raw)
+      const match = parsed.success ? parsed.data.find((attachment) => attachment.name === name) : undefined
+      if (match) return match
+    }
+    return undefined
+  }
+
+  // Native upload IDs are resolved only inside the caller's admitted transcript rows.
+  async transcriptUploadById(
+    scope: TranscriptSessionScope,
+    uploadId: string
+  ): Promise<UploadedFileReference | undefined> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT body FROM transcript WHERE orgId = ? AND channel = ? AND kind = 'text'
+        AND body LIKE ? AND ${SESSION_ROW_SCOPE_SQL} AND ${AGENT_DELIVERY_SCOPE_SQL}
+        ORDER BY seq DESC`
+      )
+      .all(
+        this.orgForRead(scope.agentId, scope.orgId),
+        scope.transcriptChannel,
+        `%${uploadId}%`,
+        scope.coordinate,
+        scope.sessionKey,
+        scope.agentId,
+        scope.agentId
+      )) as { body: string }[]
+    for (const row of rows) {
+      try {
+        const parsed = UserTurnBody.safeParse(JSON.parse(row.body))
+        const upload = parsed.success ? parsed.data.uploads?.find((file) => file.uploadId === uploadId) : undefined
+        if (upload) return upload
+      } catch {
+        // A legacy non-JSON body has no upload metadata.
+      }
+    }
+    return undefined
+  }
+
+  /** The thread a recorded platform message id (`ts`, or a webchat `postId`) was filed under; unfenced because it runs before routing and returns no content. */
+  async threadForPlatformMessage(channel: string, messageId: string): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare(
+        `SELECT thread FROM transcript WHERE channel = ? AND (ts = ? OR postId = ?) AND kind = 'text'
+           AND thread IS NOT NULL ORDER BY seq DESC LIMIT 1`
+      )
+      .get(channel, messageId, messageId)) as { thread: string } | undefined
+    return row?.thread
+  }
+
+  async openSessionAgents(channel: string, thread: string, transportScope?: string | null): Promise<string[]> {
+    return await this.threadAgentsByState(channel, thread, transportScope, 'open')
+  }
+
+  /**
+   * Agents participating in a PHYSICAL thread, split by whether their session is live.
+   *
+   * Reads `thread_participation` rather than `sessions` (channel-session-mode.md §6.4):
+   * the two agree while a session IS a thread, but an `append` session lives at a
+   * coordinate that is no thread's, so the session row stops being able to answer "who is
+   * talking in this thread". Liveness still comes from the session the row points at, so
+   * open-vs-dormant is decided in exactly one place, as before.
+   *
+   * The join fences on the SESSION's own scope and agent, not just the key: a record is
+   * only as good as its agreement with the session it names. The old lookup could not
+   * disagree with itself — it read one row — whereas these are two rows written by two
+   * statements, so a record left behind by a scope move (or a crash between them) must
+   * fail closed rather than keep resolving through a scope the session has left. The join
+   * also drops a record whose session is gone, which is what made "no session row ⇒ not
+   * listed" true before this table existed.
+   */
+  private async threadAgentsByState(
+    channel: string,
+    thread: string,
+    transportScope: string | null | undefined,
+    want: 'open' | 'closed'
+  ): Promise<string[]> {
+    const predicate = want === 'open' ? "s.state != 'closed'" : "s.state = 'closed'"
+    return (
+      (await this.db
+        .prepare(
+          `SELECT DISTINCT p.agentId AS agentId FROM thread_participation p
+           JOIN sessions s ON s.key = p.sessionKey
+             AND COALESCE(s.transportScope, '') = p.transportScope
+             AND s.agentId = p.agentId
+           WHERE p.channel = ? AND p.thread = ? AND p.transportScope = ? AND ${predicate}`
+        )
+        .all(channel, thread, transportScope ?? '')) as { agentId: string }[]
+    ).map((r) => r.agentId)
+  }
+
+  /** Agents with a TTL-`closed` session in this thread (§7.3). Backs thread-affinity
+   *  revival: when no OPEN session owns a thread, a follow-up reply can still be routed
+   *  to the sole agent that previously owned it, and SessionManager.handle recreates/
+   *  resumes the ACP session. Kept separate from `openSessionAgents` so the live
+   *  multi-agent disambiguation (2+ open owners → mention-gated) is never perturbed. */
+  async closedSessionAgents(channel: string, thread: string, transportScope?: string | null): Promise<string[]> {
+    return await this.threadAgentsByState(channel, thread, transportScope, 'closed')
+  }
+
+  /** Cache a platform id's human display name (channel or user; Slack ids don't
+   *  collide across the two). Latest-wins — renames overwrite. */
+  async setDisplayName(id: string, name: string, updatedAt: number): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO display_names (id, name, updatedAt) VALUES (?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name, updatedAt=excluded.updatedAt`
+      )
+      .run(id, name, updatedAt)
+  }
+
+  /** Display names for a set of platform ids — only the ids that have one.
+   *  One batched `IN (…)` query, not a round-trip per id. */
+  async getDisplayNames(ids: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    const unique = [...new Set(ids)]
+    if (unique.length === 0) return out
+    const rows = (await this.db
+      .prepare(`SELECT id, name FROM display_names WHERE id IN (${unique.map(() => '?').join(',')})`)
+      .all(...unique)) as unknown as { id: string; name: string }[]
+    for (const r of rows) if (r.name) out.set(r.id, r.name)
+    return out
+  }
+
+  /** Cache a public provider-hosted profile image. Latest-wins as users update avatars. */
+  async setProfileAvatar(transportScope: string, id: string, url: string, updatedAt: number): Promise<void> {
+    let parsed: URL
+    try {
+      parsed = new URL(url)
+    } catch {
+      return
+    }
+    if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return
+    await this.db
+      .prepare(
+        `INSERT INTO profile_avatars (transportScope, id, url, updatedAt) VALUES (?, ?, ?, ?)
+         ON CONFLICT(transportScope, id) DO UPDATE SET url=excluded.url, updatedAt=excluded.updatedAt`
+      )
+      .run(transportScope, id, url, updatedAt)
+  }
+
+  /** Profile images for platform ids on one physical provider connection. */
+  async getProfileAvatars(transportScope: string, ids: string[]): Promise<Map<string, string>> {
+    const out = new Map<string, string>()
+    const unique = [...new Set(ids)]
+    if (unique.length === 0) return out
+    const rows = (await this.db
+      .prepare(
+        `SELECT id, url FROM profile_avatars
+         WHERE transportScope = ? AND id IN (${unique.map(() => '?').join(',')})`
+      )
+      .all(transportScope, ...unique)) as unknown as { id: string; url: string }[]
+    for (const row of rows) if (row.url) out.set(row.id, row.url)
+    return out
+  }
+
+  /** Record where a conversation id sits — the channel and/or space enclosing it.
+   *  Latest-wins per supplied dimension; an empty note writes nothing, and a note that
+   *  carries only one dimension leaves the other as it was (the message path knows the
+   *  parent channel immediately, the space arrives with the later name lookup). */
+  async setChannelScope(
+    id: string,
+    scope: { parentId?: string; spaceId?: string; isIm?: boolean },
+    updatedAt: number
+  ): Promise<void> {
+    if (scope.parentId === undefined && scope.spaceId === undefined && scope.isIm === undefined) return
+    await this.db
+      .prepare(
+        `INSERT INTO channel_scopes (id, parentId, spaceId, isIm, updatedAt) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           parentId = COALESCE(excluded.parentId, channel_scopes.parentId),
+           spaceId = COALESCE(excluded.spaceId, channel_scopes.spaceId),
+           isIm = COALESCE(excluded.isIm, channel_scopes.isIm),
+           updatedAt = excluded.updatedAt`
+      )
+      .run(
+        id,
+        scope.parentId ?? null,
+        scope.spaceId ?? null,
+        scope.isIm === undefined ? null : scope.isIm ? 1 : 0,
+        updatedAt
+      )
+  }
+
+  /** Scopes for a set of conversation ids — only the ids that have one. One batched
+   *  `IN (…)` query, not a round-trip per id (mirrors getDisplayNames). */
+  async getChannelScopes(ids: string[]): Promise<Map<string, { parentId?: string; spaceId?: string; isIm?: boolean }>> {
+    const out = new Map<string, { parentId?: string; spaceId?: string; isIm?: boolean }>()
+    const unique = [...new Set(ids)]
+    if (unique.length === 0) return out
+    const rows = (await this.db
+      .prepare(
+        `SELECT id, parentId, spaceId, isIm FROM channel_scopes WHERE id IN (${unique.map(() => '?').join(',')})`
+      )
+      .all(...unique)) as unknown as {
+      id: string
+      parentId: string | null
+      spaceId: string | null
+      isIm: number | null
+    }[]
+    for (const r of rows) {
+      if (!r.parentId && !r.spaceId && r.isIm === null) continue
+      out.set(r.id, {
+        ...(r.parentId ? { parentId: r.parentId } : {}),
+        ...(r.spaceId ? { spaceId: r.spaceId } : {}),
+        ...(r.isIm === null ? {} : { isIm: r.isIm === 1 })
+      })
+    }
+    return out
+  }
+
+  /** One connection's remembered conversations, most recently updated first, at most `limit`. */
+  async connectionConversations(scope: string, limit: number): Promise<{ id: string; facts: string }[]> {
+    return (await this.db
+      .prepare('SELECT id, facts FROM connection_conversations WHERE scope = ? ORDER BY updatedAt DESC, id LIMIT ?')
+      .all(scope, Math.max(1, Math.trunc(limit)))) as unknown as { id: string; facts: string }[]
+  }
+
+  /** Remember a conversation for one connection, keeping only its `keep` most recently updated. */
+  async saveConnectionConversation(
+    scope: string,
+    id: string,
+    facts: string,
+    updatedAt: number,
+    keep: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO connection_conversations (scope, id, facts, updatedAt) VALUES (?, ?, ?, ?)
+         ON CONFLICT (scope, id) DO UPDATE SET facts = excluded.facts, updatedAt = excluded.updatedAt`
+      )
+      .run(scope, id, facts, updatedAt)
+    await this.db
+      .prepare(
+        `DELETE FROM connection_conversations WHERE scope = ? AND id NOT IN (
+           SELECT id FROM connection_conversations WHERE scope = ? ORDER BY updatedAt DESC, id LIMIT ?
+         )`
+      )
+      .run(scope, scope, Math.max(1, Math.trunc(keep)))
+  }
+
+  /**
+   * The persisted CP routing map — one row, and therefore EXCLUSIVELY OWNED STORES ONLY.
+   *
+   * `CpRoutingLayer` serializes its whole in-memory map on every mutation, so on a shared store
+   * each member's write erased every other member's and each boot hydrated a foreign map — a
+   * foreign `routingEpoch` with it, which then made `applyUpdate`'s stale guard discard legitimate
+   * global-rule updates until the real epoch caught up. Partitioning the row per member does not
+   * fix it either: `ownerId` is a process incarnation, so the key would change on every restart,
+   * leaking a row each time and still hydrating nothing.
+   *
+   * A shared member therefore starts from an empty map at epoch 0, which is the safe direction: it
+   * accepts the first `route/update` it is pushed, and `converge()` restates assignments from the
+   * CP snapshot on register/ok. An exclusively owned store keeps persisting exactly as before.
+   */
+  async getCpRouting(): Promise<{ routingEpoch: number; assignments: string; globalRules: string } | undefined> {
+    if (this.shared) return undefined
+    return (await this.db
+      .prepare('SELECT routingEpoch, assignments, globalRules FROM cp_routing WHERE id = 1')
+      .get()) as { routingEpoch: number; assignments: string; globalRules: string } | undefined
+  }
+
+  async setCpRouting(routingEpoch: number, assignments: string, globalRules: string): Promise<void> {
+    if (this.shared) return
+    await this.db
+      .prepare(
+        `INSERT INTO cp_routing (id, routingEpoch, assignments, globalRules) VALUES (1, @routingEpoch, @assignments, @globalRules)
+         ON CONFLICT(id) DO UPDATE SET routingEpoch=excluded.routingEpoch, assignments=excluded.assignments, globalRules=excluded.globalRules`
+      )
+      .run({ routingEpoch, assignments, globalRules })
+  }
+
+  /** Stamp a cron fire (key = `<agentId>:<cronId>`). */
+  async setCronLastRun(key: string, lastRunAt: number, definition: string): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO cron_runs (key, lastRunAt, definition) VALUES (@key, @lastRunAt, @definition)
+         ON CONFLICT(key) DO UPDATE SET lastRunAt=excluded.lastRunAt, definition=excluded.definition`
+      )
+      .run({ key, lastRunAt, definition })
+  }
+
+  async cronRun(key: string): Promise<ScheduleRun | undefined> {
+    return (await this.db.prepare('SELECT lastRunAt, definition FROM cron_runs WHERE key = ?').get(key)) as
+      ScheduleRun | undefined
+  }
+
+  /** Every stamp key this agent still carries — the substring match is exact, so an agent id with
+   *  LIKE metacharacters cannot widen it. */
+  async cronRunKeys(agentId: string): Promise<string[]> {
+    const prefix = `${agentId}:`
+    return (
+      (await this.db.prepare('SELECT key FROM cron_runs WHERE substr(key, 1, @len) = @prefix').all({
+        len: prefix.length,
+        prefix
+      })) as { key: string }[]
+    ).map((row) => row.key)
+  }
+
+  /** Drop a cron's stamp: the definition it fingerprints is gone, and a re-minted id of the same
+   *  name must start from no evidence rather than inherit the deleted schedule's last run. */
+  async deleteCronRun(key: string): Promise<void> {
+    await this.db.prepare('DELETE FROM cron_runs WHERE key = ?').run(key)
+  }
+
+  /** Hold a CP cron run's terminal outcome until the CP ACKs it; the same run replaces its own row. */
+  async queueCronReport(report: CronReport, queuedAt: number): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO cron_report_outbox (agentId, cronId, firedAt, report, queuedAt)
+         VALUES (@agentId, @cronId, @firedAt, @report, @queuedAt)
+         ON CONFLICT(agentId, cronId, firedAt) DO UPDATE SET report=excluded.report`
+      )
+      .run({
+        agentId: report.agentId,
+        cronId: report.cronId,
+        firedAt: report.firedAt,
+        report: JSON.stringify(report),
+        queuedAt
+      })
+  }
+
+  /** The oldest outcomes still owed; a shared pool store answers only for the agents this member serves. */
+  async pendingCronReports(limit: number, agentIds: readonly string[]): Promise<CronReportOutboxRow[]> {
+    const scope = idScope('agentId', this.shared ? agentIds : undefined)
+    return (await this.db
+      .prepare(
+        `SELECT agentId, cronId, firedAt, report FROM cron_report_outbox
+         WHERE 1 = 1${scope.sql} ORDER BY queuedAt ASC LIMIT @limit`
+      )
+      .all({ limit, ...scope.params })) as unknown as CronReportOutboxRow[]
+  }
+
+  /** Release one run's outcome: the CP ACKed it, or it can never accept it. */
+  async acknowledgeCronReport(agentId: string, cronId: string, firedAt: string): Promise<void> {
+    await this.db
+      .prepare('DELETE FROM cron_report_outbox WHERE agentId = ? AND cronId = ? AND firedAt = ?')
+      .run(agentId, cronId, firedAt)
+  }
+
+  /** Stamp a dream-schedule fire (one row per agent), under the definition that fired. */
+  async setDreamLastRun(agentId: string, lastRunAt: number, definition: string): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO dream_runs (agentId, lastRunAt, definition) VALUES (@agentId, @lastRunAt, @definition)
+         ON CONFLICT(agentId) DO UPDATE SET lastRunAt=excluded.lastRunAt, definition=excluded.definition`
+      )
+      .run({ agentId, lastRunAt, definition })
+  }
+
+  async dreamRun(agentId: string): Promise<ScheduleRun | undefined> {
+    return (await this.db.prepare('SELECT lastRunAt, definition FROM dream_runs WHERE agentId = ?').get(agentId)) as
+      ScheduleRun | undefined
+  }
+
+  /** CAS claim on a cron occurrence a handover missed (#1031): take it iff the stamp is still older
+   *  than the occurrence AND was written under the definition asking for it, so two members racing
+   *  one handoff compensate it exactly once and an edited schedule replays nothing. A row with no
+   *  stamp, or one fingerprinted differently, is never claimed. */
+  async claimCronCatchUp(key: string, occurrence: number, claimedAt: number, definition: string): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare('UPDATE cron_runs SET lastRunAt = ? WHERE key = ? AND lastRunAt < ? AND definition = ?')
+          .run(claimedAt, key, occurrence, definition)
+      ).changes === 1
+    )
+  }
+
+  /** The dream twin of {@link claimCronCatchUp}, over the per-agent dream stamp. */
+  async claimDreamCatchUp(
+    agentId: string,
+    occurrence: number,
+    claimedAt: number,
+    definition: string
+  ): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare('UPDATE dream_runs SET lastRunAt = ? WHERE agentId = ? AND lastRunAt < ? AND definition = ?')
+          .run(claimedAt, agentId, occurrence, definition)
+      ).changes === 1
+    )
+  }
+
+  /** Self-introduce-on-join (issue #536). The set of channels this agent has already
+   *  introduced itself into (or adopted as the silent baseline) on `platform`. */
+  async channelIntroSet(agentId: string, platform: string): Promise<Set<string>> {
+    const rows = (await this.db
+      .prepare('SELECT channel FROM channel_intro WHERE agentId = ? AND platform = ?')
+      .all(agentId, platform)) as { channel: string }[]
+    return new Set(rows.map((r) => r.channel))
+  }
+
+  /** Record that the agent has introduced itself in a channel (idempotent). `introducedAt`
+   *  is null when the channel was adopted as the silent baseline (never introduced-in). */
+  async markChannelIntro(
+    agentId: string,
+    platform: string,
+    channel: string,
+    introducedAt: number | null
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO channel_intro (agentId, platform, channel, introducedAt)
+         VALUES (@agentId, @platform, @channel, @introducedAt)`
+      )
+      .run({ agentId, platform, channel, introducedAt })
+  }
+
+  /** Whether an integration's first channel snapshot has been baselined (seeded). */
+  /** Persist one agent's advertised slash-command list (latest-wins, whole list). */
+  async setRuntimeCommands(agentId: string, row: { sessionId: string; updatedAt: string; payload: string }) {
+    await this.db
+      .prepare(
+        `INSERT INTO runtime_commands (agentId, sessionId, updatedAt, payload) VALUES (?, ?, ?, ?)
+         ON CONFLICT(agentId) DO UPDATE SET sessionId=excluded.sessionId, updatedAt=excluded.updatedAt, payload=excluded.payload`
+      )
+      .run(agentId, row.sessionId, row.updatedAt, row.payload)
+  }
+
+  async getRuntimeCommands(
+    agentId: string
+  ): Promise<{ sessionId: string; updatedAt: string; payload: string } | undefined> {
+    const row = (await this.db
+      .prepare('SELECT sessionId, updatedAt, payload FROM runtime_commands WHERE agentId = ?')
+      .get(agentId)) as { sessionId: string; updatedAt: string; payload: string } | undefined
+    return row ?? undefined
+  }
+
+  async deleteRuntimeCommands(agentId: string): Promise<void> {
+    await this.db.prepare('DELETE FROM runtime_commands WHERE agentId = ?').run(agentId)
+  }
+
+  /** The managed memory home this daemon last applied for an agent; undefined when no managed binding was ever applied. */
+  async getMemoryHomeApplied(agentId: string): Promise<ManagedMemoryHome | undefined> {
+    const row = (await this.db.prepare('SELECT memoryHome FROM memory_home_applied WHERE agentId = ?').get(agentId)) as
+      { memoryHome: string } | undefined
+    const parsed = ManagedMemoryHome.safeParse(row?.memoryHome)
+    return parsed.success ? parsed.data : undefined
+  }
+
+  /** Record the managed memory home just applied for an agent (latest-wins). */
+  async setMemoryHomeApplied(agentId: string, memoryHome: ManagedMemoryHome): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO memory_home_applied (agentId, memoryHome) VALUES (?, ?)
+         ON CONFLICT(agentId) DO UPDATE SET memoryHome = excluded.memoryHome`
+      )
+      .run(agentId, memoryHome)
+  }
+
+  async deleteMemoryHomeApplied(agentId: string): Promise<void> {
+    await this.db.prepare('DELETE FROM memory_home_applied WHERE agentId = ?').run(agentId)
+  }
+
+  async isChannelIntroSeeded(integrationId: string): Promise<boolean> {
+    return (
+      (await this.db.prepare('SELECT 1 FROM channel_intro_seed WHERE integrationId = ?').get(integrationId)) !==
+      undefined
+    )
+  }
+
+  /** Mark an integration's channel baseline as seeded (idempotent). */
+  async markChannelIntroSeeded(integrationId: string, seededAt: number): Promise<void> {
+    await this.db
+      .prepare('INSERT OR IGNORE INTO channel_intro_seed (integrationId, seededAt) VALUES (?, ?)')
+      .run(integrationId, seededAt)
+  }
+
+  /** §6.9 #353 durable inbox: persist an admitted message BEFORE its admission ACK. Keyed
+   *  by the stable delivery id (agent deliveryId or bot-scoped platform message id).
+   *  A re-append preserves the original payload/FIFO position and may only advance
+   *  the durable loop-accounting marker from 0 to 1. */
+  async appendInbox(row: InboxRow): Promise<boolean> {
+    const inserted = await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO inbox
+          (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, codeHostReplyTarget, posterPublishState,
+            terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
+         VALUES
+           (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @codeHostReplyTarget, @posterPublishState,
+            @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
+      )
+      .run({
+        id: row.id,
+        sessionKey: row.sessionKey,
+        agentId: row.agentId,
+        msg: row.msg,
+        integrationId: row.integrationId ?? null,
+        callMeta: row.callMeta ?? null,
+        hookContext: row.hookContext ?? null,
+        codeHostReplyTarget: row.codeHostReplyTarget ?? null,
+        posterPublishState: row.posterPublishState ?? null,
+        terminalReport: row.terminalReport ?? null,
+        completedAt: row.completedAt ?? null,
+        isQueueCmd: row.isQueueCmd ?? null,
+        loopGuardCounted: row.loopGuardCounted ?? 0,
+        enqueuedAt: row.enqueuedAt
+      })
+    if (inserted.changes === 0 && row.loopGuardCounted === 1) {
+      await this.db
+        .prepare(
+          'UPDATE inbox SET loopGuardCounted = CASE WHEN loopGuardCounted < 1 THEN 1 ELSE loopGuardCounted END WHERE id = ?'
+        )
+        .run(row.id)
+    }
+    return inserted.changes === 1
+  }
+
+  /** Atomically admit a message and its permanent receipt; an existing receipt admits nothing. */
+  async appendInboxWithReceipt(row: InboxRow, receipt: InboxRow): Promise<{ admitted: boolean }> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const insert = (r: InboxRow): Promise<{ changes: number }> =>
+        tx
+          .prepare(
+            `INSERT OR IGNORE INTO inbox
+              (id, sessionKey, agentId, msg, integrationId, callMeta, hookContext, codeHostReplyTarget, posterPublishState,
+                terminalReport, completedAt, isQueueCmd, loopGuardCounted, enqueuedAt)
+             VALUES
+               (@id, @sessionKey, @agentId, @msg, @integrationId, @callMeta, @hookContext, @codeHostReplyTarget, @posterPublishState,
+                @terminalReport, @completedAt, @isQueueCmd, @loopGuardCounted, @enqueuedAt)`
+          )
+          .run({
+            id: r.id,
+            sessionKey: r.sessionKey,
+            agentId: r.agentId,
+            msg: r.msg,
+            integrationId: r.integrationId ?? null,
+            callMeta: r.callMeta ?? null,
+            hookContext: r.hookContext ?? null,
+            codeHostReplyTarget: r.codeHostReplyTarget ?? null,
+            posterPublishState: r.posterPublishState ?? null,
+            terminalReport: r.terminalReport ?? null,
+            completedAt: r.completedAt ?? null,
+            isQueueCmd: r.isQueueCmd ?? null,
+            loopGuardCounted: r.loopGuardCounted ?? 0,
+            enqueuedAt: r.enqueuedAt
+          })
+      // The receipt is the CAS: a duplicate receipt admits no new work.
+      const minted = await insert(receipt)
+      if (minted.changes !== 1) return { admitted: false }
+      if ((await insert(row)).changes !== 1) throw new Error('inbox admission row was not inserted')
+      return { admitted: true }
+    })
+  }
+
+  /** Stable-id admission probe used before any hook anchoring side effect. A
+   * live row will be replayed (or is already running); a terminal row is the
+   * durable receipt. Either way, redelivery must not post another anchor. */
+  async hasInbox(id: string): Promise<boolean> {
+    return (await this.db.prepare('SELECT 1 FROM inbox WHERE id = ?').get(id)) !== undefined
+  }
+
+  async updateInboxHookState(
+    id: string,
+    hookContext: string | null,
+    posterPublishState?: 'not_started' | 'in_flight' | 'settled'
+  ): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE inbox
+         SET hookContext = @hookContext,
+             posterPublishState = COALESCE(@posterPublishState, posterPublishState)
+         WHERE id = @id`
+      )
+      .run({ id, hookContext, posterPublishState: posterPublishState ?? null })
+    return result.changes === 1
+  }
+
+  /** Persist a hook prompt rewrite and its matching trusted context together. */
+  async updateInboxHookPayload(id: string, msg: string, hookContext: string): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `UPDATE inbox
+         SET msg = @msg, hookContext = @hookContext
+         WHERE id = @id AND hookContext IS NOT NULL AND completedAt IS NULL`
+      )
+      .run({ id, msg, hookContext })
+    return result.changes === 1
+  }
+
+  /** Atomically fold one live hook delivery into another and retain the follower as a terminal receipt. */
+  async coalesceHookInbox(input: {
+    leaderId: string
+    leaderMsg: string
+    leaderHookContext: string
+    followerId: string
+    followerTerminalReport: string
+    followerOwnerId?: string
+    completedAt: number
+  }): Promise<boolean> {
+    if (input.leaderId === input.followerId) return false
+    return rollbackAs(
+      this.transaction(async (raw) => {
+        const tx = accessOf(raw)
+        const leader = await tx
+          .prepare(
+            `UPDATE inbox
+           SET msg = @leaderMsg, hookContext = @leaderHookContext
+           WHERE id = @leaderId AND hookContext IS NOT NULL AND completedAt IS NULL`
+          )
+          .run({
+            leaderId: input.leaderId,
+            leaderMsg: input.leaderMsg,
+            leaderHookContext: input.leaderHookContext
+          })
+        const follower = await tx
+          .prepare(
+            `UPDATE inbox
+           SET msg = '{}', integrationId = NULL, callMeta = NULL, hookContext = NULL,
+               posterPublishState = 'settled', terminalReport = @followerTerminalReport,
+               reportOwnerId = @followerOwnerId, reportClaimedAt = @completedAt,
+               completedAt = @completedAt, isQueueCmd = NULL
+           WHERE id = @followerId AND hookContext IS NOT NULL AND completedAt IS NULL`
+          )
+          .run({
+            followerId: input.followerId,
+            followerTerminalReport: input.followerTerminalReport,
+            followerOwnerId: input.followerOwnerId ?? null,
+            completedAt: input.completedAt
+          })
+        if (leader.changes !== 1 || follower.changes !== 1) throw new RollbackSignal()
+        return true
+      }),
+      false
+    )
+  }
+
+  /** Atomically turn a live hook inbox row into a redacted terminal receipt.
+   * The stable id remains present to absorb relay redelivery after restart;
+   * startup re-emits only the metadata report, never the model prompt. The CAS
+   * result identifies the sole writer so a later terminal path cannot replace
+   * the winning outbox body. */
+  async completeHookInbox(
+    id: string,
+    terminalReport: string,
+    completedAt: number,
+    ownerId?: string
+  ): Promise<'completed' | 'already-terminal' | 'missing'> {
+    const result = await this.db
+      .prepare(
+        `UPDATE inbox
+         SET msg = '{}', integrationId = NULL, callMeta = NULL, hookContext = NULL, codeHostReplyTarget = NULL,
+             posterPublishState = 'settled', terminalReport = @terminalReport,
+             reportOwnerId = @ownerId, reportClaimedAt = @completedAt,
+             completedAt = @completedAt, isQueueCmd = NULL
+         WHERE id = @id AND hookContext IS NOT NULL AND completedAt IS NULL`
+      )
+      .run({ id, terminalReport, completedAt, ownerId: ownerId ?? null })
+    if (result.changes === 1) return 'completed'
+
+    const row = (await this.db.prepare('SELECT completedAt FROM inbox WHERE id = ?').get(id)) as
+      { completedAt: number | null } | undefined
+    return row?.completedAt !== null && row?.completedAt !== undefined ? 'already-terminal' : 'missing'
+  }
+
+  /** A CP-correlated ACK releases only the report payload. Keep a bounded
+   * metadata-only stable-id receipt so relay redelivery still cannot rerun the
+   * model; unacknowledged reports are never capacity-evicted. On a shared pool
+   * store only the claim holder may release a body — a peer's verdict about its
+   * own dispatch says nothing about this row. */
+  async acknowledgeHookInbox(
+    id: string,
+    options: { ownerId?: string; maxAcknowledgedReceipts?: number } = {}
+  ): Promise<boolean> {
+    const maxAcknowledgedReceipts = options.maxAcknowledgedReceipts ?? 10_000
+    const fence = this.shared ? ' AND (reportOwnerId IS NULL OR reportOwnerId = @ownerId)' : ''
+    const result = await this.db
+      .prepare(
+        `UPDATE inbox
+         SET terminalReport = NULL, reportOwnerId = NULL, reportClaimedAt = NULL
+         WHERE id = @id AND completedAt IS NOT NULL AND terminalReport IS NOT NULL${fence}`
+      )
+      .run({ id, ...(fence ? { ownerId: options.ownerId ?? null } : {}) })
+    if (result.changes === 1) {
+      await this.db
+        .prepare(
+          `DELETE FROM inbox
+           WHERE id IN (
+             SELECT id FROM inbox
+             WHERE completedAt IS NOT NULL AND terminalReport IS NULL
+             ORDER BY completedAt DESC, id DESC
+             LIMIT -1 OFFSET @maxAcknowledgedReceipts
+           )`
+        )
+        .run({ maxAcknowledgedReceipts })
+    }
+    return result.changes === 1
+  }
+
+  /** Unacknowledged hook terminal reports this member may emit right now.
+   *
+   * A local store owns every row outright, so it drains the whole outbox as
+   * before. On a shared pool store the outbox is one table for every member, so
+   * a row is offered only when this member owns it, when it is unowned (legacy
+   * or pre-pool), or when its owner's claim lapsed AND this member currently
+   * serves the agent — draining a live peer's row would only earn a CONFLICT
+   * for a dispatch that is not ours. */
+  async listHookTerminalReports(now: number, ownerId?: string, agentIds?: readonly string[]): Promise<InboxRow[]> {
+    const order = ' ORDER BY sessionKey ASC, enqueuedAt ASC'
+    if (!this.shared) {
+      return (await this.db
+        .prepare(`SELECT * FROM inbox WHERE terminalReport IS NOT NULL${order}`)
+        .all()) as unknown as InboxRow[]
+    }
+    const scope = idScope('agentId', agentIds)
+    return (await this.db
+      .prepare(
+        `SELECT * FROM inbox
+         WHERE terminalReport IS NOT NULL
+           AND (reportOwnerId IS NULL OR reportOwnerId = @ownerId
+                OR (COALESCE(reportClaimedAt, 0) <= @staleBefore${scope.sql}))${order}`
+      )
+      .all({
+        ownerId: ownerId ?? null,
+        staleBefore: now - SHARED_OUTBOX_LEASE_MS,
+        ...scope.params
+      })) as unknown as InboxRow[]
+  }
+
+  /** Take or renew this member's claim on one report before emitting it. */
+  async claimHookTerminalReport(id: string, ownerId: string | undefined, now: number): Promise<boolean> {
+    if (!this.shared) return true
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE inbox
+           SET reportOwnerId = @ownerId, reportClaimedAt = @now
+           WHERE id = @id AND terminalReport IS NOT NULL
+             AND (reportOwnerId IS NULL OR reportOwnerId = @ownerId
+                  OR COALESCE(reportClaimedAt, 0) <= @staleBefore)`
+          )
+          .run({ id, ownerId: ownerId ?? null, now, staleBefore: now - SHARED_OUTBOX_LEASE_MS })
+      ).changes === 1
+    )
+  }
+
+  /** Hand a claimed report back to the daemon whose dispatch the CP accepts it
+   * from. The body is never released here: a CONFLICT raised against a peer's
+   * dispatch means "not mine to report", not "this can never be valid". */
+  async releaseHookTerminalReport(id: string, ownerId: string, now: number): Promise<boolean> {
+    if (!this.shared) return false
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE inbox
+           SET reportOwnerId = @ownerId, reportClaimedAt = @now
+           WHERE id = @id AND terminalReport IS NOT NULL`
+          )
+          .run({ id, ownerId, now })
+      ).changes === 1
+    )
+  }
+
+  /** Remove an ordinary inbox row once its turn reaches a terminal state. Hook
+   * rows are converted to bounded redacted receipts by completeHookInbox. */
+  async removeInbox(id: string): Promise<void> {
+    await this.db.prepare('DELETE FROM inbox WHERE id = ?').run(id)
+  }
+
+  /** All pending inbox rows, ordered FIFO-by-sessionKey (sessionKey, then enqueuedAt) for
+   *  startup replay (§6.9 #353). Order within a sessionKey is preserved by `enqueuedAt`. */
+  async listInboxBySessionKeyFifo(): Promise<InboxRow[]> {
+    return (await this.db
+      .prepare('SELECT * FROM inbox ORDER BY sessionKey ASC, enqueuedAt ASC')
+      .all()) as unknown as InboxRow[]
+  }
+
+  async setIntegrationRemoved(agentId: string, integrationId: string, removed: boolean): Promise<void> {
+    const sql = removed
+      ? 'INSERT INTO removed_integrations (agentId, integrationId) VALUES (?, ?) ON CONFLICT DO NOTHING'
+      : 'DELETE FROM removed_integrations WHERE agentId = ? AND integrationId = ?'
+    await this.db.prepare(sql).run(agentId, integrationId)
+  }
+
+  async isIntegrationRemoved(agentId: string, integrationId: string): Promise<boolean> {
+    return (
+      (await this.db
+        .prepare('SELECT 1 FROM removed_integrations WHERE agentId = ? AND integrationId = ?')
+        .get(agentId, integrationId)) !== undefined
+    )
+  }
+
+  // Purge ordinary turns in scope; live hook owners and unacknowledged reports retain their completion path.
+  async removeInboxByAgentId(agentId: string, integrationId?: string): Promise<string[]> {
+    const removable =
+      'agentId = ? AND hookContext IS NULL AND terminalReport IS NULL' +
+      (integrationId === undefined ? '' : ' AND integrationId = ?')
+    const params = integrationId === undefined ? [agentId] : [agentId, integrationId]
+    const rows = (await this.db.prepare(`SELECT id FROM inbox WHERE ${removable}`).all(...params)) as Array<{
+      id: string
+    }>
+    await this.db.prepare(`DELETE FROM inbox WHERE ${removable}`).run(...params)
+    return rows.map((row) => row.id)
+  }
+
+  /** Persist a bounded capture before any external side effect. Both the stable
+   * operation id and the semantic (agent, connection, turn) key deduplicate
+   * redelivery. A conflicting duplicate fails closed instead of replacing body.
+   * Insert-then-classify, not a transaction: the INSERT is the CAS, and the read that
+   * follows only names why a duplicate lost — a writer interleaving there changes neither. */
+  async appendMemoryCapture(row: MemoryCaptureOutboxRow): Promise<'inserted' | 'duplicate' | 'conflict'> {
+    const result = await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_capture_outbox
+          (operationId, turnId, agentId, connectionId, connectionRevision, pluginId, manifestDigest, config,
+           scopeKey, sessionId, input, output, payloadHash, payloadBytes, idempotency, state,
+           attempts, backendOperationId, reasonCode, nextAttemptAt, createdAt, updatedAt)
+         VALUES
+          (@operationId, @turnId, @agentId, @connectionId, @connectionRevision, @pluginId, @manifestDigest, @config,
+           @scopeKey, @sessionId, @input, @output, @payloadHash, @payloadBytes, @idempotency, @state,
+           @attempts, @backendOperationId, @reasonCode, @nextAttemptAt, @createdAt, @updatedAt)`
+      )
+      .run({
+        ...row,
+        manifestDigest: row.manifestDigest ?? null,
+        sessionId: row.sessionId ?? null,
+        backendOperationId: row.backendOperationId ?? null,
+        reasonCode: row.reasonCode ?? null
+      })
+    if (result.changes === 1) return 'inserted'
+    const existing = (await this.db
+      .prepare(
+        `SELECT operationId, turnId, agentId, connectionId, connectionRevision, pluginId, manifestDigest,
+                payloadHash, idempotency
+         FROM memory_capture_outbox
+         WHERE operationId = @operationId OR (agentId = @agentId AND connectionId = @connectionId AND turnId = @turnId)
+         LIMIT 1`
+      )
+      .get({
+        operationId: row.operationId,
+        agentId: row.agentId,
+        connectionId: row.connectionId,
+        turnId: row.turnId
+      })) as
+      | Pick<
+          MemoryCaptureOutboxRow,
+          | 'operationId'
+          | 'turnId'
+          | 'agentId'
+          | 'connectionId'
+          | 'connectionRevision'
+          | 'pluginId'
+          | 'manifestDigest'
+          | 'payloadHash'
+          | 'idempotency'
+        >
+      | undefined
+    if (
+      existing &&
+      existing.operationId === row.operationId &&
+      existing.turnId === row.turnId &&
+      existing.agentId === row.agentId &&
+      existing.connectionId === row.connectionId &&
+      existing.connectionRevision === row.connectionRevision &&
+      existing.pluginId === row.pluginId &&
+      (existing.manifestDigest ?? null) === (row.manifestDigest ?? null) &&
+      existing.payloadHash === row.payloadHash &&
+      existing.idempotency === row.idempotency
+    ) {
+      return 'duplicate'
+    }
+    return 'conflict'
+  }
+
+  async getMemoryCapture(operationId: string): Promise<MemoryCaptureOutboxRow | undefined> {
+    return (await this.db.prepare('SELECT * FROM memory_capture_outbox WHERE operationId = ?').get(operationId)) as
+      MemoryCaptureOutboxRow | undefined
+  }
+
+  async listMemoryCaptures(): Promise<MemoryCaptureOutboxRow[]> {
+    return (await this.db
+      .prepare('SELECT * FROM memory_capture_outbox ORDER BY createdAt ASC, operationId ASC')
+      .all()) as unknown as MemoryCaptureOutboxRow[]
+  }
+
+  async nextDueMemoryCapture(
+    now: number,
+    connectionIds?: readonly string[]
+  ): Promise<MemoryCaptureOutboxRow | undefined> {
+    const scope = idScope('connectionId', connectionIds)
+    return (await this.db
+      .prepare(
+        `SELECT * FROM memory_capture_outbox
+         WHERE state IN ('pending', 'accepted') AND nextAttemptAt <= @now${scope.sql}
+         ORDER BY nextAttemptAt ASC, createdAt ASC, operationId ASC
+         LIMIT 1`
+      )
+      .get({ now, ...scope.params })) as MemoryCaptureOutboxRow | undefined
+  }
+
+  async nextMemoryCaptureDueAt(connectionIds?: readonly string[]): Promise<number | undefined> {
+    const scope = idScope('connectionId', connectionIds)
+    const row = (await this.db
+      .prepare(
+        `SELECT MIN(nextAttemptAt) AS dueAt FROM memory_capture_outbox
+         WHERE state IN ('pending', 'accepted')${scope.sql}`
+      )
+      .get(scope.params)) as { dueAt: number | null } | undefined
+    return row?.dueAt ?? undefined
+  }
+
+  /** Next age/retention deadline even when there is no due send. This keeps a
+   * quiet daemon from retaining terminal dedup receipts indefinitely. */
+  async nextMemoryCaptureMaintenanceAt(
+    activeAgeMs: number,
+    connectionIds?: readonly string[]
+  ): Promise<number | undefined> {
+    const scope = idScope('connectionId', connectionIds)
+    const row = (await this.db
+      .prepare(
+        `SELECT
+           MIN(CASE WHEN state IN ('pending', 'accepted') THEN createdAt + @activeAgeMs END) AS activeAt,
+           MIN(CASE WHEN state = 'sending' THEN updatedAt + @recoveryLeaseMs END) AS recoveryAt
+         FROM memory_capture_outbox
+         WHERE 1 = 1${scope.sql}`
+      )
+      .get({
+        activeAgeMs,
+        recoveryLeaseMs: this.shared ? SHARED_OUTBOX_LEASE_MS : 0,
+        ...scope.params
+      })) as { activeAt: number | null; recoveryAt: number | null } | undefined
+    const deadlines = [row?.activeAt, row?.recoveryAt].filter(
+      (value): value is number => value !== null && value !== undefined
+    )
+    return deadlines.length ? Math.min(...deadlines) : undefined
+  }
+
+  /** The claim and the read-back are one transaction: the row this call answers with must be the
+   *  one it just claimed, not whatever a peer's retry left behind between the two statements. */
+  async claimMemoryCapture(operationId: string, now: number): Promise<MemoryCaptureOutboxRow | undefined> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const changed = await tx
+        .prepare(
+          `UPDATE memory_capture_outbox
+         SET state = 'sending', attempts = attempts + 1, updatedAt = @now
+         WHERE operationId = @operationId AND state = 'pending'`
+        )
+        .run({ operationId, now })
+      if (changed.changes !== 1) return undefined
+      return (await tx.prepare('SELECT * FROM memory_capture_outbox WHERE operationId = ?').get(operationId)) as
+        MemoryCaptureOutboxRow | undefined
+    })
+  }
+
+  async deferPendingMemoryCapture(
+    operationId: string,
+    nextAttemptAt: number,
+    now: number,
+    reasonCode: string
+  ): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET nextAttemptAt = @nextAttemptAt, updatedAt = @now, reasonCode = @reasonCode
+           WHERE operationId = @operationId AND state = 'pending'`
+          )
+          .run({ operationId, nextAttemptAt, now, reasonCode })
+      ).changes === 1
+    )
+  }
+
+  async retryMemoryCapture(
+    operationId: string,
+    nextAttemptAt: number,
+    now: number,
+    reasonCode: string
+  ): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET state = 'pending', nextAttemptAt = @nextAttemptAt, updatedAt = @now,
+               reasonCode = @reasonCode
+           WHERE operationId = @operationId AND state = 'sending'`
+          )
+          .run({ operationId, nextAttemptAt, now, reasonCode })
+      ).changes === 1
+    )
+  }
+
+  async acceptMemoryCapture(
+    operationId: string,
+    backendOperationId: string,
+    nextAttemptAt: number,
+    now: number
+  ): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET state = 'accepted', backendOperationId = @backendOperationId,
+               nextAttemptAt = @nextAttemptAt, updatedAt = @now, reasonCode = NULL,
+               input = '', output = '', sessionId = NULL,
+               payloadBytes = length(CAST(config AS BLOB))
+           WHERE operationId = @operationId AND state = 'sending'`
+          )
+          .run({ operationId, backendOperationId, nextAttemptAt, now })
+      ).changes === 1
+    )
+  }
+
+  async rescheduleAcceptedMemoryCapture(operationId: string, nextAttemptAt: number, now: number): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET nextAttemptAt = @nextAttemptAt, updatedAt = @now
+           WHERE operationId = @operationId AND state = 'accepted'`
+          )
+          .run({ operationId, nextAttemptAt, now })
+      ).changes === 1
+    )
+  }
+
+  async finishMemoryCapture(
+    operationId: string,
+    state: 'completed' | 'failed' | 'ambiguous',
+    now: number,
+    reasonCode?: string
+  ): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET state = @state, updatedAt = @now, nextAttemptAt = @now,
+               reasonCode = @reasonCode, config = '{}', input = '', output = '',
+               sessionId = NULL, payloadBytes = 0
+           WHERE operationId = @operationId AND state IN ('sending', 'accepted', 'pending')`
+          )
+          .run({ operationId, state, now, reasonCode: reasonCode ?? null })
+      ).changes === 1
+    )
+  }
+
+  /** Recover only abandoned shared claims; local stores remain exclusively owned across restart. */
+  async recoverMemoryCaptures(
+    now: number,
+    staleOnly = false,
+    connectionIds?: readonly string[]
+  ): Promise<{ retried: number; ambiguous: number }> {
+    if (staleOnly && !this.shared) return { retried: 0, ambiguous: 0 }
+    const scope = idScope('connectionId', !this.shared && !staleOnly ? undefined : connectionIds)
+    const staleClause = this.shared ? ' AND updatedAt <= @staleBefore' : ''
+    const params = this.shared
+      ? { now, staleBefore: now - SHARED_OUTBOX_LEASE_MS, ...scope.params }
+      : { now, ...scope.params }
+    const retried = (
+      await this.db
+        .prepare(
+          `UPDATE memory_capture_outbox
+         SET state = 'pending', nextAttemptAt = @now, updatedAt = @now,
+             reasonCode = 'restart_retry'
+         WHERE state = 'sending' AND idempotency = 'operation-id'${staleClause}${scope.sql}`
+        )
+        .run(params)
+    ).changes
+    const ambiguous = (
+      await this.db
+        .prepare(
+          `UPDATE memory_capture_outbox
+         SET state = 'ambiguous', nextAttemptAt = @now, updatedAt = @now,
+             reasonCode = 'restart_after_send', config = '{}', input = '', output = '',
+             sessionId = NULL, payloadBytes = 0
+         WHERE state = 'sending' AND idempotency = 'none'${staleClause}${scope.sql}`
+        )
+        .run(params)
+    ).changes
+    return { retried: Number(retried), ambiguous: Number(ambiguous) }
+  }
+
+  /** Age out a capture that never settled: a state change with a redaction and a metric, so it
+   *  stays here. Dropping the terminal row afterwards is retention and belongs to the rule table. */
+  async expireMemoryCaptures(activeBefore: number, now: number, connectionIds?: readonly string[]): Promise<number> {
+    const scope = idScope('connectionId', connectionIds)
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE memory_capture_outbox
+           SET state = 'failed', nextAttemptAt = @now, updatedAt = @now,
+               reasonCode = 'retention_expired', config = '{}', input = '', output = '',
+               sessionId = NULL, payloadBytes = 0
+           WHERE state IN ('pending', 'accepted') AND createdAt <= @activeBefore${scope.sql}`
+          )
+          .run({ now, activeBefore, ...scope.params })
+      ).changes
+    )
+  }
+
+  async memoryCaptureStats(connectionIds?: readonly string[]): Promise<MemoryCaptureOutboxStats> {
+    const scope = idScope('connectionId', connectionIds)
+    const row = (await this.db
+      .prepare(
+        `SELECT COUNT(*) AS activeCount, COALESCE(SUM(payloadBytes), 0) AS activeBytes,
+                MIN(createdAt) AS oldestActiveAt
+         FROM memory_capture_outbox
+         WHERE state IN ('pending', 'sending', 'accepted')${scope.sql}`
+      )
+      .get(scope.params)) as { activeCount: number; activeBytes: number; oldestActiveAt: number | null }
+    return {
+      activeCount: row.activeCount,
+      activeBytes: row.activeBytes,
+      ...(row.oldestActiveAt === null ? {} : { oldestActiveAt: row.oldestActiveAt })
+    }
+  }
+
+  /** Upsert the durable non-secret record of a provisioned remote MCP grant.
+   *  Overwrites a pending revocation for the conversation: re-provisioning means
+   *  the CP re-validated the authority and the stale queued revoke must not fire
+   *  against the fresh grant. */
+  async recordWebchatMcpGrant(input: {
+    conversationId: string
+    agentId: string
+    authorityId: string
+    authorityGeneration: number
+    now: number
+  }): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO webchat_mcp_grant_ledger
+           (conversationId, agentId, authorityId, authorityGeneration, state, reason, attempts, nextAttemptAt,
+            updatedAt, ownerId)
+         VALUES (@conversationId, @agentId, @authorityId, @authorityGeneration, 'active', NULL, 0, NULL, @now, @ownerId)
+         ON CONFLICT (conversationId) DO UPDATE SET
+           agentId = excluded.agentId,
+           authorityId = excluded.authorityId,
+           authorityGeneration = excluded.authorityGeneration,
+           state = 'active', reason = NULL, attempts = 0, nextAttemptAt = NULL,
+           updatedAt = excluded.updatedAt, ownerId = excluded.ownerId`
+      )
+      .run({ ...input, ownerId: this.ownerId ?? null })
+  }
+
+  /** Queue a durable revocation for a grant authority whose remote revoke failed
+   *  (or must outlive this process). Fenced to the exact authority tuple via the
+   *  upsert so a concurrent re-provision (newer tuple) is not downgraded. */
+  async markWebchatMcpGrantRevoking(input: {
+    conversationId: string
+    agentId: string
+    authorityId: string
+    authorityGeneration: number
+    reason: string
+    now: number
+  }): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO webchat_mcp_grant_ledger
+           (conversationId, agentId, authorityId, authorityGeneration, state, reason, attempts, nextAttemptAt,
+            updatedAt, ownerId)
+         VALUES (@conversationId, @agentId, @authorityId, @authorityGeneration, 'revoking', @reason, 0, @now, @now,
+            @ownerId)
+         ON CONFLICT (conversationId) DO UPDATE SET
+           state = 'revoking', reason = excluded.reason, nextAttemptAt = excluded.nextAttemptAt,
+           updatedAt = excluded.updatedAt, ownerId = excluded.ownerId
+         WHERE webchat_mcp_grant_ledger.authorityId = excluded.authorityId
+           AND webchat_mcp_grant_ledger.authorityGeneration <= excluded.authorityGeneration`
+      )
+      .run({ ...input, ownerId: this.ownerId ?? null })
+  }
+
+  /** Drop the ledger row after the CP confirmed revocation — only for the exact
+   *  tuple, so a newer re-provisioned authority record survives a late confirm. */
+  async clearWebchatMcpGrant(conversationId: string, authorityId: string, authorityGeneration: number): Promise<void> {
+    await this.db
+      .prepare(
+        `DELETE FROM webchat_mcp_grant_ledger
+         WHERE conversationId = ? AND authorityId = ? AND authorityGeneration = ?`
+      )
+      .run(conversationId, authorityId, authorityGeneration)
+  }
+
+  /** Startup orphan sweep over the grants THIS incarnation recorded: its descriptors and
+   *  plaintext died with it. On a shared store an 'active' row may be a peer's live authority
+   *  for a conversation in progress, so ownership — not process start — decides. */
+  async markOwnedWebchatMcpGrantsRevoking(reason: string, now: number): Promise<number> {
+    const owned = this.shared ? ' AND ownerId = @ownerId' : ''
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE webchat_mcp_grant_ledger
+           SET state = 'revoking', reason = @reason, nextAttemptAt = @now, updatedAt = @now
+           WHERE state = 'active'${owned}`
+          )
+          .run({ reason, now, ...(this.shared ? { ownerId: this.ownerId! } : {}) })
+      ).changes
+    )
+  }
+
+  /** Take over the grant rows of a former owner of these agents once the CP makes this process
+   *  responsible for them: the plaintext went with the owner, so the authority must be revoked. */
+  async reclaimWebchatMcpGrants(agentIds: readonly string[], reason: string, now: number): Promise<number> {
+    if (!this.shared || agentIds.length === 0) return 0
+    const scope = idScope('agentId', agentIds)
+    return Number(
+      (
+        await this.db
+          .prepare(
+            `UPDATE webchat_mcp_grant_ledger
+           SET state = 'revoking', reason = @reason, attempts = 0, nextAttemptAt = @now,
+               updatedAt = @now, ownerId = @ownerId
+           WHERE (ownerId IS NULL OR ownerId != @ownerId)${scope.sql}`
+          )
+          .run({ reason, now, ownerId: this.ownerId!, ...scope.params })
+      ).changes
+    )
+  }
+
+  /** The revocations this process must deliver: its own queue, plus rows written before ownership was
+   *  recorded. A peer's queued revoke is the peer's to land — here it would duplicate the CP call. */
+  async listDueWebchatMcpRevocations(now: number, limit = 50): Promise<WebchatMcpGrantLedgerRow[]> {
+    const owned = this.shared ? ' AND (ownerId IS NULL OR ownerId = @ownerId)' : ''
+    return (await this.db
+      .prepare(
+        `SELECT * FROM webchat_mcp_grant_ledger
+         WHERE state = 'revoking' AND (nextAttemptAt IS NULL OR nextAttemptAt <= @now)${owned}
+         ORDER BY nextAttemptAt ASC, conversationId ASC
+         LIMIT @limit`
+      )
+      .all({ now, limit, ...(this.shared ? { ownerId: this.ownerId! } : {}) })) as unknown as WebchatMcpGrantLedgerRow[]
+  }
+
+  /** Reschedule one failed revocation attempt (exact-tuple fenced). */
+  async retryWebchatMcpRevocation(
+    conversationId: string,
+    authorityId: string,
+    authorityGeneration: number,
+    nextAttemptAt: number,
+    now: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE webchat_mcp_grant_ledger
+         SET attempts = attempts + 1, nextAttemptAt = @nextAttemptAt, updatedAt = @now
+         WHERE conversationId = @conversationId AND authorityId = @authorityId
+           AND authorityGeneration = @authorityGeneration AND state = 'revoking'`
+      )
+      .run({ conversationId, authorityId, authorityGeneration, nextAttemptAt, now })
+  }
+
+  /** The §16 projection THIS daemon identity last wrote for a merge-request head, or nothing yet.
+   *  Scoped by the stable daemon id on every store: a pool peer's row is not this daemon's to read. */
+  async getNoteProjection(daemonId: string, projectionKey: string): Promise<NoteProjectionRow | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM code_host_note_projection WHERE projectionKey = @projectionKey AND daemonId = @daemonId')
+      .get({ projectionKey, daemonId })) as CodeHostNoteProjectionRow | undefined
+    return row ? toNoteProjectionRow(row) : undefined
+  }
+
+  /** Record the write marker BEFORE the provider mutation, so an interrupted write is reconcilable. */
+  async beginNoteProjectionWrite(row: NoteProjectionRow, now: number): Promise<void> {
+    await this.db
+      .prepare(NOTE_PROJECTION_UPSERT)
+      .run({ ...noteProjectionParams(row, now, this.ownerId ?? null), phase: 'in_flight', outcome: null, code: null })
+  }
+
+  /** Persist a definite outcome as UNREPORTED: it is replayed until the control plane acknowledges it. */
+  async recordNoteProjectionOutcome(
+    row: NoteProjectionRow,
+    outcome: NoteProjectionOutcome,
+    code: string | undefined,
+    now: number
+  ): Promise<void> {
+    await this.db.prepare(NOTE_PROJECTION_UPSERT).run({
+      ...noteProjectionParams(row, now, this.ownerId ?? null),
+      phase: 'settled_unreported',
+      outcome,
+      code: code ?? null
+    })
+  }
+
+  /** The control plane acknowledged the result: only then does the row stop being replayed. */
+  async markNoteProjectionReported(
+    daemonId: string,
+    projectionKey: string,
+    writeMarker: string,
+    now: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE code_host_note_projection
+         SET phase = 'settled', updatedAt = @now
+         WHERE projectionKey = @projectionKey AND daemonId = @daemonId AND writeMarker = @writeMarker
+           AND phase = 'settled_unreported'`
+      )
+      .run({ projectionKey, daemonId, writeMarker, now })
+  }
+
+  /**
+   * Writes THIS DAEMON IDENTITY has not carried to a reported outcome: reconcile or replay.
+   *
+   * Keyed by the stable daemon id, never the process incarnation, because a restart is exactly when
+   * recovery is owed — and the control plane keeps an ambiguous write marker on that same identity,
+   * so a row no restarted daemon could see would never be settled by anyone.
+   */
+  async listUnsettledNoteProjections(daemonId: string, limit = 100): Promise<NoteProjectionRow[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT * FROM code_host_note_projection
+         WHERE daemonId = @daemonId AND phase IN ('in_flight', 'settled_unreported')
+         ORDER BY updatedAt ASC LIMIT @limit`
+      )
+      .all({ daemonId, limit })) as unknown as CodeHostNoteProjectionRow[]
+    return rows.map(toNoteProjectionRow)
+  }
+
+  /**
+   * A restart-stable daemon-local secret, minted once on first use.
+   *
+   * The insert is `ON CONFLICT DO NOTHING` and the read follows it, so two callers racing
+   * the same name both observe the one stored value rather than each keeping its own.
+   */
+  async getOrCreateDaemonSecret(name: string, mint: () => string, now: number): Promise<string> {
+    await this.db
+      .prepare('INSERT INTO daemon_secret (name, value, createdAt) VALUES (@name, @value, @now) ON CONFLICT DO NOTHING')
+      .run({ name, value: mint(), now })
+    const row = (await this.db.prepare('SELECT value FROM daemon_secret WHERE name = @name').get({ name })) as
+      { value: string } | undefined
+    if (!row) throw new Error(`daemon secret ${name} could not be stored`)
+    return row.value
+  }
+
+  // Fixed slots bound retained continuation bytes per agent even with concurrent pool members.
+  async putMemoryEntryContinuation(agentId: string, value: string, expiresAt: number): Promise<string> {
+    if (Buffer.byteLength(value) > MEMORY_CONTINUATION_MAX_BYTES)
+      throw new Error('memory continuation exceeds storage budget')
+    const token = randomUUID()
+    for (let attempt = 0; attempt < 64; attempt++) {
+      const allocated = await this.transaction(async (tx) => {
+        const rows = (
+          await tx.query('SELECT slot, token, expiresAt FROM memory_entry_continuation WHERE agentId = ?', [agentId])
+        ).rows as { slot: number; token: string; expiresAt: number }[]
+        const used = new Set(rows.map((row) => row.slot))
+        const free = Array.from({ length: MEMORY_CONTINUATION_SLOTS }, (_, index) => index).find(
+          (index) => !used.has(index)
+        )
+        if (free !== undefined) {
+          const result = await tx.query(
+            `INSERT INTO memory_entry_continuation (agentId, slot, token, value, expiresAt)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (agentId, slot) DO NOTHING`,
+            [agentId, free, token, value, expiresAt]
+          )
+          return result.changes === 1
+        }
+        const oldest = rows.sort((a, b) => a.expiresAt - b.expiresAt || a.slot - b.slot)[0]!
+        // Evict only the observed occupant; a concurrent allocator's new token is never our victim.
+        const result = await tx.query(
+          `UPDATE memory_entry_continuation SET token = ?, value = ?, expiresAt = ?
+           WHERE agentId = ? AND slot = ? AND token = ?`,
+          [token, value, expiresAt, agentId, oldest.slot, oldest.token]
+        )
+        return result.changes === 1
+      })
+      if (allocated) return token
+    }
+    throw new Error('memory continuation allocation is temporarily busy')
+  }
+
+  async getMemoryEntryContinuation(agentId: string, token: string, now: number): Promise<string | undefined> {
+    const row = (await this.db
+      .prepare('SELECT value FROM memory_entry_continuation WHERE agentId = ? AND token = ? AND expiresAt > ?')
+      .get(agentId, token, now)) as { value: string } | undefined
+    return row?.value
+  }
+
+  /** Remember a control-plane frame this review attempt still owes, so a lost ack is replayed. */
+  async recordReviewIntent(row: ReviewIntentRow, now: number): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO code_host_review_intent (intentId, daemonId, attemptId, orgId, kind, frame, attempts, updatedAt)
+         VALUES (@intentId, @daemonId, @attemptId, @orgId, @kind, @frame, @attempts, @now)
+         ON CONFLICT (intentId) DO UPDATE SET
+           attempts = excluded.attempts, frame = excluded.frame, updatedAt = excluded.updatedAt`
+      )
+      .run({
+        intentId: row.intentId,
+        daemonId: row.daemonId,
+        attemptId: row.attemptId,
+        orgId: row.orgId ?? null,
+        kind: row.kind,
+        frame: row.frame,
+        attempts: row.attempts,
+        now
+      })
+  }
+
+  /** The control plane took it; nothing is owed for that frame any more. */
+  async clearReviewIntent(intentId: string): Promise<void> {
+    await this.db.prepare('DELETE FROM code_host_review_intent WHERE intentId = @intentId').run({ intentId })
+  }
+
+  /** Scoped to the stable daemon identity, so a restart replays its own frames and no peer's. */
+  async listReviewIntents(daemonId: string, limit = 100): Promise<ReviewIntentRow[]> {
+    const rows = (await this.db
+      .prepare(
+        `SELECT intentId, daemonId, attemptId, orgId, kind, frame, attempts FROM code_host_review_intent
+         WHERE daemonId = @daemonId ORDER BY updatedAt ASC LIMIT @limit`
+      )
+      .all({ daemonId, limit })) as unknown as Array<ReviewIntentRow & { orgId: string | null }>
+    return rows.map((row) => ({
+      intentId: row.intentId,
+      daemonId: row.daemonId,
+      attemptId: row.attemptId,
+      ...(row.orgId ? { orgId: row.orgId } : {}),
+      kind: row.kind,
+      frame: row.frame,
+      attempts: row.attempts
+    }))
+  }
+
+  /** Record one message's admission against a conversation-wide fixed window. A trusted
+   *  human boundary resets only the consecutive automatic counter; the total-rate
+   *  backstop deliberately keeps counting so a platform bug that misclassifies its
+   *  own events as human still eventually opens the circuit. */
+  async recordLoopGuardTurn(
+    scopeKey: string,
+    messageKey: string,
+    now: number,
+    automatic: boolean,
+    limits: { windowMs: number; maxTotal: number; maxAutomatic: number }
+  ): Promise<LoopGuardVerdict> {
+    return await this.chargeLoopGuardTurn(this.db, scopeKey, messageKey, now, automatic, limits)
+  }
+
+  /** The charge itself, on whichever statement runner the caller owns — the inbox variant runs
+   *  it inside its transaction, where a statement on the pooled facade would land outside. */
+  private async chargeLoopGuardTurn(
+    db: StoreAccess,
+    scopeKey: string,
+    messageKey: string,
+    now: number,
+    automatic: boolean,
+    limits: { windowMs: number; maxTotal: number; maxAutomatic: number }
+  ): Promise<LoopGuardVerdict> {
+    // Keep only active-window counters plus intentionally-latched incidents. Without
+    // this bounded cleanup, every one-off channel thread would leave a row forever.
+    const cutoff = now - limits.windowMs
+    await db
+      .prepare(
+        `DELETE FROM loop_guard
+         WHERE trippedAt IS NULL AND windowStartedAt <= @cutoff AND automaticWindowStartedAt <= @cutoff`
+      )
+      .run({ cutoff })
+    await db.prepare('DELETE FROM loop_guard_charge WHERE chargedAt <= @cutoff').run({ cutoff })
+    // One message delivered to several agents is one turn signal, not one per agent.
+    const firstCharge =
+      (
+        await db
+          .prepare(
+            'INSERT OR IGNORE INTO loop_guard_charge (scopeKey, messageKey, chargedAt) VALUES (@scopeKey, @messageKey, @now)'
+          )
+          .run({ scopeKey, messageKey, now })
+      ).changes === 1
+    if (!firstCharge) {
+      const current = await this.loopGuardRow(db, scopeKey)
+      if (current?.trippedAt !== null && current?.trippedAt !== undefined)
+        return await this.latchedLoopGuardVerdict(db, scopeKey)
+      return {
+        allowed: true,
+        trippedNow: false,
+        totalCount: Number(current?.totalCount ?? 0),
+        automaticCount: Number(current?.automaticCount ?? 0)
+      }
+    }
+    // The charge is one relative, window-aware statement, never a JS read-modify-write:
+    // pool members sharing this store charge the same conversation concurrently, and an
+    // absolute upsert would let the faster loop lose exactly the increments that matter.
+    // The DO UPDATE guard makes a latched circuit skip the charge and return no row.
+    const charged = (await db
+      .prepare(
+        `INSERT INTO loop_guard
+           (scopeKey, windowStartedAt, totalCount, automaticWindowStartedAt, automaticCount, trippedAt, reason)
+         VALUES (@scopeKey, @now, 1, @now, @automatic, NULL, NULL)
+         ON CONFLICT(scopeKey) DO UPDATE SET
+           windowStartedAt=CASE WHEN @now - loop_guard.windowStartedAt >= @windowMs
+             THEN @now ELSE loop_guard.windowStartedAt END,
+           totalCount=CASE WHEN @now - loop_guard.windowStartedAt >= @windowMs
+             THEN 1 ELSE loop_guard.totalCount + 1 END,
+           automaticWindowStartedAt=CASE WHEN @automatic = 0
+             OR @now - loop_guard.automaticWindowStartedAt >= @windowMs
+             THEN @now ELSE loop_guard.automaticWindowStartedAt END,
+           automaticCount=CASE WHEN @automatic = 0 THEN 0
+             WHEN @now - loop_guard.automaticWindowStartedAt >= @windowMs
+             THEN 1 ELSE loop_guard.automaticCount + 1 END
+         WHERE loop_guard.trippedAt IS NULL
+         RETURNING totalCount, automaticCount`
+      )
+      .get({ scopeKey, now, automatic: automatic ? 1 : 0, windowMs: limits.windowMs })) as
+      { totalCount: number; automaticCount: number } | undefined
+    if (!charged) return await this.latchedLoopGuardVerdict(db, scopeKey)
+
+    const totalCount = Number(charged.totalCount)
+    const automaticCount = Number(charged.automaticCount)
+    const reason =
+      automaticCount > limits.maxAutomatic
+        ? 'automatic_turn_burst'
+        : totalCount > limits.maxTotal
+          ? 'turn_rate_burst'
+          : undefined
+    if (!reason) return { allowed: true, trippedNow: false, totalCount, automaticCount }
+    // The verdict is computed from what was actually stored, so the latch is a CAS: a
+    // member that loses it still refuses the turn but runs no duplicate side effects.
+    const latched =
+      (
+        await db
+          .prepare(
+            'UPDATE loop_guard SET trippedAt=@now, reason=@reason WHERE scopeKey=@scopeKey AND trippedAt IS NULL'
+          )
+          .run({ scopeKey, now, reason })
+      ).changes === 1
+    return { allowed: false, trippedNow: latched, totalCount, automaticCount, reason }
+  }
+
+  /** The verdict for a scope another writer already latched: refuse, own no side effects. */
+  private async latchedLoopGuardVerdict(db: StoreAccess, scopeKey: string): Promise<LoopGuardVerdict> {
+    const current = await this.loopGuardRow(db, scopeKey)
+    return {
+      allowed: false,
+      trippedNow: false,
+      totalCount: Number(current?.totalCount ?? 0),
+      automaticCount: Number(current?.automaticCount ?? 0),
+      ...(current?.reason ? { reason: current.reason } : {})
+    }
+  }
+
+  /** Charge a migrated inbox delivery and advance its marker in one transaction, so a crash
+   *  can neither lose the charge nor charge the same retained row again after ownership moves.
+   *  The transaction buys atomicity only — the charge itself is a relative SQL statement and
+   *  never depends on an exclusive writer, which a shared PostgreSQL store cannot give it.
+   *  A tripping delivery is intentionally left at marker 0: the newly-open durable circuit
+   *  makes its whole scope terminal and replay purges it. */
+  async recordLoopGuardTurnForInbox(
+    inboxId: string,
+    scopeKey: string,
+    messageKey: string,
+    now: number,
+    automatic: boolean,
+    limits: { windowMs: number; maxTotal: number; maxAutomatic: number }
+  ): Promise<LoopGuardVerdict> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const verdict = await this.chargeLoopGuardTurn(tx, scopeKey, messageKey, now, automatic, limits)
+      if (verdict.allowed) {
+        const marked = await tx.prepare('UPDATE inbox SET loopGuardCounted = 1 WHERE id = ?').run(inboxId)
+        if (marked.changes !== 1) throw new Error(`inbox delivery disappeared while charging loop guard: ${inboxId}`)
+      }
+      return verdict
+    })
+  }
+
+  /** Open a loop circuit immediately for a structurally-invalid platform event. The latch
+   *  is a single guarded statement, so concurrent members elect exactly one side-effect owner. */
+  async tripLoopGuard(scopeKey: string, now: number, reason: string): Promise<LoopGuardVerdict> {
+    const latched = (await this.db
+      .prepare(
+        `INSERT INTO loop_guard
+           (scopeKey, windowStartedAt, totalCount, automaticWindowStartedAt, automaticCount, trippedAt, reason)
+         VALUES (@scopeKey, @now, 0, @now, 0, @now, @reason)
+         ON CONFLICT(scopeKey) DO UPDATE SET trippedAt=@now, reason=@reason
+         WHERE loop_guard.trippedAt IS NULL
+         RETURNING totalCount, automaticCount`
+      )
+      .get({ scopeKey, now, reason })) as { totalCount: number; automaticCount: number } | undefined
+    if (!latched) return await this.latchedLoopGuardVerdict(this.db, scopeKey)
+    return {
+      allowed: false,
+      trippedNow: true,
+      totalCount: Number(latched.totalCount),
+      automaticCount: Number(latched.automaticCount),
+      reason
+    }
+  }
+
+  async getLoopGuard(scopeKey: string): Promise<LoopGuardRow | undefined> {
+    return await this.loopGuardRow(this.db, scopeKey)
+  }
+
+  private async loopGuardRow(db: StoreAccess, scopeKey: string): Promise<LoopGuardRow | undefined> {
+    return (await db.prepare('SELECT * FROM loop_guard WHERE scopeKey = ?').get(scopeKey)) as LoopGuardRow | undefined
+  }
+
+  async isLoopGuardOpen(scopeKey: string): Promise<boolean> {
+    const row = await this.getLoopGuard(scopeKey)
+    return row?.trippedAt !== null && row?.trippedAt !== undefined
+  }
+
+  /** Explicit operator/user reset. Purged inbox rows stay purged; reset only lets a
+   *  future fresh message start a new window. Returns whether a guard existed. */
+  async resetLoopGuard(scopeKey: string): Promise<boolean> {
+    return (await this.db.prepare('DELETE FROM loop_guard WHERE scopeKey = ?').run(scopeKey)).changes > 0
+  }
+
+  // ── send-message-routing-rework.md §8.6: activation rendezvous ──
+
+  async getActivation(activationKey: string): Promise<ActivationRecord | undefined> {
+    return (await this.db.prepare('SELECT * FROM activation_rendezvous WHERE activationKey = ?').get(activationKey)) as
+      ActivationRecord | undefined
+  }
+
+  /**
+   * Record the VISIBLE half of a paired delivery and claim the key `pending`
+   * (§3.2 "platform event first"): the observation is stored, and nothing is dispatched.
+   *
+   * Deliberately never advances state on its own. The visible post is provider-
+   * authenticated, but it carries none of the trusted call envelope — so treating its
+   * arrival as an admission would fabricate the very lineage the rendezvous exists to
+   * preserve. It waits for {@link attachActivationEnvelope}.
+   *
+   * Idempotent: a redelivered platform event re-runs this and changes nothing about an
+   * existing record's state or envelope.
+   */
+  async claimActivationObservation(
+    activationKey: string,
+    observation: { agentCallDeliveryId?: string; platformMessageId: string; transcriptCoordinates: string },
+    expiresAt: number
+  ): Promise<ActivationRecord> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      await tx
+        .prepare(
+          `INSERT INTO activation_rendezvous
+             (activationKey, agentCallDeliveryId, platformMessageId, transcriptCoordinates, state, expiresAt)
+           VALUES (?, ?, ?, ?, 'pending', ?)
+           ON CONFLICT(activationKey) DO UPDATE SET
+             agentCallDeliveryId = COALESCE(excluded.agentCallDeliveryId, activation_rendezvous.agentCallDeliveryId),
+             platformMessageId = excluded.platformMessageId,
+             transcriptCoordinates = excluded.transcriptCoordinates`
+        )
+        .run(
+          activationKey,
+          observation.agentCallDeliveryId ?? null,
+          observation.platformMessageId,
+          observation.transcriptCoordinates,
+          expiresAt
+        )
+      return (await tx
+        .prepare('SELECT * FROM activation_rendezvous WHERE activationKey = ?')
+        .get(activationKey)) as ActivationRecord
+    })
+  }
+
+  /** Atomically attach the authoritative envelope; exactly one replica receives the dispatch claim.
+   *  Left CAS-shaped rather than transactional: the guarded INSERT/UPDATE elects the claimer, and
+   *  the retry loop already answers the interleaving a peer's write can cause. */
+  async attachActivationEnvelope(
+    activationKey: string,
+    callEnvelope: string,
+    expiresAt: number,
+    /** Durable inbox id used to reconcile a crash between claim and admission. */
+    dispatchId?: string
+  ): Promise<{ dispatch: boolean; record: ActivationRecord }> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const inserted = await this.db
+        .prepare(
+          `INSERT OR IGNORE INTO activation_rendezvous
+             (activationKey, callEnvelope, dispatchId, state, expiresAt)
+           VALUES (?, ?, ?, 'pending', ?)`
+        )
+        .run(activationKey, callEnvelope, dispatchId ?? null, expiresAt)
+      const claimed =
+        Number(inserted.changes) === 1
+          ? true
+          : Number(
+              (
+                await this.db
+                  .prepare(
+                    `UPDATE activation_rendezvous
+                   SET callEnvelope = ?, dispatchId = ?, expiresAt = ?
+                   WHERE activationKey = ? AND state = 'pending' AND callEnvelope IS NULL`
+                  )
+                  .run(callEnvelope, dispatchId ?? null, expiresAt, activationKey)
+              ).changes
+            ) === 1
+      const record = await this.getActivation(activationKey)
+      if (record) return { dispatch: claimed, record }
+    }
+    throw new Error(`activation claim for "${activationKey}" changed too often`)
+  }
+
+  /**
+   * Commit a dispatched activation: `pending -> admitted`, storing the child session the
+   * delivery opened so every later retry is answered from the record rather than by
+   * opening a second session. Only a `pending` record with an envelope may transition —
+   * the CHECK the design states as "a platform-first paired record cannot become
+   * `admitted` until `callEnvelope` is present".
+   */
+  async admitActivation(activationKey: string, childSessionId: string): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(
+            `UPDATE activation_rendezvous SET state = 'admitted', childSessionId = ?
+           WHERE activationKey = ? AND state = 'pending' AND callEnvelope IS NOT NULL`
+          )
+          .run(childSessionId, activationKey)
+      ).changes === 1
+    )
+  }
+
+  /**
+   * Give the claim back when the dispatch it was claimed for never reached durable
+   * admission (§8.6 — exactly-once must not become never).
+   *
+   * `attachActivationEnvelope` hands out `dispatch: true` exactly once, so a delivery
+   * that then fails to admit — a rejected turn, a persistence error, a crash in the
+   * window — would leave the key claimed forever and every retry would be deduplicated
+   * against a child that does not exist. Releasing restores the pre-claim state so the
+   * next attempt is a first attempt.
+   *
+   * Deliberately narrow: only a `pending` record is released. An `admitted` one has a
+   * real child, and a `transcript-only` one was already reported as a delivery failure —
+   * reopening either would undo a decision something downstream has acted on.
+   */
+  async releaseActivation(activationKey: string): Promise<boolean> {
+    return (
+      (
+        await this.db
+          .prepare(`DELETE FROM activation_rendezvous WHERE activationKey = ? AND state = 'pending'`)
+          .run(activationKey)
+      ).changes === 1
+    )
+  }
+
+  /**
+   * Sweep expired pending records. Two DIFFERENT failures share this table, and they must
+   * not share an outcome.
+   *
+   * **No envelope** — the visible half of a paired call whose authoritative wake never
+   * arrived (§3.2/§8.6). The observation stands, the delivery is a FAILURE, and no
+   * envelope-less child is ever synthesized from platform metadata. Terminal
+   * `transcript-only`, returned so the caller can raise the operational failure.
+   *
+   * **With an envelope** — a claim whose dispatch never reached admission. In-process that
+   * is repaired by `releaseActivation` on the admission barrier, but a hard CRASH between
+   * the claim and admission leaves the row behind with nobody to run that callback. Left
+   * alone it is claimed forever: `attachActivationEnvelope` answers every retry with
+   * `dispatch: false`, so exactly-once quietly becomes never — the failure mode the whole
+   * record exists to prevent. Past its TTL the claim is RELEASED (deleted), so the next
+   * attempt is a first attempt. It is not reported as a delivery failure because, unlike
+   * the envelope-less case, nothing here says the delivery was observed and lost.
+   */
+  async expireActivations(now: number): Promise<{ transcriptOnly: ActivationRecord[]; released: number }> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const transcriptOnly = (await tx
+        .prepare(
+          `SELECT * FROM activation_rendezvous
+           WHERE state = 'pending' AND callEnvelope IS NULL AND expiresAt <= ?`
+        )
+        .all(now)) as unknown as ActivationRecord[]
+      if (transcriptOnly.length > 0) {
+        await tx
+          .prepare(
+            `UPDATE activation_rendezvous SET state = 'transcript-only'
+             WHERE state = 'pending' AND callEnvelope IS NULL AND expiresAt <= ?`
+          )
+          .run(now)
+      }
+      // The crash-recovery arm, RECONCILED against the durable inbox rather than assumed.
+      // A crash between claim and admission leaves two rows that look identical but need
+      // OPPOSITE answers:
+      //   - the inbox row EXISTS ⇒ startup replay will run this turn. The delivery is
+      //     alive, so the claim is completed (`admitted`), never released — releasing
+      //     would let a later retry dispatch the same logical delivery a second time.
+      //   - no inbox row ⇒ the dispatch never persisted. Release, so the next attempt is a
+      //     first attempt; leaving it claimed is exactly-once becoming never.
+      // A legacy row with no `dispatchId` is not reconcilable and takes the release arm —
+      // the same answer as "never persisted".
+      await tx
+        .prepare(
+          `UPDATE activation_rendezvous SET state = 'admitted'
+           WHERE state = 'pending' AND callEnvelope IS NOT NULL AND expiresAt <= ?
+             AND dispatchId IS NOT NULL
+             AND EXISTS (SELECT 1 FROM inbox WHERE inbox.id = activation_rendezvous.dispatchId)`
+        )
+        .run(now)
+      const released = (
+        await tx
+          .prepare(
+            `DELETE FROM activation_rendezvous
+           WHERE state = 'pending' AND callEnvelope IS NOT NULL AND expiresAt <= ?`
+          )
+          .run(now)
+      ).changes
+      return { transcriptOnly, released: Number(released) }
+    })
+  }
+
+  // ── runtime model-catalog cache (runtime-model-catalog.md §4) ──
+
+  /** Upsert a runtime's catalog metadata (phase-1 probe fold or a discovery run).
+   *  A same-fingerprint write PRESERVES the stored complete/modelsHash — a phase-1
+   *  meta refresh must neither satisfy nor re-open the §3.3 discovery gate; a
+   *  fingerprint change (adapter upgrade) resets both so the runtime is re-discovered. */
+  async recordRuntimeCatalogMeta(meta: Omit<RuntimeCatalogMetaRecord, 'complete' | 'modelsHash'>): Promise<void> {
+    await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const existing = (await tx
+        .prepare(
+          'SELECT fingerprint, complete, modelsHash FROM runtime_catalog_meta WHERE ownerId = ? AND runtimeId = ?'
+        )
+        .get(this.cacheOwnerId, meta.runtimeId)) as
+        { fingerprint: string; complete: number; modelsHash: string | null } | undefined
+      const sameGeneration = existing && existing.fingerprint === meta.fingerprint ? existing : undefined
+      await tx
+        .prepare(
+          `INSERT INTO runtime_catalog_meta
+             (ownerId, runtimeId, fingerprint, source, defaultModel, permissionModes, defaultPermissionMode, complete, modelsHash, observedAt)
+           VALUES (@ownerId, @runtimeId, @fingerprint, @source, @defaultModel, @permissionModes, @defaultPermissionMode, @complete, @modelsHash, @observedAt)
+           ON CONFLICT(ownerId, runtimeId) DO UPDATE SET
+             fingerprint=excluded.fingerprint, source=excluded.source, defaultModel=excluded.defaultModel,
+             permissionModes=excluded.permissionModes, defaultPermissionMode=excluded.defaultPermissionMode,
+             complete=excluded.complete,
+             modelsHash=excluded.modelsHash, observedAt=excluded.observedAt`
+        )
+        .run({
+          ownerId: this.cacheOwnerId,
+          runtimeId: meta.runtimeId,
+          fingerprint: meta.fingerprint,
+          source: meta.source,
+          defaultModel: meta.defaultModel ?? null,
+          permissionModes: meta.permissionModes ? JSON.stringify(meta.permissionModes) : null,
+          defaultPermissionMode: meta.defaultPermissionMode ?? null,
+          complete: sameGeneration?.complete ?? 0,
+          modelsHash: sameGeneration?.modelsHash ?? null,
+          observedAt: meta.observedAt
+        })
+    })
+  }
+
+  /** Close the discovery gate for ONE generation: complete=1 + the probed-models hash,
+   *  only where the stored fingerprint still matches — a discovery finishing after the
+   *  runtime was upgraded must not close the new generation's gate. */
+  async markRuntimeCatalogComplete(
+    runtimeId: string,
+    fingerprint: string,
+    modelsHash: string,
+    observedAt: number
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE runtime_catalog_meta
+         SET complete = 1, modelsHash = @modelsHash, observedAt = @observedAt
+         WHERE ownerId = @ownerId AND runtimeId = @runtimeId AND fingerprint = @fingerprint`
+      )
+      .run({ ownerId: this.cacheOwnerId, runtimeId, fingerprint, modelsHash, observedAt })
+  }
+
+  /** Upsert one model's capability row (latest-wins). Written incrementally as each
+   *  model is discovered, so a single-model failure never discards the rest. */
+  async upsertRuntimeModelCap(rec: RuntimeModelCapRecord): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO runtime_model_catalog (ownerId, runtimeId, modelId, fingerprint, capsJson, observedAt)
+         VALUES (@ownerId, @runtimeId, @modelId, @fingerprint, @capsJson, @observedAt)
+         ON CONFLICT(ownerId, runtimeId, modelId) DO UPDATE SET
+           fingerprint=excluded.fingerprint, capsJson=excluded.capsJson, observedAt=excluded.observedAt`
+      )
+      .run({
+        ownerId: this.cacheOwnerId,
+        runtimeId: rec.runtimeId,
+        modelId: rec.modelId,
+        fingerprint: rec.fingerprint,
+        capsJson: JSON.stringify(rec.caps),
+        observedAt: rec.observedAt
+      })
+  }
+
+  /** Drop models that vanished from a runtime's catalog. Called only after a COMPLETE
+   *  successful discovery (prune-on-success) — failures must keep last-good rows. */
+  async pruneRuntimeModelCaps(runtimeId: string, keepModelIds: string[]): Promise<void> {
+    // SQLite accepts an empty IN () list (always false), so an empty keep-set clears
+    // the runtime's rows — correct for a runtime whose catalog came back empty.
+    const placeholders = keepModelIds.map(() => '?').join(', ')
+    await this.db
+      .prepare(
+        `DELETE FROM runtime_model_catalog
+         WHERE ownerId = ? AND runtimeId = ? AND modelId NOT IN (${placeholders})`
+      )
+      .run(this.cacheOwnerId, runtimeId, ...keepModelIds)
+  }
+
+  async getRuntimeCatalogMeta(runtimeId: string): Promise<RuntimeCatalogMetaRecord | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM runtime_catalog_meta WHERE ownerId = ? AND runtimeId = ?')
+      .get(this.cacheOwnerId, runtimeId)) as RuntimeCatalogMetaRow | undefined
+    return row ? runtimeCatalogMetaFromRow(row) : undefined
+  }
+
+  async listRuntimeCatalogMetas(): Promise<RuntimeCatalogMetaRecord[]> {
+    const rows = (await this.db
+      .prepare('SELECT * FROM runtime_catalog_meta WHERE ownerId = ? ORDER BY runtimeId ASC')
+      .all(this.cacheOwnerId)) as unknown as RuntimeCatalogMetaRow[]
+    return rows.map(runtimeCatalogMetaFromRow)
+  }
+
+  async listRuntimeModelCaps(runtimeId?: string): Promise<RuntimeModelCapRecord[]> {
+    const rows = (runtimeId !== undefined
+      ? await this.db
+          .prepare('SELECT * FROM runtime_model_catalog WHERE ownerId = ? AND runtimeId = ? ORDER BY modelId ASC')
+          .all(this.cacheOwnerId, runtimeId)
+      : await this.db
+          .prepare('SELECT * FROM runtime_model_catalog WHERE ownerId = ? ORDER BY runtimeId ASC, modelId ASC')
+          .all(this.cacheOwnerId)) as unknown as RuntimeModelCapRow[]
+    return rows.map((row) => ({
+      runtimeId: row.runtimeId,
+      modelId: row.modelId,
+      fingerprint: row.fingerprint,
+      caps: parseJsonColumn<RuntimeModelCapRecord['caps']>(row.capsJson) ?? {},
+      observedAt: row.observedAt
+    }))
+  }
+
+  /**
+   * Try to become the member that probes this runtime image. One atomic upsert decides it, so two
+   * members starting together cannot both win: the loser reads the winner's payload instead. A
+   * claim whose holder died is retaken once it goes stale — otherwise one crashed member would
+   * leave the pool with no probe at all.
+   */
+  async claimRuntimeImageProbe(input: {
+    imageRef: string
+    memberId: string
+    now: number
+    staleBefore: number
+  }): Promise<boolean> {
+    const row = (await this.db
+      .prepare(
+        `INSERT INTO runtime_image_probe (imageRef, claimedBy, claimedAt)
+         VALUES (@imageRef, @memberId, @now)
+         ON CONFLICT(imageRef) DO UPDATE SET claimedBy = @memberId, claimedAt = @now
+           WHERE runtime_image_probe.claimedBy IS NULL
+              OR runtime_image_probe.claimedBy = @memberId
+              OR COALESCE(runtime_image_probe.claimedAt, 0) <= @staleBefore
+         RETURNING claimedBy`
+      )
+      .get(input)) as { claimedBy: string | null } | undefined
+    return row?.claimedBy === input.memberId
+  }
+
+  /** The published answer for an image, if one has landed. */
+  async readRuntimeImageProbe(imageRef: string): Promise<{ payload: string; probedAt: number } | undefined> {
+    const row = (await this.db
+      .prepare('SELECT payload, probedAt FROM runtime_image_probe WHERE imageRef = ?')
+      .get(imageRef)) as { payload: string | null; probedAt: number | null } | undefined
+    if (!row?.payload || row.probedAt === null) return undefined
+    return { payload: row.payload, probedAt: row.probedAt }
+  }
+
+  /** Hand a claim back without an answer: this member tried and failed, and the pool should not
+   *  have to wait out the whole stale window before another member does. */
+  async releaseRuntimeImageProbe(imageRef: string, memberId: string): Promise<void> {
+    await this.db
+      .prepare('UPDATE runtime_image_probe SET claimedBy = NULL, claimedAt = NULL WHERE imageRef = ? AND claimedBy = ?')
+      .run(imageRef, memberId)
+  }
+
+  /** Publish what this member's probe found, and release the claim with it. Rows for images the
+   *  pool has long stopped running are dropped on the way past: one per image tag ever deployed
+   *  would otherwise accumulate for the life of the deployment. */
+  async publishRuntimeImageProbe(input: { imageRef: string; payload: string; now: number }): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO runtime_image_probe (imageRef, claimedBy, claimedAt, probedAt, payload)
+         VALUES (@imageRef, NULL, NULL, @now, @payload)
+         ON CONFLICT(imageRef) DO UPDATE SET claimedBy = NULL, claimedAt = NULL,
+           probedAt = @now, payload = @payload`
+      )
+      .run(input)
+    await this.db
+      .prepare('DELETE FROM runtime_image_probe WHERE imageRef <> ? AND COALESCE(probedAt, claimedAt, 0) < ?')
+      .run(input.imageRef, input.now - RUNTIME_IMAGE_PROBE_RETENTION_MS)
+  }
+
+  /** Next shim-binding generation for an agent's sandbox: one atomic upsert, so two members cannot tie. */
+  // The row outlives the claim on purpose — nothing here may hand out a number a pod has seen before.
+  async nextSandboxGeneration(agentId: string): Promise<number> {
+    const row = (await this.db
+      .prepare(
+        `INSERT INTO sandbox_generations (agentId, generation) VALUES (?, 1)
+         ON CONFLICT(agentId) DO UPDATE SET generation = sandbox_generations.generation + 1
+         RETURNING generation`
+      )
+      .get(agentId)) as { generation: number } | undefined
+    if (row === undefined) throw new Error(`could not allocate a sandbox generation for agent ${agentId}`)
+    return Number(row.generation)
+  }
+
+  /** Advance the shared write fence before a newly granted duty may mutate cluster skill state. */
+  async projectDutyWriteFence(input: { groupId: string; term: string; daemonId: string }): Promise<boolean> {
+    const result = await this.db
+      .prepare(
+        `INSERT INTO duty_write_fence (groupId, term, daemonId) VALUES (@groupId, @term, @daemonId)
+         ON CONFLICT(groupId) DO UPDATE SET term = excluded.term, daemonId = excluded.daemonId
+         WHERE length(excluded.term) > length(duty_write_fence.term)
+            OR (length(excluded.term) = length(duty_write_fence.term) AND excluded.term > duty_write_fence.term)
+            OR (excluded.term = duty_write_fence.term AND excluded.daemonId = duty_write_fence.daemonId)`
+      )
+      .run(input)
+    return result.changes === 1
+  }
+
+  async revokeDutyWriteFence(input: { groupId: string; term: string; daemonId: string }): Promise<void> {
+    await this.db
+      .prepare('DELETE FROM duty_write_fence WHERE groupId = @groupId AND term = @term AND daemonId = @daemonId')
+      .run(input)
+  }
+
+  async clusterSkillLedger(
+    agentId: string,
+    workspaceIncarnation: string
+  ): Promise<ClusterSkillLedgerRecord | undefined> {
+    const row = (await this.db
+      .prepare('SELECT revision, ledger FROM cluster_skill_ledger WHERE agentId = ? AND workspaceIncarnation = ?')
+      .get(agentId, workspaceIncarnation)) as { revision: number; ledger: string } | undefined
+    if (!row) return undefined
+    return { revision: Number(row.revision), ledger: ClusterSkillLedgerSchema.parse(JSON.parse(row.ledger)) }
+  }
+
+  async beginClusterSkillReconcile(
+    input: ClusterSkillReconcileAuthority & { desiredHash: string; replayKey: string }
+  ): Promise<
+    | {
+        ok: true
+        operationId: string
+        replayKey: string
+        priorRevision: number
+        priorLedger: ClusterSkillLedger
+        resumed: boolean
+      }
+    | { ok: false; reason: 'lost_authority' }
+  > {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const fence = (await tx
+        .prepare('SELECT term, daemonId FROM duty_write_fence WHERE groupId = ?')
+        .get(input.groupId)) as { term: string; daemonId: string } | undefined
+      if (!fence || fence.term !== input.term || fence.daemonId !== input.daemonId) {
+        return { ok: false, reason: 'lost_authority' as const }
+      }
+      const prior = (await tx
+        .prepare('SELECT revision, ledger FROM cluster_skill_ledger WHERE agentId = ? AND workspaceIncarnation = ?')
+        .get(input.agentId, input.workspaceIncarnation)) as { revision: number; ledger: string } | undefined
+      const priorRevision = prior ? Number(prior.revision) : 0
+      const priorLedger = prior ? ClusterSkillLedgerSchema.parse(JSON.parse(prior.ledger)) : { roots: [] }
+      const existing = (await tx
+        .prepare(
+          `SELECT operationId, priorRevision, desiredHash, replayKey FROM cluster_skill_journal
+           WHERE agentId = ? AND workspaceIncarnation = ? AND state = 'applying'`
+        )
+        .get(input.agentId, input.workspaceIncarnation)) as
+        { operationId: string; priorRevision: number; desiredHash: string; replayKey: string | null } | undefined
+      const resumed = Boolean(
+        existing && Number(existing.priorRevision) === priorRevision && existing.desiredHash === input.desiredHash
+      )
+      const operationId = resumed ? existing!.operationId : input.operationId
+      const replayKey = resumed && existing!.replayKey ? existing!.replayKey : input.replayKey
+      await tx
+        .prepare(
+          `INSERT INTO cluster_skill_journal
+             (agentId, workspaceIncarnation, operationId, groupId, term, daemonId, priorRevision, desiredHash, replayKey, state)
+           VALUES (@agentId, @workspaceIncarnation, @operationId, @groupId, @term, @daemonId, @priorRevision, @desiredHash, @replayKey, 'applying')
+           ON CONFLICT(agentId, workspaceIncarnation) DO UPDATE SET
+             operationId = excluded.operationId, groupId = excluded.groupId, term = excluded.term,
+             daemonId = excluded.daemonId, priorRevision = excluded.priorRevision,
+             desiredHash = excluded.desiredHash, replayKey = excluded.replayKey,
+             state = 'applying', resultLedger = NULL`
+        )
+        .run({ ...input, operationId, replayKey, priorRevision })
+      return { ok: true, operationId, replayKey, priorRevision, priorLedger, resumed }
+    })
+  }
+
+  async commitClusterSkillReconcile(
+    input: ClusterSkillReconcileAuthority & { priorRevision: number; ledger: ClusterSkillLedger }
+  ): Promise<{ ok: true; revision: number } | { ok: false; reason: 'lost_authority' }> {
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const fence = (await tx
+        .prepare('SELECT term, daemonId FROM duty_write_fence WHERE groupId = ?')
+        .get(input.groupId)) as { term: string; daemonId: string } | undefined
+      const journal = (await tx
+        .prepare(
+          `SELECT operationId, term, daemonId, priorRevision FROM cluster_skill_journal
+           WHERE agentId = ? AND workspaceIncarnation = ? AND state = 'applying'`
+        )
+        .get(input.agentId, input.workspaceIncarnation)) as
+        { operationId: string; term: string; daemonId: string; priorRevision: number } | undefined
+      if (
+        !fence ||
+        fence.term !== input.term ||
+        fence.daemonId !== input.daemonId ||
+        !journal ||
+        journal.operationId !== input.operationId ||
+        journal.term !== input.term ||
+        journal.daemonId !== input.daemonId ||
+        Number(journal.priorRevision) !== input.priorRevision
+      ) {
+        return { ok: false, reason: 'lost_authority' as const }
+      }
+      const current = (await tx
+        .prepare('SELECT revision FROM cluster_skill_ledger WHERE agentId = ? AND workspaceIncarnation = ?')
+        .get(input.agentId, input.workspaceIncarnation)) as { revision: number } | undefined
+      if ((current ? Number(current.revision) : 0) !== input.priorRevision) {
+        return { ok: false, reason: 'lost_authority' as const }
+      }
+      const revision = input.priorRevision + 1
+      const ledger = JSON.stringify(ClusterSkillLedgerSchema.parse(input.ledger))
+      await tx
+        .prepare(
+          `INSERT INTO cluster_skill_ledger (agentId, workspaceIncarnation, revision, ledger)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(agentId, workspaceIncarnation) DO UPDATE SET revision = excluded.revision, ledger = excluded.ledger`
+        )
+        .run(input.agentId, input.workspaceIncarnation, revision, ledger)
+      await tx
+        .prepare(
+          `UPDATE cluster_skill_journal SET state = 'applied', resultLedger = ?
+           WHERE agentId = ? AND workspaceIncarnation = ? AND operationId = ?`
+        )
+        .run(ledger, input.agentId, input.workspaceIncarnation, input.operationId)
+      return { ok: true, revision }
+    })
+  }
+
+  async authorizeClusterSkillMutation(
+    input: ClusterSkillReconcileAuthority & { priorRevision: number }
+  ): Promise<boolean> {
+    const row = (await this.db
+      .prepare(
+        `SELECT j.operationId, j.term, j.daemonId, j.priorRevision
+         FROM cluster_skill_journal j
+         JOIN duty_write_fence f ON f.groupId = j.groupId
+         WHERE j.agentId = ? AND j.workspaceIncarnation = ? AND j.state = 'applying'
+           AND f.term = j.term AND f.daemonId = j.daemonId`
+      )
+      .get(input.agentId, input.workspaceIncarnation)) as
+      { operationId: string; term: string; daemonId: string; priorRevision: number } | undefined
+    return Boolean(
+      row &&
+      row.operationId === input.operationId &&
+      row.term === input.term &&
+      row.daemonId === input.daemonId &&
+      Number(row.priorRevision) === input.priorRevision
+    )
+  }
+
+  // Source Cache accounting (source-cache.md §9, §10); every lock site takes the usage row, then the pointer, then the bundle.
+
+  /** Reserve a pending bundle under the org's usage-row lock, so two members never both admit past the quota (§9 step 2). */
+  async reserveBundle(input: {
+    orgId: string
+    key: string
+    refHash: string
+    shape: SourceCacheShape
+    bytes: number
+    now: number
+    expiresAt: number
+    quotaBytes: number
+    maxBundleBytes: number
+  }): Promise<SourceCacheReserveResult> {
+    const parsed = sourceCacheKeyFor(input.orgId, input.key, 'bundle')
+    if (!Number.isSafeInteger(input.bytes) || input.bytes <= 0)
+      throw new Error('reservation bytes must be a positive integer')
+    if (!(input.expiresAt > input.now)) throw new Error('reservation must expire after now')
+    if (!SOURCE_CACHE_HASH_RE.test(input.refHash)) throw new Error('refHash must be a SHA-256 hex digest')
+    if (input.shape !== 'blobless' && input.shape !== 'full') throw new Error('shape must be blobless or full')
+    if (!Number.isSafeInteger(input.quotaBytes) || input.quotaBytes < 0)
+      throw new Error('quotaBytes must be a non-negative integer')
+    if (!Number.isSafeInteger(input.maxBundleBytes) || input.maxBundleBytes < 0)
+      throw new Error('maxBundleBytes must be a non-negative integer')
+    if (input.bytes > input.maxBundleBytes) return { admitted: false, reason: 'too-large' }
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      const committedBytes = await this.lockSourceCacheUsage(tx, input.orgId, input.now)
+      const pendingBytes = await this.sourceCachePendingBytes(tx, input.orgId, input.now)
+      const existing = await tx
+        .prepare('SELECT key FROM source_cache_object WHERE orgId = ? AND key = ?')
+        .get(input.orgId, input.key)
+      if (existing) return { admitted: false, reason: 'duplicate', committedBytes, pendingBytes }
+      if (committedBytes + pendingBytes + input.bytes > input.quotaBytes)
+        return { admitted: false, reason: 'over-quota', committedBytes, pendingBytes }
+      await tx
+        .prepare(
+          `INSERT INTO source_cache_object
+             (orgId, key, kind, state, bytes, repoClass, repoId, refHash, shape, createdAt, updatedAt, expiresAt)
+           VALUES (@orgId, @key, 'bundle', 'pending', @bytes, @repoClass, @repoId, @refHash, @shape, @now, @now, @expiresAt)`
+        )
+        .run({
+          orgId: input.orgId,
+          key: input.key,
+          bytes: input.bytes,
+          repoClass: parsed.repoClass,
+          repoId: parsed.repoId,
+          refHash: input.refHash,
+          shape: input.shape,
+          now: input.now,
+          expiresAt: input.expiresAt
+        })
+      return { admitted: true, committedBytes, pendingBytes: pendingBytes + input.bytes }
+    })
+  }
+
+  /** Move an unexpired reservation to committed and charge its actual size to the org; repeating it is a no-op (§9 step 5). */
+  async commitBundle(input: {
+    orgId: string
+    key: string
+    actualBytes: number
+    now: number
+  }): Promise<SourceCacheCommitResult> {
+    sourceCacheKeyFor(input.orgId, input.key, 'bundle')
+    if (!Number.isSafeInteger(input.actualBytes) || input.actualBytes <= 0)
+      throw new Error('committed bytes must be a positive integer')
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      await this.lockSourceCacheUsage(tx, input.orgId, input.now)
+      const row = await this.lockSourceCacheObject(tx, input.orgId, input.key)
+      if (!row) return { committed: false, reason: 'missing' }
+      if (row.state === 'committed') return { committed: true, alreadyCommitted: true, bytes: row.bytes }
+      if (row.expiresAt === null || row.expiresAt <= input.now) return { committed: false, reason: 'expired' }
+      // The sweep claimed it as expired by its own clock and may already be deleting the object.
+      if (row.claimedBy !== null) return { committed: false, reason: 'claimed' }
+      if (input.actualBytes > row.bytes) return { committed: false, reason: 'size-exceeds-reservation' }
+      // A committed bundle no pointer names yet is unpointed from now, so one that lost the pointer race ages out.
+      await tx
+        .prepare(
+          `UPDATE source_cache_object SET state = 'committed', bytes = @bytes, expiresAt = NULL,
+             unpointedAt = @now, updatedAt = @now
+           WHERE orgId = @orgId AND key = @key AND state = 'pending'`
+        )
+        .run({ orgId: input.orgId, key: input.key, bytes: input.actualBytes, now: input.now })
+      await tx
+        .prepare(
+          'UPDATE source_cache_usage SET committedBytes = committedBytes + @bytes, updatedAt = @now WHERE orgId = @orgId'
+        )
+        .run({ orgId: input.orgId, bytes: input.actualBytes, now: input.now })
+      return { committed: true, alreadyCommitted: false, bytes: input.actualBytes }
+    })
+  }
+
+  /** Record which committed bundle a pointer names; the bundle it stops naming is unpointed from `now` (§10). */
+  async setSourceCachePointer(input: {
+    orgId: string
+    pointerKey: string
+    bundleKey: string
+    now: number
+    /** Compare-and-set: the target the caller last read (null for none); a different current target is `pointer-moved`. */
+    expectedTargetKey?: string | null
+  }): Promise<SourceCachePointerResult> {
+    const pointer = sourceCacheKeyFor(input.orgId, input.pointerKey, 'pointer')
+    sourceCacheKeyFor(input.orgId, input.bundleKey, 'bundle')
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      // The usage-row lock serializes pointer writes per org, so a concurrent first write is re-read, not missed.
+      await this.lockSourceCacheUsage(tx, input.orgId, input.now)
+      const current = await this.lockSourceCacheObject(tx, input.orgId, input.pointerKey)
+      const target = await this.lockSourceCacheObject(tx, input.orgId, input.bundleKey)
+      if (input.expectedTargetKey !== undefined && (current?.targetKey ?? null) !== input.expectedTargetKey)
+        return { set: false, reason: 'pointer-moved' }
+      if (!target || target.state !== 'committed') return { set: false, reason: 'bundle-not-committed' }
+      const sameRepository = target.repoClass === pointer.repoClass && target.repoId === pointer.repoId
+      if (!sameRepository || target.refHash !== pointer.refHash || target.shape !== pointer.shape)
+        return { set: false, reason: 'bundle-mismatch' }
+      // A claimed bundle is terminal even after its lease lapses: the retag may already have run, so only deletion follows.
+      if (target.claimedBy !== null) return { set: false, reason: 'bundle-claimed' }
+      const previous = current?.targetKey ?? undefined
+      await tx
+        .prepare(
+          `INSERT INTO source_cache_object
+             (orgId, key, kind, state, bytes, repoClass, repoId, refHash, shape, createdAt, updatedAt, targetKey)
+           VALUES (@orgId, @key, 'pointer', 'committed', 0, @repoClass, @repoId, @refHash, @shape, @now, @now, @targetKey)
+           ON CONFLICT(orgId, key) DO UPDATE SET targetKey = excluded.targetKey, updatedAt = excluded.updatedAt,
+             claimedBy = NULL, claimedAt = NULL`
+        )
+        .run({
+          orgId: input.orgId,
+          key: input.pointerKey,
+          repoClass: pointer.repoClass,
+          repoId: pointer.repoId,
+          refHash: pointer.refHash,
+          shape: pointer.shape,
+          now: input.now,
+          targetKey: input.bundleKey
+        })
+      if (previous === input.bundleKey) return { set: true, previousBundleKey: undefined }
+      if (previous !== undefined)
+        await tx
+          .prepare(
+            "UPDATE source_cache_object SET unpointedAt = ?, updatedAt = ? WHERE orgId = ? AND key = ? AND kind = 'bundle'"
+          )
+          .run(input.now, input.now, input.orgId, previous)
+      await tx
+        .prepare('UPDATE source_cache_object SET unpointedAt = NULL, updatedAt = ? WHERE orgId = ? AND key = ?')
+        .run(input.now, input.orgId, input.bundleKey)
+      return { set: true, previousBundleKey: previous }
+    })
+  }
+
+  /** Stamp a GET issuance; `lastReadAt` never moves backwards. True when the row exists and moved. */
+  async touchSourceCacheRead(input: { orgId: string; key: string; at: number }): Promise<boolean> {
+    sourceCacheKeyFor(input.orgId, input.key)
+    const result = await this.db
+      .prepare(
+        `UPDATE source_cache_object SET lastReadAt = @at
+         WHERE orgId = @orgId AND key = @key AND (lastReadAt IS NULL OR lastReadAt < @at)`
+      )
+      .run(input)
+    return result.changes === 1
+  }
+
+  /** Claim pending reservations past their expiry, across orgs (§9 abandoned uploads). */
+  async claimExpiredPendingSourceCache(input: SourceCacheClaimInput): Promise<SourceCacheObjectRow[]> {
+    return await this.claimSourceCacheRows("c.state = 'pending' AND c.expiresAt <= @now", 'c.expiresAt', input, {})
+  }
+
+  /** Claim committed bundles no pointer has named since `unpointedBefore`, across orgs (§10 retag). */
+  async claimUnreferencedSourceCacheBundles(
+    input: SourceCacheClaimInput & { unpointedBefore: number }
+  ): Promise<SourceCacheObjectRow[]> {
+    return await this.claimSourceCacheRows(
+      `c.kind = 'bundle' AND c.state = 'committed' AND c.unpointedAt IS NOT NULL AND c.unpointedAt <= @cutoff
+       AND NOT EXISTS (SELECT 1 FROM source_cache_object p
+         WHERE p.orgId = c.orgId AND p.kind = 'pointer' AND p.targetKey = c.key)`,
+      'c.unpointedAt',
+      input,
+      { cutoff: input.unpointedBefore }
+    )
+  }
+
+  /** Claim pointers neither read nor rewritten since `unreadBefore`, across orgs (§10 unread pointer). */
+  async claimUnreadSourceCachePointers(
+    input: SourceCacheClaimInput & { unreadBefore: number }
+  ): Promise<SourceCacheObjectRow[]> {
+    return await this.claimSourceCacheRows(
+      "c.kind = 'pointer' AND COALESCE(c.lastReadAt, c.updatedAt) <= @cutoff AND c.updatedAt <= @cutoff",
+      'COALESCE(c.lastReadAt, c.updatedAt)',
+      input,
+      { cutoff: input.unreadBefore }
+    )
+  }
+
+  /** Delete a row after its object-store step; a committed bundle releases its bytes, a pointer unpoints its target. */
+  async deleteSourceCacheObject(input: {
+    orgId: string
+    key: string
+    now: number
+    claimedBy?: string
+    unchanged?: SourceCacheUnchangedGuard
+  }): Promise<SourceCacheDeleteResult> {
+    sourceCacheKeyFor(input.orgId, input.key)
+    return await this.transaction(async (raw) => {
+      const tx = accessOf(raw)
+      await this.lockSourceCacheUsage(tx, input.orgId, input.now)
+      const row = await this.lockSourceCacheObject(tx, input.orgId, input.key)
+      if (!row) return { deleted: false, reason: 'missing' }
+      if (input.claimedBy !== undefined && row.claimedBy !== input.claimedBy)
+        return { deleted: false, reason: 'claim-lost' }
+      // A read stamps lastReadAt without clearing the claim, so only this re-check under the row lock sees it.
+      const guard = input.unchanged
+      if (
+        guard !== undefined &&
+        (row.targetKey !== guard.targetKey || row.updatedAt !== guard.updatedAt || row.lastReadAt !== guard.lastReadAt)
+      ) {
+        // The row is still wanted: release our claim so reads can use it again before the lease lapses.
+        if (input.claimedBy !== undefined)
+          await tx
+            .prepare(
+              'UPDATE source_cache_object SET claimedBy = NULL, claimedAt = NULL WHERE orgId = ? AND key = ? AND claimedBy = ?'
+            )
+            .run(input.orgId, input.key, input.claimedBy)
+        return { deleted: false, reason: 'changed' }
+      }
+      if (row.kind === 'bundle') {
+        const pointed = await tx
+          .prepare("SELECT key FROM source_cache_object WHERE orgId = ? AND kind = 'pointer' AND targetKey = ?")
+          .get(input.orgId, input.key)
+        if (pointed) return { deleted: false, reason: 'referenced' }
+      }
+      await tx.prepare('DELETE FROM source_cache_object WHERE orgId = ? AND key = ?').run(input.orgId, input.key)
+      const releasedBytes = row.kind === 'bundle' && row.state === 'committed' ? row.bytes : 0
+      if (releasedBytes > 0)
+        await tx
+          .prepare(
+            `UPDATE source_cache_usage SET updatedAt = @now,
+               committedBytes = CASE WHEN committedBytes > @bytes THEN committedBytes - @bytes ELSE 0 END
+             WHERE orgId = @orgId`
+          )
+          .run({ orgId: input.orgId, bytes: releasedBytes, now: input.now })
+      if (row.kind === 'pointer' && row.targetKey !== null)
+        await tx
+          .prepare(
+            "UPDATE source_cache_object SET unpointedAt = ?, updatedAt = ? WHERE orgId = ? AND key = ? AND kind = 'bundle'"
+          )
+          .run(input.now, input.now, input.orgId, row.targetKey)
+      return { deleted: true, releasedBytes }
+    })
+  }
+
+  async getSourceCacheObject(orgId: string, key: string): Promise<SourceCacheObjectRow | undefined> {
+    const row = (await this.db
+      .prepare('SELECT * FROM source_cache_object WHERE orgId = ? AND key = ?')
+      .get(orgId, key)) as Record<string, unknown> | undefined
+    return row ? normalizeSourceCacheObject(row) : undefined
+  }
+
+  /** The org's committed bytes and unexpired reservations, as `reserveBundle` would count them. */
+  async sourceCacheUsage(orgId: string, now: number): Promise<{ committedBytes: number; pendingBytes: number }> {
+    const usage = (await this.db
+      .prepare('SELECT committedBytes FROM source_cache_usage WHERE orgId = ?')
+      .get(orgId)) as { committedBytes: number } | undefined
+    return {
+      committedBytes: usage ? Number(usage.committedBytes) : 0,
+      pendingBytes: await this.sourceCachePendingBytes(this.db, orgId, now)
+    }
+  }
+
+  /** Create the org's usage row if missing and lock it for the rest of the transaction; returns its committed bytes. */
+  private async lockSourceCacheUsage(tx: StoreAccess, orgId: string, now: number): Promise<number> {
+    await tx
+      .prepare('INSERT OR IGNORE INTO source_cache_usage (orgId, committedBytes, updatedAt) VALUES (?, 0, ?)')
+      .run(orgId, now)
+    const lock = this.postgres ? ' FOR UPDATE' : ''
+    const row = (await tx
+      .prepare(`SELECT committedBytes FROM source_cache_usage WHERE orgId = ?${lock}`)
+      .get(orgId)) as { committedBytes: number }
+    return Number(row.committedBytes)
+  }
+
+  private async lockSourceCacheObject(
+    tx: StoreAccess,
+    orgId: string,
+    key: string
+  ): Promise<SourceCacheObjectRow | undefined> {
+    const lock = this.postgres ? ' FOR UPDATE' : ''
+    const row = (await tx
+      .prepare(`SELECT * FROM source_cache_object WHERE orgId = ? AND key = ?${lock}`)
+      .get(orgId, key)) as Record<string, unknown> | undefined
+    return row ? normalizeSourceCacheObject(row) : undefined
+  }
+
+  private async sourceCachePendingBytes(tx: StoreAccess, orgId: string, now: number): Promise<number> {
+    // SUM is numeric on PostgreSQL, which the driver hands back as a string; the cast keeps it a bigint.
+    const row = (await tx
+      .prepare(
+        `SELECT CAST(COALESCE(SUM(bytes), 0) AS INTEGER) AS pendingBytes FROM source_cache_object
+         WHERE orgId = ? AND state = 'pending' AND expiresAt > ?`
+      )
+      .get(orgId, now)) as { pendingBytes: number }
+    return Number(row.pendingBytes)
+  }
+
+  /** One atomic claim: rows chosen with SKIP LOCKED on PostgreSQL get a lease, so concurrent members take disjoint sets. */
+  private async claimSourceCacheRows(
+    filter: string,
+    order: string,
+    input: SourceCacheClaimInput,
+    extra: Record<string, number>
+  ): Promise<SourceCacheObjectRow[]> {
+    if (!Number.isSafeInteger(input.limit) || input.limit <= 0) return []
+    const skipLocked = this.postgres ? ' FOR UPDATE SKIP LOCKED' : ''
+    const rows = (await this.db
+      .prepare(
+        `UPDATE source_cache_object SET claimedBy = @owner, claimedAt = @now
+         WHERE (claimedAt IS NULL OR claimedAt <= @leaseBefore) AND (orgId, key) IN (
+           SELECT c.orgId, c.key FROM source_cache_object c
+           WHERE ${filter} AND (c.claimedAt IS NULL OR c.claimedAt <= @leaseBefore)
+           ORDER BY ${order} LIMIT @limit${skipLocked})
+         RETURNING *`
+      )
+      .all({
+        owner: input.owner,
+        now: input.now,
+        leaseBefore: input.now - input.leaseMs,
+        limit: input.limit,
+        ...extra
+      })) as Record<string, unknown>[]
+    return rows.map(normalizeSourceCacheObject)
+  }
+
+  async close(): Promise<void> {
+    // Last chance for a buffered tool body: the backend is about to go away.
+    await this.flushToolCallWrites()
+    this.clearToolWriteFlush()
+    // Closing under the mutex waits out a transcript write still in flight.
+    await this.transcriptMutex.run(() => this.backend.close())
+  }
+}
+
+interface RuntimeCatalogMetaRow {
+  runtimeId: string
+  fingerprint: string
+  source: string
+  defaultModel: string | null
+  permissionModes: string | null
+  defaultPermissionMode: string | null
+  complete: number
+  modelsHash: string | null
+  observedAt: number
+}
+
+interface RuntimeModelCapRow {
+  runtimeId: string
+  modelId: string
+  fingerprint: string
+  capsJson: string
+  observedAt: number
+}
+
+function runtimeCatalogMetaFromRow(row: RuntimeCatalogMetaRow): RuntimeCatalogMetaRecord {
+  const permissionModes = parseJsonColumn<NonNullable<RuntimeCatalogMetaRecord['permissionModes']>>(row.permissionModes)
+  return {
+    runtimeId: row.runtimeId,
+    fingerprint: row.fingerprint,
+    source: row.source as RuntimeCatalogMetaRecord['source'],
+    ...(row.defaultModel === null ? {} : { defaultModel: row.defaultModel }),
+    ...(permissionModes === undefined ? {} : { permissionModes }),
+    ...(row.defaultPermissionMode === null || row.defaultPermissionMode === undefined
+      ? {}
+      : { defaultPermissionMode: row.defaultPermissionMode }),
+    complete: row.complete === 1,
+    ...(row.modelsHash === null ? {} : { modelsHash: row.modelsHash }),
+    observedAt: row.observedAt
+  }
+}
+
+/** Parse store-written JSON, tolerating a corrupted row — hydrate runs at daemon boot
+ *  and must degrade to "field unknown" rather than fail the whole startup. */
+function parseJsonColumn<T>(raw: string | null): T | undefined {
+  if (raw === null) return undefined
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    return undefined
+  }
+}

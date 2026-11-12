@@ -1,0 +1,846 @@
+'use client'
+
+// Integrations page: the org's installed messaging bots and code hosts, and the
+// agents bound to them. Both halves are org-level infrastructure — every member
+// can see them, writes are gated on the role (viewers get no controls, and
+// uninstalling the GitHub App from an account is owner-only).
+//
+// The Add-integration dialog is the SAME one the agent page opens; reached from
+// here it carries no agent, so the modal grows an Agent field (ModalProvider's
+// `integration` kind with no target).
+
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import Link from 'next/link'
+import { useSearchParams } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import { Button, Icon, Toggle } from '@/components/ui'
+import { AgentIconView, LoadingState, PlatformMark } from '@/components/marks'
+import { useModal } from '@/components/console/ModalProvider'
+import { DefaultDispatchPicker } from '@/components/console/DefaultDispatchPicker'
+import { BotRoutingHover } from '@/components/console/decisions/routing/BotRoutingHover'
+import {
+  DecisionRoutingModal,
+  clearRoutingResume,
+  readRoutingResume,
+  stopRouting
+} from '@/components/console/decisions/routing/DecisionRoutingModal'
+import { useOptionalDecisionsPrototype } from '@/lib/decisions/provider'
+import { useChannelGates } from '@/components/console/decisions/channel-gates'
+import { useConsoleData } from '@/lib/data-context'
+import { useProfile } from '@/lib/profile'
+import { useOrgs } from '@/lib/org-context'
+import { creatorLabel, type BotDto, type MeDto } from '@/lib/api'
+import {
+  agentLabel,
+  conversationGate,
+  isDirectConversation,
+  type IntegrationChannelRow,
+  type IntegrationRow
+} from '@/lib/data'
+import { ConversationName, roomGlyph, roomPlural, rowLabelParts } from '@/components/console/IntegrationChannelList'
+import { RevokedMarkDot } from '@/components/console/IntegrationMarks'
+import {
+  botCardCopy,
+  botSharingEditable,
+  channelListSemantics,
+  platformRegistry,
+  platformSharingFixed,
+  withCredentialCode
+} from '@/components/console/platforms/registry'
+import {
+  BOT_PLATFORM_TABS,
+  botMatchesPlatformTab,
+  visibleBotPlatformTabs
+} from '@/components/console/platforms/host-projections'
+import { useOwnerChangeGuard } from '@/components/console/OwnerChangeGuard'
+import DeleteBotModal from '@/components/console/modals/DeleteBotModal'
+import GithubCard from '@/components/console/GithubCard'
+import GiteaCard from '@/components/console/GiteaCard'
+import AzureDevOpsCard from '@/components/console/AzureDevOpsCard'
+import GitlabCard from '@/components/console/GitlabCard'
+import { Scrim } from '@/components/console/Scrim'
+
+// The free-bot sub-line shows where the bot came from without repeating
+// historical usage metadata in the list row.
+function botSubline(b: BotDto, labels: { freedFrom: string; builtin: string }): string {
+  return b.freedFromAgent ? `${labels.freedFrom} ${b.freedFromAgent}` : b.prebuilt ? labels.builtin : ''
+}
+
+/** The Bots card's fallback `CardProvider`: a platform with no lifecycle
+ *  machinery still needs SOMETHING to key by platform id around the row list. */
+function PassThrough({ children }: { children: ReactNode }) {
+  return <>{children}</>
+}
+
+// Bot | Sharable | Agents | Created by | actions: the track fits four 28px controls, three below 480px where "Created by" drops.
+const BOT_GRID = 'grid-cols-[3fr_1.1fr_1fr_100px] min-[480px]:grid-cols-[2fr_0.9fr_1.5fr_1fr_136px]'
+type BotRosterRow = { kind: 'workspace'; key: string; label: string } | { kind: 'bot'; key: string; bot: BotDto }
+
+// Preserve the server's bot order within each workspace. The heading is rendered
+// only when this produces several groups, so single-workspace organizations keep
+// the compact flat list.
+function botRosterRows(bots: BotDto[], unavailableLabel: string): BotRosterRow[] {
+  const groups = new Map<string, { label: string; bots: BotDto[] }>()
+  for (const bot of bots) {
+    const workspaceId = bot.workspaceId?.trim() || null
+    const workspaceName = bot.workspaceName?.trim() || null
+    const key = workspaceId ? `id:${workspaceId}` : workspaceName ? `name:${workspaceName.toLowerCase()}` : 'unknown'
+    const current = groups.get(key)
+    if (current) {
+      if (workspaceName && current.label === workspaceId) current.label = workspaceName
+      current.bots.push(bot)
+      continue
+    }
+    groups.set(key, {
+      label: workspaceName ?? workspaceId ?? unavailableLabel,
+      bots: [bot]
+    })
+  }
+  if (groups.size <= 1) return bots.map((bot) => ({ kind: 'bot', key: bot.id, bot }))
+  return [...groups].flatMap(([workspaceKey, group]) => [
+    { kind: 'workspace', key: `workspace:${workspaceKey}`, label: group.label },
+    ...group.bots.map((bot) => ({ kind: 'bot' as const, key: bot.id, bot }))
+  ])
+}
+
+// The agents a revoked bot served: `agentIds` counts active installs only, while the revoked rows still name theirs.
+function revokedAgentIds(bot: BotDto, integrations: IntegrationRow[]): string[] {
+  const ids = new Set<string>()
+  for (const i of integrations) {
+    if (i.botId === bot.id && i.revoked && i.agentId && !bot.agentIds.includes(i.agentId)) ids.add(i.agentId)
+  }
+  return [...ids]
+}
+
+// One merged conversation row for a bot's expandable roster.
+interface BotChannelView {
+  channelId: string
+  name: string
+  kind: 'channel' | 'im' | 'mpim'
+  /** The conversation's own glyph and tint, where the platform gives it one (a Linear team). */
+  icon?: string
+  color?: string
+  /** Its handle and the page it opens on the platform, where it has them (a Linear team). */
+  key?: string
+  url?: string
+  /** Effective per-conversation owner; null only before legacy state converges. */
+  agentId: string | null
+  /** Any integration whose snapshot row backs this channel; ownership PATCHes
+   *  are bot-scoped. */
+  integrationId: string | null
+  /** The shared bot's By decision routing owns this conversation, and the routed Decision's visible name. */
+  routed: boolean
+  decisionName: string | null
+  /** The backing snapshot row, whose trigger and gate a single-owner bot's By decision reads. */
+  row: IntegrationChannelRow
+}
+
+// The bot's conversation roster, merged across its installs (a shared bot fans out to
+// one integration per agent, each reporting its own membership snapshot).
+function botChannels(bot: BotDto, integrations: IntegrationRow[]): BotChannelView[] {
+  const merged = new Map<string, BotChannelView>()
+  for (const i of integrations) {
+    if (i.botId !== bot.id) continue
+    for (const c of i.channels) {
+      const explicit = c.agentId ?? null
+      const routed = c.trigger === 'decision' && c.decisionBinding?.type === 'shared_bot_routing'
+      const prev = merged.get(c.channelId)
+      if (prev && routed && !prev.routed) {
+        prev.routed = true
+        prev.decisionName = c.decision?.name ?? null
+      }
+      if (!prev) {
+        merged.set(c.channelId, {
+          channelId: c.channelId,
+          name: c.name,
+          kind: c.kind ?? 'channel',
+          ...(c.icon ? { icon: c.icon } : {}),
+          ...(c.color ? { color: c.color } : {}),
+          ...(c.key ? { key: c.key } : {}),
+          ...(c.url ? { url: c.url } : {}),
+          agentId: explicit,
+          integrationId: i.id ?? null,
+          routed,
+          decisionName: routed ? (c.decision?.name ?? null) : null,
+          row: c
+        })
+      } else if (!prev.agentId && explicit) {
+        prev.agentId = explicit
+        prev.integrationId = i.id ?? null
+      }
+    }
+  }
+  // Channels, then direct conversations, then the code channels tasks opened — each under its own heading.
+  const rank = (c: BotChannelView) => (c.row.isCodeSession ? 2 : isDirectConversation(c.kind) ? 1 : 0)
+  return [...merged.values()].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+}
+
+/** The page's two section headings. Cards own no top margin here — the section
+ *  spacing is the wrapper's, so a heading and its card read as one block. */
+function Section({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <section className="mb-[22px]">
+      <div className="mb-2 font-sans text-[10.5px] font-semibold uppercase leading-normal tracking-[0.08em] text-(--text-tertiary)">
+        {label}
+      </div>
+      {children}
+    </section>
+  )
+}
+
+export default function IntegrationsView() {
+  const t = useTranslations('Integrations')
+  // `?bot=<id>` opens that bot's channel roster — the agent page's bot chip and
+  // the Settings-era deep links land here. `?platform=<id>` only selects the
+  // tab, for senders that know which provider needs attention but not which of
+  // its installs: the session-access "reauthorize your Slack app" notification
+  // is deliberately one of those (see `session-access-notifications.ts`).
+  const params = useSearchParams()
+  const reconnectBotId = params.get('reconnect')
+  const targetBotId = params.get('bot') ?? reconnectBotId
+  const targetPlatform = params.get('platform')
+  const { me } = useProfile()
+  const { myRole } = useOrgs()
+  const { openModal } = useModal()
+  const { bots } = useConsoleData()
+  const reconnectOpened = useRef<string | null>(null)
+  const isOwner = myRole === 'owner'
+  const canWrite = myRole !== 'viewer' // the CP denies viewer writes; hide the controls too
+  const [deletingBot, setDeletingBot] = useState<BotDto | null>(null)
+
+  useEffect(() => {
+    if (!canWrite || !reconnectBotId || reconnectOpened.current === reconnectBotId) return
+    const bot = bots.find((candidate) => candidate.id === reconnectBotId)
+    if (!bot || bot.revokedAt || bot.agentIds.length > 0) return
+    reconnectOpened.current = reconnectBotId
+    openModal('integration', undefined, { platform: bot.platform, botId: bot.id })
+  }, [bots, canWrite, openModal, reconnectBotId])
+
+  return (
+    <div className="wrap max-desktop:p-4">
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <p className="psub mt-0 min-w-[240px] flex-1">{t('description')}</p>
+        {canWrite && (
+          <Button variant="primary" size="sm" onClick={() => openModal('integration')}>
+            <Icon name="plus" size={14} />
+            {t('addIntegration')}
+          </Button>
+        )}
+      </div>
+
+      <Section label={t('messagingApps')}>
+        <BotsCard
+          canWrite={canWrite}
+          me={me}
+          targetBotId={targetBotId}
+          targetPlatform={targetPlatform}
+          onDelete={setDeletingBot}
+        />
+      </Section>
+
+      <Section label={t('codeHosts')}>
+        <GithubCard canWrite={canWrite} isOwner={isOwner} />
+        {/* Cards own no margin here (see Section) — every card after the first supplies its own gap. */}
+        <div className="mt-4">
+          <GitlabCard canWrite={canWrite} />
+        </div>
+        <div className="mt-4">
+          <AzureDevOpsCard canWrite={canWrite} />
+        </div>
+        <div className="mt-4">
+          <GiteaCard canWrite={canWrite} />
+        </div>
+      </Section>
+
+      {deletingBot && (
+        <Scrim onEscape={() => setDeletingBot(null)} onClick={() => setDeletingBot(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <DeleteBotModal bot={deletingBot} onClose={() => setDeletingBot(null)} />
+          </div>
+        </Scrim>
+      )}
+    </div>
+  )
+}
+
+// ── Tabbed IM bots card ───────────────────────────────────────────────────────
+// The platform tabs select one complete roster at a time — in-use and free bots
+// are shown together, and "Show in use" narrows to the ones an agent actually
+// answers on. Each row carries the Sharable toggle (PATCH /bots/:id; the CP's
+// 409 reason renders inline) + installed-agent stack and expands to the bot's
+// channel roster.
+function BotsCard({
+  canWrite,
+  me,
+  targetBotId,
+  targetPlatform,
+  onDelete
+}: {
+  canWrite: boolean
+  me: MeDto | null
+  targetBotId: string | null
+  targetPlatform: string | null
+  onDelete: (b: BotDto) => void
+}) {
+  const t = useTranslations('Integrations')
+  const { orgPath } = useOrgs()
+  const {
+    bots,
+    integrations,
+    getAgent,
+    setBotShareable,
+    setChannelAgent,
+    refresh,
+    loading: dataLoading
+  } = useConsoleData()
+  // On an owner-as-default platform the seat IS a private agent's grant, so moving it is confirmed first.
+  const ownerGuard = useOwnerChangeGuard()
+  const decisions = useOptionalDecisionsPrototype()
+  const gates = useChannelGates()
+  // The shared-bot conversation whose By decision rules modal is open, and a failed Stop to surface.
+  const [routingRow, setRoutingRow] = useState<{
+    botId: string
+    channelId: string
+    name: string
+    resume?: boolean
+  } | null>(null)
+  // An inline Create decision returns naming the row whose rules modal it left; its bot expands and the modal reopens on the kept draft.
+  useEffect(() => {
+    const resumed = readRoutingResume()
+    if (!resumed) return
+    const bot = bots.find((entry) => entry.id === resumed.botId)
+    const row = bot ? botChannels(bot, integrations).find((c) => c.channelId === resumed.channelId) : undefined
+    if (!bot || !row) return
+    clearRoutingResume()
+    setOpenBotId(bot.id)
+    setRoutingRow({ botId: bot.id, channelId: row.channelId, name: row.name, resume: true })
+  }, [bots, integrations])
+  const [routingErr, setRoutingErr] = useState<{ botId: string; msg: string } | null>(null)
+  const tabs = visibleBotPlatformTabs(bots)
+  const [platformTabKey, setPlatformTabKey] = useState<string>(tabs[0]?.key ?? '')
+  // Bot row expanded to its channel roster (one at a time), the bot whose
+  // shareable PATCH is in flight, and the last toggle denial to surface (the CP
+  // 409s with a reason: no relay connected / still shared by several agents).
+  const [openBotId, setOpenBotId] = useState<string | null>(null)
+  const [codeOpenBotId, setCodeOpenBotId] = useState<string | null>(null)
+  const [botBusyId, setBotBusyId] = useState<string | null>(null)
+  const [botErr, setBotErr] = useState<{ id: string; msg: string } | null>(null)
+  // Hides the bots no agent is installed on. Free bots are the reusable pool the
+  // Add-integration picker offers, so they belong in the roster by default — this
+  // is for reading the org's live surface area, not for pruning.
+  const [inUseOnly, setInUseOnly] = useState(false)
+
+  const targetBot = bots.find((bot) => bot.id === targetBotId)
+  const targetBotPlatformTabKey = targetBot ? tabs.find((tab) => botMatchesPlatformTab(targetBot, tab))?.key : undefined
+  // Ungated modules keep the strip non-empty, so falling back to the first tab keeps this lookup total.
+  const platformTab = (tabs.find((tab) => tab.key === platformTabKey) ?? tabs[0])!
+  const { label } = platformTab
+  const platformBots = bots.filter((bot) => botMatchesPlatformTab(bot, platformTab))
+  const shownBots = inUseOnly ? platformBots.filter((bot) => bot.agentIds.length > 0) : platformBots
+  const rosterRows = botRosterRows(shownBots, t('workspaceUnavailable'))
+  // Per-tab totals stay UNFILTERED: they answer "where does this org have bots",
+  // which the filter must not silently rewrite while you read across the strip.
+  const tabCounts = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const tab of BOT_PLATFORM_TABS)
+      counts.set(tab.key, bots.filter((bot) => botMatchesPlatformTab(bot, tab)).length)
+    return counts
+  }, [bots])
+
+  // Runs before the bot effect below, so `?bot=` still wins; a platform with no visible tab is ignored.
+  const targetPlatformTabKey = tabs.find((tab) => tab.platform === targetPlatform)?.key
+  useEffect(() => {
+    if (!targetPlatformTabKey) return
+    setPlatformTabKey(targetPlatformTabKey)
+  }, [targetPlatformTabKey])
+
+  useEffect(() => {
+    if (!targetBotId || !targetBotPlatformTabKey) return
+    setPlatformTabKey(targetBotPlatformTabKey)
+    setOpenBotId(targetBotId)
+  }, [targetBotId, targetBotPlatformTabKey])
+
+  useEffect(() => {
+    if (!targetBotId || openBotId !== targetBotId) return
+    document.getElementById(`integration-bot-${targetBotId}`)?.scrollIntoView({ block: 'start' })
+  }, [openBotId, targetBotId])
+
+  const flipShareable = async (b: BotDto, next: boolean) => {
+    if (botBusyId) return
+    setBotBusyId(b.id)
+    setBotErr(null)
+    try {
+      await setBotShareable(b.id, next)
+    } catch (e) {
+      setBotErr({ id: b.id, msg: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBotBusyId(null)
+    }
+  }
+
+  // The active platform's Settings fragments (§10 `settingsFragments`): row
+  // badges, provider deep links, and the lifecycle machinery that owns its own
+  // card-scope state. `CardProvider` is mounted below, KEYED BY PLATFORM, which
+  // is what keeps a module's hooks from changing identity when the tab changes.
+  const fragments = platformRegistry.get(platformTab.platform)?.settingsFragments
+  const RowBadges = fragments?.botCard?.RowBadges
+  const RowLinks = fragments?.botCard?.RowLinks
+  const RowSettings = fragments?.botCard?.RowSettings
+  const RowActions = fragments?.lifecycleActions?.RowActions
+  const CardNotice = fragments?.lifecycleActions?.CardNotice
+  const CardProvider = fragments?.lifecycleActions?.CardProvider ?? PassThrough
+  // The words the CARD writes into its own chrome (the revoked badge, the
+  // Sharable cell, and `noun` — the "app"/"bot" heading, delete tooltip and
+  // empty-state sentence). All of them used to be Slack's model rendered over
+  // every platform's rows; the module supplies the wording, the host still
+  // decides when and which arm to show.
+  const rowCopy = botCardCopy(platformTab.platform)
+  const noun = rowCopy.identityNoun.toLowerCase() === 'app' ? t('appLabel') : t('botLabel')
+
+  return (
+    <div className="card">
+      <div className="cardhead gap-0 py-0">
+        <div
+          className="flex min-w-0 flex-1 gap-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          role="tablist"
+          aria-label={t('botPlatform')}
+        >
+          {tabs.map((item) => {
+            const selected = item.key === platformTabKey
+            return (
+              <button
+                key={item.key}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                className={`${selected ? 'tab on' : 'tab'} mr-[5px] flex items-center gap-[5px] whitespace-nowrap last:mr-0 desktop:mr-[22px] desktop:gap-[6px]`}
+                onClick={() => {
+                  setPlatformTabKey(item.key)
+                  setOpenBotId(null)
+                }}
+              >
+                <span className="flex h-[14px] w-[14px] flex-none items-center justify-center">
+                  <PlatformMark platform={item.platform} fillPct={100} />
+                </span>
+                {item.label}
+                <span className="font-sans text-[11.5px] font-medium leading-normal text-(--text-tertiary)">
+                  {tabCounts.get(item.key) ?? 0}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+        {/* Pinned right of the scrolling tab strip. At 375px the full label eats a
+            third of the row, so the mobile arm keeps only the words that carry it. */}
+        <label className="flex flex-none cursor-pointer items-center gap-2 pl-3 font-sans text-[12.5px] font-normal leading-normal text-(--text-secondary)">
+          <span className="max-desktop:hidden">{t('showInUse')}</span>
+          <span className="desktop:hidden">{t('inUse')}</span>
+          <Toggle checked={inUseOnly} onChange={setInUseOnly} />
+        </label>
+      </div>
+      {/* gap must match the data rows' or the narrow tracks drift out of line. */}
+      <div className={`row h ${BOT_GRID} gap-[11px]`}>
+        {/* `.row.h` uppercases, so the module's lower-case noun renders as the
+            heading did when the host picked between two literals. */}
+        <span>{noun}</span>
+        <span>{t('sharable')}</span>
+        <span>{t('agents')}</span>
+        <span className="whitespace-nowrap max-[479px]:hidden">{t('createdBy')}</span>
+        <span />
+      </div>
+      {/* Keyed by platform id: switching tabs REMOUNTS the module's card state,
+          which is the only way the fragments' hooks keep a stable identity when
+          the active module changes. Non-lifecycle platforms get `PassThrough`, so
+          the key is inert for them. */}
+      <CardProvider key={platformTab.platform}>
+        {rosterRows.map((row) => {
+          if (row.kind === 'workspace') {
+            return (
+              <div
+                key={row.key}
+                className="flex items-center gap-2 border-b border-(--border-subtle) bg-(--surface-sunken) px-4 py-2"
+              >
+                <span className="font-sans text-[10.5px] font-semibold uppercase leading-normal tracking-[0.08em] text-(--text-tertiary)">
+                  {t('workspace')}
+                </span>
+                <span className="mono min-w-0 truncate text-[12px] text-(--text-secondary)">{row.label}</span>
+              </div>
+            )
+          }
+          const b = row.bot
+          const free = b.agentIds.length === 0
+          const served = [
+            ...b.agentIds.map((id) => ({ id, revoked: false })),
+            ...revokedAgentIds(b, integrations).map((id) => ({ id, revoked: true }))
+          ]
+          const open = openBotId === b.id
+          const channels = open ? botChannels(b, integrations) : []
+          // One member is no choice — the column would name that agent on every row and offer nothing.
+          const showDefaultDispatch = b.shareable && channels.length > 0 && b.agentIds.length > 1
+          // A single-owner bot's rooms take the same By decision gate as that agent's Integrations tab.
+          const ownerId = !b.shareable ? (b.agentIds[0] ?? null) : null
+          const showGate = gates.offered && ownerId !== null && gates.decisionTriggers(b.platform)
+          const chanGrid = showDefaultDispatch || showGate ? 'grid-cols-[1fr_auto]' : 'grid-cols-[1fr]'
+          // A shared relay bot routes By decision where its platform offers that trigger and has no per-owner gate.
+          const routable =
+            decisions !== null &&
+            b.shareable &&
+            b.transport === 'http' &&
+            channelListSemantics(b.platform).sharedDecision !== 'conversation' &&
+            (!channelListSemantics(b.platform).triggers ||
+              channelListSemantics(b.platform).triggers!.includes('decision'))
+          // The picker's choices: every agent installed on the bot.
+          const agentOptions = b.agentIds.map((id) => {
+            const ag = getAgent(id)
+            return {
+              id,
+              name: ag ? agentLabel(ag) : id,
+              model: ag?.model || ag?.runtime || '',
+              runtime: ag?.runtime || ag?.model || '',
+              icon: ag?.icon
+            }
+          })
+          const roomNoun = channelListSemantics(b.platform).roomNoun
+          const roomLabel = roomNoun.charAt(0).toUpperCase() + roomNoun.slice(1)
+          // The outgoing owner, as the owner-change warning reads it — a gate is what costs.
+          const owner = (id: string | null) => {
+            const ag = id ? getAgent(id) : undefined
+            return ag ? { id: ag.id, label: agentLabel(ag), gate: conversationGate(ag) } : undefined
+          }
+          return (
+            <Fragment key={b.id}>
+              <div
+                id={`integration-bot-${b.id}`}
+                className={`row click ${BOT_GRID} items-center gap-[11px]`}
+                onClick={() => setOpenBotId(open ? null : b.id)}
+              >
+                <div className="flex min-w-0 items-center gap-[10px]">
+                  <Icon
+                    name="chevron-right"
+                    size={14}
+                    className={`flex-none text-(--text-tertiary) transition-transform ${open ? 'rotate-90' : ''}`}
+                  />
+                  <span className="flex h-7 w-7 flex-none items-center justify-center rounded-[7px] border border-(--border-default) bg-(--surface-card)">
+                    <span className="flex h-[14px] w-[14px] items-center justify-center">
+                      <PlatformMark platform={b.platform} fillPct={100} />
+                    </span>
+                  </span>
+                  <span className="mono min-w-0 flex-1 truncate text-[12.5px]">{b.name}</span>
+                  {b.prebuilt && (
+                    <span className="badge bg-(--surface-active) text-(--text-tertiary)">{t('builtin')}</span>
+                  )}
+                  {/* A dead credential, else an ambiguously rejected one; the sentence is the module's, the code the platform's. */}
+                  {b.revokedAt ? (
+                    <span
+                      className="badge bg-(--status-error-soft) text-(--status-error)"
+                      title={withCredentialCode(rowCopy.revokedHint, b.revokedCode)}
+                    >
+                      {t('revoked')}
+                    </span>
+                  ) : b.credentialRejectedAt ? (
+                    <span
+                      className="badge bg-(--status-error-soft) text-(--status-error)"
+                      title={withCredentialCode(rowCopy.rejectedHint, b.credentialRejectedCode)}
+                    >
+                      {t('rejected')}
+                    </span>
+                  ) : null}
+                  {RowBadges && <RowBadges bot={b} />}
+                </div>
+                {/* The host picks the arm by transport; the module owns both
+                    sentences. A platform that declares none gets one sentence for
+                    both arms — its transport is not why sharing is unavailable.
+                    Enablement asks the same question the CP does
+                    (`botSharingEditable`): transport ALONE left Feishu's HTTP bots
+                    with a live toggle for a capability the server refuses. */}
+                <span
+                  className="flex items-center justify-self-start"
+                  title={
+                    (b.transport ?? 'socket') === 'socket' ? rowCopy.shareHint.unavailable : rowCopy.shareHint.available
+                  }
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {/* Structural sharing is not a control at all: the provider stamps
+                      the flag, so the cell states it rather than offering a toggle
+                      the CP would accept and the provider contract does not have. */}
+                  {platformSharingFixed(b.platform) ? (
+                    <span className="font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('always')}
+                    </span>
+                  ) : (
+                    <Toggle
+                      checked={b.shareable}
+                      disabled={!canWrite || botBusyId === b.id || !botSharingEditable(b)}
+                      onChange={(next) => void flipShareable(b, next)}
+                    />
+                  )}
+                </span>
+                {/* `isolate` keeps a revoked agent's dot above the next overlapping avatar. */}
+                <div className="isolate flex min-w-0 items-center">
+                  {served.length > 0 ? (
+                    served.map(({ id, revoked }, idx) => {
+                      const ag = getAgent(id)
+                      const name = ag ? agentLabel(ag) : id
+                      return (
+                        <Link
+                          key={id}
+                          href={orgPath(`/agents/${encodeURIComponent(id)}?tab=config`)}
+                          aria-label={`Open ${name} configuration`}
+                          title={revoked ? t('revokedAgent', { agent: name }) : name}
+                          className={`av h-[22px] w-[22px] rounded-[6px] no-underline focus-visible:z-10 focus-visible:outline-none focus-visible:shadow-(--focus-ring) ${
+                            idx > 0 ? '-ml-[6px] shadow-[-1px_0_0_0_var(--surface-card)]' : ''
+                          }`}
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <AgentIconView icon={ag?.icon} runtime={ag?.runtime || ag?.model || ''} size={22} />
+                          {revoked && <RevokedMarkDot />}
+                        </Link>
+                      )
+                    })
+                  ) : (
+                    <span className="truncate font-sans text-[11.5px] font-normal leading-normal text-(--text-tertiary)">
+                      {botSubline(b, { freedFrom: t('bot.freedFrom'), builtin: t('bot.builtin') })}
+                    </span>
+                  )}
+                </div>
+                <span className="min-w-0 font-sans text-[12.5px] font-normal leading-normal text-(--text-secondary) max-[479px]:hidden">
+                  {b.createdBy ? creatorLabel(b.createdBy, me) : b.prebuilt ? t('agentConnect') : '—'}
+                </span>
+                {/* The action track: the module's own controls and provider link first, then the host's delete. */}
+                <span className="flex items-center justify-end gap-2" onClick={(e) => e.stopPropagation()}>
+                  {RowActions && <RowActions bot={b} canWrite={canWrite} />}
+                  {RowLinks && <RowLinks bot={b} />}
+                  {free && canWrite ? (
+                    <button className="iconbtn h-7 w-7 flex-none" title={`Delete ${noun}`} onClick={() => onDelete(b)}>
+                      <Icon name="trash" size={14} />
+                    </button>
+                  ) : !free ? (
+                    <span
+                      title={t('uninstallFirst')}
+                      className="flex h-7 w-7 flex-none cursor-not-allowed items-center justify-center opacity-45"
+                    >
+                      <Icon name="trash" size={14} />
+                    </span>
+                  ) : (
+                    <span className="h-7 w-7 flex-none" />
+                  )}
+                </span>
+              </div>
+              {botErr?.id === b.id && (
+                <div className="border-b border-(--border-subtle) px-4 py-2 font-sans text-[12px] font-normal leading-normal text-(--status-error)">
+                  {botErr.msg}
+                </div>
+              )}
+              {CardNotice && <CardNotice bot={b} />}
+              {open && (
+                <div className="border-b border-(--border-subtle) bg-(--surface-sunken) px-4 pb-[14px] pl-10 pt-3">
+                  {RowSettings && <RowSettings bot={b} canWrite={canWrite} />}
+                  {channels.length > 0 ? (
+                    <>
+                      <div
+                        className={`grid ${chanGrid} gap-[11px] px-3 pb-[7px] font-mono text-[10.5px] font-semibold uppercase leading-normal tracking-[0.08em] text-(--text-tertiary)`}
+                      >
+                        {/* The platform's own noun for the room, not "conversation": these rows
+                            are a Linear workspace's teams and a Slack bot's channels. */}
+                        <span>{roomPlural(roomLabel)}</span>
+                        {showDefaultDispatch && (
+                          <span className="justify-self-end">{routable ? t('dispatch') : t('defaultDispatch')}</span>
+                        )}
+                      </div>
+                      {routingErr?.botId === b.id && (
+                        <div
+                          role="alert"
+                          className="mb-2 flex items-start gap-2 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)"
+                        >
+                          <Icon name="triangle-alert" size={13} className="mt-[2px] flex-none" />
+                          <span>{routingErr.msg}</span>
+                        </div>
+                      )}
+                      <div className="overflow-visible rounded-lg border border-(--border-subtle) bg-(--surface-card)">
+                        {channels.map((c, index) => {
+                          const code = !!c.row.isCodeSession
+                          const codeOpen = codeOpenBotId === b.id
+                          // Code channels sort last; the first one carries the group's collapsible header.
+                          const codeHeader = code && !channels[index - 1]?.row.isCodeSession && (
+                            <button
+                              type="button"
+                              className="flex w-full items-center gap-2 border-b border-(--border-subtle) bg-(--surface-sunken) px-3 py-[6px] font-sans text-[10.5px] font-semibold uppercase leading-normal tracking-[0.08em] text-(--text-tertiary) last:border-b-0 hover:text-(--text-primary)"
+                              aria-expanded={codeOpen}
+                              onClick={() => setCodeOpenBotId(codeOpen ? null : b.id)}
+                            >
+                              <Icon name={codeOpen ? 'chevron-down' : 'chevron-right'} size={13} />
+                              <span>{t('channelList.codeChannels')}</span>
+                              <span className="ml-auto tabular-nums">
+                                {channels.filter((other) => other.row.isCodeSession).length}
+                              </span>
+                            </button>
+                          )
+                          if (code && !codeOpen) {
+                            return codeHeader ? <Fragment key={c.channelId}>{codeHeader}</Fragment> : null
+                          }
+                          const label = rowLabelParts(c, b.platform)
+                          // The room marker is the platform's own glyph, not the channel convention:
+                          // a Linear team and a Telegram group carry no "#", so they get no icon.
+                          const glyph = roomGlyph(c.kind, b.platform)
+                          const glyphIcon =
+                            glyph === '@@' ? 'users' : glyph === '@' ? 'at-sign' : glyph === '#' ? 'hash' : null
+                          return (
+                            <Fragment key={c.channelId}>
+                              {codeHeader}
+                              {!code &&
+                                isDirectConversation(c.kind) &&
+                                !isDirectConversation(channels[index - 1]?.kind) && (
+                                  <div className="border-b border-(--border-subtle) bg-(--surface-sunken) px-3 py-[6px] font-sans text-[10.5px] font-semibold uppercase leading-normal tracking-[0.08em] text-(--text-tertiary)">
+                                    {t('directMessages')}
+                                  </div>
+                                )}
+                              <div
+                                className={`grid ${chanGrid} items-center gap-[11px] border-b border-(--border-subtle) px-3 py-2 last:border-b-0`}
+                              >
+                                <span className="mono flex min-w-0 items-center gap-[7px] text-[12px]">
+                                  {glyphIcon && (
+                                    <Icon
+                                      name={glyphIcon}
+                                      size={12}
+                                      color="var(--text-tertiary)"
+                                      className="flex-none"
+                                    />
+                                  )}
+                                  {/* The room's noun is the platform's own; the two direct kinds are platform-free. */}
+                                  <span className="sr-only">
+                                    {c.kind === 'mpim'
+                                      ? t('groupDm')
+                                      : c.kind === 'im'
+                                        ? t('directMessage')
+                                        : roomLabel}
+                                    :{' '}
+                                  </span>
+                                  <span className="flex min-w-0 items-baseline gap-[6px] truncate">
+                                    <ConversationName row={c.row} name={label.name} platform={b.platform} bot={b} />
+                                    {label.hint && (
+                                      <span className="flex-none text-(--text-tertiary)">{label.hint}</span>
+                                    )}
+                                  </span>
+                                </span>
+                                {showGate && (
+                                  <span className="justify-self-end">
+                                    {gates.entry({
+                                      botId: b.id,
+                                      platform: b.platform,
+                                      integrationId: canWrite ? (c.integrationId ?? undefined) : undefined,
+                                      row: c.row
+                                    })}
+                                  </span>
+                                )}
+                                {showDefaultDispatch && (
+                                  <DefaultDispatchPicker
+                                    options={agentOptions}
+                                    activeId={c.agentId ?? b.agentIds[0] ?? null}
+                                    disabled={!canWrite || !c.integrationId}
+                                    {...(routable && !isDirectConversation(c.kind)
+                                      ? {
+                                          routing: {
+                                            name: c.decisionName,
+                                            active: c.routed,
+                                            canStop: canWrite,
+                                            hover: (
+                                              <BotRoutingHover
+                                                botId={b.id}
+                                                name={c.decisionName ?? t('channelList.dispatch.routingFallback')}
+                                              />
+                                            ),
+                                            onOpen: () =>
+                                              setRoutingRow({ botId: b.id, channelId: c.channelId, name: c.name }),
+                                            onStop: (agentId?: string) => {
+                                              setRoutingErr(null)
+                                              stopRouting(decisions!, b.id, c.channelId, agentId)
+                                                .then(refresh)
+                                                .catch((cause: unknown) =>
+                                                  setRoutingErr({
+                                                    botId: b.id,
+                                                    msg: cause instanceof Error ? cause.message : String(cause)
+                                                  })
+                                                )
+                                            }
+                                          }
+                                        }
+                                      : {})}
+                                    onPick={(agentId) =>
+                                      ownerGuard.guard(
+                                        {
+                                          platform: b.platform,
+                                          from: owner(c.agentId ?? b.agentIds[0] ?? null),
+                                          toId: agentId,
+                                          room: c.name
+                                        },
+                                        () => setChannelAgent(c.integrationId!, c.channelId, agentId)
+                                      )
+                                    }
+                                  />
+                                )}
+                              </div>
+                              {showGate &&
+                                gates.strip({
+                                  botId: b.id,
+                                  integrationId: canWrite ? (c.integrationId ?? undefined) : undefined,
+                                  row: c.row,
+                                  agentName: owner(ownerId)?.label ?? '',
+                                  padX: 12,
+                                  siblings: {
+                                    platform: b.platform,
+                                    rows: channels.map((other) => ({
+                                      integrationId: canWrite ? (other.integrationId ?? undefined) : undefined,
+                                      row: other.row
+                                    }))
+                                  }
+                                })}
+                            </Fragment>
+                          )
+                        })}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+                      {t('noConversations', { room: roomNoun })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </Fragment>
+          )
+        })}
+      </CardProvider>
+      {routingRow && decisions && (
+        <DecisionRoutingModal
+          botId={routingRow.botId}
+          channelId={routingRow.channelId}
+          channelName={routingRow.name}
+          resume={routingRow.resume}
+          onClose={() => setRoutingRow(null)}
+        />
+      )}
+      {shownBots.length === 0 &&
+        (dataLoading ? (
+          <LoadingState size={22} padding={20} />
+        ) : platformBots.length > 0 ? (
+          // Filtered empty — say so, or the roster reads as "this org has no
+          // Slack bots" when it has several sitting free.
+          <div className="px-4 py-7 text-center font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+            {t(platformBots.length === 1 ? 'empty.filteredOne' : 'empty.filteredMany', {
+              platform: label,
+              noun,
+              count: platformBots.length
+            })}
+          </div>
+        ) : (
+          <div className="px-4 py-7 text-center">
+            <div className="font-sans text-[13px] font-semibold leading-normal">{t('empty.noneTitle', { noun })}</div>
+            <div className="mt-1 font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+              {t('empty.noneBody', { platform: label, noun })}
+            </div>
+          </div>
+        ))}
+      {ownerGuard.dialog}
+    </div>
+  )
+}

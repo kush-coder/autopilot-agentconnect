@@ -1,0 +1,139 @@
+// Per-daemon key management: metadata listing, authorized issuance, and revocation.
+import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { z } from 'zod'
+import type { ZodTypeProvider } from '../plugins/zod.js'
+import type { HttpDeps } from '../deps.js'
+import type { ApiKeyView } from '../../ports.js'
+import { DaemonId } from '../../domain/ids.js'
+import { denyViewerWrite, ctxOf, orgOf } from '../rbac.js'
+import { canView, canEdit, canIssueDaemonKey } from '../../authorization/policy.js'
+import { ApiKeyListDto, MintedKeyDto, ApiKeyDto, IdParam, ErrorDto, type ApiKeyDtoT } from '../dto/index.js'
+import { daemonStartCommand, daemonWsUrl } from '../onboarding.js'
+import { Tag } from '../plugins/openapi.js'
+
+const KeyParam = z.object({ id: z.string(), keyId: z.string() })
+
+function toDto(v: ApiKeyView): ApiKeyDtoT {
+  return {
+    id: v.id,
+    displayTail: v.displayTail,
+    name: v.name,
+    createdAt: v.createdAt.toISOString(),
+    lastUsedAt: v.lastUsedAt ? v.lastUsedAt.toISOString() : null,
+    expiresAt: v.expiresAt ? v.expiresAt.toISOString() : null,
+    revokedAt: v.revokedAt ? v.revokedAt.toISOString() : null
+  }
+}
+
+export function keyRoutes(deps: HttpDeps) {
+  return async function keyRoutesPlugin(app: FastifyInstance): Promise<void> {
+    const r = app.withTypeProvider<ZodTypeProvider>()
+
+    // Key metadata inherits daemon visibility; issuing an identity credential has its own policy.
+    const getOrgDaemon = async (req: FastifyRequest, id: string) => {
+      const view = await deps.registry.get(orgOf(req), DaemonId(id))
+      if (!view) return null
+      return canView(view, ctxOf(req)) ? view : null
+    }
+
+    r.get(
+      '/daemons/:id/keys',
+      {
+        config: { interactiveOnly: true },
+        schema: {
+          tags: [Tag.DaemonKeys],
+          summary: 'List a daemon’s keys',
+          description: 'Lists a daemon’s API keys, never exposing the secret or its hash.',
+          operationId: 'listDaemonKeys',
+          params: IdParam,
+          response: { 200: ApiKeyListDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (!(await getOrgDaemon(req, req.params.id))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+        }
+        const rows = await deps.apiKeys.listForDaemon(orgOf(req), DaemonId(req.params.id))
+        return rows.map(toDto)
+      }
+    )
+
+    // Mint an additional key for overlap rotation or reconnecting an existing daemon.
+    r.post(
+      '/daemons/:id/keys',
+      {
+        config: { interactiveOnly: true },
+        schema: {
+          tags: [Tag.DaemonKeys],
+          summary: 'Issue a daemon key',
+          description:
+            'An organization owner or the daemon creator with current edit access may mint an additional API key for reconnecting or overlap rotation, returning the one-time plaintext and a ready-to-run start command.',
+          operationId: 'issueDaemonKey',
+          params: IdParam,
+          response: { 201: MintedKeyDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const view = await getOrgDaemon(req, req.params.id)
+        if (!view) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+        }
+        if (!canIssueDaemonKey(view, ctxOf(req))) {
+          return reply.code(403).send({
+            error: 'Forbidden',
+            statusCode: 403,
+            message: 'only an organization owner or the daemon creator with edit access can issue keys'
+          })
+        }
+        const minted = await deps.apiKeys.mintForDaemon(orgOf(req), DaemonId(req.params.id), {
+          createdByUserId: req.orgCtx!.userId
+        })
+        const command = daemonStartCommand(daemonWsUrl(deps.config), minted.token, deps.config.DAEMON_DIST_TAG)
+        return reply.code(201).send({
+          apiKeyId: minted.apiKeyId,
+          apiKey: minted.token,
+          displayTail: minted.displayTail,
+          command
+        })
+      }
+    )
+
+    r.delete(
+      '/daemons/:id/keys/:keyId',
+      {
+        config: { interactiveOnly: true },
+        schema: {
+          tags: [Tag.DaemonKeys],
+          summary: 'Revoke a daemon key',
+          description:
+            'Revokes one of a daemon’s API keys as a kill switch; a key from another daemon or org reads as absent (404).',
+          operationId: 'revokeDaemonKey',
+          params: KeyParam,
+          response: { 200: ApiKeyDto, 403: ErrorDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const daemon = await getOrgDaemon(req, req.params.id)
+        if (!daemon) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+        }
+        if (!canEdit(daemon, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this daemon' })
+        }
+        // Bind the keyId to the org-checked daemon — a raw key id from ANOTHER
+        // daemon/org must read as absent, not get revoked (cross-tenant kill).
+        const owned = await deps.apiKeys.listForDaemon(orgOf(req), DaemonId(req.params.id))
+        if (!owned.some((k) => k.id === req.params.keyId)) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'key not found' })
+        }
+        const view = await deps.apiKeys.revoke(req.params.keyId, 'revoked via console')
+        // Kill the revoked credential's relay reach immediately (§9 revocation loop): every
+        // relay drops this daemon's rd/* connection and re-verifies on its next hello.
+        deps.relayControl.daemonRevoke(req.params.id)
+        return toDto(view)
+      }
+    )
+  }
+}

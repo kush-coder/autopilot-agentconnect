@@ -1,0 +1,491 @@
+'use client'
+
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import {
+  fetchAgentDto,
+  fetchAgentSkillSources,
+  fetchAgentSkillSourceStatus,
+  fetchSkillSourceSkills,
+  fmtDate,
+  listManagedSkills,
+  repoLabel,
+  type AgentSkillSourceDto,
+  type AgentSkillSourceStatusDto,
+  type ManagedSkillDto,
+  type SkillSourceDto,
+  type SkillSourceSkillsDto
+} from '@/lib/api'
+import { useConsoleData } from '@/lib/data-context'
+import { MOCK_MODE } from '@/lib/data'
+import { AttachedEmpty, AttachedNote, AttachedRow, AttachMenu } from '@/components/console/AttachedList'
+import { InstallRegistrySkillModal } from '@/components/console/InstallRegistrySkillModal'
+import { CreateGitUrlSkillSourceModal, CreateSkillSourceModal } from '@/components/console/SkillSourcesCard'
+import { isTrustedByUrl } from '@/lib/skill-source'
+import { SkillMark, SkillSourceLine } from '@/components/console/ToolTile'
+import { Button, Icon, Toggle } from '@/components/ui'
+import { Scrim } from '@/components/console/Scrim'
+
+// The agent's skill roster (shared-skills.md): whole or per-skill Git source refs plus managed bundles, each Source with its latest install failure.
+
+const sourceOf = (ref: string) => (ref.includes('/') ? ref.slice(0, ref.indexOf('/')) : ref)
+const skillOf = (ref: string) => (ref.includes('/') ? ref.slice(ref.indexOf('/') + 1) : '*')
+
+/** Split a comma/whitespace-separated skill list into unique names. */
+function parseSkillNames(raw: string): string[] {
+  return [...new Set(raw.split(/[,\s]+/).filter(Boolean))]
+}
+
+/** The agent's current selection for one source: whole-source vs a specific set. */
+function selectionFor(enabled: string[], name: string): { all: boolean; skills: Set<string> } {
+  const mine = enabled.filter((r) => sourceOf(r) === name)
+  const all = mine.some((r) => skillOf(r) === '*')
+  return { all, skills: new Set(mine.map(skillOf).filter((s) => s !== '*')) }
+}
+
+export function AgentSkillsCard({
+  agentId,
+  canEdit,
+  onBusyChange
+}: {
+  agentId: string
+  canEdit: boolean
+  /** Reports a write in flight, so a host dialog can hold its own completion until the row settles. */
+  onBusyChange?: (busy: boolean) => void
+}) {
+  const t = useTranslations('Agents.detail.tools')
+  const { updateAgent, skillSources, skillSourcesLoading } = useConsoleData()
+  const [enabled, setEnabled] = useState<string[] | null>(null) // saved refs; null ⇒ not loaded
+  const [managedEnabled, setManagedEnabled] = useState<string[] | null>(null)
+  const [managedLibrary, setManagedLibrary] = useState<ManagedSkillDto[] | null>(null)
+  const [own, setOwn] = useState<AgentSkillSourceDto[] | null>(null) // sources this agent enables
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [manifests, setManifests] = useState<Record<string, SkillSourceSkillsDto | 'loading'>>({})
+  const [creating, setCreating] = useState(false)
+  const [creatingGit, setCreatingGit] = useState(false)
+  const [browsing, setBrowsing] = useState(false)
+  const [failures, setFailures] = useState<AgentSkillSourceStatusDto['sources']>([])
+  const [manualDraft, setManualDraft] = useState<Record<string, string>>({})
+  const fetched = useRef(false)
+  useEffect(() => {
+    onBusyChange?.(saving)
+  }, [saving, onBusyChange])
+
+  useEffect(() => {
+    if (fetched.current) return
+    // Demo agents (canEdit false) have no spec to fetch — mock mode seeds a selection
+    // so both row states (whole source vs a picked subset) are visible.
+    if (!canEdit) {
+      if (MOCK_MODE) {
+        setEnabled(['example-ai-kit/*', 'internal-runbooks/safe-deploy'])
+        setManagedEnabled([])
+        setManagedLibrary([])
+        return
+      }
+    }
+    fetched.current = true
+    fetchAgentDto(agentId).then(
+      (dto) => {
+        setEnabled(dto.skills ?? [])
+        setManagedEnabled(dto.managedSkills ?? [])
+      },
+      (e) => setErr(e instanceof Error ? e.message : String(e))
+    )
+    listManagedSkills(true).then(
+      (rows) => setManagedLibrary(rows),
+      (e) => {
+        setManagedLibrary([])
+        setErr(e instanceof Error ? e.message : String(e))
+      }
+    )
+    // Resolving the agent's own refs is best-effort decoration: it only ADDS rows
+    // for sources missing from the registry list, so a failure degrades to the
+    // registry view rather than blocking the card.
+    if (canEdit) {
+      fetchAgentSkillSources(agentId).then(
+        (rows) => setOwn(rows),
+        () => setOwn([])
+      )
+    }
+    // Install status is decoration too: a CP that predates it answers 404, which reads as no failures.
+    fetchAgentSkillSourceStatus(agentId).then(
+      (status) => setFailures(status.sources),
+      () => setFailures([])
+    )
+  }, [agentId, canEdit])
+
+  const save = async (next: string[]) => {
+    if (enabled === null || saving) return
+    const prev = enabled
+    setEnabled(next)
+    setSaving(true)
+    setErr(null)
+    try {
+      await updateAgent(agentId, { skills: next })
+    } catch (e) {
+      setEnabled(prev) // revert so the rows never lie about what's saved
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveManaged = async (next: string[]) => {
+    if (managedEnabled === null || saving) return
+    const prev = managedEnabled
+    const activeIds = new Set((managedLibrary ?? []).filter((skill) => !skill.archivedAt).map((skill) => skill.id))
+    const valid = [...new Set(next)].filter((id) => activeIds.has(id))
+    setManagedEnabled(valid)
+    setSaving(true)
+    setErr(null)
+    try {
+      await updateAgent(agentId, { managedSkills: valid })
+    } catch (e) {
+      setManagedEnabled(prev)
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const withoutSource = (name: string) => (enabled ?? []).filter((r) => sourceOf(r) !== name)
+
+  // Enable/disable a whole source ("<source>/*").
+  const toggleSource = (name: string, on: boolean) => {
+    if (!canEdit || enabled === null) return
+    void save(on ? [...withoutSource(name), `${name}/*`] : withoutSource(name))
+  }
+
+  // Toggle one skill; converts a whole-source selection to an explicit set first,
+  // and collapses back to "<source>/*" when every discovered skill ends up selected.
+  const toggleSkill = (name: string, skill: string, discovered: string[]) => {
+    if (!canEdit || enabled === null) return
+    const cur = selectionFor(enabled, name)
+    const set = cur.all ? new Set(discovered) : new Set(cur.skills)
+    if (set.has(skill)) set.delete(skill)
+    else set.add(skill)
+    const base = withoutSource(name)
+    if (set.size === 0) return void save(base)
+    if (discovered.length > 0 && discovered.every((s) => set.has(s))) return void save([...base, `${name}/*`])
+    void save([...base, ...[...set].map((s) => `${name}/${s}`)])
+  }
+
+  // A typed skill list for a source the console cannot scan; empty ⇒ the whole source.
+  const applyManual = (id: string, name: string, raw: string) => {
+    if (!canEdit || enabled === null) return
+    const picked = parseSkillNames(raw)
+    const base = withoutSource(name)
+    setManualDraft((cur) => Object.fromEntries(Object.entries(cur).filter(([key]) => key !== id)))
+    void save(picked.length === 0 ? [...base, `${name}/*`] : [...base, ...picked.map((sk) => `${name}/${sk}`)])
+  }
+
+  // A source registered from this card is what the operator wanted on THIS agent,
+  // so it is enabled whole as soon as the library accepts it.
+  const enableCreated = (created: SkillSourceDto) => toggleSource(created.name, true)
+
+  const expand = (id: string) => {
+    setExpanded((cur) => {
+      const next = new Set(cur)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+    if (!manifests[id]) {
+      setManifests((cur) => ({ ...cur, [id]: 'loading' }))
+      fetchSkillSourceSkills(id).then(
+        (m) => setManifests((cur) => ({ ...cur, [id]: m })),
+        () => setManifests((cur) => ({ ...cur, [id]: { resolvable: false, skills: [] } }))
+      )
+    }
+  }
+
+  // Registry rows the caller can see, then the agent's own sources that sharing keeps
+  // out of that list. The second group is `registry: false` — off-only, with no
+  // per-skill picker, because the CP gates ADDING a ref on seeing the source; they
+  // exist to say what the agent installs and to let it be removed.
+  const sources = useMemo(() => {
+    const known = new Set(skillSources.map((s) => s.name))
+    // `registry` is a literal so it discriminates the union: only the registry arm
+    // carries the fields the menu's repo hint reads.
+    return [
+      ...skillSources.map((s) => ({ ...s, registry: true as const })),
+      ...(own ?? []).filter((s) => !known.has(s.name)).map((s) => ({ ...s, registry: false as const }))
+    ]
+  }, [skillSources, own])
+
+  // Nothing is known yet while either list is in flight; rendering the empty state
+  // then would claim the agent has nothing when we simply haven't asked.
+  const loading = skillSourcesLoading || (canEdit && own === null) || managedLibrary === null || enabled === null
+  const interactive = canEdit && enabled !== null && !saving
+
+  const library = managedLibrary ?? []
+  const managedIds = managedEnabled ?? []
+  const attachedManaged = library.filter((skill) => managedIds.includes(skill.id))
+  const attachedSources = sources.filter((s) => {
+    const sel = enabled ? selectionFor(enabled, s.name) : null
+    return !!sel && (sel.all || sel.skills.size > 0)
+  })
+  const empty = attachedManaged.length === 0 && attachedSources.length === 0
+
+  const menu = canEdit ? (
+    <AttachMenu
+      ariaLabel={t('addCustomSkillSource')}
+      disabled={!interactive || managedEnabled === null}
+      groups={[
+        {
+          heading: t('addManagedSkills'),
+          icon: 'package',
+          options: library
+            .filter((skill) => !skill.archivedAt && !managedIds.includes(skill.id))
+            .map((skill) => ({
+              key: skill.id,
+              name: skill.name,
+              meta: `rev ${skill.currentRevision}`,
+              onPick: () => void saveManaged([...managedIds, skill.id])
+            })),
+          emptyLabel: t('noMoreManagedSkills')
+        },
+        {
+          heading: t('gitSkillSources'),
+          icon: 'book-open',
+          // Only registry sources are offerable — the CP rejects enabling a ref to a
+          // source this caller can't see.
+          options: sources
+            .filter((s) => s.registry && !attachedSources.some((a) => a.name === s.name))
+            .map((s) => ({
+              key: s.id,
+              name: s.name,
+              meta: repoLabel(s.source),
+              onPick: () => toggleSource(s.name, true)
+            })),
+          emptyLabel: t('allSourcesEnabled')
+        }
+      ]}
+      actions={[
+        { key: 'registry', label: t('searchSkills'), icon: 'search', onPick: () => setBrowsing(true) },
+        { key: 'custom', label: t('addCustomSkillSource'), icon: 'plus', onPick: () => setCreating(true) },
+        { key: 'git-url', label: t('addGitUrlSkillSource'), icon: 'git-branch', onPick: () => setCreatingGit(true) }
+      ]}
+    />
+  ) : undefined
+
+  return (
+    <div className="card overflow-hidden max-desktop:rounded-lg desktop:max-w-[760px]">
+      <div className="cardhead flex-wrap gap-2">
+        <span className="cardtitle">{t('skills')}</span>
+        <span className="mono ml-auto text-[11px] text-(--text-tertiary)">{t('managedBundlesGitSources')}</span>
+        {menu}
+      </div>
+
+      {empty ? (
+        <AttachedEmpty
+          title={loading ? t('loading') : t('noSkills')}
+          hint={
+            loading ? 'Reading this agent’s enabled skills.' : canEdit ? t('enableSkillsHint') : t('noSkillsEnabled')
+          }
+          action={loading ? undefined : menu}
+        />
+      ) : (
+        <>
+          <div>
+            {attachedManaged.map((skill) => (
+              <AttachedRow
+                key={skill.id}
+                mark={<SkillMark />}
+                name={skill.name}
+                meta={`rev ${skill.currentRevision} · ${skill.fileCount} file${skill.fileCount === 1 ? '' : 's'} · immutable bundle`}
+                dimmed={!!skill.archivedAt}
+                badge={
+                  <span
+                    className={`badge flex-none ${skill.archivedAt ? 'bg-(--surface-sunken) text-(--text-disabled)' : 'bg-(--status-online-soft) text-(--status-online)'}`}
+                  >
+                    {skill.archivedAt ? t('archived') : t('managed')}
+                  </span>
+                }
+                onRemove={
+                  canEdit && !saving ? () => void saveManaged(managedIds.filter((id) => id !== skill.id)) : undefined
+                }
+                removeTitle={t('removeFromAgent')}
+              />
+            ))}
+            {attachedSources.map((s) => {
+              const sel = enabled ? selectionFor(enabled, s.name) : { all: false, skills: new Set<string>() }
+              const manifest = manifests[s.id]
+              const isOpen = expanded.has(s.id)
+              const trusted = isTrustedByUrl(s)
+              const failure = failures.find((f) => f.name === s.name)
+              const selectedText = sel.all ? '' : [...sel.skills].join(', ')
+              const draft = manualDraft[s.id] ?? selectedText
+              // The source's own filter bounds what a selection can install, so a name outside it would install nothing.
+              const outsideFilter =
+                s.skills.length > 0 ? parseSkillNames(draft).filter((sk) => !s.skills.includes(sk)) : []
+              return (
+                <AttachedRow
+                  key={s.id}
+                  mark={<SkillMark />}
+                  name={s.name}
+                  meta={<SkillSourceLine source={s.source} subDir={s.subDir} />}
+                  badge={
+                    <span className="flex flex-none flex-col items-end gap-1 desktop:flex-row desktop:items-center">
+                      {trusted && (
+                        <span
+                          className="badge flex-none bg-(--surface-sunken) text-(--text-secondary)"
+                          title={t('trustedByUrlHint')}
+                        >
+                          {t('trustedByUrl')}
+                        </span>
+                      )}
+                      <span className="badge flex-none bg-(--status-info-soft) text-(--status-info)">
+                        {sel.all ? t('allSkills') : t('selectedSkills', { count: sel.skills.size })}
+                      </span>
+                    </span>
+                  }
+                  // An agent-scoped source has no per-skill picker: the CP would reject
+                  // re-adding a ref to a source this caller can't see.
+                  actions={
+                    s.registry ? (
+                      <button
+                        type="button"
+                        className="iconbtn h-[26px] w-[26px] flex-none"
+                        onClick={() => expand(s.id)}
+                        aria-label={t('chooseIndividualSkills')}
+                        aria-expanded={isOpen}
+                        title={t('chooseIndividualSkills')}
+                      >
+                        <Icon name={isOpen ? 'chevron-down' : 'chevron-right'} size={13} />
+                      </button>
+                    ) : undefined
+                  }
+                  onRemove={canEdit && !saving ? () => toggleSource(s.name, false) : undefined}
+                  removeTitle="Remove from this agent"
+                >
+                  {failure && (
+                    <div
+                      data-skill-source-failure={failure.code}
+                      className="flex items-start gap-2 px-4 pb-3 font-sans text-[12px] font-normal leading-[1.5] text-(--status-error)"
+                    >
+                      <Icon name="triangle-alert" size={14} className="mt-[2px] flex-none" />
+                      <span className="min-w-0">
+                        <span className="font-semibold">{t('installFailed')}</span>
+                        {t.has(`failureCodes.${failure.code}`) && <span>: {t(`failureCodes.${failure.code}`)}</span>}
+                        <span className="mono ml-1 text-[11px] text-(--text-tertiary)">
+                          {failure.code} · {t('installFailedAt', { date: fmtDate(failure.reportedAt) })}
+                        </span>
+                      </span>
+                    </div>
+                  )}
+                  {isOpen && s.registry && (
+                    <div className="border-t border-(--border-subtle) bg-(--surface-sunken) px-[14px] py-2">
+                      {manifest === 'loading' || manifest === undefined ? (
+                        <div className="py-1 font-sans text-[12px] text-(--text-tertiary)">{t('loadingSkills')}</div>
+                      ) : !manifest.resolvable ? (
+                        <div className="flex flex-col gap-2 py-1">
+                          <span className="font-sans text-[12px] leading-[1.5] text-(--text-tertiary)">
+                            {t('manualSkillsHint')}
+                          </span>
+                          {s.skills.length > 0 && (
+                            <span
+                              data-source-filter
+                              className={`font-sans text-[12px] leading-[1.5] ${outsideFilter.length > 0 ? 'text-(--status-error)' : 'text-(--text-tertiary)'}`}
+                            >
+                              {t('manualSkillsLimited', { skills: s.skills.join(', ') })}
+                            </span>
+                          )}
+                          <div className="flex items-center gap-2">
+                            <input
+                              className="inp mn min-w-0 flex-1"
+                              aria-label={t('chooseIndividualSkills')}
+                              placeholder={t('manualSkillsPlaceholder')}
+                              value={draft}
+                              disabled={!interactive}
+                              onChange={(e) => setManualDraft((cur) => ({ ...cur, [s.id]: e.target.value }))}
+                            />
+                            <Button
+                              variant="secondary"
+                              size="xs"
+                              disabled={!interactive || draft.trim() === selectedText || outsideFilter.length > 0}
+                              onClick={() => applyManual(s.id, s.name, draft)}
+                            >
+                              {t('applySkills')}
+                            </Button>
+                          </div>
+                        </div>
+                      ) : manifest.skills.length === 0 ? (
+                        <div className="py-1 font-sans text-[12px] leading-[1.5] text-(--text-tertiary)">
+                          {t('noSkillManifest')}
+                        </div>
+                      ) : (
+                        manifest.skills.map((sk) => (
+                          <div key={sk.name} className="flex items-center gap-[11px] py-[7px]">
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-mono text-[12px] font-medium leading-normal text-(--text-primary)">
+                                {sk.name}
+                              </div>
+                              <div className="truncate font-sans text-[11px] font-normal leading-normal text-(--text-tertiary)">
+                                {sk.dirPath}
+                              </div>
+                            </div>
+                            <Toggle
+                              checked={sel.all || sel.skills.has(sk.name)}
+                              disabled={!interactive}
+                              onChange={() =>
+                                toggleSkill(
+                                  s.name,
+                                  sk.name,
+                                  manifest.skills.map((x) => x.name)
+                                )
+                              }
+                            />
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </AttachedRow>
+              )
+            })}
+          </div>
+          <AttachedNote>
+            {t.rich('skillInstallNote', {
+              command: () => <span className="mono text-[11.5px]">{t('skillsCommand')}</span>
+            })}
+          </AttachedNote>
+        </>
+      )}
+
+      {err && (
+        <div className="border-t border-(--border-subtle) px-4 py-[11px] font-sans text-[12px] font-normal leading-normal text-(--red-600)">
+          {err}
+        </div>
+      )}
+
+      {browsing && (
+        <Scrim onEscape={() => setBrowsing(false)}>
+          <div className="modal">
+            <InstallRegistrySkillModal
+              existing={skillSources}
+              onClose={() => setBrowsing(false)}
+              onCreated={enableCreated}
+            />
+          </div>
+        </Scrim>
+      )}
+      {creating && (
+        <Scrim onEscape={() => setCreating(false)}>
+          <div className="modal">
+            <CreateSkillSourceModal onClose={() => setCreating(false)} onCreated={enableCreated} />
+          </div>
+        </Scrim>
+      )}
+      {creatingGit && (
+        <Scrim onEscape={() => setCreatingGit(false)}>
+          <div className="modal">
+            <CreateGitUrlSkillSourceModal onClose={() => setCreatingGit(false)} onCreated={enableCreated} />
+          </div>
+        </Scrim>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,912 @@
+'use client'
+
+// Settings page (design: `isSettings`). Everything here is REAL and scoped to
+// the active org: the Organization card (rename via PATCH /orgs/:id, owners
+// only), self-service organization leave, Members & roles (GET /members;
+// owners can invite-by-email, re-role and remove members — the CP enforces the
+// last-owner guard), the org-wide agent policies, and the Roles explainer.
+//
+// The org's bots and code hosts are NOT here — they live on their own
+// Integrations page (IntegrationsView), which unlike Settings is reachable in
+// no-auth mode.
+
+import { useCallback, useEffect, useState } from 'react'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
+import { useTranslations } from 'next-intl'
+import useSWR from 'swr'
+import { Avatar, Button, Icon, Toggle } from '@/components/ui'
+import { AgentIconView, LoadingState, PlatformMark } from '@/components/marks'
+import { withIconUrl } from '@/lib/agent-icon'
+import { AgentIconPicker } from '@/components/console/AgentIconPicker'
+import { useModal } from '@/components/console/ModalProvider'
+import { useConsoleData } from '@/lib/data-context'
+import { useOrgs } from '@/lib/org-context'
+import { initialsFrom } from '@/lib/auth'
+import {
+  createOrgInviteLink,
+  fetchMembers,
+  fetchOrgInviteLink,
+  fetchSessionExternalAccess,
+  memberDisplayName,
+  revokeOrgInviteLink,
+  putSessionExternalAccess,
+  updateOrg,
+  uploadOrgIcon,
+  type MemberDto,
+  type MemberRole,
+  type OrgInviteLinkDto,
+  type SessionAccessProvider
+} from '@/lib/api'
+import { type AgentCallPolicy } from '@/lib/data'
+import { consoleKeys } from '@/lib/swr-keys'
+import { inviteLinkStatus, inviteLinkUrl } from '@/lib/org-invite-link'
+import EditMemberModal, { type MemberTarget } from '@/components/console/modals/EditMemberModal'
+import InviteMembersModal from '@/components/console/modals/InviteMembersModal'
+import { OrganizationEnvironmentCard } from '@/components/console/OrganizationEnvironmentCard'
+import { ServiceAccountsCard } from '@/components/console/ServiceAccountsCard'
+import { Scrim } from '@/components/console/Scrim'
+
+// A session-access row is a platform name and its switch. What the switch does is
+// said once, in the card header — restating it per row ("People with Slack access"
+// beside an on switch in a row already labelled Slack) is the same sentence three
+// times. Only EXCEPTIONS get words: a chip when the setting is not fully taking
+// effect, and the per-platform detail on the row's info button.
+//
+// A provider this deployment cannot offer at all is not an exception to explain,
+// it is a row to leave out — see `hasNothingToOffer`.
+//
+// Two halves, and both are easy to state wrongly.
+//
+// "New sessions" is load-bearing in the Off half: turning the policy off stops
+// NEW sessions binding to platform access. The ones already bound keep their
+// `external` classification and simply stop being shown — they are not
+// deleted, and turning the policy back on brings them back (each `details`
+// string below says so too). That direction surprises people, because turning
+// a restriction OFF shows them LESS, so it has to be spelled out rather than
+// implied.
+//
+// And the Off half is Everyone, not the agent's audience: the session list
+// reads every org agent regardless of Agent Team visibility
+// (`routes/sessions.ts` — "Agent Team visibility does not narrow Session
+// reads"), so promising "anyone who can view the agent" understated it.
+// `Everyone` is the audience word for the internal `org` value — see
+// docs/product-conventions.md.
+/** The live policy for one provider, plus the owner's write path. */
+function useSessionAccess(provider: SessionAccessProvider, orgId: string | undefined, isOwner: boolean) {
+  const key = consoleKeys.sessionAccess(orgId, provider)
+  const {
+    data: access,
+    error: loadError,
+    mutate
+  } = useSWR(key, ([, scopedOrgId, , scopedProvider]) => fetchSessionExternalAccess(scopedProvider, scopedOrgId))
+  const [busy, setBusy] = useState(false)
+  const [actionError, setActionError] = useState<{ scope: string; message: string } | null>(null)
+  // Keyed by org+provider: switching orgs re-keys SWR but keeps this state.
+  const scope = `${orgId ?? ''}:${provider}`
+
+  const setEnabled = async (enabled: boolean) => {
+    if (!orgId || !isOwner || busy) return
+    setBusy(true)
+    setActionError(null)
+    try {
+      const next = await putSessionExternalAccess(provider, enabled, orgId)
+      await mutate(next, { revalidate: false })
+    } catch (error) {
+      setActionError({ scope, message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return {
+    provider,
+    access,
+    loadError,
+    busy,
+    actionError: actionError?.scope === scope ? actionError.message : null,
+    setEnabled
+  }
+}
+
+type SessionAccessState = ReturnType<typeof useSessionAccess>
+
+/**
+ * Whether the row would be a dead control: this deployment has no sign-in (and,
+ * for GitHub, no access checks) wiring behind the provider, and the org is not
+ * on the policy either. Nothing an owner does here can change that — the CP
+ * refuses to enable it (409) and there is nothing to turn off — so the row is
+ * left out rather than shown greyed with an explanation nobody can act on.
+ *
+ * `available === false` with the policy still ENABLED is the opposite case: the
+ * wiring went away under a live policy, so sessions are being hidden and the
+ * owner needs the switch to turn it back off. That row stays, with a chip.
+ *
+ * Unknown (still loading, or the read failed) is never hidden — absence has to
+ * be a fact, not a default.
+ */
+function hasNothingToOffer(state: SessionAccessState): boolean {
+  return state.access !== undefined && !state.access.available && !state.access.enabled
+}
+
+function SessionAccessRow({
+  state,
+  isOwner,
+  bordered = false
+}: {
+  state: SessionAccessState
+  isOwner: boolean
+  bordered?: boolean
+}) {
+  const t = useTranslations('Settings.sessionAccess')
+  const { provider, access, loadError, busy, actionError } = state
+  const copy = {
+    slack: {
+      name: t('providers.slack.name'),
+      label: t('providers.slack.label'),
+      description: t('providers.slack.description'),
+      details: t('providers.slack.details'),
+      unavailable: t('providers.slack.unavailable'),
+      unresolved: (count: number) => t('providers.slack.unresolved', { count }),
+      degraded: t('providers.slack.degraded')
+    },
+    github: {
+      name: t('providers.github.name'),
+      label: t('providers.github.label'),
+      description: t('providers.github.description'),
+      details: t('providers.github.details'),
+      unavailable: t('providers.github.unavailable'),
+      unresolved: (count: number) => t('providers.github.unresolved', { count }),
+      degraded: t('providers.github.degraded')
+    },
+    gitlab: {
+      name: t('providers.gitlab.name'),
+      label: t('providers.gitlab.label'),
+      description: t('providers.gitlab.description'),
+      details: t('providers.gitlab.details'),
+      unavailable: t('providers.gitlab.unavailable'),
+      unresolved: (count: number) => t('providers.gitlab.unresolved', { count }),
+      degraded: t('providers.gitlab.degraded')
+    },
+    feishu: {
+      name: t('providers.feishu.name'),
+      label: t('providers.feishu.label'),
+      description: t('providers.feishu.description'),
+      details: t('providers.feishu.details'),
+      unavailable: t('providers.feishu.unavailable'),
+      unresolved: (count: number) => t('providers.feishu.unresolved', { count }),
+      degraded: t('providers.feishu.degraded')
+    },
+    telegram: {
+      name: t('providers.telegram.name'),
+      label: t('providers.telegram.label'),
+      description: t('providers.telegram.description'),
+      details: t('providers.telegram.details'),
+      unavailable: t('providers.telegram.unavailable'),
+      unresolved: (count: number) => t('providers.telegram.unresolved', { count }),
+      degraded: t('providers.telegram.degraded')
+    },
+    discord: {
+      name: t('providers.discord.name'),
+      label: t('providers.discord.label'),
+      description: t('providers.discord.description'),
+      details: t('providers.discord.details'),
+      unavailable: t('providers.discord.unavailable'),
+      unresolved: (count: number) => t('providers.discord.unresolved', { count }),
+      degraded: t('providers.discord.degraded')
+    },
+    googlechat: {
+      name: t('providers.googlechat.name'),
+      label: t('providers.googlechat.label'),
+      description: t('providers.googlechat.description'),
+      details: t('providers.googlechat.details'),
+      unavailable: t('providers.googlechat.unavailable'),
+      unresolved: (count: number) => t('providers.googlechat.unresolved', { count }),
+      degraded: t('providers.googlechat.degraded')
+    },
+    msteams: {
+      name: t('providers.msteams.name'),
+      label: t('providers.msteams.label'),
+      description: t('providers.msteams.description'),
+      details: t('providers.msteams.details'),
+      unavailable: t('providers.msteams.unavailable'),
+      unresolved: (count: number) => t('providers.msteams.unresolved', { count }),
+      degraded: t('providers.msteams.degraded')
+    }
+  }[provider]
+  const hiddenSessions = access?.hiddenSessions ?? 0
+  // The wiring disappeared under a live policy (the hidden-row case inverted).
+  const stranded = access?.available === false && access.enabled
+
+  return (
+    <div className={`flex items-center gap-3 px-4 py-[15px] ${bordered ? 'border-t border-(--border-subtle)' : ''}`}>
+      <span className="flex h-[18px] w-[18px] flex-none items-center justify-center text-(--text-primary)">
+        <PlatformMark platform={provider} fillPct={100} />
+      </span>
+      <div className="min-w-0 flex-1">
+        {/* The detail is hover copy, so it needs a control that keyboard focus can
+            land on — `TooltipLayer` opens from focus, and a plain span never
+            takes any. Same affordance the two-line row carried. */}
+        <div className="flex items-center gap-[5px]">
+          <span className="font-sans text-[13px] font-medium leading-normal">{copy.label}</span>
+          <button
+            type="button"
+            className="flex h-4 w-4 flex-none items-center justify-center rounded-full text-(--text-tertiary) transition-colors hover:text-(--text-primary) focus-visible:outline-none focus-visible:shadow-(--focus-ring)"
+            aria-label={t('providerHelp', { label: copy.label })}
+            title={copy.details}
+          >
+            <Icon name="info" size={13} />
+          </button>
+        </div>
+        <div className="mt-[2px] font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+          {copy.description}
+        </div>
+        {(actionError || loadError) && (
+          <div role="alert" className="mt-1 font-sans text-[11.5px] font-normal leading-normal text-(--status-error)">
+            {actionError ?? t('loadError', { name: copy.name })}
+          </div>
+        )}
+      </div>
+      {/* Amber is reserved for the actionable cases — a scope that stopped
+          resolving after enablement, or configuration pulled out from under a
+          live policy. The hidden-session backlog is expected and permanent (the
+          CP freezes it as the policy's legacy mark), so its chip reads as a
+          muted fact, not a fault the owner is failing to clear.
+          A chip is a shortening, not a hiding: the full sentence is hover copy
+          for a pointer and screen-reader text for everyone else. */}
+      {stranded && (
+        <span className="badge flex-none bg-(--status-paused-soft) text-(--status-paused)" title={copy.unavailable}>
+          <span aria-hidden="true">{t('notConfigured')}</span>
+          <span className="sr-only">{copy.unavailable}</span>
+        </span>
+      )}
+      {access?.state === 'degraded' && !stranded && (
+        <span className="badge flex-none bg-(--status-paused-soft) text-(--status-paused)" title={copy.degraded}>
+          <span aria-hidden="true">{t('scopesNotResolving')}</span>
+          <span className="sr-only">{copy.degraded}</span>
+        </span>
+      )}
+      {hiddenSessions > 0 && (
+        <span
+          className="badge flex-none bg-(--surface-sunken) text-(--text-tertiary)"
+          title={copy.unresolved(hiddenSessions)}
+        >
+          <span aria-hidden="true">{t('hidden', { count: hiddenSessions })}</span>
+          <span className="sr-only">{copy.unresolved(hiddenSessions)}</span>
+        </span>
+      )}
+      <span title={isOwner ? undefined : t('ownerOnly')}>
+        <Toggle
+          checked={access?.enabled === true}
+          disabled={!isOwner || !access || busy || (!access.available && !access.enabled)}
+          ariaLabel={copy.label}
+          onChange={(next) => void state.setEnabled(next)}
+        />
+      </span>
+    </div>
+  )
+}
+
+export function SessionAccessCard({ orgId, isOwner }: { orgId?: string; isOwner: boolean }) {
+  const t = useTranslations('Settings.sessionAccess')
+  // Fixed hooks keep the provider reads stable while the card filters unavailable rows.
+  const providers = [
+    useSessionAccess('github', orgId, isOwner),
+    useSessionAccess('gitlab', orgId, isOwner),
+    useSessionAccess('slack', orgId, isOwner),
+    useSessionAccess('feishu', orgId, isOwner),
+    useSessionAccess('telegram', orgId, isOwner),
+    useSessionAccess('discord', orgId, isOwner),
+    useSessionAccess('googlechat', orgId, isOwner),
+    useSessionAccess('msteams', orgId, isOwner)
+  ]
+  const pending = providers.some((state) => state.access === undefined && !state.loadError)
+  const rows = providers.filter((state) => !hasNothingToOffer(state))
+
+  // Nothing wired and nothing enabled: no header over an empty card either.
+  if (!pending && rows.length === 0) return null
+
+  return (
+    <div className="card mt-[18px]" id="session-access">
+      <div className="cardhead justify-between">
+        <span className="cardtitle">{t('title')}</span>
+        <span className="flex items-center gap-[6px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+          {t('followPlatformAccess')}
+          <button
+            type="button"
+            className="flex h-4 w-4 flex-none items-center justify-center rounded-full text-(--text-tertiary) transition-colors hover:text-(--text-primary) focus-visible:outline-none focus-visible:shadow-(--focus-ring)"
+            aria-label={t('help')}
+            title={t('hint')}
+          >
+            <Icon name="info" size={13} />
+          </button>
+        </span>
+      </div>
+      {/* Hold the rows until every provider has answered: a row that appears and
+          then vanishes reads as a glitch, and this card can vanish whole. */}
+      {pending ? (
+        <LoadingState size={22} padding={20} />
+      ) : (
+        rows.map((state, index) => (
+          <SessionAccessRow key={state.provider} state={state} isOwner={isOwner} bordered={index > 0} />
+        ))
+      )}
+    </div>
+  )
+}
+
+function AgentVisibilityCard({
+  orgId,
+  policy,
+  isOwner,
+  onChange
+}: {
+  orgId?: string
+  policy: AgentCallPolicy
+  isOwner: boolean
+  onChange: (policy: AgentCallPolicy) => Promise<void>
+}) {
+  const t = useTranslations('Settings.agentVisibility')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const setPolicy = async (next: AgentCallPolicy) => {
+    if (!orgId || !isOwner || busy || next === policy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await onChange(next)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const disabled = !orgId || !isOwner || busy
+  // Only the chosen option's consequence is spelled out — the unchosen one is a
+  // segment label, not a second paragraph.
+  const options = [
+    { key: 'all' as const, label: t('options.all.label'), sub: t('options.all.description') },
+    { key: 'selected' as const, label: t('options.selected.label'), sub: t('options.selected.description') }
+  ] satisfies ReadonlyArray<{ key: AgentCallPolicy; label: string; sub: string }>
+  const selected = options.find((option) => option.key === policy)
+
+  return (
+    <div className="card mt-[18px]" id="agent-visibility">
+      <div className="cardhead justify-between">
+        <span className="cardtitle">{t('title')}</span>
+        <span className="font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+          {t('newAgentsOnly')}
+        </span>
+      </div>
+      <div className="flex flex-col gap-3 px-4 py-[15px] desktop:flex-row desktop:items-center desktop:gap-4">
+        <div className="min-w-0 flex-1">
+          <div className="font-sans text-[13px] font-medium leading-normal">{t('newAgentsStart')}</div>
+          <div className="mt-[2px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+            {selected?.sub}
+          </div>
+        </div>
+        <div
+          className="pillbar self-start desktop:flex-none desktop:self-auto"
+          role="radiogroup"
+          aria-label={t('title')}
+          aria-busy={busy}
+          title={isOwner ? undefined : t('ownerOnly')}
+        >
+          {options.map((option) => (
+            <button
+              key={option.key}
+              type="button"
+              role="radio"
+              disabled={disabled}
+              aria-checked={policy === option.key}
+              onClick={() => void setPolicy(option.key)}
+              className={
+                policy === option.key
+                  ? disabled
+                    ? 'pill on cursor-not-allowed opacity-50'
+                    : 'pill on'
+                  : disabled
+                    ? 'pill cursor-not-allowed opacity-50'
+                    : 'pill'
+              }
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {error && (
+        <div
+          role="alert"
+          className="border-t border-(--border-subtle) px-4 py-3 font-sans text-[12px] font-normal leading-normal text-(--status-error)"
+        >
+          {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// The org's starting auto-upgrade switch for daemons added from now on; existing daemons keep their own.
+function DaemonAutoUpgradeDefaultCard({
+  orgId,
+  enabled,
+  isOwner,
+  onChange
+}: {
+  orgId?: string
+  enabled: boolean
+  isOwner: boolean
+  onChange: (enabled: boolean) => Promise<void>
+}) {
+  const t = useTranslations('Settings.daemonAutoUpgrade')
+  const [optimistic, setOptimistic] = useState<boolean | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const busy = optimistic !== null
+
+  const change = async (next: boolean) => {
+    if (!orgId || !isOwner || busy) return
+    setOptimistic(next)
+    setError(null)
+    try {
+      await onChange(next)
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError))
+    } finally {
+      setOptimistic(null)
+    }
+  }
+
+  return (
+    <div className="card mt-[18px]" id="daemon-auto-upgrade">
+      <div className="cardhead justify-between">
+        <span className="cardtitle">{t('title')}</span>
+        <span className="font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+          {t('newDaemonsOnly')}
+        </span>
+      </div>
+      <div className="flex items-center gap-4 px-4 py-[15px]">
+        <div className="min-w-0 flex-1">
+          <div className="font-sans text-[13px] font-medium leading-normal">{t('label')}</div>
+          <div className="mt-[2px] font-sans text-[12px] font-normal leading-[1.5] text-(--text-tertiary)">
+            {t('help')}
+          </div>
+        </div>
+        <span className="flex-none" title={isOwner ? undefined : t('ownerOnly')}>
+          <Toggle
+            checked={optimistic ?? enabled}
+            disabled={!orgId || !isOwner || busy}
+            ariaLabel={t('label')}
+            onChange={(next) => void change(next)}
+          />
+        </span>
+      </div>
+      {error && (
+        <div
+          role="alert"
+          className="border-t border-(--border-subtle) px-4 py-3 font-sans text-[12px] font-normal leading-normal text-(--status-error)"
+        >
+          {error}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// One rendered member row, precomputed from the wire DTO.
+interface MemberRowView {
+  userId: string
+  name: string
+  email: string | null
+  picture: string | null
+  initials: string
+  avBg: string
+  avText: string
+  roleBg: string
+  roleText: string
+  role: MemberRole
+  isCurrentUser: boolean
+}
+
+function rowFromDto(m: MemberDto): MemberRowView {
+  const name = memberDisplayName(m)
+  const owner = m.role === 'owner'
+  return {
+    userId: m.userId,
+    name,
+    email: m.email,
+    picture: m.picture,
+    initials: initialsFrom(m.name ?? '', m.email ?? undefined),
+    avBg: owner ? 'var(--magenta-100)' : 'var(--gray-100)',
+    avText: owner ? 'var(--magenta-700)' : 'var(--text-secondary)',
+    roleBg: owner ? 'var(--brand-soft)' : 'var(--surface-active)',
+    roleText: owner ? 'var(--brand-soft-text)' : 'var(--text-secondary)',
+    role: m.role,
+    isCurrentUser: m.isCurrentUser
+  }
+}
+
+const MEMBER_GRID = 'grid-cols-[2fr_1.4fr_auto]'
+
+function InviteLinksCard({ orgId }: { orgId: string }) {
+  const t = useTranslations('Settings.inviteLinks')
+  const key = consoleKeys.inviteLink(orgId)
+  const {
+    data: link,
+    error: loadError,
+    mutate
+  } = useSWR<OrgInviteLinkDto | null>(key, ([, id]) => fetchOrgInviteLink(id as string))
+  const [revealed, setRevealed] = useState<{ id: string; url: string } | null>(null)
+  const [busy, setBusy] = useState<'generate' | 'revoke' | null>(null)
+  const [copied, setCopied] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setRevealed(null)
+    setCopied(false)
+    setActionError(null)
+  }, [orgId])
+
+  const status = link ? inviteLinkStatus(link) : null
+  const canGenerate = link !== undefined && (!link || status !== 'active')
+
+  const generate = async () => {
+    if (busy || !canGenerate) return
+    setBusy('generate')
+    setActionError(null)
+    setCopied(false)
+    try {
+      const created = await createOrgInviteLink(orgId)
+      setRevealed({ id: created.id, url: inviteLinkUrl(created.token, window.location.origin) })
+      await mutate(created, { revalidate: false })
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const revoke = async () => {
+    if (!link || busy) return
+    setBusy('revoke')
+    setActionError(null)
+    try {
+      await revokeOrgInviteLink(link.id, orgId)
+      setRevealed(null)
+      await mutate()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const copy = async () => {
+    if (!revealed) return
+    try {
+      await navigator.clipboard.writeText(revealed.url)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* clipboard unavailable — the URL stays visible for manual selection */
+    }
+  }
+
+  return (
+    <div className="card mt-[18px]" id="invite-links">
+      <div className="cardhead justify-between">
+        <span className="cardtitle">{t('title')}</span>
+        {canGenerate && (
+          <Button variant="secondary" size="xs" onClick={() => void generate()}>
+            <Icon name="link" size={14} />
+            {busy === 'generate' ? t('generating') : link ? t('generateNew') : t('generate')}
+          </Button>
+        )}
+      </div>
+
+      {link === undefined && !loadError ? (
+        <LoadingState size={22} padding={20} />
+      ) : loadError ? (
+        <div className="px-4 py-[15px] font-sans text-[12.5px] font-normal leading-normal text-(--status-error)">
+          {t('loadError')}
+        </div>
+      ) : !link ? (
+        <div className="flex items-center gap-3 px-4 py-[15px]">
+          <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md bg-(--surface-sunken)">
+            <Icon name="link" size={17} color="var(--text-tertiary)" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="font-sans text-[13px] font-semibold leading-normal">{t('none')}</div>
+            <div className="mt-[2px] font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+              {t('noneDescription')}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="flex flex-col gap-3 px-4 py-[15px] desktop:flex-row desktop:items-center">
+            <span className="flex h-9 w-9 flex-none items-center justify-center rounded-md bg-(--brand-soft)">
+              <Icon name="link" size={17} color="var(--brand)" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-sans text-[13px] font-semibold leading-normal">{t('organizationLink')}</span>
+                <span
+                  className={`badge ${
+                    status === 'active'
+                      ? 'bg-(--status-online-soft) text-(--status-online)'
+                      : status === 'expired'
+                        ? 'bg-(--status-paused-soft) text-(--status-paused)'
+                        : 'bg-(--status-error-soft) text-(--status-error)'
+                  }`}
+                >
+                  {status === 'active'
+                    ? t('status.active')
+                    : status === 'expired'
+                      ? t('status.expired')
+                      : t('status.revoked')}
+                </span>
+              </div>
+            </div>
+            {status === 'active' && (
+              <Button variant="secondary" size="xs" onClick={() => void revoke()}>
+                <Icon name="ban" size={13} />
+                {busy === 'revoke' ? t('revoking') : t('revoke')}
+              </Button>
+            )}
+          </div>
+
+          {revealed?.id === link.id && (
+            <div className="mx-4 mb-4 overflow-hidden rounded-[9px] border border-(--gray-800) bg-(--gray-1000)">
+              <div className="flex items-center gap-2 border-b border-(--gray-800) px-[13px] py-[9px]">
+                <Icon name="link" size={13} color="var(--text-inverse-dim)" />
+                <span className="font-mono text-[11px] font-medium leading-normal text-(--text-inverse-dim)">
+                  {t('copyOnce')}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => void copy()}
+                  className="ml-auto inline-flex cursor-pointer items-center gap-[5px] border-0 bg-transparent font-mono text-[11px] font-medium leading-normal text-(--text-inverse-dim)"
+                >
+                  <Icon name={copied ? 'check' : 'copy'} size={12} />
+                  {copied ? t('copied') : t('copy')}
+                </button>
+              </div>
+              <div className="break-all px-[14px] py-[13px] font-mono text-[12px] leading-[1.7] text-[#cdd6e0]">
+                {revealed.url}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {actionError && (
+        <div className="border-t border-(--border-subtle) px-4 py-3 font-sans text-[12px] font-normal leading-normal text-(--status-error)">
+          {actionError}
+        </div>
+      )}
+    </div>
+  )
+}
+
+export default function SettingsView() {
+  const t = useTranslations('Settings')
+  const { activeOrg, myRole, refreshOrgs, updateOrg: updateOrgSettings, leaveOrg, error: orgError } = useOrgs()
+  const { openModal } = useModal()
+  // The organization-environment picker filters this to agents the viewer can manage.
+  const { agents } = useConsoleData()
+  const isOwner = myRole === 'owner'
+
+  const membersKey = consoleKeys.members(activeOrg?.id)
+  const {
+    data: membersData,
+    error: membersError,
+    mutate: mutateMembers
+  } = useSWR(membersKey, ([, orgId]) => fetchMembers(orgId))
+  const loadFailed = membersData === undefined && Boolean(membersError ?? orgError)
+  const members = loadFailed ? [] : (membersData ?? null)
+  const [editing, setEditing] = useState<MemberTarget | null>(null)
+  const [inviting, setInviting] = useState(false)
+
+  // `?invite=1` auto-opens the invite-members dialog (the getting-started "Invite
+  // teammates" CTA lands here with it). One-shot: the param is stripped immediately
+  // so back/refresh doesn't reopen the modal.
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  useEffect(() => {
+    if (!searchParams.get('invite')) return
+    setInviting(true)
+    const sp = new URLSearchParams(searchParams)
+    sp.delete('invite')
+    router.replace(`${pathname}${sp.size ? `?${sp}` : ''}`, { scroll: false })
+  }, [searchParams, pathname, router])
+
+  // A member change can affect ME (self-demote/-remove) — re-pull the org list
+  // too so myRole / the active org stay honest instead of 403-ing controls.
+  const onMembersChanged = useCallback(() => {
+    void Promise.allSettled([mutateMembers(), refreshOrgs()])
+  }, [mutateMembers, refreshOrgs])
+
+  const rows = (members ?? []).map(rowFromDto)
+  const ownerCount = rows.filter((r) => r.role === 'owner').length
+
+  const edit = (r: MemberRowView) => {
+    setEditing({
+      userId: r.userId,
+      name: r.name,
+      email: r.email,
+      picture: r.picture,
+      initials: r.initials,
+      avBg: r.avBg,
+      avText: r.avText,
+      role: r.role,
+      isCurrentUser: r.isCurrentUser,
+      lastOwner: r.role === 'owner' && ownerCount <= 1
+    })
+  }
+
+  return (
+    <div className="wrap max-w-[900px] max-desktop:p-4">
+      {/* Card ids are GlobalSearch anchor targets — keep in sync with nav.ts SETTING_CARDS. */}
+      <div className="card" id="organization">
+        <div className="cardhead justify-between">
+          <span className="cardtitle">{t('organization.title')}</span>
+          {isOwner && (
+            <Button variant="secondary" size="xs" onClick={() => openModal('editOrg')}>
+              <Icon name="pencil" size={14} />
+              {t('organization.edit')}
+            </Button>
+          )}
+        </div>
+        <div className="flex items-center gap-[14px] px-4 py-[15px]">
+          {isOwner ? (
+            // Owners edit the org avatar in place: glyph/color via onCommit, an uploaded
+            // image via onUploadImage (shown only when the object store is configured).
+            <AgentIconPicker
+              value={withIconUrl(activeOrg?.icon, activeOrg?.iconUrl)}
+              runtime=""
+              size={44}
+              radiusClass="rounded-[10px]"
+              onCommit={(icon) =>
+                activeOrg &&
+                void updateOrg(activeOrg.id, { icon })
+                  .then(() => refreshOrgs())
+                  .catch(() => {})
+              }
+              onUploadImage={
+                activeOrg?.iconUploadEnabled
+                  ? async (blob) => {
+                      await uploadOrgIcon(blob, activeOrg.id)
+                      refreshOrgs()
+                    }
+                  : undefined
+              }
+            />
+          ) : (
+            <span className="av h-11 w-11 flex-none rounded-[10px]">
+              <AgentIconView icon={withIconUrl(activeOrg?.icon, activeOrg?.iconUrl)} runtime="" size={44} />
+            </span>
+          )}
+          <div className="min-w-0 flex-1">
+            <div className="font-sans text-[15px] font-semibold leading-normal">
+              {activeOrg?.name ?? activeOrg?.slug ?? '—'}
+            </div>
+            <div className="mono mt-[2px] text-[11.5px] text-(--text-tertiary)">{activeOrg?.slug ?? ''}</div>
+          </div>
+        </div>
+      </div>
+
+      <AgentVisibilityCard
+        key={activeOrg?.id ?? 'loading'}
+        orgId={activeOrg?.id}
+        policy={activeOrg?.defaultAgentVisibility ?? 'all'}
+        isOwner={isOwner}
+        onChange={async (policy) => {
+          if (!activeOrg) return
+          await updateOrgSettings(activeOrg.id, { defaultAgentVisibility: policy })
+        }}
+      />
+
+      <SessionAccessCard orgId={activeOrg?.id} isOwner={isOwner} />
+
+      <DaemonAutoUpgradeDefaultCard
+        orgId={activeOrg?.id}
+        enabled={activeOrg?.defaultDaemonAutoUpgrade ?? false}
+        isOwner={isOwner}
+        onChange={async (enabled) => {
+          if (!activeOrg) return
+          await updateOrgSettings(activeOrg.id, { defaultDaemonAutoUpgrade: enabled })
+        }}
+      />
+
+      {/* Sits with the other organization-wide agent policies. Owner-only, so the
+          card renders nothing at all for collaborators and viewers (§8.1). */}
+      <OrganizationEnvironmentCard orgId={activeOrg?.id} isOwner={isOwner} agents={agents} />
+
+      <div className="card mt-[18px]" id="members">
+        <div className="cardhead justify-between">
+          <span className="cardtitle">{t('members.title')}</span>
+          {isOwner && (
+            <Button variant="secondary" size="xs" onClick={() => setInviting(true)}>
+              <Icon name="user-plus" size={14} />
+              {t('members.invite')}
+            </Button>
+          )}
+        </div>
+        <div className={`row h ${MEMBER_GRID}`}>
+          <span>{t('members.member')}</span>
+          <span>{t('members.role')}</span>
+          <span />
+        </div>
+        {rows.map((p) => (
+          <div key={p.userId} className={`row ${MEMBER_GRID} gap-[11px]`}>
+            <div className="flex min-w-0 items-center gap-[11px]">
+              <Avatar src={p.picture} initials={p.initials} size={32} fontSize={12} bg={p.avBg} fg={p.avText} />
+              <div className="min-w-0">
+                <div className="truncate font-sans text-[13px] font-semibold leading-normal">{p.name}</div>
+                <div className="mono truncate text-[11px] text-(--text-tertiary)">{p.email ?? '—'}</div>
+              </div>
+            </div>
+            <span className="badge self-center justify-self-start" style={{ background: p.roleBg, color: p.roleText }}>
+              {
+                {
+                  owner: t('members.roles.owner'),
+                  collaborator: t('members.roles.collaborator'),
+                  viewer: t('members.roles.viewer')
+                }[p.role]
+              }
+            </span>
+            {isOwner || p.isCurrentUser ? (
+              <button
+                className="iconbtn h-7 w-7 self-center"
+                title={isOwner ? t('members.edit') : t('members.manage')}
+                onClick={() => edit(p)}
+              >
+                <Icon name="pencil" size={14} />
+              </button>
+            ) : (
+              <span className="w-7" />
+            )}
+          </div>
+        ))}
+        {members === null && (
+          <div className="row grid-cols-[1fr]">
+            <LoadingState size={22} padding={20} />
+          </div>
+        )}
+        {loadFailed && (
+          <div className="row grid-cols-[1fr] font-sans text-[12.5px] font-normal leading-normal text-(--status-error)">
+            {t('members.loadError')}
+          </div>
+        )}
+      </div>
+
+      {isOwner && activeOrg && <InviteLinksCard orgId={activeOrg.id} />}
+
+      {isOwner && activeOrg && <ServiceAccountsCard org={activeOrg} />}
+
+      {inviting && (
+        <Scrim onEscape={() => setInviting(false)} onClick={() => setInviting(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <InviteMembersModal onClose={() => setInviting(false)} onAdded={onMembersChanged} />
+          </div>
+        </Scrim>
+      )}
+      {editing && (
+        <Scrim onEscape={() => setEditing(null)} onClick={() => setEditing(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <EditMemberModal
+              member={editing}
+              canEditRole={isOwner}
+              onLeave={editing.isCurrentUser ? () => leaveOrg(editing.userId) : undefined}
+              onClose={() => setEditing(null)}
+              onChanged={onMembersChanged}
+            />
+          </div>
+        </Scrim>
+      )}
+    </div>
+  )
+}

@@ -1,0 +1,61 @@
+import type { MemoryWriteSource } from '../store.js'
+import type { MemoryProvider, MemoryScope, MemoryWriteGuard } from '../types.js'
+import type { MemoryTextCheck } from '../organization-files.js'
+import type { LocalStore } from '../../store/local-store.js'
+import { MemoryEntriesError } from './contract.js'
+import { MemoryEntries, memoryDigest } from './service.js'
+import { memoryContinuations, memoryEntryTokens } from './state.js'
+
+// Projection-specific authorization runs before resolving the live provider, on every call.
+export async function createMemoryEntryService(input: {
+  provider: MemoryProvider
+  scope: MemoryScope
+  store: LocalStore
+  canRead: () => boolean | Promise<boolean>
+  /** `check` refuses a managed write's final text before it is stored; `guard` then sees the text before and after. */
+  write?: {
+    source: MemoryWriteSource
+    canWrite: () => boolean | Promise<boolean>
+    check?: MemoryTextCheck
+    guard?: MemoryWriteGuard
+  }
+}): Promise<MemoryEntries> {
+  const scope = { ...input.scope }
+  return new MemoryEntries(
+    async () => {
+      if (!(await input.canRead())) throw new MemoryEntriesError('FORBIDDEN', 'memory read access is not allowed')
+      const writeSource = input.write && (await input.write.canWrite()) ? input.write.source : undefined
+      const view = await input.provider.entryView?.(
+        scope,
+        writeSource,
+        writeSource ? input.write?.check : undefined,
+        writeSource ? input.write?.guard : undefined
+      )
+      if (view) return view
+      return {
+        identity: memoryDigest(['no-entry-view', scope.agentId]),
+        capabilities: {
+          version: 1,
+          operations: [],
+          supportedScopes: [],
+          writeConsistency: 'last-write-wins',
+          exactCreate: false,
+          exactEdit: false,
+          enumeration: 'unavailable',
+          graph: false,
+          limits: { maxPageItems: 100, maxItemBytes: 256_000 }
+        },
+        async context() {
+          return { freshness: 'unknown', coverage: 'unavailable', overview: '' }
+        }
+      }
+    },
+    await memoryEntryTokens(input.store),
+    memoryContinuations(input.store, scope.agentId),
+    Date.now,
+    async () => {
+      if (!input.write || !(await input.write.canWrite()))
+        throw new MemoryEntriesError('FORBIDDEN', 'memory write access is not allowed')
+    }
+  )
+}

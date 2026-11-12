@@ -1,0 +1,953 @@
+// Per-HTTP-bot Slack handler held by the relay (shared-bot-relay.md §12): the route hands it verified events and interactions, and `botToken`/`signingSecret` are never logged.
+import { WebClient, type FetchFunction, type WebClientOptions } from '@slack/web-api'
+import { Agent, fetch as undiciFetch, FormData as UndiciFormData, ProxyAgent, type Dispatcher } from 'undici'
+import {
+  isSlackSystemMessage,
+  normalizeSlackMessage,
+  normalizeSlackResponseFinalization,
+  slackCodeChannelInfo,
+  slackExternalReason,
+  type SlackMessageLike
+} from '@agentconnect.md/message'
+import {
+  buildSlackAppHomeView,
+  slackSetupReply,
+  ELICIT_ACTION_PREFIX,
+  ELICIT_CONFIRM_ACTION,
+  ELICIT_DISMISS_ACTION,
+  PERMISSION_ACTION_PREFIX,
+  SHARED_AGENT_SELECT_ACTION_ID,
+  SHARED_CONFIG_ACTION_ID,
+  SLACK_MANAGE_SESSION_SHORTCUT_CALLBACK_ID,
+  SLACK_CODE_MODEL_KEY,
+  SLACK_CODE_CONTEXT_KEY,
+  SLACK_STATUS_ACTION,
+  decodePermValue,
+  decodeSlackStatusOverflowValue,
+  decodeSharedSlackStatusTarget,
+  elicitFormViewValues,
+  type PlaceExternalReason,
+  type RdSlackAction,
+  type SlackAppHomeContext,
+  type SlackViewState,
+  type SharedSlackStatusTarget,
+  type WireNormalizedMessage
+} from '@agentconnect.md/protocol'
+import type { Logger } from '../../log.js'
+import type { RelayForwardOutcome } from '../contract.js'
+
+export { normalizeSlackMessage } from '@agentconnect.md/message'
+export type SlackMessageEvent = SlackMessageLike & {
+  tab?: string
+  /** Who added the member, on a `member_joined_channel`. */
+  inviter?: string
+  assistant_thread?: { user_id?: string; channel_id?: string; thread_ts?: string }
+  tokens?: { bot?: unknown; oauth?: unknown }
+}
+
+/** block_id / action_id of the modal's agent selector (local to this file). */
+const CONFIG_BLOCK = 'agent_block'
+const CONFIG_ACTION = 'agent_select'
+
+/** The subset of a Slack interactive (block_actions / view_submission) payload we read.
+ *  `api_app_id` / `team` are demux hints the HTTP route reads BEFORE dispatch. */
+export interface SlackInteractiveBody {
+  type?: string
+  command?: string
+  channel_id?: string
+  user_id?: string
+  team_id?: string
+  api_app_id?: string
+  team?: { id?: string }
+  user?: { id?: string }
+  trigger_id?: string
+  callback_id?: string
+  action_id?: string
+  block_id?: string
+  value?: string
+  channel?: { id?: string }
+  container?: { channel_id?: string; message_ts?: string }
+  message?: { ts?: string; thread_ts?: string }
+  actions?: {
+    action_id?: string
+    action_ts?: string
+    block_id?: string
+    value?: string
+    selected_option?: { value?: string }
+  }[]
+  /** A `block_actions` payload's full message state (Slack, 2020-09-01) — how a Confirm tap
+   *  carries every input its own card was showing. */
+  state?: SlackViewState
+  view?: {
+    callback_id?: string
+    private_metadata?: string
+    state?: { values?: Record<string, Record<string, { selected_option?: { value?: string } }>> }
+  }
+}
+
+interface HttpSlackInteractionReceipt {
+  /** Stable across Slack redelivery of the same interaction. The manager hashes this
+   *  with the target + operation before placing it on rd/msg, so trigger ids never
+   *  appear in logs while daemon-side (sessionKey,msgId) dedup remains effective. */
+  interactionId: string
+}
+
+export type HttpSlackSessionAction = HttpSlackInteractionReceipt & {
+  target: SharedSlackStatusTarget
+  /** Who tapped it (Slack `body.user`), forwarded so the daemon can attribute the
+   *  session change. Absent when the payload names no user. */
+  userId?: string
+} & Exclude<RdSlackAction, { kind: 'open-config-for-thread' | 'app-home-opened' | 'assistant-thread-started' }>
+
+export interface HttpSlackAppHomeOpened extends HttpSlackInteractionReceipt {
+  channelId: string
+  userId: string
+}
+
+/** A user started a new Assistant thread ("new chat") in a DM with the app. */
+export interface HttpSlackAssistantThreadStarted extends HttpSlackInteractionReceipt {
+  channelId: string
+  threadTs: string
+  userId?: string
+}
+
+/** The bot itself joined a channel; the owning daemon may take a getting-to-know task of it. */
+export interface HttpSlackBotJoined extends HttpSlackInteractionReceipt {
+  channelId: string
+  /** Who added the bot, where the event names them. */
+  inviter?: string
+}
+
+/** Someone other than the bot joined a channel; the owning daemon decides whether the place turned external. */
+export interface HttpSlackMemberJoined extends HttpSlackInteractionReceipt {
+  channelId: string
+  userId: string
+  /** The envelope said the channel is shared with another organization. */
+  externallyShared: boolean
+}
+
+export interface HttpSlackSessionShortcut extends HttpSlackInteractionReceipt {
+  channelId: string
+  threadTs: string
+  triggerId: string
+  userId?: string
+}
+
+/** Slack's native agent-session Stop, as the Events API delivers it. Conversation-addressed:
+ *  the event names no session, so the owning daemon resolves one from (channel, thread). */
+export interface HttpSlackSessionStop extends HttpSlackInteractionReceipt {
+  channelId: string
+  threadTs: string
+  userId?: string
+  /** An archive, which also closes the task the channel holds. */
+  archived?: true
+}
+
+type HttpSlackAgent = { agentId: string; name: string }
+
+function httpSlackAgentOption(agent: HttpSlackAgent) {
+  const label = agent.name.trim() || agent.agentId
+  return {
+    text: { type: 'plain_text' as const, text: label.length > 75 ? `${label.slice(0, 74)}…` : label },
+    value: agent.agentId
+  }
+}
+
+/** Build one external-select response from the relay's current HTTP-bot member
+ *  directory. Slack caps a suggestion response at 100 options. Matching both name
+ *  and id keeps a pasted agent id useful without changing the visible label. */
+export function httpSlackAgentOptions(agents: HttpSlackAgent[], query = '') {
+  const needle = query.trim().toLocaleLowerCase()
+  return agents
+    .filter((agent) => !needle || agent.name.toLocaleLowerCase().includes(needle) || agent.agentId.includes(needle))
+    .slice(0, 100)
+    .map(httpSlackAgentOption)
+}
+
+/** Decode and locally validate the relay-managed status bar's agent selection. The CP
+ *  validates membership again when it persists the channel owner; this edge check
+ *  avoids forwarding stale/tampered option values in the common case. */
+export function parseHttpSlackAgentSelection(
+  body: SlackInteractiveBody,
+  agents: HttpSlackAgent[]
+): { channelId: string; threadTs?: string; agentId: string } | null {
+  if (body.type !== 'block_actions') return null
+  const action = body.actions?.find((candidate) => candidate.action_id === SHARED_AGENT_SELECT_ACTION_ID)
+  const channelId = body.channel?.id ?? body.container?.channel_id
+  const agentId = action?.selected_option?.value
+  if (!channelId || !agentId || !agents.some((agent) => agent.agentId === agentId)) return null
+  const threadTs = body.message?.thread_ts
+  return { channelId, ...(threadTs ? { threadTs } : {}), agentId }
+}
+
+/** Decode the relay-managed status overflow's Switch agent choice. Slack has no nested
+ *  overflow menus, so this choice opens the relay-owned picker modal instead. */
+export function parseHttpSlackAgentSwitch(
+  body: SlackInteractiveBody
+): { channelId: string; threadTs?: string; currentAgentId: string } | null {
+  if (body.type !== 'block_actions') return null
+  const action = body.actions?.find((candidate) => candidate.action_id === SLACK_STATUS_ACTION.more)
+  const choice = action?.selected_option?.value ? decodeSlackStatusOverflowValue(action.selected_option.value) : null
+  if (choice?.action !== 'switch-agent') return null
+  const rawTarget = action?.block_id ?? choice.target
+  const target = rawTarget ? decodeSharedSlackStatusTarget(rawTarget) : null
+  const channelId = body.channel?.id ?? body.container?.channel_id
+  if (!target || !channelId) return null
+  const threadTs = body.message?.thread_ts ?? body.message?.ts
+  return { channelId, ...(threadTs ? { threadTs } : {}), currentAgentId: target.agentId }
+}
+
+type HttpSlackAgentModalContext = { channelId: string; threadTs?: string }
+
+function encodeAgentModalContext(context: HttpSlackAgentModalContext): string {
+  return context.threadTs ? JSON.stringify({ v: 1, ...context }) : context.channelId
+}
+
+function decodeAgentModalContext(value: string): HttpSlackAgentModalContext | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as { v?: unknown; channelId?: unknown; threadTs?: unknown }
+    if (parsed.v !== 1 || typeof parsed.channelId !== 'string') return null
+    if (parsed.threadTs !== undefined && typeof parsed.threadTs !== 'string') return null
+    return { channelId: parsed.channelId, ...(parsed.threadTs ? { threadTs: parsed.threadTs } : {}) }
+  } catch {
+    // Older channel-default modals store the channel id directly.
+    return { channelId: value }
+  }
+}
+
+/** Decode one daemon-owned session control from an HTTP app's Slack interaction.
+ *  The target is opaque user-interface state at this edge; RelayIngressManager validates
+ *  its agent against the current bot assignment before choosing a daemon/integration. */
+export function parseHttpSlackSessionAction(body: SlackInteractiveBody): HttpSlackSessionAction | null {
+  const parsed = decodeHttpSlackSessionAction(body)
+  if (!parsed) return null
+  // Attach the actor at the single exit so every decoded verb carries it.
+  return body.user?.id ? { ...parsed, userId: body.user.id } : parsed
+}
+
+function decodeHttpSlackSessionAction(body: SlackInteractiveBody): HttpSlackSessionAction | null {
+  if (body.type !== 'block_actions') return null
+  const action = body.actions?.[0]
+  if (!action?.action_id) return null
+  const receipt = action.action_ts || body.trigger_id
+  if (!receipt) return null
+  const target = action.block_id ? decodeSharedSlackStatusTarget(action.block_id) : null
+  if (target && action.action_id.startsWith(`${PERMISSION_ACTION_PREFIX}:`)) {
+    const choice = action.value ? decodePermValue(action.value) : null
+    return choice
+      ? {
+          target,
+          interactionId: JSON.stringify([action.action_id, receipt]),
+          kind: 'permission-choice',
+          ...choice
+        }
+      : null
+  }
+  if (target && action.action_id.startsWith(`${ELICIT_ACTION_PREFIX}:`)) {
+    const choice = action.value ? decodePermValue(action.value) : null
+    return choice
+      ? {
+          target,
+          interactionId: JSON.stringify([action.action_id, receipt]),
+          kind: 'elicitation-choice',
+          requestId: choice.requestId,
+          value: choice.optionId
+        }
+      : null
+  }
+  // An input-block card's Confirm. A field CHANGE is not forwarded at all — an `input` block
+  // raises no interaction, and the values ride this tap's own message state, which Slack has
+  // carried on `block_actions` since 2020-09-01. Reading them here is what makes the forwarded
+  // answer the state THIS reader confirmed, rather than whatever was recorded last.
+  if (target && action.action_id === ELICIT_CONFIRM_ACTION && action.value) {
+    return {
+      target,
+      interactionId: JSON.stringify([action.action_id, receipt]),
+      kind: 'elicitation-confirm',
+      requestId: action.value,
+      fields: elicitFormViewValues(body.state)
+    }
+  }
+  if (target && action.action_id === ELICIT_DISMISS_ACTION && action.value) {
+    return {
+      target,
+      interactionId: JSON.stringify([action.action_id, receipt]),
+      kind: 'elicitation-choice',
+      requestId: action.value,
+      value: null
+    }
+  }
+  const overflow =
+    action.action_id === SLACK_STATUS_ACTION.more && action.selected_option?.value
+      ? decodeSlackStatusOverflowValue(action.selected_option.value)
+      : null
+  if (action.action_id === SLACK_STATUS_ACTION.more && (!overflow || overflow.action === 'switch-agent')) return null
+  const effectiveActionId =
+    overflow?.action === 'manage'
+      ? SLACK_STATUS_ACTION.manage
+      : overflow?.action === 'cancel'
+        ? SLACK_STATUS_ACTION.cancel
+        : action.action_id
+  const rawTarget =
+    (overflow ? (action.block_id ?? overflow.target) : undefined) ??
+    (effectiveActionId === SLACK_STATUS_ACTION.manage ? action.value : (body.view?.private_metadata ?? action.value))
+  if (!rawTarget) return null
+  const statusTarget = decodeSharedSlackStatusTarget(rawTarget)
+  if (!statusTarget) return null
+  // Slack supplies action_ts on Block Kit actions. Keep trigger_id as a defensive
+  // fallback for SDK/test payloads that omit it; both values are stable when Slack
+  // redelivers the same HTTP interaction.
+  const interactionId = JSON.stringify([effectiveActionId, receipt])
+
+  const selected = action.selected_option?.value
+  switch (effectiveActionId) {
+    case SLACK_STATUS_ACTION.manage:
+      return body.trigger_id
+        ? { target: statusTarget, interactionId, kind: 'open-config', triggerId: body.trigger_id }
+        : null
+    case SLACK_STATUS_ACTION.setModel:
+      return selected ? { target: statusTarget, interactionId, kind: 'set-model', model: selected } : null
+    case SLACK_STATUS_ACTION.setEffort:
+      return selected ? { target: statusTarget, interactionId, kind: 'set-effort', effort: selected } : null
+    case SLACK_STATUS_ACTION.setPermissionMode:
+      return selected
+        ? { target: statusTarget, interactionId, kind: 'set-permission-mode', permissionMode: selected }
+        : null
+    case SLACK_STATUS_ACTION.setFast:
+      return selected === 'on' || selected === 'off'
+        ? { target: statusTarget, interactionId, kind: 'set-fast', fastMode: selected === 'on' }
+        : null
+    case SLACK_STATUS_ACTION.setOutput:
+      return selected === 'none' ||
+        selected === 'minimal' ||
+        selected === 'low' ||
+        selected === 'medium' ||
+        selected === 'high'
+        ? { target: statusTarget, interactionId, kind: 'set-output', outputMode: selected }
+        : null
+    case SLACK_STATUS_ACTION.cancel:
+      return { target: statusTarget, interactionId, kind: 'cancel' }
+    default:
+      return null
+  }
+}
+
+/** Proxy dispatcher from HTTPS_PROXY/HTTP_PROXY (as the daemon's SlackConnection
+ *  does), or undefined for a direct connection. */
+function proxyDispatcher(): ProxyAgent | undefined {
+  const url = process.env.HTTPS_PROXY ?? process.env.HTTP_PROXY
+  return url ? new ProxyAgent(url) : undefined
+}
+
+// Keep Slack independent of the Undici version that claims the process-wide dispatcher.
+const directSlackDispatcher = new Agent()
+
+function fetchWithDispatcher(dispatcher: Dispatcher = directSlackDispatcher): FetchFunction {
+  return (url, init) => {
+    const options = { ...(init as Parameters<typeof undiciFetch>[1]), dispatcher }
+    // The SDK builds native FormData, which bundled Undici does not recognize as multipart.
+    if (init?.body instanceof FormData) {
+      const form = new UndiciFormData()
+      for (const [name, value] of init.body) form.append(name, value)
+      options.body = form
+    }
+    return undiciFetch(url, options)
+  }
+}
+
+/** `auth.test` codes proving the token is dead (`account_inactive` is what an uninstall leaves); a false positive revokes a live bot, so keep it narrow. */
+const REVOKED_CREDENTIAL_ERRORS = new Set(['account_inactive', 'token_revoked'])
+
+/** Codes Slack also returns for a live token, e.g. to a caller outside the app's IP allowlist, so they only mark the bot. */
+const REJECTED_CREDENTIAL_ERRORS = new Set(['invalid_auth'])
+
+/** The credential tier of one failed `auth.test`; undefined for anything else (network, rate limit, `missing_scope`, …). */
+export function classifyAuthTestFailure(err: unknown): { tier: 'revoked' | 'rejected'; code: string } | undefined {
+  // @slack/web-api puts the API's `error` string on `err.data.error`.
+  const code = (err as { data?: { error?: unknown } })?.data?.error
+  if (typeof code !== 'string') return undefined
+  if (REVOKED_CREDENTIAL_ERRORS.has(code)) return { tier: 'revoked', code }
+  if (REJECTED_CREDENTIAL_ERRORS.has(code)) return { tier: 'rejected', code }
+  return undefined
+}
+
+/** How the ingest learned its token is dead: a lifecycle `event` (Slack's `event_time` in ms when present) or a `probe` Slack answered with `code`. */
+export type SlackRevocationProof = { evidence: 'event'; eventAtMs?: number } | { evidence: 'probe'; code: string }
+
+/** An `auth.test` answer that does not revoke: `ok`, or `rejected` with Slack's ambiguous code. */
+export type SlackCredentialCheck = { result: 'ok' } | { result: 'rejected'; code: string }
+
+/** Top-level chat subtypes. Structural/system records stay out of routing. */
+function isRoutableSubtype(subtype: string | undefined): boolean {
+  return (
+    subtype === undefined ||
+    subtype === 'file_share' ||
+    subtype === 'me_message' ||
+    subtype === 'thread_broadcast' ||
+    subtype === 'reply_broadcast'
+  )
+}
+
+function isRoutableEvent(event: SlackMessageEvent): boolean {
+  return (
+    Boolean(event.user || event.bot_id) &&
+    !event.hidden &&
+    event.message === undefined &&
+    (isRoutableSubtype(event.subtype) || event.subtype === 'bot_message')
+  )
+}
+
+/**
+ * Per-message values the relay must forward but must NOT normalize onto the message.
+ *
+ * `searchActionToken` is Slack's ephemeral proof that a user action triggered a search — the
+ * only way a bot token may call the Data Access API. It is a credential, and the normalized
+ * message is what the owning daemon persists to its durable inbox and replays after a
+ * restart, so it travels beside the payload rather than inside it (the same reason §8.2 keeps
+ * the relay's `trusted*` assertions out of `payload`).
+ */
+export interface SlackIngestSidecar {
+  searchActionToken?: string
+}
+
+/** One channel of a membership snapshot, with whether Slack reports it shared externally (assistant-mode.md §5.3). */
+export interface SlackReportedChannel {
+  id: string
+  name?: string
+  isPrivate?: boolean
+  isCodeSession?: boolean
+  externalReason?: PlaceExternalReason | null
+}
+
+export interface SlackHttpIngestDeps {
+  /** Hand a normalized message to the router/forwarder; resolves to core's outcome, which the HTTP answer reports. NEVER throws. */
+  onMessage: (msg: WireNormalizedMessage, sidecar?: SlackIngestSidecar) => Promise<RelayForwardOutcome>
+  /** Report the resolved bot user id (from auth.test) for arbitration. */
+  onBotUserId: (botUserId: string) => void
+  /** Report the bot's complete Slack channel-membership snapshot after an event
+   *  says the bot itself joined or left a channel. */
+  onChannelsChanged: (channels: SlackReportedChannel[]) => void
+  /** Candidate agents for the config modal's "default agent" selector (bot members). */
+  agents: () => { agentId: string; name: string }[]
+  /** This channel's current default agent (initial modal selection), if any. */
+  currentOwner: (channelId: string) => string | undefined
+  /** Persist the operator's pick (→ CP `rc/set-channel-agent`). */
+  onSetChannelAgent: (channelId: string, agentId: string) => void
+  /** Rebind this Slack thread immediately, then persist the same agent as the
+   *  channel default. The thread timestamp comes from the source status message. */
+  onSelectThreadAgent: (channelId: string, threadTs: string, agentId: string) => void
+  /** Forward the current agent/session controls to its owning daemon. */
+  onSessionAction: (action: HttpSlackSessionAction) => void
+  /** Resolve and forward the app-level message shortcut. False opens a local
+   *  unavailable modal while the one-shot trigger id is still valid. */
+  onSessionShortcut: (shortcut: HttpSlackSessionShortcut) => boolean
+  /** Forward the native agent-session Stop to the daemon owning that conversation. */
+  onSessionStopped: (stop: HttpSlackSessionStop) => void
+  onAppHomeOpened?: (opened: HttpSlackAppHomeOpened) => void
+  /** Forward an Assistant "new chat" to the DM's owning daemon, which starts a fresh session where the DM appends. */
+  onAssistantThreadStarted?: (started: HttpSlackAssistantThreadStarted) => void
+  /** Forward another member's join to the channel's owning daemon (assistant-mode.md §5.3); the relay looks nobody up. */
+  onMemberJoined?: (joined: HttpSlackMemberJoined) => void
+  /** Forward the bot's own join to the channel's owning daemon (assistant-mode.md §5.13). */
+  onBotJoined?: (joined: HttpSlackBotJoined) => void
+  appHomeContext?: (channelId?: string) => SlackAppHomeContext
+  /** The bot's credential is definitively dead (an uninstall, a token revocation, or a probe saying so); report it so the CP revokes the bot. */
+  onBotRevoked?: (reason: 'app_uninstalled' | 'tokens_revoked', proof: SlackRevocationProof) => void
+  /** A probe answer that does not revoke: `ok` clears an earlier rejection, `rejected` only marks the bot. */
+  onCredentialCheck?: (check: SlackCredentialCheck) => void
+  /** Test seam for the bot-token Web API client. */
+  webClientFactory?: (botToken: string, options?: WebClientOptions) => WebClient
+  log: Logger
+}
+
+export class SlackHttpIngest {
+  private readonly codeChannels = new Map<string, { at: number; value: Promise<{ code: boolean; owners: string[] }> }>()
+
+  private async prepareCodeChannel(msg: WireNormalizedMessage): Promise<void> {
+    if (!this.web || msg.isDm || msg.isGroupDm) return
+    let entry = this.codeChannels.get(msg.channel)
+    if (!entry || Date.now() - entry.at >= 60000) {
+      const value = this.web.conversations
+        .info({ channel: msg.channel })
+        .then((result) => slackCodeChannelInfo(result.channel))
+      entry = { at: Date.now(), value }
+      if (this.codeChannels.size >= 1000) this.codeChannels.delete(this.codeChannels.keys().next().value!)
+      this.codeChannels.set(msg.channel, entry)
+    }
+    let info: { code: boolean; owners: string[] }
+    try {
+      info = await entry.value
+    } catch {
+      if (this.codeChannels.get(msg.channel) === entry) this.codeChannels.delete(msg.channel)
+      this.deps.log.debug('slack: channel discovery unavailable; retaining inbound coordinates')
+      return
+    }
+    if (!info.code) return
+    msg.thread = msg.channel
+    if (info.owners.includes(this.botUserId)) msg.conversationBotId = this.botUserId
+  }
+  private web?: WebClient // bot-token Web API client (auth.test + views.open for the modal)
+  private botUserId = ''
+  private slackBotId = ''
+  private channelRefresh?: Promise<void>
+  private channelRefreshQueued = false
+  private probing = false
+  /** users.info label cache for DM counterpart names (null = lookup failed). */
+  private readonly userNames = new Map<string, string | null>()
+
+  constructor(
+    readonly botId: string,
+    private readonly secrets: { botToken: string; signingSecret: string },
+    private readonly deps: SlackHttpIngestDeps
+  ) {}
+
+  /** The Slack signing secret — the HTTP ingress HMACs inbound POSTs with it to
+   *  demux+authenticate a request to this bot. Read-only; NEVER log it. */
+  get signingSecret(): string {
+    return this.secrets.signingSecret
+  }
+
+  /** §8 relay-side egress/read facet: Slack is the platform whose relay ingest
+   *  owns bot egress (the §14 gating notice, DM-row labeling). Its PRESENCE is
+   *  the platform-neutral fact core reads — a platform that keeps egress on the
+   *  daemon simply exposes none. */
+  readonly egress = {
+    notice: (channelId: string, text: string, threadTs?: string): Promise<void> =>
+      this.postText(channelId, text, threadTs),
+    lookupUserName: (userId: string): Promise<string | undefined> => this.lookupUserName(userId)
+  }
+
+  /** Post one plain, chrome-marked text message (the §14 gating notice) — chrome so
+   *  peer daemons' thread backfill never re-ingests it as conversation. */
+  async postText(channel: string, text: string, threadTs?: string): Promise<void> {
+    await this.web?.chat.postMessage({
+      channel,
+      text,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      metadata: { event_type: 'agentconnect_chrome', event_payload: {} }
+    })
+  }
+
+  /** Cached best-effort users.info lookup → "@Display Name" label for a DM
+   *  conversation row. Undefined when the lookup fails (the row lands nameless). */
+  async lookupUserName(userId: string): Promise<string | undefined> {
+    if (this.userNames.has(userId)) return this.userNames.get(userId) ?? undefined
+    try {
+      const res = await this.web?.users.info({ user: userId })
+      const u = res?.user as
+        { profile?: { display_name?: string; real_name?: string }; real_name?: string; name?: string } | undefined
+      const name = u?.profile?.display_name || u?.profile?.real_name || u?.real_name || u?.name
+      const label = name ? `@${name}` : null
+      this.userNames.set(userId, label)
+      return label ?? undefined
+    } catch {
+      this.userNames.set(userId, null)
+      return undefined
+    }
+  }
+
+  /** Build the Web API client and run the first credential probe; inbound arrives on the pool-wide HTTP routes, so no socket opens. */
+  async start(): Promise<void> {
+    const dispatcher = proxyDispatcher()
+    const options: WebClientOptions = {
+      fetch: fetchWithDispatcher(dispatcher),
+      timeout: 3000,
+      retryConfig: { retries: 0 },
+      rejectRateLimitedCalls: true
+    }
+    this.web = this.deps.webClientFactory
+      ? this.deps.webClientFactory(this.secrets.botToken, options)
+      : new WebClient(this.secrets.botToken, options)
+    await this.probeCredential()
+  }
+
+  /** Run `auth.test` (at start and on core's periodic schedule): learn the bot identity, and report the answer's credential tier. */
+  async probeCredential(): Promise<void> {
+    const web = this.web
+    if (!web || this.probing) return
+    this.probing = true
+    try {
+      const auth = await web.auth.test()
+      // Best-effort identity: arbitration degrades to keyword/default until a probe resolves it.
+      if (auth.bot_id) this.slackBotId = auth.bot_id
+      if (auth.user_id) {
+        this.botUserId = auth.user_id
+        this.deps.onBotUserId(auth.user_id)
+      }
+      this.deps.onCredentialCheck?.({ result: 'ok' })
+    } catch (err) {
+      this.deps.log.warn(`slack-http-ingest(${this.botId}): auth.test failed: ${(err as Error).message}`)
+      // A dead answer is the backstop for a lost `app_uninstalled`; no `eventAtMs`, so the CP fences on the probed revision alone.
+      const verdict = classifyAuthTestFailure(err)
+      if (verdict?.tier === 'revoked') {
+        this.deps.log.warn(
+          `slack-http-ingest(${this.botId}): credential is dead (${verdict.code}) — reporting revocation`
+        )
+        this.deps.onBotRevoked?.('tokens_revoked', { evidence: 'probe', code: verdict.code })
+      } else if (verdict?.tier === 'rejected') {
+        this.deps.onCredentialCheck?.({ result: 'rejected', code: verdict.code })
+      }
+    } finally {
+      this.probing = false
+    }
+  }
+
+  // Handle one verified event, dropping own echoes and unsupported types; a forwarded message resolves to core's outcome.
+  async handleEvent(
+    event: SlackMessageEvent | undefined,
+    eventAtMs?: number,
+    eventId?: string,
+    externallyShared = false
+  ): Promise<RelayForwardOutcome | undefined> {
+    try {
+      if (event?.type === 'app_home_opened') {
+        if (event.tab === 'home' && event.user)
+          await this.web?.views.publish({
+            user_id: event.user,
+            view: buildSlackAppHomeView(this.botUserId, this.deps.appHomeContext?.(event.channel))
+          })
+        if (event.tab === 'messages' && event.channel?.startsWith('D') && event.user && eventId)
+          this.deps.onAppHomeOpened?.({ channelId: event.channel, userId: event.user, interactionId: eventId })
+        return
+      }
+      if (event?.type === 'assistant_thread_started') {
+        const thread = event.assistant_thread
+        if (thread?.channel_id && thread.thread_ts)
+          this.deps.onAssistantThreadStarted?.({
+            channelId: thread.channel_id,
+            threadTs: thread.thread_ts,
+            interactionId: eventId ?? `${thread.channel_id}:${thread.thread_ts}`,
+            ...(thread.user_id ? { userId: thread.user_id } : {})
+          })
+        return
+      }
+      // Personal token revocations must not disconnect the workspace's bot.
+      if (event?.type === 'app_uninstalled' || event?.type === 'tokens_revoked') {
+        if (event.type === 'tokens_revoked') {
+          const bot = event.tokens?.bot
+          if (!this.botUserId || !Array.isArray(bot) || !bot.includes(this.botUserId)) return
+        }
+        this.deps.onBotRevoked?.(event.type, { evidence: 'event', ...(eventAtMs !== undefined ? { eventAtMs } : {}) })
+        return
+      }
+      // The native Stop button — not chat either, and the one non-chat event this transport
+      // forwards to a daemon, which cancels the turn its conversation owns.
+      if (event?.type === 'agent_session_stopped') {
+        if (event.channel)
+          this.deps.onSessionStopped({
+            channelId: event.channel,
+            threadTs: event.thread_ts ?? event.channel,
+            // No event id ⇒ fall back to the thread + envelope time; a second stop within the
+            // same second then dedups, which is harmless — the turn is already cancelled.
+            interactionId: eventId ?? `${event.thread_ts ?? event.channel}:${eventAtMs ?? ''}`,
+            ...(event.user ? { userId: event.user } : {})
+          })
+        return
+      }
+      // An archive is a Stop for the channel's session; the daemon ignores it unless the channel is a code channel.
+      if ((event?.type === 'channel_archive' || event?.type === 'group_archive') && event.channel) {
+        this.deps.onSessionStopped({
+          channelId: event.channel,
+          threadTs: event.channel,
+          interactionId: eventId ?? `${event.type}:${event.channel}:${eventAtMs ?? ''}`,
+          ...(event.user ? { userId: event.user } : {}),
+          archived: true
+        })
+        await this.refreshChannels()
+        return
+      }
+      if (event && this.isOwnMembershipChange(event)) {
+        if (event.type === 'member_joined_channel' && event.channel)
+          this.deps.onBotJoined?.({
+            channelId: event.channel,
+            ...(event.inviter ? { inviter: event.inviter } : {}),
+            interactionId: eventId ?? `${event.channel}:${event.user ?? ''}:${eventAtMs ?? ''}`
+          })
+        await this.refreshChannels()
+        return
+      }
+      if (event?.type === 'member_joined_channel') {
+        if (event.user && event.channel)
+          this.deps.onMemberJoined?.({
+            channelId: event.channel,
+            userId: event.user,
+            externallyShared,
+            interactionId: eventId ?? `${event.channel}:${event.user}:${eventAtMs ?? ''}`
+          })
+        return
+      }
+      if (event?.bot_id && (!this.botUserId || !this.slackBotId)) return
+      if (!event || isSlackSystemMessage(event)) return
+      // send-message-routing-rework.md §5: the ONE edit wrapper that survives ingest is
+      // the one closing an agent's logical response. It deliberately runs BEFORE the
+      // own-echo and routability filters, both of which would otherwise discard it:
+      //  - `isRoutableEvent` drops every `message_changed`, yet a streamed answer can
+      //    only be declared complete by editing its last message; and
+      //  - on a SHARED bot every agent posts as the same bot user, so echo suppression
+      //    would silently make agent-to-agent mentions impossible exactly where the
+      //    shared-bot address form (§8.5) exists to make them work.
+      // Recognition is by daemon-written metadata, so mid-answer `streaming` edits and
+      // ordinary human edits still return null here and stay filtered.
+      const finalization = normalizeSlackResponseFinalization(event)
+      if (finalization) {
+        await this.prepareCodeChannel(finalization)
+        return await this.deps.onMessage(finalization)
+      }
+      const ownMessage = event.user === this.botUserId || event.bot_id === this.slackBotId
+      if (ownMessage || !isRoutableEvent(event)) return
+      if (event.type !== 'message' && event.type !== 'app_mention') return
+      // An installation that cannot answer yet says what finishes setup to every DM and mention, and forwards nothing.
+      const setup = this.deps.appHomeContext ? slackSetupReply(this.deps.appHomeContext(event.channel)) : undefined
+      if (setup) {
+        if (event.channel && (event.channel_type === 'im' || event.type === 'app_mention'))
+          await this.web?.chat.postMessage({
+            channel: event.channel,
+            text: setup,
+            ...(event.thread_ts || event.type === 'app_mention' ? { thread_ts: event.thread_ts ?? event.ts } : {})
+          })
+        return
+      }
+      const msg = normalizeSlackMessage(event)
+      if (msg) await this.prepareCodeChannel(msg)
+      // The envelope says the conversation is shared with another organization (assistant-mode.md §5.3).
+      if (msg && externallyShared) msg.externallyShared = true
+      if (msg)
+        return await this.deps.onMessage(
+          msg,
+          event.action_token ? { searchActionToken: event.action_token } : undefined
+        )
+    } catch (err) {
+      this.deps.log.warn(`slack-http-ingest(${this.botId}): event handler error: ${(err as Error).message}`)
+    }
+  }
+
+  /** Slack's member_joined_channel fires for every member in channels the bot can
+   *  see, so only the bot's own user id means its membership changed. channel_left
+   *  and group_left are already self-scoped ("you left") events. */
+  private isOwnMembershipChange(event: SlackMessageEvent): boolean {
+    return (
+      (event.type === 'member_joined_channel' && !!this.botUserId && event.user === this.botUserId) ||
+      event.type === 'channel_left' ||
+      event.type === 'group_left'
+    )
+  }
+
+  /** Coalesce concurrent membership events but retain one trailing refresh, so a
+   *  leave arriving while a join-triggered API call is in flight cannot be lost. */
+  private refreshChannels(): Promise<void> {
+    if (this.channelRefresh) {
+      this.channelRefreshQueued = true
+      return this.channelRefresh
+    }
+    const refresh = (async () => {
+      do {
+        this.channelRefreshQueued = false
+        await this.refreshChannelsOnce()
+      } while (this.channelRefreshQueued)
+    })().finally(() => {
+      if (this.channelRefresh === refresh) this.channelRefresh = undefined
+    })
+    this.channelRefresh = refresh
+    return refresh
+  }
+
+  /** Re-list the authenticated bot user's public/private channel membership. A full
+   *  snapshot makes join and leave handling idempotent and self-correcting. */
+  private async refreshChannelsOnce(): Promise<void> {
+    const web = this.web
+    if (!web) return
+    const channels: SlackReportedChannel[] = []
+    let cursor: string | undefined
+    do {
+      const res = await web.users.conversations({
+        types: 'public_channel,private_channel',
+        exclude_archived: true,
+        limit: 200,
+        ...(cursor ? { cursor } : {})
+      })
+      for (const channel of res.channels ?? []) {
+        if (!channel.id || channel.is_im || channel.is_mpim || channel.is_archived) continue
+        channels.push({
+          id: channel.id,
+          ...(channel.name ? { name: channel.name } : {}),
+          ...(channel.is_private ? { isPrivate: true } : {}),
+          isCodeSession: slackCodeChannelInfo(channel).code,
+          externalReason: slackExternalReason(channel)
+        })
+      }
+      cursor = res.response_metadata?.next_cursor || undefined
+    } while (cursor)
+    this.deps.onChannelsChanged(channels)
+  }
+
+  // Check provider ownership before resolving the channel-wide session; never dispatch a settings click as chat.
+  private async openCodeSessionOptions(channelId: string, triggerId: string, userId: string): Promise<void> {
+    try {
+      const result = await this.web?.conversations.info({ channel: channelId })
+      const channel = slackCodeChannelInfo(result?.channel)
+      if (
+        channel.code &&
+        channel.owners.includes(this.botUserId) &&
+        this.deps.onSessionShortcut({ channelId, threadTs: channelId, triggerId, userId, interactionId: triggerId })
+      )
+        return
+    } catch {
+      this.deps.log?.debug('slack: code-channel settings lookup failed')
+    }
+    await this.openUnavailableModal(triggerId)
+  }
+
+  // Acknowledge verified interactions immediately; only suggestions return data in the HTTP response.
+  async handleInteraction(body: SlackInteractiveBody): Promise<unknown> {
+    try {
+      if (body.command === `/${SLACK_CODE_MODEL_KEY}` || body.command === `/${SLACK_CODE_CONTEXT_KEY}`) {
+        if (body.channel_id && body.trigger_id && body.user_id)
+          void this.openCodeSessionOptions(body.channel_id, body.trigger_id, body.user_id)
+        return ''
+      }
+      if (body.type === 'block_suggestion' && body.action_id === SHARED_AGENT_SELECT_ACTION_ID) {
+        // The one branch whose result rides the 200 body (replaces `ack({ options })`).
+        return { options: httpSlackAgentOptions(this.deps.agents(), body.value) }
+      }
+      if (body.type === 'message_action' && body.callback_id === SLACK_MANAGE_SESSION_SHORTCUT_CALLBACK_ID) {
+        const triggerId = body.trigger_id
+        const channelId = body.channel?.id
+        const threadTs = body.message?.thread_ts ?? body.message?.ts
+        const forwarded =
+          !!triggerId &&
+          !!channelId &&
+          !!threadTs &&
+          this.deps.onSessionShortcut({
+            triggerId,
+            channelId,
+            threadTs,
+            interactionId: triggerId,
+            ...(body.user?.id ? { userId: body.user.id } : {})
+          })
+        if (triggerId && !forwarded) void this.openUnavailableModal(triggerId)
+        return ''
+      }
+      if (
+        body.type === 'block_actions' &&
+        body.actions?.some((action) => action.action_id === SHARED_AGENT_SELECT_ACTION_ID)
+      ) {
+        const selected = parseHttpSlackAgentSelection(body, this.deps.agents())
+        if (selected?.threadTs) this.deps.onSelectThreadAgent(selected.channelId, selected.threadTs, selected.agentId)
+        else if (selected) this.deps.onSetChannelAgent(selected.channelId, selected.agentId)
+        return ''
+      }
+      const agentSwitch = parseHttpSlackAgentSwitch(body)
+      if (agentSwitch && body.trigger_id) {
+        // trigger_id is valid ~3s — fire promptly, don't block the 200.
+        void this.openConfigModal(
+          body.trigger_id,
+          agentSwitch.channelId,
+          agentSwitch.threadTs,
+          agentSwitch.currentAgentId
+        )
+        return ''
+      }
+      if (
+        body.type === 'block_actions' &&
+        body.actions?.some((a) => a.action_id === SHARED_CONFIG_ACTION_ID) &&
+        body.trigger_id &&
+        body.channel?.id
+      ) {
+        void this.openConfigModal(body.trigger_id, body.channel.id)
+        return ''
+      }
+      const view = body.view
+      if (body.type === 'view_submission' && view && view.callback_id === SHARED_CONFIG_ACTION_ID) {
+        const context = decodeAgentModalContext(view.private_metadata || '')
+        const picked = view.state?.values?.[CONFIG_BLOCK]?.[CONFIG_ACTION]?.selected_option?.value
+        if (context?.threadTs && picked) this.deps.onSelectThreadAgent(context.channelId, context.threadTs, picked)
+        else if (context && picked) this.deps.onSetChannelAgent(context.channelId, picked)
+        return '' // empty 200 closes the modal (same as the old empty ack)
+      }
+      const sessionAction = parseHttpSlackSessionAction(body)
+      if (sessionAction) {
+        this.deps.onSessionAction(sessionAction)
+        return ''
+      }
+      return ''
+    } catch (err) {
+      this.deps.log.warn(`slack-http-ingest(${this.botId}): interactive error: ${(err as Error).message}`)
+      return ''
+    }
+  }
+
+  private async openUnavailableModal(triggerId: string): Promise<void> {
+    try {
+      await this.web?.views.open({
+        trigger_id: triggerId,
+        view: {
+          type: 'modal',
+          title: { type: 'plain_text', text: 'Session options' },
+          close: { type: 'plain_text', text: 'Close' },
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: 'No AgentConnect session was found for this conversation.'
+              }
+            }
+          ]
+        }
+      } as never)
+    } catch (err) {
+      this.deps.log.warn(`slack-http-ingest(${this.botId}): views.open failed: ${(err as Error).message}`)
+    }
+  }
+
+  /** Open the "default agent for this channel" modal (a single static_select of the
+   *  bot's member agents), seeded with the channel's current owner if set. */
+  private async openConfigModal(
+    triggerId: string,
+    channelId: string,
+    threadTs?: string,
+    currentAgentId?: string
+  ): Promise<void> {
+    const agents = this.deps.agents()
+    if (agents.length === 0) return // nothing to pick from
+    const options = agents.map((a) => ({ text: { type: 'plain_text', text: a.name }, value: a.agentId }))
+    const owner = currentAgentId ?? this.deps.currentOwner(channelId)
+    const initial = owner ? options.find((o) => o.value === owner) : undefined
+    await this.web?.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: 'modal',
+        callback_id: SHARED_CONFIG_ACTION_ID,
+        private_metadata: encodeAgentModalContext({ channelId, ...(threadTs ? { threadTs } : {}) }),
+        title: { type: 'plain_text', text: threadTs ? 'Switch agent' : 'Default agent' },
+        submit: { type: 'plain_text', text: 'Save' },
+        close: { type: 'plain_text', text: 'Cancel' },
+        blocks: [
+          {
+            type: 'input',
+            block_id: CONFIG_BLOCK,
+            label: {
+              type: 'plain_text',
+              text: threadTs
+                ? 'Which agent should handle this thread?'
+                : 'Which agent should answer this channel by default?'
+            },
+            element: {
+              type: 'static_select',
+              action_id: CONFIG_ACTION,
+              options,
+              ...(initial ? { initial_option: initial } : {})
+            }
+          }
+        ]
+      }
+    } as never)
+  }
+
+  async stop(): Promise<void> {
+    // No socket to close — inbound is the pool-wide HTTP surface. Drop the WebClient so a
+    // re-assign rebuilds it with (possibly rotated) credentials.
+    this.web = undefined
+  }
+}

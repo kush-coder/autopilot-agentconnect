@@ -1,0 +1,157 @@
+/**
+ * `createRelayDaemonServer` (shared-bot-relay.md §7.2) — the relay's daemon-facing
+ * `rd/*` WS edge, a `noServer` `ws.WebSocketServer` on the relay's Fastify
+ * `http.Server` at {@link RELAY_DAEMON_WS_PATH}.
+ *
+ * Negotiation: only `agentconnect.rd.v1` is accepted (HTTP 400 otherwise). Each
+ * accepted socket becomes a {@link RelayDaemonConnection}; authenticated daemons are
+ * tracked by daemonId so `rc/daemon-revoke` (from the CP, via the relay's CP client)
+ * can immediately drop them (§9 revocation loop), and so the browser webchat gateway can find
+ * a daemon's connection to bridge a turn onto (`rd/msg`, PR 3).
+ */
+import { WebSocketServer, type WebSocket } from 'ws'
+import type { FastifyInstance } from 'fastify'
+import type { IncomingMessage } from 'node:http'
+import type { Duplex } from 'node:stream'
+import { MAX_FRAME_BYTES, RELAY_DAEMON_SUBPROTOCOL, RELAY_DAEMON_WS_PATH } from '@agentconnect.md/protocol'
+import { WsServerTransport, attachKeepalive, type Clock } from '@agentconnect.md/connection'
+import { RelayDaemonConnection, type RelayDaemonConnDeps } from './relay-daemon-connection.js'
+
+/** Close code the CP-driven revoke uses (the daemon reconnects, then re-verify decides). */
+const CLOSE_REVOKED = 4409
+
+export interface RelayDaemonServerDeps {
+  verify: RelayDaemonConnDeps['verify']
+  relayId: RelayDaemonConnDeps['relayId']
+  clock: Clock
+  /** Route an inbound `rd/chat` back to the browser for its chatId (webchat, PR 3). */
+  onChat: RelayDaemonConnDeps['onChat']
+  /** Route an inbound `rd/webchat-post` to the conversation's browser connection. */
+  onWebchatPost: RelayDaemonConnDeps['onWebchatPost']
+  onWebchatImageUpdate?: RelayDaemonConnDeps['onWebchatImageUpdate']
+  onWebchatPromptSuggestion?: RelayDaemonConnDeps['onWebchatPromptSuggestion']
+  /** Route an inbound cross-daemon `rd/agentmsg` (agent-collaboration P2). */
+  onAgentMsg: RelayDaemonConnDeps['onAgentMsg']
+  /** Route an evaluation host's `rd/route` and `rd/route/report` (message-intake.md §6). */
+  onRoute: RelayDaemonConnDeps['onRoute']
+  onRouteReport: RelayDaemonConnDeps['onRouteReport']
+  /** Answer a daemon's `rd/platform/request` through the bot's platform plugin. */
+  onPlatformRequest?: RelayDaemonConnDeps['onPlatformRequest']
+  log: RelayDaemonConnDeps['log']
+  /** A daemon's `rd/*` link became READY (first dial or redial); frames it streamed while unlinked were dropped. */
+  onDaemonReady?: (daemonId: string) => void
+  /** Half-open ping/pong sweep cadence (ms). */
+  keepaliveMs?: number
+}
+
+export interface RelayDaemonServer {
+  readonly wss: WebSocketServer
+  /** Drop every `rd/*` connection for `daemonId` (on a CP `rc/daemon-revoke`). */
+  revoke(daemonId: string): void
+  /** The daemon's most recently READY `rd/*` connection; an older one may be half-open until keepalive drops it. */
+  get(daemonId: string): RelayDaemonConnection | undefined
+  /** Any live duty-governed pool connection — the webchat rendezvous fallback when a recorded
+   *  member is gone (§4.4): a pool member claims the duty on receipt or names the holder, and
+   *  a wrong-pool pick self-corrects the same way. Org-scoped `daemon-key` daemons are never
+   *  candidates: they are outside the install's duty plane and must not see other orgs' turns. */
+  rendezvousCandidate(): { daemonId: string; conn: RelayDaemonConnection } | undefined
+  /** Number of authenticated daemon connections (observability / tests). */
+  size(): number
+}
+
+/** A daemon's connections, most recently READY first (a Set iterates in insertion order). */
+const newestFirst = (set: Set<RelayDaemonConnection>): RelayDaemonConnection[] => [...set].reverse()
+
+export function createRelayDaemonServer(app: FastifyInstance, deps: RelayDaemonServerDeps): RelayDaemonServer {
+  const byDaemon = new Map<string, Set<RelayDaemonConnection>>()
+
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_FRAME_BYTES,
+    handleProtocols: (protocols: Set<string>) =>
+      protocols.has(RELAY_DAEMON_SUBPROTOCOL) ? RELAY_DAEMON_SUBPROTOCOL : false
+  })
+  const trackAlive = attachKeepalive(wss, deps.keepaliveMs ?? 30_000)
+
+  const connDeps: RelayDaemonConnDeps = {
+    verify: deps.verify,
+    relayId: deps.relayId,
+    clock: deps.clock,
+    onChat: deps.onChat,
+    onWebchatPost: deps.onWebchatPost,
+    ...(deps.onWebchatImageUpdate ? { onWebchatImageUpdate: deps.onWebchatImageUpdate } : {}),
+    ...(deps.onWebchatPromptSuggestion ? { onWebchatPromptSuggestion: deps.onWebchatPromptSuggestion } : {}),
+    onAgentMsg: deps.onAgentMsg,
+    onRoute: deps.onRoute,
+    onRouteReport: deps.onRouteReport,
+    ...(deps.onPlatformRequest ? { onPlatformRequest: deps.onPlatformRequest } : {}),
+    log: deps.log,
+    onReady: (daemonId, conn) => {
+      const set = byDaemon.get(daemonId) ?? new Set()
+      set.add(conn)
+      byDaemon.set(daemonId, set)
+      deps.onDaemonReady?.(daemonId)
+    },
+    onClosed: (daemonId, conn) => {
+      const set = byDaemon.get(daemonId)
+      if (!set) return
+      set.delete(conn)
+      if (set.size === 0) byDaemon.delete(daemonId)
+    }
+  }
+
+  app.server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    let pathname: string
+    try {
+      pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+    } catch {
+      socket.destroy()
+      return
+    }
+    if (pathname !== RELAY_DAEMON_WS_PATH) return // not ours
+
+    const offered = (req.headers['sec-websocket-protocol'] ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (!offered.includes(RELAY_DAEMON_SUBPROTOCOL)) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+      socket.destroy()
+      return
+    }
+
+    wss.handleUpgrade(req, socket, head, (raw: WebSocket) => {
+      trackAlive(raw)
+      const remoteAddr = req.socket.remoteAddress ?? 'unknown'
+      new RelayDaemonConnection(new WsServerTransport(raw, remoteAddr), {
+        ...connDeps,
+        bufferedAmount: () => raw.bufferedAmount
+      }).start()
+    })
+  })
+
+  return {
+    wss,
+    revoke(daemonId: string): void {
+      const set = byDaemon.get(daemonId)
+      if (!set) return
+      // Copy first: close() → onClosed mutates the set mid-iteration.
+      for (const conn of [...set]) conn.close(CLOSE_REVOKED, 'daemon credential revoked')
+    },
+    get(daemonId: string): RelayDaemonConnection | undefined {
+      const set = byDaemon.get(daemonId)
+      return set ? newestFirst(set)[0] : undefined
+    },
+    rendezvousCandidate(): { daemonId: string; conn: RelayDaemonConnection } | undefined {
+      for (const [daemonId, set] of byDaemon) {
+        for (const conn of newestFirst(set)) if (conn.credentialKind === 'daemon-token') return { daemonId, conn }
+      }
+      return undefined
+    },
+    size(): number {
+      let n = 0
+      for (const set of byDaemon.values()) n += set.size
+      return n
+    }
+  }
+}

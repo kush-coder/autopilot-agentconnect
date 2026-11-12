@@ -1,0 +1,76 @@
+services:
+  control-plane:
+    environment:
+      - LOGTO_ENDPOINT=${LOGTO_ENDPOINT:-http://localhost:3001}
+      - LOGTO_MGMT_ENDPOINT=${LOGTO_MGMT_ENDPOINT:-http://logto:3001}
+
+  web:
+    environment:
+      - LOGTO_ENDPOINT=${LOGTO_ENDPOINT:-http://localhost:3001}
+
+  setup-server:
+    environment:
+      - LOGTO_MGMT_ENDPOINT=${LOGTO_MGMT_ENDPOINT:-http://logto:3001}
+
+  logto-db-init:
+    image: postgres:18-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGDATABASE: agentconnect
+      PGUSER: agentconnect
+      PGPASSWORD: ${AGENTCONNECT_POSTGRES_PASSWORD:-agentconnect-local-only}
+      LOGTO_POSTGRES_PASSWORD: ${LOGTO_POSTGRES_PASSWORD:-logto}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$${LOGTO_POSTGRES_PASSWORD}" in
+          ''|*[!A-Za-z0-9._~-]*)
+            echo 'LOGTO_POSTGRES_PASSWORD must use URL-safe characters: A-Z a-z 0-9 . _ ~ -' >&2
+            exit 1
+            ;;
+        esac
+        psql -v ON_ERROR_STOP=1 -v logto_password="$${LOGTO_POSTGRES_PASSWORD}" <<'SQL'
+        -- Logto creates its own tenant-scoped roles while seeding.
+        SELECT format('CREATE ROLE logto LOGIN CREATEROLE PASSWORD %L', :'logto_password')
+        WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'logto') \gexec
+        SELECT format('ALTER ROLE logto LOGIN CREATEROLE PASSWORD %L', :'logto_password') \gexec
+        SELECT 'CREATE DATABASE logto OWNER logto'
+        WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'logto') \gexec
+        SQL
+    restart: 'no'
+
+  logto:
+    image: ghcr.io/logto-io/logto:${LOGTO_VERSION:-1.45.0}
+    depends_on:
+      logto-db-init:
+        condition: service_completed_successfully
+    entrypoint: ['sh', '-c', 'npm run cli db seed -- --swe && npm run cli db alteration deploy latest && npm start']
+    environment:
+      CI: 'true'
+      DB_URL: postgresql://logto:${LOGTO_POSTGRES_PASSWORD:-logto}@postgres:5432/logto
+      ENDPOINT: ${LOGTO_ENDPOINT:-http://localhost:3001}
+      ADMIN_ENDPOINT: ${LOGTO_ADMIN_ENDPOINT:-http://localhost:3002}
+      # Private addresses an SSO identity provider is reached at; empty keeps every one blocked.
+      SSRF_ALLOWED_ADDRESSES: ${LOGTO_SSRF_ALLOWED_ADDRESSES:-}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3001/oidc/.well-known/openid-configuration').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    init: true
+    ports:
+      - 127.0.0.1:3001:3001
+      - 127.0.0.1:3002:3002
+    restart: unless-stopped
+    networks:
+      - default
+      - admin

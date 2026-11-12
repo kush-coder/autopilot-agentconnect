@@ -1,0 +1,780 @@
+import type { TurnMessage } from '../assistant/place-members.js'
+import type { HostKey } from '../acp/host-key.js'
+import type { CodeHostDecisionContext } from '../codehost/decision-state.js'
+import type { DutyGrantEntry, EventSession, ExternalSessionAudience, SessionKey } from '@agentconnect.md/protocol'
+import type { AcpHost } from '../acp/acp-host.js'
+import type { LoadedAgent } from '../agents/load-agents.js'
+import type { TurnPlan } from './turn-plan.js'
+import type { WebchatRouting } from '../webchat/narrowed-scope.js'
+import type { TurnEvaluationReporter } from './turn-evaluation.js'
+import type { KeyGrant } from '../key-server/client.js'
+import type { NormalizedMessage } from '../messages/normalized.js'
+import type { SessionMessageKind } from '../store/session-messages.js'
+import type { WorkBoundary } from '../messages/message-boundary.js'
+import type { ApprovalWait } from '../permissions/coordinator.js'
+import type { GithubTurnState } from '../platforms/github/turn-output.js'
+import type { ModelProviderTarget } from '../runtimes/model-provider-config.js'
+import type { TranscriptRecorder } from '../session/transcript-recorder.js'
+import type { TerminalOutputFolder } from '../session/terminal-output-folder.js'
+import type { KnownToolCall } from './tool-classification.js'
+import type { OutputConverger, SlackAction } from '../slack/render.js'
+import type { TelegramAction, TelegramConverger } from '../telegram/render.js'
+import type { DiscordAction, DiscordConverger } from '../discord/render.js'
+import type { FeishuAction, FeishuConverger } from '../feishu/render.js'
+import type { LinearAction, LinearConverger } from '../platforms/linear/turn-output.js'
+import type { QQAction, QQConverger } from '../platforms/qq/turn-output.js'
+import type { DingTalkAction, DingTalkConverger } from '../platforms/dingtalk/turn-output.js'
+import type { GoogleChatAction, GoogleChatConverger } from '../platforms/googlechat/turn-output.js'
+import type { MsTeamsAction, MsTeamsConverger } from '../platforms/msteams/turn-output.js'
+import type { WeChatAction, WeChatConverger } from '../platforms/wechat/turn-output.js'
+import type { WeComAction, WeComConverger } from '../platforms/wecom/turn-output.js'
+import type { PlatformConnection } from '../platforms/connection-reconciler.js'
+import type { TurnAcknowledgement } from '../platforms/turn-output.js'
+import type { SlackConnection } from '../slack/connection.js'
+import type { TelegramConnection } from '../telegram/connection.js'
+import type { DiscordConnection } from '../discord/connection.js'
+import type { FeishuConnection } from '../feishu/connection.js'
+import type { HookDispatchContext } from '../github/hook-coords.js'
+import type { CodeHostReplyTarget } from '../codehost/reply-target.js'
+import type { ChatTurnContext, ChatTurnOutput } from '../session/chat-turn.js'
+import type { WorkspaceFileLinkResolver } from '../messages/workspace-file-links.js'
+
+/** Thrown to a `dispatch()` caller when the per-session admission queue is at its depth
+ *  cap (§4.4 backpressure): the message is fast-failed, not buffered. Carries a stable
+ *  `reason` so an agent-call source (P1/P2) can surface a typed `queue_full`. */
+export class QueueFullError extends Error {
+  readonly reason = 'queue_full' as const
+  constructor(sessionKey: string) {
+    super(`admission queue full for session ${sessionKey}`)
+    this.name = 'QueueFullError'
+  }
+}
+
+/** Thrown to the `dispatch()` callers of the messages still queued behind a turn that
+ *  FAILED (§6.9 #378 fail-stop): the daemon does not auto-run buffered work onto a broken
+ *  session, so each follow-up is rejected rather than silently dropped or force-run. */
+export class FailStopError extends Error {
+  readonly reason = 'fail_stop' as const
+  constructor(sessionKey: string) {
+    super(`turn failed for session ${sessionKey}; queued messages were not auto-run`)
+    this.name = 'FailStopError'
+  }
+}
+
+/** Interrupts that are the turn's own failure, not an operator's or a peer's decision: they settle as `failed`. */
+export function interruptFailsTurn(reason: TurnInterruptReason | undefined): boolean {
+  return reason === 'loop protection' || reason === 'stalled'
+}
+
+/** The stall watchdog's turn failure (#1915): the notice for a prompt cancelled after a silent budget. */
+export class TurnStalledError extends Error {
+  readonly reason = 'stalled' as const
+  constructor(silentMs: number) {
+    const minutes = Math.max(1, Math.round(silentMs / 60_000))
+    super(
+      `no activity from the model runtime for ${minutes} minute${minutes === 1 ? '' : 's'} — the turn was cancelled as stalled; send your message again to start a new turn`
+    )
+    this.name = 'TurnStalledError'
+  }
+}
+
+/** Internal fail-closed outcome for a turn whose process cleanup rejected. The raw
+ * cleanup rejection is logged once at the lifecycle boundary; this stable sentinel
+ * lets the serial gate fail-stop and release its dispatch lease without reporting the
+ * same rejection again through transport fire-and-forget handlers. */
+export class LifecycleCleanupBlockedError extends Error {
+  readonly reason = 'lifecycle_cleanup_blocked' as const
+  constructor(sessionKey: string, cause: unknown) {
+    super(`lifecycle cleanup blocked for session ${sessionKey}`, { cause })
+    this.name = 'LifecycleCleanupBlockedError'
+  }
+}
+
+/** ACP session ids are scoped to one agent runtime, not globally unique. */
+// Keyed by the OWNING HOST, not the agent: ACP ids are runtime-local, and a confined agent runs one
+// host per session, so two of its children can both mint `acp-1`. The shared host's owner is the agent id.
+export function pendingTurnKey(owner: HostKey, acpSessionId: string): string {
+  return JSON.stringify([owner, acpSessionId])
+}
+
+/** The host a pendingTurnKey / sdkLeaseKey belongs to. */
+export function pendingTurnOwner(key: string): HostKey {
+  return (JSON.parse(key) as [HostKey, string])[0]
+}
+
+/** The ACP session id a pendingTurnKey / sdkLeaseKey names. */
+export function pendingTurnAcpSessionId(key: string): string {
+  return (JSON.parse(key) as [string, string])[1]
+}
+
+/** Background-task leases are per (agent, ACP session) for the same reason turns are: two
+ *  agents can each expose an `acp-1`. Sharing one entry would let one agent's live task
+ *  suppress the other's completion wake, or overwrite its task record under a colliding id. */
+export function sdkLeaseKey(owner: HostKey, acpSessionId: string): string {
+  return pendingTurnKey(owner, acpSessionId)
+}
+
+/** One LIVE background task — a member of the lease's liveness set. `startedAt` is when the
+ *  `task_started` edge arrived, which is the only start time the feed offers. */
+export interface LiveSdkTask {
+  description?: string
+  isSubagent: boolean
+  startedAt: number
+  /** The thread the turn that started it replied in; absent at a conversation's top level or with no turn live. */
+  thread?: string
+}
+
+/** One SETTLED background task, retained for the console's `task/list` read. Display history and
+ *  nothing else: it lives in the lease's `settled` array, never in `tasks`, so no reclaim
+ *  decision can see it. `status` is the terminal status a runtime edge reported, when any. */
+export interface SettledSdkTask extends LiveSdkTask {
+  id: string
+  endedAt: number
+  status?: string
+  /** The runtime's own completion summary (`task_notification.summary`), when it sent one —
+   *  carried into the wake prompt so the model reports from the result, not from memory. */
+  summary?: string
+}
+
+/** The task a daemon report speaks for: its `taskId`, its kind as `listTasks` names it, and its title. */
+export interface ReportTask {
+  taskId: string
+  kind: 'delegated task' | 'follow-up' | 'getting to know' | 'approved proposal' | 'research'
+  title?: string
+}
+
+/** Daemon-private trusted metadata for an agent-originated delivery: caller identity and the hop/origin chain, never model-derived. */
+export interface CallMeta {
+  /** Trusted caller agentId (the agent that invoked `messageAgent`). */
+  callFrom: string
+  /** Depth of this agent-call chain; inbound platform/user turns are 0. */
+  hopCount: number
+  /** Stable id of the delivery that started this turn (== the msgId's ts segment). */
+  deliveryId: string
+  /**
+   * send-message-routing-rework.md §8.6: the activation rendezvous key this delivery was
+   * claimed under, when it has one.
+   *
+   * It rides on CallMeta specifically because CallMeta is PERSISTED with the durable inbox
+   * row and restored on replay. That is what closes the crash window: a turn that crashed
+   * after its inbox row landed is re-dispatched at startup carrying this key, so the
+   * SAME central admission below completes the rendezvous — no separate replay hook, and
+   * no dependence on the inbox row still existing by the time the sweep runs.
+   */
+  activationKey?: string
+  /**
+   * This delivery was OBSERVED on the platform, in the very conversation it targets — an
+   * agent's ordinary reply or channel-root mention — rather than being a postless
+   * `toAgent` call.
+   *
+   * It decides whether the woken turn may bind the conversation's external audience.
+   * A postless child must not: its coordinates are derived from the caller's session and
+   * the model influences the target, so binding one would let model input claim a shared
+   * conversation. A platform-observed delivery has the OPPOSITE property — its channel
+   * and thread come from the provider event itself, exactly like a human message in that
+   * thread — so it must bind, or it can never wake an agent that already holds an
+   * externally-bound session there, which is every agent already talking in the thread.
+   *
+   * A channel-ROOT self-post seed carries it for the same reason: the post landed, so its
+   * channel and thread are the provider's own coordinates for a thread that did not exist
+   * before — there is no shared conversation to claim, and the alternative (inheriting the
+   * origin session's audience) binds the seed to a channel it does not live in.
+   *
+   * Persisted with the inbox row alongside the rest of CallMeta, so a replayed turn makes
+   * the same classification it would have made live.
+   */
+  platformOrigin?: true
+  /** A report that opens its place's long session (assistant-mode.md §5.13): the session is the place's own root, bound to the place, as its first message would open it. */
+  opensPlace?: true
+  /** A getting-to-know task in a place whose long session does not exist yet (§5.13): with no parent to inherit from, it binds and reports the place's own audience. */
+  placeAudience?: true
+  /**
+   * webchat-multi-agents.md §5.2a (#549 parity): this delivery is a conversation-roster
+   * CONTINUATION — a peer participant's committed post fanned to this agent — not a
+   * direct `sendMessage` call. It keeps the full trusted call chain (hop budget,
+   * exactly-once rendezvous, caller identity) but must NOT assert "this activation is
+   * addressed to you": the standing response-choice contract decides whether the woken
+   * agent answers, exactly as it does for the user-targeted roster fan-out. Persisted
+   * with the inbox row like the rest of CallMeta.
+   */
+  conversationContinuation?: true
+  /** §5.2a: the human's webchat @mention scope a continuation inherits and stamps on its own reply. */
+  addressedAgentIds?: string[]
+  /** §5.2a: the human addressed other participants and the waking post does not @-name this one. */
+  outsideHumanScope?: true
+  /** A self-authored channel-root post initializes its new session but is not a model turn.
+   *  Persisted with the inbox row so crash replay cannot accidentally activate the model. */
+  initializeOnly?: boolean
+  /** The sending session's outward id, the source a session message names (send-message-guide.md §9.3); absent on root turns. */
+  originSessionId?: string
+  /** Immutable output of the delegating turn; null means it had no public reply. */
+  originCodeHostReplyTarget?: CodeHostReplyTarget | null
+  /** The source session's landing coords, recorded with the message so a reply from another daemon can route there. */
+  originCoords?: { platform: Exclude<NormalizedMessage['platform'], 'hook'>; channel: string; thread?: string }
+  /** Immutable external source inherited from the waking Session. This is
+   * daemon-authored metadata and never comes from model text. The credential
+   * locator stays at the direct ingress; descendants inherit only the stable
+   * provider/realm/resource tuple. */
+  externalOrigin?: ExternalSessionAudience
+  /** Daemon-internal, never a tool input: this turn is the round a getting-to-know task's report arrives in, naming its follow-up (assistant-mode.md §5.13), so the place's long session may `propose` on it. Persisted with the inbox row. */
+  gettingToKnowReport?: string
+  /** Daemon-internal, never a tool input: this turn is the one run of the approved proposal it names, in the thread its task holds (auto-session-mode.md §6.9.1), so it is never replayed and never steered. Persisted with the inbox row. */
+  approvedProposal?: string
+  /** Daemon-internal: the task a daemon report speaks for, which a coordinator's batch names it by (assistant-mode.md §5.18 ④). Persisted with the inbox row. */
+  reportOf?: ReportTask
+  /** Daemon-internal (issue #536, never a tool input): when this turn calls
+   *  `messageAgent`, deliver the woken peer's turn HEADLESS so it records silently
+   *  with no channel output. Set only by the self-introduce-on-join fan-out; does
+   *  NOT cascade (the peer's own callMeta doesn't carry it). */
+  deliverHeadless?: boolean
+  /** Daemon-internal (issue #536, never a tool input): the channel this turn exists to
+   *  introduce the agent into. It HARD-BOUNDS peer discovery for the turn — the
+   *  `channelAgents` dep forces this channel as the directory filter even when the model
+   *  omits (or widens, or redirects) the tool's `channel` argument. Without a code-level
+   *  bound the org-wide default would fan one channel join out to every agent in the org;
+   *  `MAX_AGENT_CALL_HOPS` bounds depth and `INTRO_MAX_BURST` bounds channels per snapshot,
+   *  but neither bounds PEERS per intro. The prompt asks for the same filter (belt and
+   *  braces); this is what makes it true regardless of model compliance. Set only by the
+   *  self-introduce-on-join dispatch and, like `deliverHeadless`, does NOT cascade. */
+  introChannel?: string
+  /** The sender asked for an outcome (`toAgent.needsReply`, or a task input), which opens this message's obligation (send-message-guide.md §9.5). */
+  needsReply?: boolean
+  /** send-message-guide.md §8.4: the daemon-owned work round of a sub-session this input belongs to; persisted with the inbox row. */
+  subsessionRound?: number
+  /** send-message-guide.md §9.3: the session message this input is, by the id its sending daemon minted. */
+  messageId?: string
+  messageKind?: SessionMessageKind
+  /** For a reply, the message it answers. */
+  inReplyTo?: string
+  /** The id was synthesized here for a delivery that carried none, so a reply to it takes the pre-id route. */
+  legacyMessage?: true
+  /** session-visibility.md §5.1: the WAKING session is private, so this child's
+   *  transcript holds prompt text copied out of it and must not feed shared agent
+   *  memory. Strictly ONE-DIRECTIONAL — it can only tighten. A `false`/absent
+   *  value never opens capture: an A2A child always starts excluded, and only a
+   *  CP-confirmed `org` state (which the CP derives from the post-cascade parent)
+   *  may open it. That is what makes a stale hint in flight during a §4.3
+   *  tightening harmless. */
+  parentPrivate?: boolean
+}
+
+/** `handover` is the infrastructure class — this daemon stopped serving the agent, which is the
+ *  duty teardown alone (`stopServingAgentSettled`: revoke, self-fence, registry shrink, shutdown
+ *  release) and NOT the drain paths, which keep their own reasons. Deliberately not `stop`: a user
+ *  stop is a verdict about the work, a handover says nothing about it, and outcome reporting has
+ *  to tell them apart. */
+export type TurnInterruptReason =
+  | 'pause'
+  | 'loop protection'
+  | 'stop'
+  | 'cancel'
+  | 'shutdown'
+  | 'superseded'
+  | 'handover'
+  // The stall watchdog (#1915): a prompt whose runtime went silent past `limits.turnStallTimeoutMs`.
+  | 'stalled'
+  // assistant-mode.md §5.6: a sub-session's permission request went unanswered past `permissionWaitHours`.
+  | 'approval wait expired'
+
+/** What an interrupt means for the agent's admitted-but-unrun durable rows. `terminal` ends that
+ *  work here (pause, removal, host respawn); `handoff` leaves the rows for the successor holder to
+ *  replay (#1050). Orthogonal to `reason`: a removal and a host respawn are both terminal `stop`. */
+export type TurnInterruptDisposition = 'terminal' | 'handoff'
+
+/**
+ * One admitted message waiting in (or entering) the per-sessionKey serial gate (design
+ * §4.3/§6.9). Carries the FULL DispatchContext so a queued turn dispatches identically to
+ * one that ran immediately — same reply transport (`integrationId`), same webchat sink,
+ * same trusted `callMeta` — and settles its OWN `dispatch()` promise (§6.9 #367). The gate
+ * is keyed by the LOGICAL sessionKey (platform:channel:thread:agentId[:transportScope]), NOT the ACP
+ * sessionId, so a cold session (no ACP id yet) is serialized too.
+ */
+export interface SelectedTurnHost {
+  host: AcpHost
+  /** The host's key — the owner every pending/lease entry of its sessions is filed under. */
+  hostKey: HostKey
+  /** Full lifecycle cleanup for the exact process selected for this turn. */
+  stop: (deadlineMs?: number) => Promise<void>
+  /** The exact stop operation once lifecycle cleanup has begun, or an already
+   * settled promise while the selected process has not been asked to stop. */
+  waitForCleanup: () => Promise<void>
+}
+
+export interface ModelSessionHost {
+  agentId: string
+  sessionKey: string
+  target: ModelProviderTarget
+  grant: KeyGrant
+  host?: AcpHost
+  /** In-progress start, joined by release so a host born after teardown is still stopped. */
+  starting?: Promise<AcpHost>
+  stopping?: Promise<void>
+  released?: boolean
+}
+
+export type TurnLifecycleCleanupOutcome = { blocked: false } | { blocked: true; error: unknown }
+
+export interface QueueEntry {
+  agentId: string
+  msg: NormalizedMessage
+  /** Messages coalesced or steered into this live turn: the read rule reads for their senders too (assistant-mode.md §5.5). */
+  foldedMessages?: TurnMessage[]
+  /** Session messages folded into this live turn, by delivery and message id (send-message-guide.md §9.5). */
+  foldedCalls?: { deliveryId: string; messageId?: string }[]
+  /** Cancels the entire cold SessionManager initialization path after the bounded
+   *  host-stop backstop, including non-host awaits such as workspace/history I/O. */
+  initAbort: AbortController
+  // Stop startup chrome immediately while uncancellable initialization retains its cleanup fence.
+  closeStartup?: () => void
+  integrationId?: string
+  webchat?: ChatTurnContext
+  callMeta?: CallMeta
+  hookContext?: HookDispatchContext
+  // Model and repository selection share one collected snapshot for this session birth.
+  codeHostDecisionContext?: Promise<CodeHostDecisionContext | undefined>
+  /** Best-effort lifecycle notification after ACP session initialization but
+   *  before prompting. Used by trigger sources that expose a live deep-link. */
+  onSessionReady?: (sessionId: string) => void
+  /** True when this entry was buffered via the user `!queue` command (ACK wording only —
+   *  it is one and the same admission queue as ordinary inbound, per §6.9 #390). */
+  isQueueCmd?: boolean
+  /** Re-admitted from the durable inbox, so an earlier attempt may have stopped partway. */
+  fromInboxReplay?: boolean
+  /** The ACP id this cold turn reported to the CP as `resuming`; cleared once the turn announces its start. */
+  resumingReported?: string
+  /** Settles the `dispatch()` promise for THIS message: resolve with its ACP sessionId
+   *  (or null when a gate skipped it), reject with its own turn error. */
+  resolve: (sessionId: string | null) => void
+  reject: (err: unknown) => void
+  /** §6.9 #353 durable inbox: the stable id (deliveryId/msgId) of the row persisted for
+   *  this entry BEFORE its admission ACK, or undefined when nothing was persisted (webchat
+   *  turns, or a replayed entry re-admitted from an already-present row). Set once on
+   *  admission and used to delete the row on every terminal path. */
+  inboxId?: string
+  /** The delivery receipt minted with `inboxId`; released when the admission is dropped before running. */
+  receiptId?: string
+  /** P3 outbound: publish the turn's completed reply on this code-host thread. Hook
+   * deliveries duplicate this reference in their durable HookDispatchContext so
+   * restart replay can recreate the poster behind its publish-state fence. */
+  githubReply?: CodeHostReplyTarget
+  /** Selected before session/new|load so cancellation uses the exact host. */
+  selectedHost?: SelectedTurnHost
+  /** Session initialization must await cleanup before releasing ownership. */
+  lifecycleCleanup?: Promise<void>
+  /** Permanent fail-closed latch after lifecycle cleanup rejects. The serial
+   * dispatch lease may terminate, but admission must remain fenced until restart. */
+  lifecycleCleanupBlocked?: Promise<never>
+  /** Deduplicates cleanup-failure observability across error, backstop, and final
+   * cleanup observers of the same admitted turn. */
+  lifecycleCleanupFailureLogged?: boolean
+  /** Latched cancellation for an already-admitted head. Unlike reading the current
+   *  pause/loop state, this survives a quick pause→unpause or trip→!resume race while
+   *  a cold sessions.handle() call is still initializing. */
+  cancelledReason?: TurnInterruptReason
+  /** A newer turn took this conversation's Slack status slot over: teardown leaves it alone. */
+  displacedByNewerTurn?: boolean
+  /** The acknowledgement its surface posted at turn start, and the egress lease held until runLoop ends it. */
+  acknowledgement?: { handle: TurnAcknowledgement; release: () => void }
+  /** Settles when dispatch() finishes this placed entry's admission bookkeeping: 'run' to
+   *  start it, 'drop' when a late rejection withdrew it. The runner awaits this before
+   *  starting a shifted entry, so a rejected caller's turn can never already be running. */
+  admissionHold?: Promise<'run' | 'drop'>
+  /** Cross-session GitHub coordination must settle before this durable entry can start. */
+  coordinationWait?: Promise<void>
+  /** A coordinator turn's batch (auto-session-mode.md §4.3): the queued entries this turn decides on too, settled with it. */
+  coordinatorBatch?: QueueEntry[]
+  /** The coordinator turn's rendered batch, the prompt that replaces its trigger. */
+  coordinatorPrompt?: string
+  /** How this coordinator turn ended, which decides its undecided messages' fallback (§4.5). */
+  coordinatorEnded?: 'answered' | 'failed' | 'stopped'
+  /** An admitted continuation waits for its platform mirror; false skips only this entry. */
+  admissionWait?: Promise<boolean>
+  /** Record chat observation only after admissionWait succeeds. */
+  deferObservedInbound?: boolean
+  posterPublishState?: 'not_started' | 'in_flight' | 'settled'
+  /** The live inbox row was redacted into a durable terminal HookReport
+   * receipt; removeInbox must retain it for restart-safe redelivery dedup. */
+  hookTerminalReceipt?: boolean
+  /** A duty handoff released this row to the successor holder instead of ending it, so the
+   *  entry's later terminal settle must not delete it either (#1050). */
+  inboxHandedOff?: boolean
+}
+
+/** The platform transport a turn's ordinary output posts through. Linear is deliberately
+ *  absent: it has no free-text surface at all (§4.6 — the agent activity feed is its only
+ *  reply channel), so its Layer-2 applier resolves its own egress port instead. */
+export type ReplyConnection = SlackConnection | TelegramConnection | DiscordConnection | FeishuConnection
+
+/** What `SessionManager.handle()` hands back to a dispatched turn. */
+export interface HandledTurnSession {
+  sessionId: string
+  blocks: import('@agentclientprotocol/sdk/unstable').ContentBlock[]
+  created: boolean
+  skipped?: boolean
+  captureInput?: string
+  turnId?: string
+  initializedOnly?: boolean
+  contextRevision?: number
+  contextEvents?: { ts: string; text?: string }[]
+  providerCheckpoint?: string
+  additionalMcpServersAttached?: boolean
+  /** The digest of the standing context the blocks carry inline, recorded once the runtime answers the prompt. */
+  standingDigest?: string
+  /** The tool digests the blocks bring the model up to, recorded once the runtime answers the prompt. */
+  toolDigests?: string
+}
+
+/** The handles every `dispatchOne` phase shares: the entry being run, the pure plan for it,
+ *  the agent snapshot the turn was planned against, and the reporters bound before host work. */
+export interface TurnRun {
+  readonly entry: QueueEntry
+  /** Logical session key. */
+  readonly key: string
+  readonly plan: TurnPlan
+  // Session runtime selection replaces only the execution fields before opening the host.
+  agent: LoadedAgent
+  modelEvaluation?: {
+    decisionId: string
+    selected: boolean
+    reason: string | null
+    at: number
+    evidence: import('../decisions/model-selection.js').SessionModelEvaluationEvidence | null
+  }
+  readonly replyConn: ReplyConnection | undefined
+  /** The platform egress transport this turn leased, when its output does not go through
+   *  `replyConn`. Resolved ONCE, with the lease, and handed to the output surface as-is. */
+  readonly egressConn?: PlatformConnection
+  readonly evaluation: TurnEvaluationReporter
+}
+
+/** A turn whose answer may be committed: the prompt loop settled on one accepted generation. */
+export interface AnsweredTurn {
+  kind: 'answered'
+  stopReason: Awaited<ReturnType<AcpHost['prompt']>>['stopReason']
+  usage: Awaited<ReturnType<AcpHost['prompt']>>['usage']
+  /** The recall query the accepted generation was actually prompted with. */
+  finalCaptureInput: string
+}
+
+/** `cancelled` covers every prompt-loop exit that commits no answer (operator interrupt,
+ *  context churn). The caller re-issues its own `return null` so settlement still runs. */
+export type TurnPromptOutcome = AnsweredTurn | { kind: 'cancelled' }
+
+/** The two try-scoped facts `dispatchOne`'s phases hand to its settlement. `finalPhase`
+ *  becomes the session outcome + CP snapshot phase; `propagatingTurnError` keeps a genuine
+ *  prompt failure the outward error even when cleanup also fails. */
+export interface TurnSettlement {
+  finalPhase: EventSession['phase']
+  propagatingTurnError: boolean
+}
+
+/** Where in the cold-session window a fence sits. The site name is also the log label, and it
+ *  selects which unwind steps the call point owns — see `Daemon.coldSessionFence`. */
+export type ColdFenceSite = 'admitted' | 'initialized' | 'ready'
+
+/** The per-turn handles a cold fence needs to unwind its call point's state. Which fields are
+ *  read depends on the site: `admitted` runs before any host work and uses only the reporter. */
+export interface ColdFenceContext {
+  finishEvaluation: (type: 'turn.cancelled', data: Record<string, unknown>) => void
+  /** Clear the transient platform activity indicator. Unused at `admitted` — none is showing yet. */
+  clearActivity?: () => void
+  /** Release the reply-connection lease. Only `initialized` owns it; `ready` leaves it to the outer finally. */
+  releaseReplyConn?: () => void
+  /** Undo the delivery-binding install done before session/new|load. */
+  restoreDeliveryBinding?: () => void
+  /** The ACP session id, once known. `ready` reports it in the hook payload. */
+  sessionId?: string
+  /** sessions.handle() created this ACP session on this very turn. */
+  created?: boolean
+}
+
+export interface MemoryExtractionCollector {
+  chunks: string[]
+  sessionKey?: string
+  runtimeCostReported?: boolean
+  /** Dream sessions expose the same original reasoning/tool activity as ordinary
+   *  sessions. Background distillation has no transcript and leaves this unset. */
+  transcript?: { channel: string; thread: string; recorder: TranscriptRecorder }
+  /** Calls to this daemon's own bridge tools: the only requests an extraction turn may be granted (#2091). */
+  builtinSystemToolCallIds: Set<string>
+}
+
+/** The union of every platform's renderer action, and of every platform's
+ *  converger. Each surface narrows to its own arm; the unions exist because the
+ *  turn record is still core-owned (they dissolve when the convergers move with
+ *  their platforms). */
+export type DaemonRenderAction =
+  | QQAction
+  | DingTalkAction
+  | SlackAction
+  | TelegramAction
+  | DiscordAction
+  | FeishuAction
+  | LinearAction
+  | GoogleChatAction
+  | MsTeamsAction
+  | WeChatAction
+  | WeComAction
+export type DaemonConverger =
+  | QQConverger
+  | DingTalkConverger
+  | OutputConverger
+  | TelegramConverger
+  | DiscordConverger
+  | FeishuConverger
+  | LinearConverger
+  | GoogleChatConverger
+  | MsTeamsConverger
+  | WeChatConverger
+  | WeComConverger
+
+/**
+ * §7.3 per-turn platform state. Each shape is owned by exactly one turn-output
+ * surface and reached only through {@link turnState} from that surface's
+ * applier — core stores the slot and never looks inside. These used to be
+ * platform-named fields on the turn record itself, which is precisely the
+ * accretion the opaque slot exists to stop.
+ */
+/** Read a turn's opaque platform state as the owning surface's shape. Only that
+ *  surface's applier (and the platform-scoped timers it arms) calls this.
+ *
+ *  The slot materializes on first read: a turn whose surface seeded nothing — or
+ *  whose record was built directly, as isolated applier tests do — simply starts
+ *  with empty platform state, which is what "no state yet" means. Seeding is an
+ *  optimization for platforms that HAVE an initial value (Telegram's reply
+ *  anchor), never a precondition for reading. */
+export function turnState<S extends object>(p: Pending): S {
+  return (p.turnState ??= {} as S) as S
+}
+
+/** The in-place platform chrome anchors a turn edits rather than re-posts. Each `*Ts` is the
+ *  message id of a single row, and its `*Attempted` sibling records that the first post was
+ *  tried so a failed post cannot spam a duplicate on the next action. */
+export interface TurnChromeCursors {
+  /** The session's stored (fallback or runtime) title, pushed onto the thread after the
+   *  turn's FIRST status write — which is what registers the thread as an agent session, so
+   *  an earlier rename would be refused. Cleared once flushed or superseded by a live
+   *  runtime title. */
+  sessionTitleToPush?: string
+  /** ts of the single in-place "main progress" message, once posted (medium/high). */
+  progressTs?: string
+  /** Whether the progress message's first post was attempted. */
+  progressAttempted?: boolean
+  /** ts of the single in-place plan-summary message, once posted (medium/high). */
+  planTs?: string
+  planAttempted?: boolean
+  /** ts of the single in-place reasoning "context block" message, once posted (high). */
+  reasoningTs?: string
+  reasoningAttempted?: boolean
+  /** ts of the single in-place agent reply (Telegram / Discord minimal mode's `live-reply`), once posted. */
+  liveReplyTs?: string
+  liveReplyAttempted?: boolean
+  /** Text last written to the live-reply message — skip an edit when unchanged. */
+  liveReplyText?: string
+  /** ts of the session's interactive status-bar message, once known. Persisted in the
+   *  session row so later turns update the first line instead of posting duplicates. */
+  statusBarTs?: string
+  statusBarAttempted?: boolean
+  /** Dedup key for the last status snapshot emitted this turn, so a `usage_update` that
+   *  changes nothing observable skips a redundant edit. */
+  lastStatusBar?: string
+}
+
+/** What one turn has said so far: the raw stream, the generation-local attempt held behind
+ *  the context fence, and the pointers to what is actually posted. */
+export interface ReplyAccumulator {
+  /** Complete raw assistant text, used only as input to opt-in memory distillation. */
+  text: string
+  /** IM answer text staged since the last committed segment boundary; the final
+   *  context fence commits the closing segment (the only regenerable one). */
+  attemptText: string
+  /** Answer-bearing ACP updates withheld from the platform converger until their
+   *  segment commits — at a tool/thought/plan boundary, or at the final fence. */
+  attemptAnswerUpdates: any[]
+  /** Current successfully-delivered agent reply message. `footerKey` records which footer
+   *  it owns; progress/tool/reasoning chrome never replaces this pointer. */
+  lastReply?: { ts: string; text: string; footerKey?: string }
+  /** The LAST agent-authored conversational message posted this turn, with the exact
+   *  text it currently shows — the message turn finalization re-stamps as
+   *  `delivery_state: 'final'` (§5.5). The text is carried because chat.update REPLACES
+   *  content, so closing the response means re-sending what is already displayed.
+   *  Undefined when the turn posted no conversational body (chrome-only, `none` mode, or
+   *  a headless turn): there is then no response event to close. */
+  lastResponse?: { ts: string; text: string }
+  /** ts of the FIRST agent-authored conversational message posted this turn; a getting-to-know task's cards thread under it (assistant-mode.md §5.13). */
+  firstResponse?: string
+  /** send-message-routing-rework.md §5.1: the id of the ONE complete logical response
+   *  this turn produces. Every physical message of a long answer carries it, so a peer
+   *  deduplicates on (responseId, target agent) and activates exactly once even when the
+   *  answer was split across several Slack messages. Minted per turn, never per post. */
+  responseId: string
+  /** Routing facts of the COMPLETE response, resolved at final flush (§5.5): recipients,
+   *  the addressed-anyone bit, whether any peer agent shares this conversation, and
+   *  whether one of them posts as the SAME bot (their ingress admits only the closing
+   *  edit past its self-echo filter, so those conversations keep the re-stamp). Unset
+   *  until then — and left unset without an org/snapshot, which makes the closure fall
+   *  back to the unconditional re-stamp. */
+  finalRouting?: {
+    mentionedAgentIds: string[]
+    addressedAnyone: boolean
+    hasPeers: boolean
+    peerSharesBot: boolean
+  }
+  /** ts of the body message born `delivery_state: 'final'` — a terminal section posted at
+   *  finalization with the closing metadata already aboard, so `closeResponse` skips its
+   *  content-identical edit (which would mark the visible reply "(edited)"). */
+  finalStamped?: string
+  /** What the closure actually resolved to, recorded when `closeSlackResponse` computes it
+   *  locally — §5.2's footer migration must re-supply it if it later edits that message. */
+  closedRouting?: { mentionedAgentIds: string[]; addressedAnyone: boolean }
+}
+
+/** The turn's completion machinery: what settles it, what defers it, and the once-only
+ *  latches that keep its terminal reporting from firing twice. */
+export interface TurnSignals {
+  /** Resolves when this turn leaves `pending` (success or failure) — drain awaits it. */
+  done: Promise<void>
+  /** Settles `done`; called once from dispatch's finally. */
+  resolveDone: () => void
+  /** Pending idle-flush timer (§9.1). */
+  idleTimer?: NodeJS.Timeout
+  /** Serializes applyAction so in-place edits don't race on the chrome cursors. */
+  applyChain: Promise<void>
+  /** True once the normal turn-end usage/report has been emitted. */
+  usageReportSent: boolean
+  /** Native cost suppresses the public-pricing fallback for this turn. */
+  runtimeCostReported: boolean
+  /** Concrete model reported during this turn, distinct from its initial selector snapshot. */
+  runtimeReportedModel?: string
+}
+
+/** Per-in-flight-turn rendering state, keyed by ACP sessionId in `this.pending`.
+ *
+ *  Everything a turn DECIDED before it ran lives on the readonly `plan` and is read
+ *  through it; the mutable rest is grouped by who writes it — platform chrome cursors,
+ *  reply accumulation, the approval-wait meter (permissions/), and completion signals. */
+export interface Pending {
+  /** §5.2a: this webchat turn's routing once coalesced activations folded in; absent means the entry's own. */
+  webchatRouting?: WebchatRouting
+  // Completed tool calls already projected into a native dialog during this turn.
+  nativeAppToolCallIds?: Set<string>
+  /** The same trusted workspace link resolver used by every output surface for this turn. */
+  resolveFileLink?: WorkspaceFileLinkResolver
+  /** The pure decisions this turn was planned with — its identity, coordinates, output
+   *  mode, and surface. Readonly by construction: nothing here is turn state. */
+  readonly plan: TurnPlan
+  chrome: TurnChromeCursors
+  reply: ReplyAccumulator
+  /** Explicit human-approval wait meter (permissions/coordinator owns every write). */
+  approval: ApprovalWait
+  signals: TurnSignals
+  /** Admitted-turn lifecycle owner. Backstops and finalization share its cleanup
+   * failure latch so one rejected stop cannot be logged or fenced twice. */
+  entry: QueueEntry
+  // Platform-tagged converger: OutputConverger emits SlackAction[] (slack/webchat),
+  // TelegramConverger emits TelegramAction[]. enqueueApply routes by `platform`.
+  conv: DaemonConverger
+  /** Captures the full activity log (tool/reasoning) from the raw ACP stream,
+   *  independent of output mode. Text/result rows are recorded at send time. */
+  rec: TranscriptRecorder
+  /** Folds codex-acp's out-of-band `_meta.terminal_output*` stream back into the owning tool
+   *  call at ingress, so every consumer sees the command's real output. */
+  termOut: TerminalOutputFolder
+  /** Keeps staged answer commits aligned with the renderer's work boundaries. */
+  workBoundary: WorkBoundary
+  /** Tool-call ids structurally identified as this daemon's own MCP tools. Approval
+   *  requests may carry only this opaque id, regardless of which ACP path is used. */
+  builtinSystemToolCallIds: Set<string>
+  /** Each tool call's title and input summary from its updates, for an approval card whose
+   *  request names only the call's id (`rememberToolCall`). Created on the first tool call. */
+  knownToolCalls?: Map<string, KnownToolCall>
+  /** This turn's execute calls not yet settled, by start time; the ones still open at a clean end are background terminals. */
+  openExecs?: Map<string, number>
+  /** Bounded fingerprint of the prompt text this turn sent, for recognizing a runtime
+   *  fallback title that is only that prompt read back (session/derive-title.ts). */
+  promptEchoPrefix?: string
+  /** The live ACP session id for this turn (part of the `this.pending` map key). */
+  acpSessionId: string
+  /** The host that minted `acpSessionId` — the other half of the `this.pending` key. */
+  hostKey: HostKey
+  /** True only while a `session/prompt` for this turn is awaiting the runtime — the window a
+   *  same-session arrival can be steered into instead of queued. */
+  promptInFlight?: boolean
+  /** Whether this admitted turn has started a tool call; later prompts must not retry past that point. */
+  promptRanTool?: boolean
+  /** Last proof the runtime is alive on this turn (prompt sent, any update, a human's answer) — the stall watchdog's input (#1915). */
+  runtimeActivityAt?: number
+  /** `_session/steering` calls this turn has absorbed, bounded by MAX_STEERS_PER_TURN. */
+  steerCount?: number
+  /** The same session's OUTWARD id (session-concept.md §1.1) — what the console knows it by, so
+   *  every deep link and status payload this turn produces addresses a row the CP actually has.
+   *  Stamped once here because most of those producers are synchronous. */
+  outwardSessionId: string
+  /** The exact host selected for this turn, including its full cleanup boundary. */
+  selectedHost?: SelectedTurnHost
+  /** Once an operator pause or loop trip targets this turn, no subsequent ACP update
+   *  or queued renderer action may publish output, even if the gate is later reset. */
+  outputSuppressed?: TurnInterruptReason
+  /** P3 outbound: the final-answer selector + completed comment on the triggering
+   *  GitHub issue/PR. Commentary stays transcript-local; final is awaited at turn end.
+   *  For a headless hook, explicit final chunks are withheld from OutputConverger and
+   *  persisted once from the collector so transport flushes cannot split one answer. */
+  github?: GithubTurnState
+  conn?: SlackConnection | TelegramConnection | DiscordConnection | FeishuConnection
+  // The leased platform egress for a surface that posts outside `conn` (TurnRun.egressConn).
+  egress?: PlatformConnection
+  /** §7.3 OPAQUE per-turn platform state, seeded by this turn's output surface and
+   *  read only by that surface (see {@link turnState}). Core carries the slot and
+   *  never inspects it — the reason platform-shaped fields stopped accreting here. */
+  turnState?: unknown
+  /** Linked footer prepared before the runtime starts streaming. Every reply section is
+   *  initially posted with these trailing blocks so Slack can suppress unfurls. */
+  attribution?: { blocks: unknown[]; key: string }
+  /** Trusted call metadata of a `messageAgent`-started turn, kept out of the prompt. TODO(P4): move into QueueEntry (§6.9 #367). */
+  callMeta?: CallMeta
+  // Human chat services share the execution accumulator, never their reconnect state.
+  webchat?: ChatTurnOutput
+  /** Agent questions this turn has already told the channel it could not render (#1794), so a
+   *  runtime re-raising the same unrenderable ask posts one notice rather than one per attempt. */
+  declinedElicitNotices?: Set<string>
+}
+
+/** Visible Slack thread messages that establish a new chronological boundary. Any live
+ * in-place chrome from the active turn must continue below one of these messages. */
+export type LiveChromeBoundaryMessageType = 'human-input-card' | 'agent-message'
+
+export const LIVE_CHROME_BOUNDARY_MESSAGE_TYPES = new Set<LiveChromeBoundaryMessageType>([
+  'human-input-card',
+  'agent-message'
+])
+
+/** Exact platform delivery route retained after a turn leaves `pending`, so a
+ *  late ACP title update can still rename the same Slack DM it came from. */
+export interface SessionDeliveryBinding {
+  agentId: string
+  platform: string
+  integrationId?: string
+  isDm: boolean
+}
+
+/** Build the wire SessionKey (protocol §5) for a pending turn — what `drain/done`
+ *  reports as released so the CP may reassign it. Uses the real `thread` (absent for
+ *  a channel-root message), NOT `statusThread` (which falls back to msgId): the CP
+ *  keys assignments by `thread ?? "-"`, so reporting the msgId would miss the match. */
+export function pendingSessionKey(p: Pending): SessionKey {
+  const { platform: rawPlatform, channel, thread } = p.plan
+  const platform = rawPlatform as SessionKey['platform']
+  return thread !== undefined ? { platform, channel, thread } : { platform, channel }
+}
+
+/** One shutdown duty drain: its bound, its counters, and the grants that landed after the latch. */
+export interface ShutdownDutyDrain {
+  deadlineAt: number
+  stats: { groups: number; agents: number; late: number; acked: number; lapsing: number }
+  /** Grants that landed after the latch: never installed, never acknowledged before the loop is done. */
+  late: Map<string, DutyGrantEntry>
+  /** Agents of groups the loop left to lapse — a late grant covering any of them lapses too. */
+  lapsedAgents: Set<string>
+  /** Set once the main loop has finished with every held group. */
+  loopDone: boolean
+}

@@ -1,0 +1,147 @@
+/**
+ * The **transport identity strategies** (`transportScopeIdentity` /
+ * `tenantScope` in §7.4, stage S2) — two different answers to "what identifies
+ * this integration's connection?", with two different lifetimes:
+ *
+ *  - {@link connectionIdentityFor} feeds the TRANSPORT scope: which credential
+ *    actually identifies one physical connection, so integrations consolidated
+ *    onto the same credential share a scope. It deliberately rotates with the
+ *    credential; the caller hashes it and no raw credential is persisted or
+ *    logged. The §7.5 connection-pool keys state the same fact for LIVE
+ *    connections; this states it for configs, before any connection exists.
+ *
+ *  - {@link tenantScopeFor} feeds the DURABLE owner identity
+ *    (`<platform>:<scope>:<uid>`, session-visibility §2). It must SURVIVE
+ *    rotation, so it prefers the platform's own tenant id and falls back to a
+ *    scope minted once per integration and persisted by core.
+ *
+ * Both read the integration through the platform module's VALIDATED config
+ * (§6.4, `platforms/integration-config.ts`) — the payload is opaque `unknown`
+ * on the entry, so an unchecked structural cast would let a malformed value
+ * (say `botToken: 42`) reach `.split()` and throw from a path the connection
+ * consolidator already skipped. A payload the module schema refuses reads as
+ * "no credential", and both strategies fall back fail-closed: the transport
+ * scope isolates on the integration id, the tenant scope on the minted value.
+ */
+import type { Integration } from '../agents/agent-schema.js'
+import { integrationCore, platformIntegrationConfig } from './integration-config.js'
+
+/** The stable public BotFather bot-id prefix, or undefined for non-standard
+ *  test/config tokens. */
+function telegramBotId(botToken: string): string | undefined {
+  const botId = botToken.split(':', 1)[0]
+  return /^\d+$/.test(botId ?? '') ? botId : undefined
+}
+
+const CONNECTION_IDENTITY = new Map<string, (integration: Integration) => string | undefined>([
+  ['qq', (int) => platformIntegrationConfig('qq', int)?.appId],
+  // The Client ID survives a secret rotation and names one organization's internal app.
+  ['dingtalk', (int) => platformIntegrationConfig('dingtalk', int)?.clientId],
+  // A shared bot has no app token to key on; a socket integration keys on it.
+  [
+    'slack',
+    (int) => {
+      const slack = platformIntegrationConfig('slack', int)
+      if (!slack) return undefined
+      return integrationCore(int).mode === 'shared' ? slack.botToken : (slack.appToken ?? slack.botToken)
+    }
+  ],
+  // The bot-id prefix survives a secret rotation; non-standard tokens fall back
+  // to the full high-entropy credential before hashing.
+  [
+    'telegram',
+    (int) => {
+      const token = platformIntegrationConfig('telegram', int)?.botToken
+      return token === undefined ? undefined : (telegramBotId(token) ?? token)
+    }
+  ],
+  ['discord', (int) => platformIntegrationConfig('discord', int)?.botToken],
+  [
+    'feishu',
+    (int) => {
+      const feishu = platformIntegrationConfig('feishu', int)
+      // `region` is schema-defaulted ('feishu'), so a validated payload always has it.
+      return feishu && `${feishu.region}:${feishu.appId}`
+    }
+  ],
+  // The Chat app's project number, not its key: a rotated key must keep the installation's scope (google-chat-integration.md §3).
+  ['googlechat', (int) => platformIntegrationConfig('googlechat', int)?.projectNumber],
+  // The bot's app ID survives a secret rotation; Entra IDs compare case-insensitively.
+  ['msteams', (int) => platformIntegrationConfig('msteams', int)?.appId.toLowerCase()],
+  // The bot id names one QR binding; its token changes only with a re-scan.
+  ['wechat', (int) => platformIntegrationConfig('wechat', int)?.botId],
+  // The BotID survives a Secret reset and names one organization's smart bot.
+  ['wecom', (int) => platformIntegrationConfig('wecom', int)?.botId]
+])
+
+/** The credential string identifying `integration`'s physical connection —
+ *  hashed by the caller, never persisted raw. Fail-CLOSED default: an
+ *  unregistered platform — or an entry whose config payload does not validate —
+ *  identifies by integration id, so its scope never consolidates across
+ *  integrations (over-isolating is safe; over-sharing a scope would merge
+ *  unrelated conversations). */
+export function connectionIdentityFor(integration: Integration): string {
+  return CONNECTION_IDENTITY.get(integration.platform)?.(integration) ?? integration.id
+}
+
+/** Core-owned inputs a tenant-scope strategy may consult. */
+export interface TenantScopeHost {
+  /** The live connection's workspace/team id, where the platform exposes one. */
+  liveWorkspaceId(integrationId: string): string | undefined
+  /** A scope minted once per integration and persisted — the rotation-immune
+   *  fallback when the platform exposes no tenant id. */
+  minted(integrationId: string): Promise<string | undefined>
+}
+
+// Platforms whose durable scope is the live connection's tenant id; their minted scope is only a pre-auth fallback.
+const LIVE_TENANT_SCOPE = new Set(['slack'])
+
+const TENANT_SCOPE = new Map<string, (host: TenantScopeHost, integration: Integration) => Promise<string | undefined>>([
+  ['qq', async (_host, int) => platformIntegrationConfig('qq', int)?.appId],
+  ['dingtalk', async (_host, int) => platformIntegrationConfig('dingtalk', int)?.clientId],
+  // The BotID names one organization's smart bot and survives a Secret reset.
+  ['wecom', async (host, int) => platformIntegrationConfig('wecom', int)?.botId ?? (await host.minted(int.id))],
+  // A re-scan mints a new bot id but keeps ilink_user_id, so the owner is `wechat:ilink:<ilink_user_id>` (wechat-integration.md §4.2).
+  ['wechat', async (host, int) => (platformIntegrationConfig('wechat', int) ? 'ilink' : await host.minted(int.id))],
+  // The auth.test workspace id; a not-yet-authenticated connection falls back to the minted scope rather than throw.
+  ['slack', async (host, int) => host.liveWorkspaceId(int.id) || (await host.minted(int.id))],
+  // The public bot id prefix survives a BotFather token rotation.
+  [
+    'telegram',
+    async (host, int) => {
+      const token = platformIntegrationConfig('telegram', int)?.botToken
+      const botId = token === undefined ? undefined : telegramBotId(token)
+      return botId ? `bot${botId}` : await host.minted(int.id)
+    }
+  ],
+  // App id + region is the tenant anchor Feishu/Lark exposes to us.
+  [
+    'feishu',
+    async (host, int) => {
+      const feishu = platformIntegrationConfig('feishu', int)
+      return feishu ? `${feishu.region}:${feishu.appId}` : await host.minted(int.id)
+    }
+  ],
+  // The Chat app's project is the durable tenant anchor Google exposes; it survives key rotation.
+  [
+    'googlechat',
+    async (host, int) => platformIntegrationConfig('googlechat', int)?.projectNumber ?? (await host.minted(int.id))
+  ],
+  // A person's Entra object ID is scoped by the tenant, which survives a secret rotation (teams-integration.md §4.1).
+  [
+    'msteams',
+    async (host, int) =>
+      platformIntegrationConfig('msteams', int)?.tenantId.toLowerCase() ?? (await host.minted(int.id))
+  ]
+])
+
+// Platforms without a tenant anchor keep their durable per-integration mint; an absent scope never grants ownership.
+export async function tenantScopeFor(host: TenantScopeHost, integration: Integration): Promise<string | undefined> {
+  const strategy = TENANT_SCOPE.get(integration.platform)
+  return strategy ? await strategy(host, integration) : await host.minted(integration.id)
+}
+
+// True while a live-tenant platform's connection has not reported its tenant id, so its durable scope is not yet known.
+export function tenantScopePending(host: TenantScopeHost, integration: Integration): boolean {
+  return LIVE_TENANT_SCOPE.has(integration.platform) && !host.liveWorkspaceId(integration.id)
+}

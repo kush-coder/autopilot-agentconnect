@@ -1,0 +1,233 @@
+'use client'
+
+// The caller's OWN Slack App Configuration token, on the Profile page. Per-user
+// (docs/designs/slack-install-smoothing.md §Tier B): the app the one-click installer
+// creates is owned by whoever's token created it — so you store your own here, and
+// only you can generate that app's App-Level token. Stored ⇒ the Add-integration
+// modal runs the one-click auto-install for the apps YOU create; absent ⇒ you either
+// paste it inline when installing, or fall back to the manual flow.
+//
+// The config (access) token is required; the refresh token is optional — with it the
+// pair auto-rotates and never expires (durable), without it the access token is stored
+// as-is and lapses after ~12h (then re-enter). The tokens are secret — the CP validates
+// + normalizes on save and never returns them; this card only ever sees status.
+// Org-scoped (keyed by the active org), so the fetch waits for OrgProvider to resolve —
+// mirroring the org-gated pattern the rest of the console uses.
+//
+// The Slack module's `ProfileCredentialCard` (§10). It was the last direct core
+// caller of a platform-named `lib/api` export; the CP calls now go through the
+// module's own `slackApi` bindings, and `ProfileView` reaches it through the
+// registry instead of importing a Slack-named component.
+
+import { useEffect, useState } from 'react'
+import { useTranslations } from 'next-intl'
+import { Button, Icon } from '@/components/ui'
+import { fmtDate, type SlackConfigDto } from '@/lib/api'
+import { useOrgs } from '@/lib/org-context'
+import { slackApi } from './api'
+
+const EMPTY: SlackConfigDto = {
+  configured: false,
+  durable: false,
+  funnelEnabled: false,
+  autoAvailable: false,
+  accessExpiresAt: null,
+  relayAvailable: false,
+  relayPublicUrl: null,
+  updatedAt: null
+}
+
+export function SlackConfigCard() {
+  const t = useTranslations('Profile.slack')
+  // Gate the org-scoped fetch on the active org: on a hard refresh `orgBase()` throws
+  // "no active organization" until OrgProvider resolves it, so a bare mount-fetch would
+  // catch → show "Not configured" even when it IS. Re-fetch when it resolves.
+  const { activeOrg } = useOrgs()
+  const [status, setStatus] = useState<SlackConfigDto | 'loading'>('loading')
+  const [editing, setEditing] = useState(false)
+  const [access, setAccess] = useState('')
+  const [refresh, setRefresh] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!activeOrg) return
+    let alive = true
+    setStatus('loading')
+    slackApi
+      .readConfig()
+      .then((s) => alive && setStatus(s))
+      .catch(() => alive && setStatus(EMPTY))
+    return () => {
+      alive = false
+    }
+  }, [activeOrg])
+
+  const save = async () => {
+    // The access (config) token is required; the refresh token is optional — omit it and
+    // the CP stores an access-only token that works until it expires (~12h), then re-enter.
+    if (busy || !access.trim()) return
+    setBusy(true)
+    setErr(null)
+    try {
+      const refreshTrim = refresh.trim()
+      setStatus(
+        await slackApi.saveConfig({
+          accessToken: access.trim(),
+          ...(refreshTrim ? { refreshToken: refreshTrim } : {})
+        })
+      )
+      setEditing(false)
+      setAccess('')
+      setRefresh('')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const clear = async () => {
+    if (busy) return
+    setBusy(true)
+    setErr(null)
+    try {
+      await slackApi.clearConfig()
+      setStatus(EMPTY)
+      setEditing(false)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const configured = status !== 'loading' && status.configured
+  const showForm = status !== 'loading' && (!configured || editing)
+  // An access-only token (no refresh) that has passed its ~12h expiry — the caller must
+  // re-enter it. Durable tokens auto-rotate and never reach this state.
+  const accessExpired =
+    status !== 'loading' &&
+    status.configured &&
+    !status.durable &&
+    (status.accessExpiresAt == null || new Date(status.accessExpiresAt).getTime() <= Date.now())
+
+  return (
+    <div className="card mt-[18px]">
+      <div className="cardhead">
+        <span className="cardtitle">{t('title')}</span>
+      </div>
+
+      <div className="px-4 py-[13px]">
+        {status === 'loading' ? (
+          <div className="font-sans text-[12.5px] font-normal leading-normal text-(--text-tertiary)">
+            {t('loading')}
+          </div>
+        ) : (
+          <>
+            {configured && !editing ? (
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Icon
+                    name={status.durable && status.autoAvailable ? 'circle-check' : 'circle-alert'}
+                    size={15}
+                    color={
+                      accessExpired
+                        ? 'var(--status-error)'
+                        : status.durable && status.autoAvailable
+                          ? 'var(--brand)'
+                          : 'var(--status-paused)'
+                    }
+                    className="flex-none"
+                  />
+                  <span className="flex-none font-sans text-[12.5px] font-semibold leading-normal text-(--text-secondary)">
+                    {accessExpired ? t('expired') : t('stored')}
+                  </span>
+                  <span className="truncate font-sans text-[12px] font-normal leading-normal text-(--text-tertiary)">
+                    {!status.funnelEnabled
+                      ? t('quickInstallUnavailable')
+                      : accessExpired
+                        ? t('reenterQuickInstall')
+                        : status.durable
+                          ? `${t('autoRenews')}${status.updatedAt ? ` · ${t('updated', { date: fmtDate(status.updatedAt) })}` : ''}`
+                          : status.accessExpiresAt
+                            ? t('expires', { date: fmtDate(status.accessExpiresAt) })
+                            : t('expiresSoon')}
+                  </span>
+                </div>
+                <span className="flex flex-none items-center gap-2">
+                  <Button variant="ghost" onClick={() => setEditing(true)}>
+                    <Icon name="pencil" size={13} />
+                    {accessExpired ? t('reenter') : t('replace')}
+                  </Button>
+                  <Button variant="ghost" onClick={() => void clear()}>
+                    <Icon name="trash" size={13} />
+                    {busy ? t('clearing') : t('clear')}
+                  </Button>
+                </span>
+              </div>
+            ) : (
+              !showForm && (
+                <div className="font-sans text-[12.5px] font-normal leading-[1.55] text-(--text-tertiary)">
+                  {t('notConfigured')}
+                </div>
+              )
+            )}
+
+            {showForm && (
+              <div className={configured ? 'mt-1' : ''}>
+                <div className="mb-3 font-sans text-[12.5px] font-normal leading-[1.55] text-(--text-tertiary)">
+                  {t('hintBefore')}{' '}
+                  <a href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer" className="lnk">
+                    {t('appsUrl')}
+                  </a>{' '}
+                  {t('hintAfter')}
+                </div>
+                <div className="grid grid-cols-1 gap-[10px] min-[440px]:grid-cols-2">
+                  <div className="fld">
+                    <span className="fldlbl">{t('configToken')}</span>
+                    <input
+                      className="inp mn"
+                      placeholder={t('accessPlaceholder')}
+                      value={access}
+                      onChange={(e) => setAccess(e.target.value)}
+                    />
+                  </div>
+                  <div className="fld">
+                    <span className="fldlbl">
+                      {t('refreshToken')} <span className="font-normal text-(--text-tertiary)">({t('optional')})</span>
+                    </span>
+                    <input
+                      className="inp mn"
+                      placeholder={t('refreshPlaceholder')}
+                      value={refresh}
+                      onChange={(e) => setRefresh(e.target.value)}
+                    />
+                  </div>
+                </div>
+                <div className="mt-3 flex items-center gap-2">
+                  <Button
+                    onClick={() => void save()}
+                    className={access.trim() && !busy ? undefined : 'cursor-default opacity-50'}
+                  >
+                    <Icon name="check" size={14} />
+                    {busy ? t('saving') : t('save')}
+                  </Button>
+                  {configured && (
+                    <Button variant="ghost" onClick={() => setEditing(false)}>
+                      {t('cancel')}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {err && (
+              <div className="mt-3 font-sans text-[12px] font-normal leading-normal text-(--status-error)">{err}</div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  )
+}

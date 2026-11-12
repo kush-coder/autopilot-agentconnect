@@ -1,0 +1,517 @@
+// Daemon-facing relay connection with periodic daemon-key checks; credentials must never be logged.
+import {
+  buildRelayDaemonFrame,
+  API_AHP_V1_FEATURE,
+  type RdAhpOpen,
+  type RdAhpMessage,
+  type RdAhpClose,
+  decodeRelayDaemonFrame,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  RD_DECISION_ROUTE_V1,
+  RD_PLATFORM_REQUEST_V1,
+  RD_WEBCHAT_IMAGES_V1,
+  RD_WEBCHAT_PROMPT_SUGGESTION_V1,
+  type RdWebchatImageUpdate,
+  type RdWebchatPromptSuggestion,
+  type RelayDaemonFrame,
+  type RdRoute,
+  type RdRouteAck,
+  type RdRouteReport,
+  type RdRouteReportAck,
+  type RdPlatformRequest,
+  type RdPlatformReply,
+  type RdHello,
+  type RdHelloOk,
+  type RdMsg,
+  type RdAck,
+  type RdAgentMsg,
+  type RdAgentMsgFwd,
+  type RdAgentMsgAck,
+  type RdChat,
+  type RdWebchatPost,
+  type RcVerifyResult,
+  type ErrorCode
+} from '@agentconnect.md/protocol'
+import {
+  ReqRep,
+  WireError,
+  type Clock,
+  type TimerHandle,
+  type RequestOpts,
+  type ServerTransport
+} from '@agentconnect.md/connection'
+import type { Logger } from './log.js'
+
+type State = 'AUTHENTICATING' | 'READY' | 'CLOSED'
+
+// App-defined close codes (mirror the daemon↔CP convention):
+const CLOSE_AUTH_FAILED = 4401 // definitively-invalid credential → daemon stops dialing THIS relay
+const CLOSE_TRY_LATER = 1013 // relay not ready / transient verify error → daemon backs off + retries
+const ACK_TIMEOUT_MS = 5000
+export const DAEMON_AUTH_RECHECK_MS = 60_000
+
+export interface RelayDaemonConnDeps {
+  /** Delegate a credential check to the CP (`RelayCpClient.verify`). Throws when the
+   *  relay↔CP link is not READY or the CP answers an error → treat as transient. */
+  verify: (kind: 'daemon-key' | 'daemon-token', credential: string, daemonId?: string) => Promise<RcVerifyResult>
+  /** This relay's CP-assigned id (undefined until it has registered with the CP). */
+  relayId: () => string | undefined
+  clock: Clock
+  /** Called once a daemon is authenticated — bind it for routing + `rc/daemon-revoke` teardown. */
+  onReady: (daemonId: string, conn: RelayDaemonConnection) => void
+  /** Called on close — unbind. */
+  onClosed: (daemonId: string, conn: RelayDaemonConnection) => void
+  /** Route an inbound `rd/chat` (agent reply chunk) back to the browser for its `chatId`. */
+  onChat: (chat: RdChat) => void
+  /** Route an inbound `rd/webchat-post` (a participant's completed reply post) to the
+   *  conversation's browser connection, which renders it and fans the context copies
+   *  to the other participants' daemons (webchat-multi-agents.md §5.2). The socket's
+   *  AUTHENTICATED `daemonId` is passed in — like `onAgentMsg`, and for the same
+   *  reason: the frame's authorship fields are a daemon-supplied claim, and since a
+   *  context copy can now carry the activation-capable depth stamp (§5.2a), the
+   *  fan-out must first bind that claim to the daemon that actually sent the frame. */
+  onWebchatPost: (fromDaemonId: string, post: RdWebchatPost) => void
+  /** Route an `rd/webchat-image-update` to the conversation's browsers only, bound to the AUTHENTICATED daemon. */
+  onWebchatImageUpdate?: (fromDaemonId: string, update: RdWebchatImageUpdate) => void
+  /** Route an `rd/webchat-prompt-suggestion` to the conversation's browsers only, bound to the AUTHENTICATED daemon. */
+  onWebchatPromptSuggestion?: (fromDaemonId: string, suggestion: RdWebchatPromptSuggestion) => void
+  /** Route an inbound cross-daemon `rd/agentmsg` (agent-collaboration §2.3/§6.2). The
+   *  socket's AUTHENTICATED `daemonId` is passed in (NOT the frame's untrusted
+   *  `claimedFromAgentId`) — the router binds the request to it, validates/authorizes
+   *  via the collaboration snapshot, and forwards to the target daemon. Resolves with
+   *  the typed admission verdict to ack back to the source. */
+  onAgentMsg: (fromDaemonId: string, msg: RdAgentMsg) => Promise<RdAgentMsgAck>
+  /** An evaluation host's `rd/route`, bound to the socket's authenticated daemonId (the host fence). */
+  onRoute: (fromDaemonId: string, msg: RdRoute) => Promise<RdRouteAck>
+  /** An evaluation host's owner/participant report, bound the same way. */
+  onRouteReport: (fromDaemonId: string, msg: RdRouteReport) => RdRouteReportAck | Promise<RdRouteReportAck>
+  /** A platform module's provider call for a bot, bound to the socket's authenticated daemonId; absent ⇒ refused. */
+  onPlatformRequest?: (fromDaemonId: string, msg: RdPlatformRequest) => Promise<RdPlatformReply>
+  log: Logger
+  bufferedAmount?: () => number
+}
+
+export class RelayDaemonConnection {
+  state: State = 'AUTHENTICATING'
+  daemonId = ''
+  private helloInFlight = false
+  private refreshTimer?: TimerHandle
+  /** Which verified credential authenticated this socket. `daemon-token` is a TokenReviewed
+   *  install-wide pool identity — duty-governed, so it can rendezvous a webchat trigger.
+   *  `daemon-key` is an org-scoped standalone daemon that would answer `no_agent` instead. */
+  credentialKind?: 'daemon-key' | 'daemon-token'
+
+  /** Optional behaviors this daemon advertised at hello (§8.4). Populated only after a
+   *  successful handshake, so a caller that reads it on a non-READY socket correctly
+   *  sees nothing. An older daemon sends no `capabilities` at all, which is why the
+   *  default is EMPTY rather than "assume supported" — {@link supports} then fails
+   *  closed and the relay refuses the delivery instead of degrading it. */
+  private capabilities: ReadonlySet<string> = new Set()
+
+  private readonly correlator: ReqRep<RelayDaemonFrame>
+  private readonly ahpListeners = new Map<string, (event: RdAhpMessage | RdAhpClose) => void>()
+  private readonly closeListeners = new Set<() => void>()
+
+  constructor(
+    private readonly transport: ServerTransport,
+    private readonly deps: RelayDaemonConnDeps
+  ) {
+    this.correlator = new ReqRep<RelayDaemonFrame>(deps.clock, ACK_TIMEOUT_MS)
+  }
+
+  start(): void {
+    this.transport.onMessage((t) => void this.onText(t))
+    this.transport.onClose(() => this.onClose())
+  }
+
+  /** Did this daemon advertise `capability` at hello? Fails closed for an older daemon
+   *  that advertised nothing — the caller must then refuse a delivery that needs it
+   *  (§8.4), never forward it and hope. */
+  supports(capability: string): boolean {
+    return this.capabilities.has(capability)
+  }
+
+  /**
+   * Send one inbound item to the daemon (`rd/msg` REQ) and resolve with the
+   * `rd/ack` verdict — a browser webchat op, a shared-bot `im` message, or a hook
+   * fire. Rejects (retryable {@link WireError}) if the socket isn't READY. `opts` overrides the retransmit budget.
+   */
+  async sendMsg(payload: RdMsg, opts?: RequestOpts): Promise<RdAck> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    const frame = buildRelayDaemonFrame('rd/msg', payload)
+    let bytes = 0
+    let rep: RelayDaemonFrame
+    try {
+      rep = await this.correlator.request(
+        frame,
+        (e) => {
+          bytes = Buffer.byteLength(e)
+          this.write(e)
+        },
+        opts
+      )
+    } catch (err) {
+      // The daemon drops an undecodable or oversized frame without a reply, so the size is the one
+      // fact the sender can add to a timeout.
+      if (err instanceof WireError) throw new WireError(err.code, `${err.message} (${bytes} bytes)`, err.retryable)
+      throw err
+    }
+    if (rep.type !== 'rd/ack') throw new WireError('INTERNAL', `expected rd/ack, got ${rep.type}`, false)
+    return rep.payload
+  }
+
+  /**
+   * Forward a validated cross-daemon agent-call to the TARGET's owning daemon
+   * (`rd/agentmsg/fwd` REQ) and resolve with its admission verdict — mirrors
+   * {@link sendMsg}, but the payload carries the relay's minted TRUSTED caller claim
+   * (agent-collaboration §2.5/§6.4). The `rd/agentmsg/ack` is returned after the target
+   * daemon durably admits/enqueues the turn (P4-gate), NOT after the model turn.
+   */
+  async forwardAgentMsg(payload: RdAgentMsgFwd): Promise<RdAgentMsgAck> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    const frame = buildRelayDaemonFrame('rd/agentmsg/fwd', payload)
+    const rep = await this.correlator.request(frame, (e) => this.write(e))
+    if (rep.type !== 'rd/agentmsg/ack') {
+      throw new WireError('INTERNAL', `expected rd/agentmsg/ack, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  // Binding lives on this authenticated daemon socket, never on a caller-supplied daemon id.
+  listenAhp(attachmentId: string, listener: (event: RdAhpMessage | RdAhpClose) => void): () => void {
+    this.ahpListeners.set(attachmentId, listener)
+    return () => {
+      if (this.ahpListeners.get(attachmentId) === listener) this.ahpListeners.delete(attachmentId)
+    }
+  }
+
+  async authorizeAhp(payload: RdAhpOpen, initial = false): Promise<boolean> {
+    if (this.state !== 'READY' || !this.supports(API_AHP_V1_FEATURE)) return false
+    const frame = buildRelayDaemonFrame(initial ? 'rd/ahp/open' : 'rd/ahp/authorize', payload)
+    const reply = await this.correlator.request(frame, (text) => this.sendAhpText(text), { maxTries: 1 })
+    const expected = initial ? 'rd/ahp/opened' : 'rd/ahp/authorized'
+    if (reply.type !== expected) return false
+    return reply.payload.attachmentId === payload.attachmentId && reply.payload.accepted
+  }
+
+  sendAhp(payload: RdAhpMessage | RdAhpClose): void {
+    const type = 'message' in payload ? 'rd/ahp/message' : 'rd/ahp/close'
+    this.sendAhpText(JSON.stringify(buildRelayDaemonFrame(type, payload)))
+  }
+
+  private sendAhpText(text: string): void {
+    if (this.state !== 'READY' || !this.supports(API_AHP_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'AHP service unavailable', true)
+    }
+    if ((this.deps.bufferedAmount?.() ?? 0) + Buffer.byteLength(text) > 1024 * 1024) {
+      throw new WireError('OVERLOADED', 'AHP carrier overloaded', true)
+    }
+    this.write(text)
+  }
+
+  private async onText(text: string): Promise<void> {
+    if (this.state === 'CLOSED') return
+    const decoded = decodeRelayDaemonFrame(text)
+    if (!decoded.ok) {
+      const code = this.decodeErrorCode(decoded.msg)
+      this.sendError(decoded.id, code, decoded.msg)
+      if (decoded.corr) {
+        this.correlator.reject(decoded.corr, new WireError(code, `invalid correlated reply: ${decoded.msg}`, false))
+      }
+      return
+    }
+    const frame = decoded.frame
+    // A correlated rd/ack settles a relay-issued rd/msg.
+    if (frame.corr && this.correlator.settle(frame)) return
+    if (!this.isLegalInState(frame.type)) {
+      this.sendError(frame.id, 'PROTOCOL_STATE', `${frame.type} illegal in ${this.state}`)
+      return
+    }
+    try {
+      switch (frame.type) {
+        case 'rd/ahp/message':
+        case 'rd/ahp/close':
+          this.ahpListeners.get(frame.payload.attachmentId)?.(frame.payload)
+          return
+        case 'rd/hello':
+          await this.handleHello(frame, frame.payload)
+          return
+        case 'rd/chat':
+          // Agent reply chunk → route to the browser owning this chatId.
+          this.deps.onChat(frame.payload)
+          return
+        case 'rd/webchat-post':
+          // Completed reply post → browser render + context fan-out. Bound to the
+          // AUTHENTICATED daemonId (never the frame's own authorship claim).
+          this.deps.onWebchatPost(this.daemonId, frame.payload)
+          return
+        case 'rd/webchat-image-update':
+          this.deps.onWebchatImageUpdate?.(this.daemonId, frame.payload)
+          return
+        case 'rd/webchat-prompt-suggestion':
+          this.deps.onWebchatPromptSuggestion?.(this.daemonId, frame.payload)
+          return
+        case 'rd/agentmsg': {
+          // Cross-daemon agent-call REQ (§2.3/§6.2). Bind to the AUTHENTICATED daemonId —
+          // NEVER the frame's untrusted claimedFromAgentId. The router validates +
+          // authorizes + forwards, then we ack the typed verdict back to the source.
+          const msg = frame.payload
+          void this.deps
+            .onAgentMsg(this.daemonId, msg)
+            .then((ack) => this.replyAgentAck(frame, ack))
+            .catch((err) => {
+              this.deps.log.warn(`relay: rd/agentmsg routing failed: ${(err as Error).message}`)
+              this.replyAgentAck(frame, { deliveryId: msg.deliveryId, delivered: false, reason: 'offline' })
+            })
+          return
+        }
+        case 'rd/route': {
+          const msg = frame.payload
+          void Promise.resolve()
+            .then(() => this.deps.onRoute(this.daemonId, msg))
+            .then((ack) => this.replyFrame(frame, 'rd/route/ack', ack))
+            .catch((err) => {
+              this.deps.log.warn(`relay: rd/route routing failed: ${(err as Error).message}`)
+              this.replyFrame(frame, 'rd/route/ack', {
+                deliveryId: msg.deliveryId,
+                disposition: 'retry',
+                reason: 'offline'
+              })
+            })
+          return
+        }
+        case 'rd/route/report': {
+          const msg = frame.payload
+          void Promise.resolve()
+            .then(() => this.deps.onRouteReport(this.daemonId, msg))
+            .then((ack) => this.replyFrame(frame, 'rd/route/report/ack', ack))
+            .catch((err) => {
+              this.deps.log.warn(`relay: rd/route/report failed: ${(err as Error).message}`)
+              this.replyFrame(frame, 'rd/route/report/ack', { accepted: false, reason: 'error' })
+            })
+          return
+        }
+        case 'rd/platform/request': {
+          void this.answerPlatformRequest(frame, frame.payload)
+          return
+        }
+        default:
+          this.sendError(frame.id, 'PROTOCOL_STATE', `unsupported: ${frame.type}`)
+      }
+    } catch (err) {
+      this.deps.log.warn(`relay: rd connection handler error: ${(err as Error).message}`)
+      this.close(1011, 'SERVER_INTERNAL')
+    }
+  }
+
+  private isLegalInState(type: string): boolean {
+    switch (this.state) {
+      case 'AUTHENTICATING':
+        return type === 'rd/hello'
+      case 'READY':
+        // rd/ack + rd/agentmsg/ack settle above
+        return (
+          type === 'rd/ahp/message' ||
+          type === 'rd/ahp/close' ||
+          type === 'rd/chat' ||
+          type === 'rd/webchat-post' ||
+          type === 'rd/webchat-image-update' ||
+          type === 'rd/webchat-prompt-suggestion' ||
+          type === 'rd/agentmsg' ||
+          type === 'rd/route' ||
+          type === 'rd/route/report' ||
+          type === 'rd/platform/request'
+        )
+      default:
+        return false
+    }
+  }
+
+  private async handleHello(frame: RelayDaemonFrame, hello: RdHello): Promise<void> {
+    // A retransmitted hello while its verify waits out a CP handoff: the one reply settles both.
+    if (this.helloInFlight) return
+    this.helloInFlight = true
+    try {
+      await this.answerHello(frame, hello)
+    } finally {
+      this.helloInFlight = false
+    }
+  }
+
+  private async answerHello(frame: RelayDaemonFrame, hello: RdHello): Promise<void> {
+    const relayId = this.deps.relayId()
+    if (!relayId) {
+      // Not registered with the CP yet ⇒ can't verify or echo an id. Ask the daemon to retry.
+      this.sendError(frame.id, 'PROTOCOL_STATE', 'relay not ready', true)
+      this.close(CLOSE_TRY_LATER, 'relay not registered')
+      return
+    }
+
+    // The projected token wins where a daemon has one: an in-cluster daemon carries no key
+    // at all, and a stale key must never pick a different identity than the CP socket did.
+    const presented: { kind: 'daemon-key' | 'daemon-token'; credential: string } | undefined = hello.serviceAccountToken
+      ? { kind: 'daemon-token', credential: hello.serviceAccountToken }
+      : hello.apiKey
+        ? { kind: 'daemon-key', credential: hello.apiKey }
+        : undefined
+    if (!presented) {
+      this.sendError(frame.id, 'AUTH_FAILED', 'no daemon credential presented')
+      this.close(CLOSE_AUTH_FAILED, 'auth failed')
+      return
+    }
+    let result: RcVerifyResult
+    try {
+      // CP verifies the untrusted echoed id against the reviewed pool member Pod UID.
+      result = await this.deps.verify(presented.kind, presented.credential, hello.daemonId)
+    } catch {
+      // Link not READY / CP error → transient; the daemon backs off and retries.
+      this.sendError(frame.id, 'INTERNAL', 'verify unavailable', true)
+      this.close(CLOSE_TRY_LATER, 'verify unavailable')
+      return
+    }
+    // The socket may have closed during the verify RTT. onClose ran with daemonId
+    // still '' (so it skipped onClosed) — if we now proceeded to onReady we would
+    // register a DEAD connection in the server's byDaemon map that never gets
+    // removed. Bail: no reply, no onReady.
+    if (this.state === 'CLOSED') return
+
+    if (!result.ok || !result.daemonId) {
+      // Definitively invalid (revoked / expired / unknown / not a daemon key).
+      this.sendError(frame.id, 'AUTH_FAILED', 'invalid daemon credential')
+      this.close(CLOSE_AUTH_FAILED, 'auth failed')
+      return
+    }
+    if (result.daemonId !== hello.daemonId) {
+      // The daemon claimed an id its key does not resolve to — trust the CP's id.
+      this.sendError(frame.id, 'AUTH_FAILED', 'daemonId mismatch')
+      this.close(CLOSE_AUTH_FAILED, 'daemonId mismatch')
+      return
+    }
+
+    this.daemonId = result.daemonId
+    this.credentialKind = presented.kind
+    this.capabilities = new Set(hello.capabilities ?? [])
+    this.state = 'READY'
+    if (presented.kind === 'daemon-key') this.scheduleKeyRevalidation(presented.credential)
+    this.reply(frame, 'rd/hello/ok', {
+      relayId,
+      capabilities: [
+        RD_CODEHOST_REPLY_TARGET_V1,
+        RD_DECISION_ROUTE_V1,
+        RD_PLATFORM_REQUEST_V1,
+        RD_WEBCHAT_IMAGES_V1,
+        RD_WEBCHAT_PROMPT_SUGGESTION_V1
+      ]
+    })
+    this.deps.onReady(this.daemonId, this)
+  }
+
+  // Recheck organization daemon keys; projected pool tokens rotate without expiring their verified socket identity.
+  private scheduleKeyRevalidation(apiKey: string): void {
+    if (this.state !== 'READY') return
+    this.refreshTimer = this.deps.clock.setTimeout(() => {
+      void this.deps
+        .verify('daemon-key', apiKey, this.daemonId)
+        .then((result) => {
+          if (this.state === 'READY' && (!result.ok || result.daemonId !== this.daemonId)) {
+            this.close(CLOSE_TRY_LATER, 'daemon authorization changed')
+          }
+        })
+        .catch(() => {})
+        .finally(() => this.scheduleKeyRevalidation(apiKey))
+    }, DAEMON_AUTH_RECHECK_MS)
+  }
+
+  private write(text: string): void {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', 'daemon admission unavailable', true)
+    this.transport.send(text)
+  }
+
+  private reply(req: RelayDaemonFrame, type: 'rd/hello/ok', payload: RdHelloOk): void {
+    this.write(JSON.stringify(buildRelayDaemonFrame(type, payload, { corr: req.id })))
+  }
+
+  // A handler failure may follow the provider call, so it answers an error the daemon reads as ambiguous, never `unavailable`; a failed reply is only logged.
+  private async answerPlatformRequest(frame: RelayDaemonFrame, msg: RdPlatformRequest): Promise<void> {
+    const handle = this.deps.onPlatformRequest
+    let reply: RdPlatformReply
+    try {
+      reply = handle ? await handle(this.daemonId, msg) : { outcome: 'refused', reason: 'unsupported' }
+    } catch (err) {
+      this.deps.log.warn(`relay: rd/platform/request failed: ${(err as Error).message}`)
+      if (this.state !== 'CLOSED') this.sendError(frame.id, 'INTERNAL', 'platform request failed', false)
+      return
+    }
+    try {
+      this.replyFrame(frame, 'rd/platform/reply', reply)
+    } catch (err) {
+      this.deps.log.warn(`relay: rd/platform/reply not sent: ${(err as Error).message}`)
+    }
+  }
+
+  /** Answer an inbound `rd/route`, `rd/route/report` or `rd/platform/request` request. */
+  private replyFrame<T extends 'rd/route/ack' | 'rd/route/report/ack' | 'rd/platform/reply'>(
+    req: RelayDaemonFrame,
+    type: T,
+    payload: T extends 'rd/route/ack' ? RdRouteAck : T extends 'rd/platform/reply' ? RdPlatformReply : RdRouteReportAck
+  ): void {
+    if (this.state !== 'READY') return
+    this.write(JSON.stringify(buildRelayDaemonFrame(type, payload as never, { corr: req.id })))
+  }
+
+  /** Ack an inbound `rd/agentmsg` (corr = the source's REQ id) with the typed verdict. */
+  private replyAgentAck(req: RelayDaemonFrame, ack: RdAgentMsgAck): void {
+    if (this.state !== 'READY') return
+    this.write(JSON.stringify(buildRelayDaemonFrame('rd/agentmsg/ack', ack, { corr: req.id })))
+  }
+
+  private sendError(corr: string, code: ErrorCode, message: string, retryable = false): void {
+    this.transport.send(JSON.stringify(buildRelayDaemonFrame('error', { code, message, retryable }, { corr })))
+  }
+
+  private decodeErrorCode(msg: string): ErrorCode {
+    if (msg === 'FRAME_TOO_LARGE') return 'FRAME_TOO_LARGE'
+    if (msg === 'UNKNOWN_FRAME') return 'UNKNOWN_FRAME'
+    return 'BAD_PAYLOAD'
+  }
+
+  /** Run `listener` once when this socket closes (at once if it already has); returns the unsubscribe. */
+  onceClosed(listener: () => void): () => void {
+    if (this.state === 'CLOSED') {
+      queueMicrotask(listener)
+      return () => {}
+    }
+    this.closeListeners.add(listener)
+    return () => this.closeListeners.delete(listener)
+  }
+
+  close(code: number, reason: string): void {
+    this.state = 'CLOSED'
+    this.correlator.rejectAll(new WireError('INTERNAL', 'connection closed', true))
+    this.transport.close(code, reason)
+    this.fireClosed()
+  }
+
+  private onClose(): void {
+    this.state = 'CLOSED'
+    this.correlator.rejectAll(new WireError('INTERNAL', 'connection closed', true))
+    if (this.daemonId) this.deps.onClosed(this.daemonId, this)
+    this.fireClosed()
+  }
+
+  private fireClosed(): void {
+    if (this.refreshTimer !== undefined) this.deps.clock.clearTimeout(this.refreshTimer)
+    const listeners = [...this.closeListeners]
+    this.closeListeners.clear()
+    const attachments = [...this.ahpListeners]
+    this.ahpListeners.clear()
+    for (const [attachmentId, listener] of attachments) {
+      try {
+        listener({ attachmentId, reason: 'unavailable' })
+      } catch {
+        this.deps.log.warn('AHP attachment close listener failed')
+      }
+    }
+    for (const listener of listeners) listener()
+  }
+}

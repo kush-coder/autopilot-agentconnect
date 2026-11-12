@@ -1,0 +1,127 @@
+import { createHash } from 'node:crypto'
+import type { Clock } from '../../domain/clock.js'
+import type { WebchatMcpAccessGrantRepo, WebchatMcpDelegationRepo } from '../../persistence/ports.js'
+import type { WebchatMcpGrantTokenCodec } from '../../registry/webchatMcpGrantToken.js'
+import { resolveLiveWebchatMcpAuthority, type LiveWebchatMcpAuthorityDeps } from '../../registry/webchatMcpAuthority.js'
+
+export interface InvocationContext {
+  /** Request-local correlation only; delegated write identity lives in the operation ledger. */
+  invocationId: string
+  conversationId: string
+  grantId: string
+  authorityGeneration: number
+  agentId: string
+  /** The daemon serving the agent for this invocation, resolved live — never a stored member id. */
+  daemonId: string
+  orgId: string
+  userId: string
+  startedAt: Date
+  requestId?: string
+  requestHash: string
+  method: 'tools/list' | 'tools/call'
+  toolName?: string
+}
+
+export interface ParsedInvocationMetadata {
+  /** The raw JSON-RPC method — classification is this module's job, not the caller's. */
+  method: string
+  requestId?: string
+  toolName?: string
+}
+
+/** Transport-level methods a grant may issue without an invocation identity. The MCP
+ *  handshake is MANDATORY (a client sends `initialize` before anything else and may
+ *  keep the connection warm with `ping`), so denying these denies the whole server:
+ *  the adapter never completes `initialize` and the session shows no admin tools at
+ *  all. They are answered inside the MCP handler, reach no tool, no nested REST call,
+ *  and no org-scoped data — but they still require a live, unrevoked grant, so an
+ *  expired credential learns nothing beyond the same 401. */
+const HANDSHAKE_METHODS = new Set([
+  'initialize',
+  'notifications/initialized',
+  'ping',
+  'resources/list',
+  'resources/read'
+])
+
+export type RemoteGrantClaimResult =
+  { kind: 'execute'; context: InvocationContext } | { kind: 'handshake' } | { kind: 'denied'; reason: string }
+
+export interface RemoteGrantAuthenticatorDeps extends LiveWebchatMcpAuthorityDeps {
+  clock: Pick<Clock, 'now'>
+  tokenCodec: Pick<WebchatMcpGrantTokenCodec, 'hash'>
+  grants: Pick<WebchatMcpAccessGrantRepo, 'getByTokenHash'>
+  authorities: Pick<WebchatMcpDelegationRepo, 'getCurrent'>
+  isCuratedTool(toolName: string): boolean
+}
+
+export class RemoteGrantAuthenticator {
+  constructor(private readonly deps: RemoteGrantAuthenticatorDeps) {}
+
+  async authenticate(input: {
+    bearer: string
+    requestBytes: Uint8Array
+    parseMetadata(): ParsedInvocationMetadata | Promise<ParsedInvocationMetadata>
+  }): Promise<RemoteGrantClaimResult> {
+    const tokenHash = this.deps.tokenCodec.hash(input.bearer)
+    if (!tokenHash) return { kind: 'denied', reason: 'credential' }
+    const now = new Date(this.deps.clock.now())
+    const grant = await this.deps.grants.getByTokenHash(tokenHash)
+    if (!grant) return { kind: 'denied', reason: 'grant_unknown' }
+    // A revoked grant names why (e.g. `rotated`), so a runtime holding a stale bearer is told apart from an expired one.
+    if (grant.revokedAt || grant.status === 'revoked') {
+      return { kind: 'denied', reason: `grant_revoked:${grant.revokedReason ?? 'unknown'}` }
+    }
+    if (grant.status !== 'active') return { kind: 'denied', reason: `grant_${grant.status}` }
+    if (grant.expiresAt <= now) return { kind: 'denied', reason: 'grant_expired' }
+    const authority = await this.deps.authorities.getCurrent(grant.authorityId)
+    if (!authority || authority.revokedAt || authority.expiresAt <= now) {
+      return { kind: 'denied', reason: 'authority_inactive' }
+    }
+    // No daemon identity on this seam — the grant arrives over HTTP from the agent's adapter — so
+    // the live check asks the resolver for whichever daemon serves the agent now.
+    const live = await resolveLiveWebchatMcpAuthority(this.deps, {
+      conversationId: authority.conversationId,
+      expectedUserId: authority.userId,
+      orgId: authority.orgId,
+      agentId: authority.agentId
+    })
+    if (!live.ok) return { kind: 'denied', reason: live.reason }
+
+    let metadata: ParsedInvocationMetadata
+    try {
+      metadata = await input.parseMetadata()
+    } catch {
+      return { kind: 'denied', reason: 'metadata' }
+    }
+    if (HANDSHAKE_METHODS.has(metadata.method)) return { kind: 'handshake' }
+    const method = metadata.method
+    if (
+      (method !== 'tools/list' && method !== 'tools/call') ||
+      (method === 'tools/list' && metadata.toolName !== undefined) ||
+      (method === 'tools/call' && (!metadata.toolName || !this.deps.isCuratedTool(metadata.toolName)))
+    ) {
+      return { kind: 'denied', reason: 'tool' }
+    }
+    return {
+      kind: 'execute',
+      context: {
+        invocationId: createHash('sha256')
+          .update(`${grant.id}\0${metadata.requestId ?? createHash('sha256').update(input.requestBytes).digest('hex')}`)
+          .digest('hex'),
+        conversationId: authority.conversationId,
+        grantId: grant.id,
+        authorityGeneration: authority.generation,
+        agentId: authority.agentId,
+        daemonId: live.daemonId,
+        orgId: authority.orgId,
+        userId: authority.userId,
+        startedAt: now,
+        ...(metadata.requestId ? { requestId: metadata.requestId } : {}),
+        requestHash: createHash('sha256').update(input.requestBytes).digest('hex'),
+        method,
+        ...(metadata.toolName ? { toolName: metadata.toolName } : {})
+      }
+    }
+  }
+}

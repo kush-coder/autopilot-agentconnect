@@ -1,0 +1,194 @@
+// Console route metadata, shared by the Shell (rail / mobile drawer / app-bar titles)
+// and GlobalSearch (the "Pages" and "Settings" result groups). One table per
+// surface, defined here so the nav and the search index can never drift apart.
+
+import { featureFlagEnabled, type FeatureFlagId } from '@/lib/feature-flags'
+
+export interface NavItem {
+  href: string
+  label: string
+  icon: string
+  /** Feature flag this destination needs. Absent ⇒ always shown. Every consumer
+   *  filters through `navVisible`, so the rail, the mobile drawer and the search
+   *  index can never disagree about what this deployment offers. */
+  requires?: FeatureFlagId
+}
+
+/** Is the destination's feature switched on for this deployment? */
+export function navVisible(item: { requires?: FeatureFlagId }): boolean {
+  return item.requires ? featureFlagEnabled(item.requires) : true
+}
+
+// The rail's destinations (and the mobile drawer's — one table, so the two can
+// never drift), in groups separated by a rule: what the organization runs (agents
+// and the surfaces they answer on) first, then what it runs on and pays for —
+// infrastructure, the usage that came out of it, the bill. You visit the second
+// group to check on the deployment, not to get work done.
+export const NAV_GROUPS: NavItem[][] = [
+  [
+    { href: '/home', label: 'Home', icon: 'house' },
+    { href: '/agents', label: 'Agents', icon: 'bot' },
+    { href: '/sessions', label: 'Sessions', icon: 'messages-square' },
+    // The judgement a channel consults, so it sits with the work rather than with Infra.
+    { href: '/decisions', label: 'Decisions', icon: 'split' },
+    { href: '/crons', label: 'Schedules', icon: 'calendar-clock' },
+    { href: '/tools', label: 'Tools & Skills', icon: 'blocks' },
+    { href: '/integrations', label: 'Integrations', icon: 'plug' },
+    { href: '/knowledge', label: 'Knowledge', icon: 'book-open' }
+  ],
+  [
+    { href: '/daemons', label: 'Infra', icon: 'server' },
+    { href: '/usage', label: 'Analytics', icon: 'circle-gauge' },
+    { href: '/billing', label: 'Billing', icon: 'credit-card', requires: 'billing' }
+  ]
+]
+
+// Section label for the mobile app bar, matched by path prefix. (Desktop has no
+// title strip — the rail's active row says where you are.)
+export const SECTIONS: { prefix: string; label: string }[] = [
+  { prefix: '/home', label: 'Home' },
+  { prefix: '/agents', label: 'Agents' },
+  { prefix: '/sessions', label: 'Sessions' },
+  // Merged conversation pages live in the Sessions section (§5.3).
+  { prefix: '/conversations', label: 'Sessions' },
+  { prefix: '/decisions', label: 'Decisions' },
+  { prefix: '/crons', label: 'Schedules' },
+  { prefix: '/tools', label: 'Tools & Skills' },
+  { prefix: '/integrations', label: 'Integrations' },
+  { prefix: '/knowledge', label: 'Knowledge' },
+  { prefix: '/daemons', label: 'Infra' },
+  // A Computer's detail page sits under Infra, which lists Computers as a section.
+  { prefix: '/computers', label: 'Infra' },
+  { prefix: '/usage', label: 'Analytics' },
+  { prefix: '/billing', label: 'Billing' },
+  { prefix: '/settings', label: 'Settings' },
+  { prefix: '/profile', label: 'Profile' }
+]
+
+// ── Localized labels ─────────────────────────────────────────────────────────
+// Which catalog key words each destination, kept HERE beside the tables rather than in a
+// `switch` in the shell: two switches had drifted, so the rail fell back to English.
+
+/** The `Shell.navigation` keys, spelled out so a template lookup still type-checks. */
+export type ShellNavKey =
+  | 'home'
+  | 'agents'
+  | 'sessions'
+  | 'decisions'
+  | 'schedules'
+  | 'tools'
+  | 'integrations'
+  | 'knowledge'
+  | 'infra'
+  | 'analytics'
+  | 'billing'
+  | 'settings'
+  | 'profile'
+  | 'organizationSettings'
+
+/** The rail, the mobile drawer, and the mobile app-bar crumb. */
+export const NAV_LABEL_KEYS: Readonly<Record<string, ShellNavKey>> = {
+  '/home': 'home',
+  '/agents': 'agents',
+  '/sessions': 'sessions',
+  '/conversations': 'sessions',
+  '/decisions': 'decisions',
+  '/crons': 'schedules',
+  '/tools': 'tools',
+  '/integrations': 'integrations',
+  '/knowledge': 'knowledge',
+  '/daemons': 'infra',
+  '/computers': 'infra',
+  '/usage': 'analytics',
+  '/billing': 'billing',
+  '/settings': 'settings',
+  '/profile': 'profile'
+}
+
+// ── Search page index ────────────────────────────────────────────────────────
+
+export interface ConsolePage extends NavItem {
+  /** Which GlobalSearch group the entry belongs to. */
+  kind: 'page' | 'setting'
+  /** Match terms the label doesn't cover: route aliases and the features/settings
+   *  that live on the page but have no route of their own. */
+  keywords?: string[]
+  /** SettingsView renders the target card only for org owners — GlobalSearch hides
+   *  the entry from everyone else so results never dead-end on a missing anchor. */
+  ownerOnly?: boolean
+}
+
+// Aliases and on-page features per route. Keep the integrations list in sync with
+// the cards actually rendered by IntegrationsView — they are what makes a query
+// like "bots" land on the page that owns that feature.
+const PAGE_KEYWORDS: Record<string, string[]> = {
+  '/crons': ['cron'],
+  '/billing': ['balance', 'credit', 'invoice', 'payment', 'top up'],
+  '/tools': ['mcp', 'connectors', 'skills'],
+  '/integrations': ['bots', 'github', 'slack', 'telegram', 'discord', 'lark', 'feishu'],
+  '/decisions': ['judgement', 'question', 'trigger when', 'routing'],
+  '/usage': ['usage', 'costs', 'tokens'],
+  '/daemons': ['computers', 'computer use', 'desktop', 'screen']
+}
+
+// Card-level settings entries: one per card on /settings (anchored to the card's
+// DOM id — keep hrefs in sync with the `id`s SettingsView renders) plus Profile.
+// Every entry carries the 'settings' keyword so the bare query still finds them.
+const SETTING_CARDS: ConsolePage[] = [
+  { href: '/settings#organization', label: 'Organization', icon: 'settings', kind: 'setting', keywords: ['settings'] },
+  {
+    href: '/settings#agent-visibility',
+    label: 'Default agent visibility',
+    icon: 'eye',
+    kind: 'setting',
+    keywords: ['settings', 'agents']
+  },
+  {
+    href: '/settings#session-access',
+    label: 'Session access',
+    icon: 'messages-square',
+    kind: 'setting',
+    keywords: ['settings', 'slack', 'github', 'gitlab', 'feishu']
+  },
+  {
+    href: '/settings#environment',
+    label: 'Variables & secrets',
+    icon: 'key-round',
+    kind: 'setting',
+    keywords: ['settings', 'environment', 'env'],
+    ownerOnly: true
+  },
+  {
+    href: '/settings#members',
+    label: 'Members & roles',
+    icon: 'users',
+    kind: 'setting',
+    keywords: ['settings', 'invite']
+  },
+  {
+    href: '/settings#invite-links',
+    label: 'Invite links',
+    icon: 'link',
+    kind: 'setting',
+    keywords: ['settings', 'invite'],
+    ownerOnly: true
+  },
+  {
+    href: '/settings#service-accounts',
+    label: 'Service accounts',
+    icon: 'bot',
+    kind: 'setting',
+    keywords: ['settings', 'api key', 'bot'],
+    ownerOnly: true
+  },
+  { href: '/profile', label: 'Profile', icon: 'circle-user-round', kind: 'setting', keywords: ['account'] }
+]
+
+// Everything GlobalSearch offers as a navigation target: the rail destinations as
+// "Pages", plus the per-card settings entries and Profile as "Settings". The
+// settings entries only exist in authed mode — no-auth deployments bounce those
+// routes to /home (see Shell), so search must hide them there too.
+export const SEARCH_PAGES: ConsolePage[] = [
+  ...NAV_GROUPS.flat().map((n) => ({ ...n, kind: 'page' as const, keywords: PAGE_KEYWORDS[n.href] })),
+  ...SETTING_CARDS
+]

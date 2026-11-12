@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "customConditions": ["development"],
+    "declaration": false,
+    "noEmit": true,
+    "rootDir": "../.."
+  },
+  "include": [
+    "src",
+    "test",
+    "vitest.config.ts",
+    "scripts/smoke-runtime-image.mts",
+    "scripts/smoke-microsandbox-runtime.mts"
+  ]
+}

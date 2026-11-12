@@ -1,0 +1,198 @@
+/**
+ * `RelayControlSender` — the CP→relay control fan-out (shared-bot-relay.md §9).
+ *
+ * The mirror of `ControlSender.broadcastRelayRoster` but the OTHER direction: that
+ * fans `relay/roster` to daemons (via `connReg`); this fans `rc/daemon-revoke` and
+ * the compiled hook rules (`rc/hook-assign` / `rc/hook-remove`, pool-wide —
+ * webhook-type ingress is pool-served) to relays (via {@link RelayRegistry}).
+ * Kept off `RelayRegistry` itself so the wire (frame building) stays out of the
+ * connection index.
+ *
+ * Fire-and-forget + per-socket isolated: a dead relay socket's error is swallowed
+ * (its close removes it from the registry).
+ */
+import type {
+  RcFollowUpWatch,
+  RcCodeHostFeedbackWatch,
+  RcGithubAppAssign,
+  RcHookAssign,
+  RcCollabRoutes,
+  RcMcpAssign,
+  RcMcpUnassign,
+  RcMemoryConnectionAssign,
+  RcMemoryConnectionUnassign,
+  RcSnapshotKind
+} from '@agentconnect.md/protocol'
+import {
+  AZURE_DEVOPS_HOOKS_V1_FEATURE,
+  CODEHOST_FEEDBACK_FEATURE,
+  FOLLOW_UP_WATCH_FEATURE,
+  GITHUB_APP_WEBHOOK_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  HOOK_GITHUB_INSTALLATION_V1_FEATURE,
+  HOOK_INSTRUCTIONS_V1_FEATURE,
+  codeHostHookRuleOf
+} from '@agentconnect.md/protocol'
+import { advertises } from '../domain/daemon-features.js'
+import { codeHostProviders } from '../codehost/registry.js'
+import type { RelayChannel, RelayRegistry } from '../ws/relay-registry.js'
+
+/** Whether a relay may hold this rule: a routed rule only where the relay routes its provider (code-host-decisions.md §3.3). */
+export function hookRuleSupported(
+  rule: Pick<
+    RcHookAssign,
+    'routing' | 'kind' | 'github' | 'githubInstallation' | 'gitlab' | 'gitea' | 'azureDevOps' | 'webhook'
+  >,
+  features: readonly string[] | undefined
+) {
+  // A relay that cannot fill an installation rule's repository in never holds one.
+  if (rule.githubInstallation && !advertises(features, [HOOK_GITHUB_INSTALLATION_V1_FEATURE])) return false
+  // One that would drop a generic rule's instructions and run the payload as the instruction never holds it either.
+  if (rule.webhook?.instructions !== undefined && !advertises(features, [HOOK_INSTRUCTIONS_V1_FEATURE])) return false
+  // An Azure DevOps rule only reaches a relay that serves its endpoint (azure-devops-integration.md §11.9).
+  if (rule.azureDevOps !== undefined && !advertises(features, [AZURE_DEVOPS_HOOKS_V1_FEATURE])) return false
+  if (rule.routing === undefined) return true
+  const host = codeHostHookRuleOf(rule)
+  return advertises(
+    features,
+    host ? codeHostProviders[host.provider].routing.requiredFeatures : [HOOK_DECISION_ROUTING_V1_FEATURE]
+  )
+}
+
+/** Features a relay must advertise before it holds one of this host's compiled rules. */
+export function relayRuleFeatures(host: NonNullable<ReturnType<typeof codeHostHookRuleOf>>): readonly string[] {
+  const features = codeHostProviders[host.provider].features
+  return features.ruleRequired?.() ?? features.required(features.ruleHost(host))
+}
+
+export class RelayControlSender {
+  // Live projection frames for a relay that is replaying that projection, flushed in order when the replay ends.
+  private readonly held = new WeakMap<RelayChannel, Map<RcSnapshotKind, { depth: number; queue: Array<() => void> }>>()
+
+  constructor(private readonly relays: RelayRegistry) {}
+
+  /** Hold live `kind` changes for one relay until the returned release, so none lands before a replayed frame it supersedes. */
+  hold(ch: RelayChannel, kind: RcSnapshotKind): () => void {
+    let byKind = this.held.get(ch)
+    if (!byKind) this.held.set(ch, (byKind = new Map()))
+    const entry = byKind.get(kind) ?? { depth: 0, queue: [] }
+    byKind.set(kind, entry)
+    entry.depth++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      if (--entry.depth > 0) return
+      byKind.delete(kind)
+      for (const send of entry.queue) send()
+    }
+  }
+
+  feedbackWatch(watch: RcCodeHostFeedbackWatch): void {
+    this.broadcast((ch) => {
+      if (ch.features?.includes(CODEHOST_FEEDBACK_FEATURE)) ch.send('rc/codehost-feedback-watch', watch)
+    })
+  }
+
+  /** One object a follow-up watches, or no longer does, to every relay that holds watches. */
+  followUpWatch(watch: RcFollowUpWatch): void {
+    this.broadcast((ch) => {
+      if (ch.features?.includes(FOLLOW_UP_WATCH_FEATURE)) ch.send('rc/follow-up-watch', watch)
+    }, 'follow-up-watch')
+  }
+
+  /**
+   * Tell every connected relay to immediately drop `daemonId`'s connection and
+   * stop routing to it (a key revoke / daemon removal — §9 revocation loop). The relay
+   * re-verifies on the daemon's next `rd/hello`, so a daemon with another still-valid
+   * key simply reconnects; a fully-removed daemon stays out.
+   */
+  daemonRevoke(daemonId: string): void {
+    this.broadcast((ch) => ch.send('rc/daemon-revoke', { daemonId }))
+  }
+
+  /** Upsert one compiled rule pool-wide (never logged: it carries the hmacSecret), feature-gated per relay as the §17.3/§24.4 negotiation. */
+  hookAssign(rule: RcHookAssign): void {
+    const host = codeHostHookRuleOf(rule)
+    this.broadcast((ch) => {
+      // A routed rule on a relay that cannot route would fire unrouted, so that relay drops any copy instead.
+      if (!hookRuleSupported(rule, ch.features)) return ch.send('rc/hook-remove', { hookId: rule.hookId })
+      if (!host) return ch.send('rc/hook-assign', rule)
+      if (!advertises(ch.features, relayRuleFeatures(host))) return
+      ch.send('rc/hook-assign', rule)
+    }, 'hook')
+  }
+
+  /** Drop one hook rule pool-wide (hook disabled / deleted / agent unplaced). */
+  hookRemove(hookId: string): void {
+    this.broadcast((ch) => ch.send('rc/hook-remove', { hookId }), 'hook')
+  }
+
+  /** Load an MCP provider's proxy binding onto every relay (whole-pool BROADCAST —
+   *  any relay may serve the agent's HTTPS request). `headers` carry the UPSTREAM
+   *  credential — the frame is NEVER logged (centralized-tool-management.md §5.2). */
+  mcpAssign(a: RcMcpAssign): void {
+    this.broadcast((ch) => ch.send('rc/mcp-assign', a), 'mcp')
+  }
+
+  /** Drop an MCP proxy binding pool-wide: whole provider (`{providerId}`) or a single
+   *  retired grant hash (`{providerId, grantKeyHash}`). */
+  mcpUnassign(u: RcMcpUnassign): void {
+    this.broadcast((ch) => ch.send('rc/mcp-unassign', u), 'mcp')
+  }
+
+  /** Purpose-separated external-memory proxy binding (upstream-secret-bearing). */
+  memoryConnectionAssign(a: RcMemoryConnectionAssign): void {
+    this.broadcast((ch) => ch.send('rc/memoryconnection-assign', a), 'memory')
+  }
+
+  memoryConnectionUnassign(u: RcMemoryConnectionUnassign): void {
+    this.broadcast((ch) => ch.send('rc/memoryconnection-unassign', u), 'memory')
+  }
+
+  /** A dedicated GitHub App's webhook secret, to every relay that verifies them (never logged). */
+  githubAppAssign(a: RcGithubAppAssign): void {
+    this.broadcast((ch) => {
+      if (advertises(ch.features, [GITHUB_APP_WEBHOOK_V1_FEATURE])) ch.send('rc/github-app-assign', a)
+    }, 'github-app')
+  }
+
+  githubAppUnassign(githubAppId: string): void {
+    this.broadcast((ch) => {
+      if (advertises(ch.features, [GITHUB_APP_WEBHOOK_V1_FEATURE])) ch.send('rc/github-app-unassign', { githubAppId })
+    }, 'github-app')
+  }
+
+  /** Ship one org's bot-agnostic collaboration routing snapshot to EVERY relay
+   *  (agent-collaboration §2.3/§6.2). FULL-REPLACE per (orgId) — the relay merges the
+   *  org's channels into its table. Pool-wide: any relay may route any org's agent-call.
+   *  Bodiless routing/policy metadata. */
+  collabRoutes(snapshot: RcCollabRoutes): void {
+    this.broadcast((ch) => ch.send('rc/collab-routes', snapshot))
+  }
+
+  /** Ship one org's collaboration snapshot to a SINGLE relay channel (on its (re)register
+   *  — the reconnect baseline). */
+  collabRoutesTo(ch: RelayChannel, snapshot: RcCollabRoutes): void {
+    try {
+      ch.send('rc/collab-routes', snapshot)
+    } catch {
+      // dead socket — its onClose removes it from the registry
+    }
+  }
+
+  private broadcast(send: (ch: RelayChannel) => void, kind?: RcSnapshotKind): void {
+    for (const ch of this.relays.all()) {
+      const run = () => {
+        try {
+          send(ch)
+        } catch {
+          // dead socket — its onClose removes it from the registry
+        }
+      }
+      const queue = kind === undefined ? undefined : this.held.get(ch)?.get(kind)?.queue
+      if (queue) queue.push(run)
+      else run()
+    }
+  }
+}

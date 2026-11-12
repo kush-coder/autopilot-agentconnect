@@ -1,0 +1,8838 @@
+// Control Plane (C2 BFF) HTTP client for the console.
+// Talks to the Fastify REST API in packages/control-plane (`/agents`, `/sessions`,
+// `/daemons`, …). DTOs here mirror packages/control-plane/src/http/dto. The
+// mappers translate the lean wire DTOs into the richer UI shapes from `./data`,
+// filling fields the API does not (yet) expose with placeholders.
+
+import type {
+  ApiGatePreviewInput,
+  CodeHostRoutingPreviewInput,
+  CodeHostRoutingPreviewResult,
+  DecisionApi,
+  DecisionConversationRef,
+  DecisionGatePreviewResult
+} from '@agentconnect.md/protocol/decision-api'
+import type {
+  AgentModelSelection,
+  AgentRepositorySelector,
+  AgentCoordinatorFilter,
+  ChannelDecisionGate,
+  CodeHostRoutingFamily,
+  CodeHostRoutingProvider,
+  DecisionEvaluationRecordDetail,
+  DecisionEvaluationRecordPage,
+  DecisionModelEvaluationRecordDetail,
+  DecisionModelEvaluationRecordPage,
+  SharedBotDecisionRouting
+} from '@agentconnect.md/protocol/decision'
+import type { CoordinatorModel } from '@agentconnect.md/protocol/coordinator-model'
+import type {
+  ComputerAgentAccess,
+  ComputerCapabilities,
+  ComputerDoctorReport,
+  ComputerPolicy,
+  ComputerSession,
+  ComputerStatus
+} from '@agentconnect.md/protocol/computer'
+import type {
+  Agent,
+  AgentCallPolicy,
+  ConnectionStatusKey,
+  DaemonRow,
+  ResourceVisibility,
+  Session,
+  SessionImage,
+  Workspace,
+  PlacementKindValue,
+  RuntimeStrategyEntry,
+  StrategyTable
+} from '@/lib/data'
+import { isSelfSender, lifecycleStatus, MOCK_MODE, placementValueOf, poolLabel } from '@/lib/data'
+import { HOST_ONLY_TABLE, HOST_STRATEGY } from '@/lib/execution-strategy'
+import type {
+  AgentModelProvider,
+  AgentApiProtocol,
+  AssistantModeAdmission,
+  AssistantModePolicy,
+  ChatActions,
+  HookKind,
+  SessionStayedHomeReason,
+  ProviderKeyProvider,
+  ProviderKeyStatus,
+  SetProviderKeyInput,
+  SharedImageDownload,
+  SharedImageOriginal,
+  SharedImagePreview,
+  SkillSourceFailureCode
+} from '@agentconnect.md/protocol'
+import type { CodeHostProvider } from '@agentconnect.md/protocol/code-host'
+import { isSubsessionCoordinate } from '@agentconnect.md/protocol/subsession-coordinate'
+import { isCoordinatorCoordinate } from '@agentconnect.md/protocol/append-coordinate'
+import {
+  appendSessionLabel,
+  appendSessionStartedAt,
+  hookKindFromIntegration,
+  hookSourceLabel
+} from '@/lib/session-trigger'
+import type { AgentIcon } from '@/lib/agent-icon'
+import { withIconUrl } from '@/lib/agent-icon'
+import {
+  getToken,
+  getIdTokenRaw,
+  getUser,
+  redirectExpiredSession,
+  refreshTokenAfterUnauthorized,
+  signOutDeletedAccount
+} from '@/lib/auth'
+import { chatRoomSigil } from '@/lib/platform-labels'
+import { track } from '@/lib/analytics'
+import { createSseParser } from '@/lib/sse'
+import { isUpgradeAvailable } from '@/lib/version'
+import { cpBase } from '@/lib/endpoints'
+import type { SocialLoginTarget } from '@/lib/social-login-providers'
+
+/** A non-2xx CP response. `status` lets callers branch without parsing strings;
+ *  `code` carries the CP's machine-readable denial reason when the endpoint
+ *  provides one (e.g. github user-authz: GITHUB_IDENTITY_REQUIRED). */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code?: string,
+    /** The CP's parsed error body, for the few denials that carry structured
+     *  detail a message can't render well (Slack's `missingScopes` list). Read
+     *  it behind a `code` check and narrow it — nothing here is guaranteed. */
+    readonly details?: Record<string, unknown>
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
+/** The CP REST base (`http(s)://…/api/v1`), so an agent's API Quickstart shows the exact mint endpoint. */
+export function cpRestBase(): string {
+  return cpBase()
+}
+
+// Static bearer token (e.g. CI/service token). When OIDC is configured the live
+// per-user token from `@/lib/auth` takes precedence; with both unset the CP runs
+// its zero-config devAuth stub (admits all) — the OSS no-auth default.
+const TOKEN = process.env.NEXT_PUBLIC_CP_TOKEN
+
+/** CP-minted webchat token + the relay ingress the browser should dial (shared-bot-relay §10). */
+export interface WebchatTokenDto {
+  token: string
+  relayUrl: string
+  conversationId: string
+  /** A coordinator conversation's current session, once it has one. */
+  sessionId?: string
+  protocol?: 'legacy' | 'ahp'
+  ahp?: { url: string; sessionUri?: string; peers?: Array<{ agentId: string; url: string; sessionUri?: string }> }
+}
+
+export interface WebchatMcpOperationDto {
+  operationId: string
+  toolName: string
+  arguments: unknown
+  status: 'awaiting_confirmation' | 'executing' | 'completed' | 'failed' | 'ambiguous' | 'stale'
+  createdAt: string
+  confirmationExpiresAt: string
+  completedAt: string | null
+  result?: unknown
+}
+
+const webchatMcpOperationPath = (orgId: string, agentId: string, conversationId: string) =>
+  `/orgs/${encodeURIComponent(orgId)}/agents/${encodeURIComponent(agentId)}/webchat/${encodeURIComponent(conversationId)}/mcp-operations`
+
+export function listWebchatMcpOperations(
+  orgId: string,
+  agentId: string,
+  conversationId: string
+): Promise<WebchatMcpOperationDto[]> {
+  return apiGet<WebchatMcpOperationDto[]>(webchatMcpOperationPath(orgId, agentId, conversationId))
+}
+
+export function getWebchatMcpOperation(
+  orgId: string,
+  agentId: string,
+  conversationId: string,
+  operationId: string
+): Promise<WebchatMcpOperationDto> {
+  return apiGet<WebchatMcpOperationDto>(
+    `${webchatMcpOperationPath(orgId, agentId, conversationId)}/${encodeURIComponent(operationId)}`
+  )
+}
+
+export function decideWebchatMcpOperation(
+  orgId: string,
+  agentId: string,
+  conversationId: string,
+  operationId: string,
+  decision: 'approve' | 'deny'
+): Promise<WebchatMcpOperationDto> {
+  return apiPost<WebchatMcpOperationDto>(
+    `${webchatMcpOperationPath(orgId, agentId, conversationId)}/${encodeURIComponent(operationId)}/decision`,
+    { decision }
+  )
+}
+
+/**
+ * Mint a short-lived webchat token for an agent (POST …/agents/:id/webchat/token).
+ * The browser presents it to the relay pool to open a playground session; the relay
+ * verifies it with the CP (`rc/verify(webchat-token)`) and bridges to the agent's daemon.
+ * Throws `ApiError(503)` when the CP has no relay pool configured (`PUBLIC_RELAY_URL`).
+ */
+export function mintWebchatToken(
+  orgId: string,
+  agentId: string,
+  conversationId?: string,
+  protocol: 'legacy' | 'ahp' = 'legacy'
+): Promise<WebchatTokenDto> {
+  return apiPost<WebchatTokenDto>(
+    `/orgs/${encodeURIComponent(orgId)}/agents/${encodeURIComponent(agentId)}/webchat/token`,
+    { conversationId, protocol }
+  )
+}
+
+/** The member's private coordinator conversation with an agent, created on first use, with its current session once it has one (auto-session-mode.md §10). */
+export async function openCoordinatorConversation(
+  orgId: string,
+  agentId: string
+): Promise<{ conversationId: string; sessionId?: string }> {
+  const minted = await apiPost<WebchatTokenDto>(
+    `/orgs/${encodeURIComponent(orgId)}/agents/${encodeURIComponent(agentId)}/webchat/token`,
+    { coordinator: true, protocol: 'legacy' }
+  )
+  return { conversationId: minted.conversationId, ...(minted.sessionId ? { sessionId: minted.sessionId } : {}) }
+}
+
+/**
+ * Add a participant agent to an existing conversation (mid-conversation join,
+ * webchat-multi-agents.md §3.1). Owner-only; 409 when the roster is full or a
+ * participant's daemon lacks multi-agent webchat support. Idempotent.
+ */
+export function addWebchatConversationAgent(
+  orgId: string,
+  conversationId: string,
+  agentId: string
+): Promise<{ participants: Array<{ agentId: string; primary?: boolean }> }> {
+  return apiPost(
+    `/orgs/${encodeURIComponent(orgId)}/webchat/conversations/${encodeURIComponent(conversationId)}/agents`,
+    { agentId }
+  )
+}
+
+/** Remove a non-primary member from a conversation (§3.1a); owner-only, 409 for the primary, idempotent. */
+export function removeWebchatConversationAgent(
+  orgId: string,
+  conversationId: string,
+  agentId: string
+): Promise<{ participants: Array<{ agentId: string; primary?: boolean }> }> {
+  return apiDelete(
+    `/orgs/${encodeURIComponent(orgId)}/webchat/conversations/${encodeURIComponent(conversationId)}/agents/${encodeURIComponent(agentId)}`
+  )
+}
+
+/**
+ * Conversation-scoped mint (webchat-multi-agents.md §6.2): pass `agentIds` (first
+ * entry = primary) to CREATE a conversation — the roster is fixed at creation — or
+ * `conversationId` to resume one. Creating with more than one agent requires every
+ * selected agent's daemon to support multi-agent webchat (409 otherwise).
+ */
+export function mintWebchatConversationToken(
+  orgId: string,
+  body: { conversationId?: string; agentIds?: string[] },
+  protocol: 'legacy' | 'ahp' = 'legacy'
+): Promise<WebchatTokenDto> {
+  return apiPost<WebchatTokenDto>(`/orgs/${encodeURIComponent(orgId)}/webchat/conversations/token`, {
+    ...body,
+    protocol
+  })
+}
+
+/**
+ * Session-targeted mint (webchat-cross-integration-continuation.md §6.5): mint a
+ * token whose conversation adopts an existing chat-origin session, so the console
+ * composer can continue it. 403/409 per the server-computed continuation gates.
+ */
+export function mintWebchatSessionToken(
+  orgId: string,
+  sessionId: string,
+  protocol: 'legacy' | 'ahp' = 'legacy'
+): Promise<WebchatTokenDto> {
+  return apiPost<WebchatTokenDto>(
+    `/orgs/${encodeURIComponent(orgId)}/sessions/${encodeURIComponent(sessionId)}/webchat/token`,
+    { protocol }
+  )
+}
+
+/** `webchatWsUrl` for a session continuation: mint the session-target token, dial the relay. */
+export async function webchatSessionWsUrl(orgId: string, sessionId: string): Promise<string> {
+  const minted = await mintWebchatSessionToken(orgId, sessionId)
+  const base = minted.relayUrl.replace(/^http/, 'ws').replace(/\/+$/, '')
+  const params = new URLSearchParams({ token: minted.token, conversation_id: minted.conversationId })
+  return `${base}/webchat?${params.toString()}`
+}
+
+/**
+ * Build the client-facing webchat WebSocket URL for an agent (milestone A4: the relay
+ * pool is the ONLY webchat path — the CP is never on the message hot path). Mint a
+ * CP token, then dial `${relayUrl}/webchat?token=…&conversation_id=…`; content never
+ * touches the CP. Throws `ApiError(503)` when no relay pool is configured.
+ *
+ * Pass `conversationId` to RESUME an existing conversation owned by the current user:
+ * the CP authorizes that binding, and the relay lands the socket on the same daemon
+ * session. Omit it to start fresh (the CP allocates and binds the id, echoed back in the
+ * `ready` frame).
+ */
+export async function webchatWsUrl(
+  orgId: string,
+  agentId: string,
+  conversationId?: string,
+  agentIds?: string[]
+): Promise<string> {
+  // A multi-agent create (roster fixed at creation) goes through the
+  // conversation-scoped mint. A RESUME also prefers it — the legacy per-agent
+  // path authorizes only the conversation's PRIMARY agent, and a resume opened
+  // from a member participant's session row would 404 there — falling back to
+  // the legacy mint when the CP predates the conversation route.
+  const minted =
+    agentIds && agentIds.length > 1 && !conversationId
+      ? await mintWebchatConversationToken(orgId, { agentIds })
+      : conversationId
+        ? await mintWebchatConversationToken(orgId, { conversationId }).catch((err) => {
+            if (err instanceof ApiError && err.status === 404) return mintWebchatToken(orgId, agentId, conversationId)
+            throw err
+          })
+        : await mintWebchatToken(orgId, agentId, conversationId)
+  const base = minted.relayUrl.replace(/^http/, 'ws').replace(/\/+$/, '') // http→ws, https→wss
+  const params = new URLSearchParams({ token: minted.token, conversation_id: minted.conversationId })
+  return `${base}/webchat?${params.toString()}`
+}
+
+// ── wire DTOs (subset we consume) ───────────────────────────────────────────
+
+// Who vouches for the workspace repository (git-workspace-model.md §5, read
+// shape): provenance persisted at the last workspace write. Absent ⇒ anonymous.
+export type AgentWorkspaceCredentialDto =
+  { provider: 'github'; access: 'read' | 'write' } | { provider: 'gitlab'; access: 'read' | 'write'; projectId: string }
+
+export type AgentWorkspaceDto =
+  | { mode: 'scratch' }
+  | {
+      mode: 'git'
+      worktree?: boolean
+      gitRepo: string
+      gitBranch?: string
+      agentDir?: string
+      credential?: AgentWorkspaceCredentialDto
+    }
+
+export interface ExternalMemoryRecallPolicy {
+  mode: 'auto' | 'tool-only'
+  topK: number
+  maxBytes: number
+  timeoutMs: number
+}
+
+/** Offline consolidation policy for the managed store (docs/designs/memory-dreaming.md). */
+export interface MemoryDreamingConfig {
+  enabled: boolean
+  sessionWindow?: number // recent sessions to mine (1–100)
+  schedule?: string // cron expression for scheduled dreams
+  timezone?: string // IANA zone the schedule is evaluated in (absent ⇒ daemon local)
+  instructions?: string // operator steering text (≤4096 chars)
+  mineSkills?: boolean // also mine reusable procedures (D-3)
+  autoAdopt?: boolean // adopt automatically without content review; absent defaults off
+}
+
+/** Where the managed tree lives (memory-evolution.md §3.2.1); absent on a binding written before the field existed. */
+export type ManagedMemoryHome = 'daemon' | 'control-plane'
+
+export type AgentMemoryConfig =
+  | {
+      provider: 'managed'
+      autoDistill?: boolean
+      dreaming?: MemoryDreamingConfig
+      home?: ManagedMemoryHome
+      /** CP-owned and read-only: set by the `daemon` → `control-plane` switch, cleared by the owning daemon's completion report. */
+      homeMigration?: 'pending'
+    }
+  | { provider: 'native' | 'none'; autoDistill?: boolean }
+  | {
+      provider: 'external'
+      connectionId: string
+      recall?: ExternalMemoryRecallPolicy
+      capture?: { mode: 'turn' | 'manual' }
+    }
+
+/** What an agent's new rooms and group DMs start at: Auto, @-mentions on Per thread, or Off. */
+export type NewConversationMode = 'auto' | 'mention' | 'off'
+
+export interface AgentDto {
+  id: string
+  orgId: string
+  name: string // slug — lowercase [a-z0-9-], unique per org
+  displayName: string | null // human-readable label; null when the slug is the only name
+  builtin: boolean // built-in preset agent — labeled "builtin", not deletable
+  icon: AgentIcon | null // console avatar; null ⇒ legacy default (runtime mark)
+  iconUrl: string | null // resolved URL for an uploaded `image` icon; null otherwise
+  description: string | null
+  runtime: string | null // null ⇒ deferred exec config (an unplaced preset; set at placement)
+  model: string | null
+  modelProvider?: AgentModelProvider | null
+  reasoningEffort: string | null
+  outputMode: string | null // platform output verbosity: low | medium | high; null when unset
+  showFooter: boolean // render attribution/session footer; defaults true
+  showStatusBar: boolean // render Slack's persistent session status row; defaults false
+  fastMode: boolean | null // runtime fast mode; null when never set (runtime default)
+  permissionMode: string | null // runtime permission/approval mode; null when never set
+  chatActions: ChatActions // what people can do in chat
+  pause: boolean | null // operational message-processing toggle; true ⇒ agent skips all messages; null ⇒ not paused
+  computerUse?: AgentComputerUse | null // computer use (computer-use.md §4.1); null or absent ⇒ off
+  env: Record<string, string> // the agent's OWN variables
+  secretKeys: string[] // names of the agent's write-only secret env vars (values never returned)
+  liveSecrets?: Array<{ name: string; description: string | null }> // live secrets by name; absent on list reads and an older CP
+  // Organization-owned rows assigned to THIS agent (organization-secrets-and-variables.md
+  // §6). Absent on an older CP. Read-only in the agent surfaces; organization
+  // variable values are ordinary config, organization secrets contribute names only.
+  organizationVariables?: Array<{ key: string; value: string }>
+  organizationSecretKeys?: string[]
+  status: string
+  // Placement is a TARGET: `set` names a member set through `setId` and carries no member id.
+  placementKind?: PlacementKindValue
+  placementReady?: boolean
+  // Can a new Webchat with this agent attach over AHP? Absent from an older CP, which reads as no.
+  ahpWebchat?: boolean
+  // A group agent's confirmed duty holder; absent for a daemon or pool placement and from an older CP.
+  holderDaemonId?: string | null
+  daemonId: string | null
+  daemonName: string | null
+  setId?: string | null
+  workspace: AgentWorkspaceDto
+  workspaceRepoId?: string | null
+  capabilities: string[]
+  mcpServers: string[] // daemon-configured MCP server names attached at session/new; empty ⇒ none
+  skills: string[] // enabled shared-skills "<source>/<skill>" / "<source>/*"; empty ⇒ none
+  managedSkills?: string[] // enabled centrally accepted immutable skill ids; absent on older CPs
+  decisionIds?: string[] // explicitly attached saved Decisions
+  modelSelection?: AgentModelSelection | null
+  coordinatorModel?: CoordinatorModel | null // the `auto` coordinator's model; null ⇒ Default, absent on an older CP
+  coordinatorDisabled?: boolean // the coordinator is off; absent on an older CP
+  coordinatorFilter?: AgentCoordinatorFilter | null // screens messages before the coordinator; absent on an older CP
+  repositorySelector?: AgentRepositorySelector | null // the evaluator that chooses `decision` repositories; absent on an older CP
+  memory: AgentMemoryConfig | null // memory backend; null ⇒ managed default
+  assistantMode?: AssistantModePolicy | null // null ⇒ never configured, off; absent on an older CP
+  createdAt: string // ISO-8601
+  createdBy: string | null // creator's userId (resolved to a name / "You" in the UI); null for daemon/CLI-created
+  lastModifiedAt: string // ISO-8601
+  lastModifiedBy: string | null // editor's userId (resolved to a name / "You" in the UI); null for daemon/CLI-created
+  visibility: ResourceVisibility // 'org' = all members; 'restricted' = sharedWith plus organization owners
+  sharedWith: string[] // explicit app_user.id audience when restricted
+  canEdit: boolean // whether the caller may change non-sharing agent settings
+  canManageSharing: boolean // whether the caller may change this resource's sharing
+  callPolicy: AgentCallPolicy // which peer agents may call this agent as a sub-agent
+  allowedCallerAgentIds: string[] // agent.id set, meaningful when callPolicy='selected'
+  outboundPolicy: AgentCallPolicy // which peer agents this agent may discover/call
+  allowedTargetAgentIds: string[] // agent.id set, meaningful when outboundPolicy='selected'
+  introduceOnJoin: boolean // #536: self-introduce to peers on a genuine channel join
+  newConversationMode?: NewConversationMode | null // what its new rooms and group DMs start at; null or absent ⇒ the platform default (Auto where the daemon reads it, else @-mentions)
+  githubAppId?: string | null // the organization GitHub App the agent works through; null or absent ⇒ the built-in App
+  execution?: string // the strategy slug sessions run in (session-executors.md §5); absent only on an older CP
+  strategies?: StrategyTable // what the placement offers `execution`, host alone for an unplaced agent; absent only on an older CP
+  hookKinds: HookKind[] // distinct kinds of enabled inbound triggers (list-view marks)
+  apiProtocols: AgentApiProtocol[] // the chat APIs it accepts calls on (list-view mark)
+}
+
+/** The `PUT /{agents,daemons,crons}/:id/sharing` request body. */
+/** An agent's computer use as the Control Plane derives it: the Computers whose agent access grants it, and its managed mode. */
+export interface AgentComputerUse {
+  enabled: boolean
+  computers: string[]
+  /** An agent-driven managed computer from the pool (computer-use.md §15.1). */
+  managed?: { mode: 'ephemeral' | 'per-agent' }
+}
+
+/** What an agent itself sets for computer use: only its managed mode; access is set on each Computer. */
+export interface AgentComputerSetting {
+  managed?: { mode: 'ephemeral' | 'per-agent' }
+}
+
+export interface SharingInput {
+  visibility: ResourceVisibility
+  sharedWith: string[] // app_user.id set (intersected with current org members server-side)
+}
+
+/** `PUT /agents/:id/call-policy` request body. */
+export interface AgentCallPolicyInput {
+  callPolicy: AgentCallPolicy
+  allowedCallerAgentIds: string[]
+  outboundPolicy: AgentCallPolicy
+  allowedTargetAgentIds: string[]
+}
+
+// `/sessions` list row. The CP stores metadata snapshots reported by daemons
+// (`event/session`) plus usage telemetry; the transcript is a separate on-demand
+// daemon pull.
+// Per-session token accounting (protocol `SessionUsage`). Token counts are
+// session-cumulative; context/cost are the latest snapshot. All fields optional —
+// a runtime that reports no usage yields absent fields.
+export interface SessionUsageDto {
+  reportedAt?: string
+  totalTokens?: number
+  inputTokens?: number
+  outputTokens?: number
+  thoughtTokens?: number
+  cachedReadTokens?: number
+  cachedWriteTokens?: number
+  contextUsed?: number
+  contextSize?: number
+  costAmount?: number
+  costCurrency?: string
+}
+
+// Session-level visibility (docs/designs/session-visibility.md): 'private' rows are
+// visible only to the session owner (no role override, org owners included); 'org'
+// to every organization member. It is independent from the owning Agent's Team
+// visibility and deliberately NOT ResourceVisibility ('org' | 'restricted').
+export type SessionVisibility = 'private' | 'org' | 'external'
+export type MutableSessionVisibility = 'private' | 'org'
+
+export interface SessionDto {
+  sessionId: string
+  sessionKey: { platform: string; channel: string; thread?: string }
+  agentId: string
+  /** Session-scoped display projection; does not imply Agent access. */
+  agentName?: string | null
+  title: string | null
+  status: string | null
+  lastActivityAt: string | null
+  usage: SessionUsageDto | null
+  // Absent/null on a CP that predates session visibility — treated as 'org'
+  // (matching the server-side backfill of legacy rows).
+  visibility?: SessionVisibility | null
+  /** Live wait state (slack-approval-dm.md §7); absent on a CP that predates it. */
+  activityState?: SessionActivityState | null
+  externalProvider?: string | null
+  externalResolution?: 'pending' | 'settled' | 'invalid' | null
+  triggeredBy: string | null
+  hookKind?: HookKind | null
+  // Daemon-resolved display names; null until the daemon has resolved them.
+  channelName: string | null
+  triggeredByName: string | null
+  /** The console member who linked the triggering chat account. */
+  triggeredByUserId?: string
+  // Platform-native deep link back to the source message/thread, captured or
+  // derived by the daemon; null when unavailable.
+  threadUrl: string | null
+  // Execution-config snapshot the session actually ran with (daemon-reported;
+  // daemonId is CP-stamped from the reporting WS connection). null ⇒ never
+  // reported (legacy row): the console falls back to the owning agent's
+  // current config. A null value on a reported row ⇒ the runtime's own default.
+  runtime: string | null
+  model: string | null
+  effort: string | null
+  fastMode: boolean | null
+  permissionMode: string | null // effective session preset; Codex Auto is composite
+  outputMode: string | null
+  daemonId: string | null
+  /** The shared-store pool set holding the rows; null ⇒ the recorder's private store. Absent on older CPs. */
+  contentSetId?: string | null
+  /** Retention GC (#485): when the owning daemon deleted this session's local
+   *  content. Non-null ⇒ the transcript is gone for good. Absent on a CP that
+   *  predates the field. */
+  contentPurgedAt?: string | null
+  workspaceIsolation?: 'shared' | 'session' | null
+}
+
+export interface SessionFacetsDto {
+  agents: string[]
+  /** Session-scoped labels keyed by facet Agent id; absent on older CPs. */
+  agentNames?: Record<string, string>
+  integrations: string[]
+  channels: Array<{
+    value: string
+    platform: string
+    integration: string
+    name: string | null
+    triggeredByName: string | null
+  }>
+  triggers: Array<{
+    value: string
+    integration: string
+    name: string | null
+    hookKind: HookKind | null
+    githubRepoId: string | null
+    /** The console member who linked the triggering chat account. */
+    userId?: string
+  }>
+}
+
+/** One grouped-list row (merged-conversation-view.md §5.2). */
+export interface ConversationDto {
+  /** §5.1 encoded key — null for singleton conversations. */
+  key: string | null
+  platform: string | null
+  channel: string | null
+  thread: string | null
+  /** Current member sessions, representative (newest visible) first. Narrowed by
+   *  an `agentId` filter — these are the rows the query asked for, not the
+   *  conversation's membership. */
+  sessions: SessionDto[]
+  /** Every visible member's session id, the ones an `agentId` filter kept out of
+   *  `sessions` included. Absent on a CP that predates the field, where the
+   *  filtered rows are the best membership available. */
+  memberSessionIds?: string[]
+  /** Key-addressed resolver only: the stable representative in `sessions` (webchat primary, else earliest started). */
+  representativeSessionId?: string
+}
+
+/** Why a provider failed closed — a CAUSE, never a target (no channel, user or
+ *  workspace id ever appears here). `authorization` is the VIEWER's own linked
+ *  identity; `app_authorization` is the installed app's grant, which only an
+ *  administrator can restore. A CP that predates a variant simply never sends
+ *  it, and an unrecognized one falls back to the generic notification. */
+export interface SessionAccessIssue {
+  provider: string
+  region?: string
+  reason: 'authorization' | 'app_authorization' | 'quota' | 'unavailable'
+}
+
+export interface SessionListPageDto {
+  /** Present on `view=flat` responses (and older CPs). */
+  sessions?: SessionDto[]
+  /** Present on default (grouped) responses. */
+  conversations?: ConversationDto[]
+  total: number | null
+  nextCursor: string | null
+  /** Org-level "any session exists" boolean (first page only) — a bare boolean so the
+   *  getting-started conversation step can be org-wide without exposing hidden rows. */
+  orgHasSessions?: boolean
+  accessSyncDegraded?: boolean
+  accessIssues?: SessionAccessIssue[]
+}
+
+export interface SessionListFilters {
+  /** One agent scopes to that agent's sessions; several ask for the conversations
+   *  all of them took part in, and return each of their sessions in those threads. */
+  agentId?: string | string[]
+  platform?: string
+  integration?: string
+  channel?: string
+  triggeredBy?: string
+  githubRepoId?: string
+  /** Leave tasks (delegated tasks, follow-ups and approved proposals) out of the rows, the total and the facets. */
+  excludeTasks?: boolean
+}
+
+export interface SessionFacets {
+  agentIds: string[]
+  agentNames: Record<string, string>
+  integrations: string[]
+  channels: Array<{ value: string; label: string; platform: string }>
+  triggers: Array<{
+    value: string
+    name?: string
+    platform: string
+    hookKind?: HookKind
+    githubRepoId?: string
+    userId?: string
+  }>
+}
+
+export interface SessionListPage {
+  sessions: Session[]
+  total: number | null
+  nextCursor: string | null
+  orgHasSessions?: boolean
+  accessSyncDegraded?: boolean
+  accessIssues?: SessionAccessIssue[]
+}
+
+export interface SessionRelationDto {
+  id: string
+  agentId: string
+  /** Session-scoped display projection; absent on older Control Planes. */
+  agentName?: string | null
+  platform: string
+  title: string | null
+  /** A task (delegated task, follow-up or approved proposal) rather than a conversation; absent on older Control Planes. */
+  subsession?: boolean
+}
+
+export interface SessionDetailDto {
+  id: string
+  parentSession: SessionRelationDto | null
+  /** This session is a task (its own `subsession:` thread, or a threaded task some session owns); absent from an older CP. */
+  task?: boolean
+  /** Absent on a Control Plane that predates sibling navigation. */
+  siblingSessions?: SessionRelationDto[]
+  childSessions: SessionRelationDto[]
+  agentId: string
+  /** Session-scoped display projection; absent on older Control Planes. */
+  agentName?: string | null
+  platform: string | null
+  channel: string | null
+  thread: string | null
+  title: string | null
+  status: string | null
+  lastActivityAt: string
+  usage: SessionUsageDto | null
+  triggeredBy: string | null
+  /** Stable source kind for hook-backed sessions. Absent on older Control Planes. */
+  hookKind?: HookKind | null
+  channelName: string | null
+  triggeredByName: string | null
+  triggeredByUserId?: string
+  threadUrl: string | null
+  runtime: string | null
+  model: string | null
+  effort: string | null
+  fastMode: boolean | null
+  permissionMode: string | null // effective session preset; Codex Auto is composite
+  outputMode: string | null
+  daemonId: string | null
+  /** The shared-store pool set holding the rows; null ⇒ the recorder's private store. Absent on older CPs. */
+  contentSetId?: string | null
+  workspaceIsolation?: 'shared' | 'session' | null
+  /** Birth verdict (session-executors.md §7): the group member executing this session, or the
+   *  reason it stayed with its holder. At most one is set; both absent on an older CP. */
+  executorDaemonId?: string | null
+  stayedHomeReason?: SessionStayedHomeReason | null
+  // Session visibility (docs/designs/session-visibility.md §5/§6). All three are
+  // absent on a CP that predates the feature. `visibilityState` is the §5.1
+  // tighten cutover: 'pending' until every affected daemon acked the change,
+  // then 'applied'. `canChangeVisibility` is server-computed (the
+  // identity-matched session owner only — roles grant nothing) — the client
+  // never re-derives it.
+  visibility?: SessionVisibility | null
+  visibilityState?: 'pending' | 'applied' | null
+  canChangeVisibility?: boolean | null
+  /** Server-computed continuation gate (webchat-cross-integration-continuation.md
+   *  §6.5): whether THIS caller may continue the session from the console
+   *  composer. Absent on a CP that predates the feature (⇒ read-only). */
+  canContinue?: boolean | null
+  /** Whether THIS caller owns this webchat conversation; absent on an older Control Plane. */
+  ownsConversation?: boolean | null
+  continuationUnavailableReason?:
+    'unauthorized' | 'content_purged' | 'unsupported_platform' | 'agent_moved' | 'daemon_offline' | 'unavailable' | null
+  /** What a continued turn may carry; absent or null ⇒ text only. */
+  continuationAttachments?: 'images' | 'images_and_files' | null
+  externalProvider?: string | null
+  externalResolution?: 'pending' | 'settled' | 'invalid' | null
+  /** Actual source gateway for Feishu/Lark external sessions. Absent on older CPs. */
+  feishuRegion?: 'feishu' | 'lark' | null
+  accessSyncDegraded?: boolean
+  accessIssues?: SessionAccessIssue[]
+  /** Multi-agent webchat conversation roster, in pick order. Null for single-agent
+   *  conversations and other platforms; absent on a CP that predates the feature.
+   *  `name` is null only when no Agent display record can be resolved. */
+  participants?: Array<{ agentId: string; name: string | null; primary: boolean }> | null
+  /** Durable workspace/tenant scope (merged-conversation-view.md §5.1) — part of
+   *  the conversation key. Absent on a CP that predates the feature. */
+  tenantScope?: string | null
+  /** Retention GC (#485): when the owning daemon deleted this session's local
+   *  content (and any per-session worktree), with the reason it reported. Non-null
+   *  ⇒ `/messages` has nothing left to return, ever. Absent on older CPs. */
+  contentPurgedAt?: string | null
+  contentPurgedReason?: string | null
+}
+
+// The full ACP tool body (protocol `ToolBody`), transported as a JSON STRING in
+// `SessionMessageDto.body`. Mirrors the protocol schema; free-form fields stay
+// opaque (`unknown`) — no reshaping. Kept structural so web needn't depend on
+// the protocol package's zod runtime.
+export interface ToolBody {
+  toolCallId: string
+  kind?: string // ACP ToolKind: read|edit|delete|move|search|execute|think|fetch|switch_mode|other
+  status?: string // ACP ToolCallStatus: pending|in_progress|completed|failed
+  rawInput?: unknown
+  rawOutput?: unknown
+  content?: unknown[] // ACP ToolCallContent[] (content|diff|terminal blocks)
+  locations?: { path: string; line?: number }[]
+  truncated?: boolean // daemon capped the stored body at write time
+  screenshots?: string[] // stored screenshot hashes the body names, kept when a cap cuts them off
+}
+
+// The agent's task list for one turn (protocol `PlanBody`), transported as a JSON
+// STRING in `SessionMessageDto.body` on a `kind === 'plan'` row. An ACP plan update
+// carries the whole list every time, so one row per turn holds the latest snapshot.
+export interface PlanBody {
+  entries: { content: string; status: string; priority?: string }[]
+}
+
+// One transcript message (`GET /sessions/:id/messages`, proxied live from the owning daemon).
+// `kind` is the daemon transcript kind: text | tool | reasoning | plan | elicit. `body` carries a
+// ToolBody on a tool row, a PlanBody on a plan row and an ElicitBody on an elicit row; it is
+// absent on text/reasoning rows, and on rows from a daemon or CP predating them.
+export interface SessionMessageDto {
+  seq: number
+  sender: string
+  senderName?: string // daemon-resolved display name; absent if unknown
+  senderAvatarUrl?: string // public provider-hosted profile image
+  /** The console member who linked this sender's chat account, as the Control Plane resolved it. */
+  senderUserId?: string
+  /** The agent this sender's bot speaks for, as the Control Plane resolved it. */
+  senderAgentId?: string
+  trustedAgentBot?: boolean // daemon-verified AgentConnect Slack bot provenance
+  ts: string
+  /** Normalized chronological coordinate (epoch µs) from the daemon's event-time
+   *  axis — provider-authoritative when the platform supplied its send time. */
+  eventTimeUs?: number
+  /** Canonical webchat post identity (merged-conversation-view.md §6) — identical
+   *  on every participant's copy; absent on non-webchat and pre-upgrade rows. */
+  postId?: string
+  kind: string
+  text: string
+  attachments?: SessionImage[]
+  /** A shared image's preview and original descriptor (webchat-generated-images.md §4); never a signed URL. */
+  sharedImage?: { attachment: SharedImagePreview; original: SharedImageOriginal; revision: number }
+  toolCallId?: string // ties the row to its full body (session/tool-body key)
+  toolStatus?: string // ACP ToolCallStatus — drives the console status badge
+  toolKind?: string // ACP ToolKind — drives the console icon
+  body?: string // JSON.stringify(ToolBody) on a tool row, PlanBody on a plan row, ElicitBody on an elicit row, UserTurnBody on a text row; may be a truncated-but-VALID-JSON preview
+  bodyTruncated?: boolean // preview was shrunk for the frame; full body via fetchToolBody
+  bodyBytes?: number // full (untruncated) body byte length
+  /** The roots view alone: the root id of the thread this row is a reply in (webchat-threads.md §8). */
+  thread?: string
+  /** A webchat root handed into a task's thread: that thread's root id; the row stays at the root and reads as a reply there (webchat-threads.md §5.1). */
+  handedTo?: string
+}
+
+/** Who wrote in a thread, as its footer names them. */
+export interface SessionThreadAuthorDto {
+  sender: string
+  senderName?: string
+  senderAvatarUrl?: string
+  senderUserId?: string
+  senderAgentId?: string
+}
+
+/** One thread's footer (webchat-threads.md §5.3); `readable` false leaves out its excerpts and task title (§7.1). */
+export interface SessionThreadSummaryDto {
+  rootId: string
+  rootExcerpt?: string
+  replies: number
+  lastReplyAt?: string
+  lastReply?: SessionThreadAuthorDto & { excerpt?: string }
+  /** Repliers, newest first, at most five. */
+  participants: SessionThreadAuthorDto[]
+  /** The task that holds the thread; `sessionId` is absent while it starts, and `starting` marks it unread until its session exists. */
+  task?: { sessionId?: string; title?: string; state: 'open' | 'done' | 'failed'; starting?: true }
+  /** A turn runs in the thread now. */
+  running?: boolean
+  readable: boolean
+}
+
+export interface SessionHistoryDto {
+  sessionId: string
+  messages: SessionMessageDto[]
+  nextCursor: string | null
+  liveCursor: string | null
+  liveMore: boolean
+  /** The roots view alone: the footers of the threads its rows start or reply in. */
+  threads?: SessionThreadSummaryDto[]
+}
+
+/** One page of a thread's record, the root first, with its footer; no messages when the footer is not `readable`. */
+export interface SessionThreadMessagesDto {
+  sessionId: string
+  rootId: string
+  messages: SessionMessageDto[]
+  nextCursor: string | null
+  liveCursor: string | null
+  liveMore: boolean
+  summary: SessionThreadSummaryDto
+}
+
+// A scheduled trigger (`/crons`): every `schedule` tick the owning agent is
+// prompted with `trigger`. The CP owns the definition; the daemon fires it.
+// `targetChannel` is optional output routing (the trigger is posted there and
+// the agent replies in its thread); null ⇒ headless fire. `agentId` is only
+// null when the agent was deleted (orphaned — inert until re-assigned).
+export interface CronDto {
+  id: string
+  orgId: string
+  agentId: string | null
+  name: string | null // console display name; null for legacy/CLI rows
+  schedule: string
+  timezone: string
+  targetPlatform: string // §6.8 open id — derived from the anchor integration
+  targetChannel: string | null
+  targetIntegrationId: string | null // null ⇒ legacy row / integration uninstalled
+  trigger: string
+  enabled: boolean
+  lastRunAt: string | null
+  createdBy: string | null // creator's userId (resolved to a name / "You" in the UI); null for CLI/legacy
+  createdAt: string // ISO-8601
+  lastModifiedBy: string | null // editor's userId (resolved to a name / "You" in the UI); null for CLI/legacy
+  lastModifiedAt: string // ISO-8601
+  visibility: ResourceVisibility
+  sharedWith: string[]
+  canEdit: boolean
+  canManageSharing: boolean
+}
+
+// PUT /crons/:id body (idempotent upsert keyed on the cron UUID).
+export interface UpsertCronInput {
+  agentId: string // the agent this cron drives — required
+  name?: string // console display name
+  schedule: string
+  timezone?: string // omitted ⇒ UTC on create, the schedule's existing zone on an edit
+  targetPlatform: string // §6.8 open id — derived from the anchor integration
+  targetChannel?: string // optional — absent ⇒ headless fire
+  targetIntegrationId?: string // the agent integration posting the anchor (platform derives from it)
+  trigger: string
+  enabled: boolean
+  visibility?: ResourceVisibility // initial visibility — honored only on create (a fresh id)
+  sharedWith?: string[] // initial share set (create only; intersected with members server-side)
+}
+
+// POST /integrations body — install a Slack connection from the console. Bound to
+// one owning agent (`agentId`); that agent's daemon opens the Socket Mode socket.
+// The bot identity comes one of two ways: reuse an existing FREE bot (`botId` —
+// the CP already holds its tokens), or register a new bot from pasted tokens
+// (`slack`). The CP stores the tokens (currently plaintext-in-PG behind the
+// BotSecret store seam) and pushes them to the daemon — the console posts them
+// once and never gets them back. Socket Mode needs only the bot token (xoxb-) +
+// app-level token (xapp-); no signing secret / app id. The owning agent must
+// already be placed on a daemon (the CP replies 409 otherwise).
+// Fields shared by every platform's create/reuse request.
+interface CreateIntegrationBase {
+  // Optional: you're connecting a bot that already has a name, so the console
+  // doesn't force one. When omitted the CP derives it from the platform (Slack
+  // auth.test / Telegram getMe / Discord). Ignored when reusing an existing bot.
+  name?: string
+  agentId: string
+  /** Reuse an existing bot. A classic bot must be free; a SHAREABLE bot may already
+   *  serve other agents (exclusive with the token block only for a fresh bot). */
+  botId?: string
+  /** Opt the (new or reused) bot into shared mode — many agents, inbound via a relay. */
+  shareable?: boolean
+}
+
+// Register/reuse a platform integration. Discriminated on `platform`: each platform
+// carries its own credential block. Slack and Feishu additionally carry a `transport`:
+//   - `socket` — Socket Mode; the credential block is bot token (xoxb-) + app-level
+//     token (xapp-) for Slack, or Long Connection for Feishu. The daemon opens it.
+//   - `http` — Events API via the relay; the credential block is bot token (xoxb-) +
+//     signing secret (no xapp-) for Slack, or callback verification values for Feishu.
+// The CP maps socket→IntegrationSlackConfig.mode:'direct', http→'shared' for the
+// daemon. Telegram/Discord each take a single bot token — no transport concept.
+export type CreateIntegrationInput =
+  | (CreateIntegrationBase & {
+      platform: 'slack'
+      transport: 'socket' | 'http'
+      slack?: { botToken: string; appToken: string } | { botToken: string; signingSecret: string }
+    })
+  | (CreateIntegrationBase & { platform: 'qq'; qq?: { appId: string; appSecret: string } })
+  | (CreateIntegrationBase & { platform: 'wecom'; wecom?: { botId: string; secret: string } })
+  | (CreateIntegrationBase & {
+      platform: 'dingtalk'
+      dingtalk?: { clientId: string; clientSecret: string; edition?: 'mainland' | 'international' }
+    })
+  | (CreateIntegrationBase & { platform: 'telegram'; telegram?: { botToken: string } })
+  | (CreateIntegrationBase & { platform: 'discord'; discord?: { botToken: string } })
+  | (CreateIntegrationBase & {
+      platform: 'feishu'
+      transport?: 'socket' | 'http'
+      feishu?: {
+        appId: string
+        appSecret: string
+        region?: 'feishu' | 'lark'
+        verificationToken?: string
+        encryptKey?: string
+      }
+    })
+  // Linear carries no credential block from the console: a workspace bot only ever
+  // exists after the OAuth callback minted it, so the only create shape here is
+  // "add this agent as a member of a connected workspace" (linear-integration.md §7.1).
+  | (CreateIntegrationBase & { platform: 'linear'; transport?: 'http'; botId: string })
+  // Google Chat delivers events only to the relay, so its one transport is http; the number is an optional cross-check.
+  | (CreateIntegrationBase & {
+      platform: 'googlechat'
+      transport: 'http'
+      googlechat?: { projectId: string; projectNumber?: string; serviceAccountKey: string }
+    })
+  // Teams delivers only to the relay as well; the two IDs are GUIDs, the secret the app registration's own.
+  | (CreateIntegrationBase & {
+      platform: 'msteams'
+      transport: 'http'
+      msteams?: { appId: string; tenantId: string; clientSecret: string }
+    })
+  // WeChat installs only through the CP's QR login, so the console's one create shape is a reuse by bot id.
+  | (CreateIntegrationBase & { platform: 'wechat'; botId: string })
+
+export interface TelegramBotCheckDto {
+  status: 'ready' | 'privacy_enabled' | 'invalid' | 'unreachable'
+}
+
+// ── Slack config-token auto-install funnel (docs/designs/slack-install-smoothing.md §Tier B) ──
+// The CP creates the Slack app from a manifest (using the operator's App
+// Configuration Token), the user approves an OAuth install in the browser, and
+// the CP obtains the bot token itself — so the operator pastes only the
+// app-level token (still UI-minted; no Slack API for it) at the end.
+
+/** `POST /integrations/slack/app` body — start the auto-install. The config token
+ *  is the CALLER's own stored one, resolved server-side, not passed here. */
+export interface StartSlackInstallInput {
+  agentId: string
+  name?: string
+  // Which transport to build the auto-created app for. `http` sets
+  // socket_mode_enabled:false + the relay request_urls server-side; `socket`
+  // keeps the Socket Mode shape (and the app-level-token paste step).
+  transport: 'socket' | 'http'
+  // (The `shareable` choice is sent to finalize, not here.)
+}
+/** Response — the new app id + the browser OAuth install link (no tokens). */
+export interface SlackInstallStartDto {
+  installId: string
+  appId: string
+  installUrl: string
+  // The transport the app was created as — the modal pins its later steps to this.
+  transport: 'socket' | 'http'
+}
+/** `GET /integrations/slack/app/:id` — funnel progress (no tokens). */
+export interface SlackInstallStatusDto {
+  installId: string
+  appId: string
+  status: 'awaiting_oauth' | 'bot_ready'
+}
+
+/** Feishu/Lark one-click self-built app registration. The browser receives only
+ * the provider authorization URL; App ID/Secret are finalized server-side. */
+export interface StartFeishuRegistrationInput {
+  agentId: string
+  name?: string
+  region?: 'feishu' | 'lark'
+  transport?: 'socket' | 'http'
+}
+export interface FeishuRegistrationStartDto {
+  id: string
+  authorizationUrl: string
+  expiresAt: string
+  transport: 'socket' | 'http'
+}
+export interface FeishuRegistrationStatusDto {
+  id: string
+  status: 'pending' | 'completed' | 'failed'
+  failureReason:
+    'denied' | 'expired' | 'agent_unavailable' | 'invalid_credentials' | 'org_mismatch' | 'setup_failed' | null
+  integrationId: string | null
+  expiresAt: string
+}
+
+/** `GET /slack/config` — the CALLER's own stored-config status (drives the create
+ *  modal's forced auto/manual mode). Per-user. NEVER carries the token. */
+export interface SlackConfigDto {
+  configured: boolean // the signed-in caller has stored their own token
+  durable: boolean // a refresh token is stored ⇒ the pair auto-rotates and never expires
+  funnelEnabled: boolean // this deployment supports auto-install (public callback)
+  autoAvailable: boolean // funnelEnabled AND the stored token is usable right now
+  accessExpiresAt: string | null // ISO expiry of the stored access token (drives the expires/expired copy)
+  // The sole signal the console has for the "http default vs socket-only" rule:
+  relayAvailable: boolean // PUBLIC_RELAY_URL set AND ≥1 relay connected
+  relayPublicUrl: string | null // https(s) LB URL for the http manifest request_url; null when unavailable
+  // The platform-published "Add to Slack" app is installable on this deployment
+  // (SLACK_PLATFORM_* + public callback + relay). Missing (older CP) ⇒ false.
+  platformInstallAvailable?: boolean
+  updatedAt: string | null
+}
+
+/** `POST /integrations/slack/platform-install` — a pending platform-app install:
+ *  the state id + the slack.com authorize URL the console opens in a popup. */
+export interface SlackPlatformInstallDto {
+  id: string
+  installUrl: string
+}
+/** `GET /integrations/slack/platform-install/:id` — the completion signal the modal
+ *  polls while the authorize tab is open. */
+export interface SlackPlatformInstallStatusDto {
+  id: string
+  status: 'pending' | 'completed' | 'failed'
+  failureReason: string | null
+  /** The required bot scopes Slack withheld, when `failureReason` is
+   *  'missing_scopes'. Empty on every other outcome. */
+  missingScopes: string[]
+  botId: string | null
+}
+/** `PUT /slack/config` body — the caller's own Slack App Configuration token. The
+ *  access (config) token is required; the refresh token is optional (adds durability). */
+export interface SlackConfigInput {
+  accessToken: string // xoxe.xoxp-…
+  refreshToken?: string // xoxe-… — optional; omit to store an access-only (expiring) token
+}
+
+// How the bot activates in one conversation: not at all ('off' — conversation
+// gating for restricted agents), only when @-mentioned, or on any message.
+export type ChannelTrigger = 'off' | 'mention' | 'any'
+
+/** Which session a conversation's message joins (channel-session-mode.md); `auto` hands each to the coordinator (auto-session-mode.md). */
+export type ChannelSessionMode = 'createNew' | 'append' | 'auto'
+
+// One conversation the integration's bot is in (daemon-reported) + its trigger
+// choice. kind 'im' rows are DM conversations and 'mpim' rows are Slack group DMs;
+// both are observed rather than enumerable and appear for every agent visibility.
+export interface IntegrationChannelDto {
+  channelId: string
+  name: string | null // "deploys" without the hash (or DM counterpart); null if lookup failed
+  spaceId: string | null // enclosing Discord server id — the identity (names are not unique)
+  space: string | null // that server's display name; null elsewhere and until resolved
+  icon: string | null // the conversation's own glyph — a Linear icon name or an emoji; null elsewhere
+  color: string | null // that glyph's hex tint; null elsewhere
+  key: string | null // the conversation's short platform handle — a Linear team's "ENG"; null elsewhere
+  url: string | null // the page it opens on the platform; null elsewhere
+  isPrivate: boolean
+  isCodeSession?: boolean
+  kind: 'channel' | 'im' | 'mpim'
+  // 'decision' is By decision; the same PATCH sets it together with its complete gate binding.
+  trigger: ChannelTrigger | 'decision'
+  decisionBinding?: import('@agentconnect.md/protocol').ChannelDecisionBinding | null
+  decision?: ChannelDecisionView | null
+  sessionMode: ChannelSessionMode
+  agentId: string | null // effective shared-conversation owner; null before convergence / when not applicable
+}
+
+/** A By decision row's bound Decision: its visible name, whether it runs, and the consumer's readiness. */
+export interface ChannelDecisionView {
+  consumer?: 'gate' | 'shared_bot_routing'
+  id: string
+  name: string | null
+  enabled: boolean
+  disabledReason?: 'needs_review' | 'access_revoked' | 'paused'
+  readiness: { status: 'ready' | 'pending_sync' | 'needs_review' | 'daemon_offline' | 'unsupported'; reason?: string }
+}
+
+/** One conversation PATCH: a By decision trigger always travels with its complete gate. */
+export type IntegrationChannelPatch =
+  | { trigger?: ChannelTrigger; decisionBinding?: never; sessionMode?: ChannelSessionMode; agentId?: string }
+  | { trigger: 'decision'; decisionBinding: ChannelDecisionGate; sessionMode?: ChannelSessionMode; agentId?: string }
+
+// `/integrations` list/create row — control-plane metadata only, NEVER tokens.
+export interface IntegrationDto {
+  id: string
+  name: string
+  platform: string
+  agentId: string
+  botId: string
+  status: string
+  region?: 'feishu' | 'lark' // feishu integrations only: which open-platform gateway
+  createdAt: string // ISO-8601
+  channels: IntegrationChannelDto[]
+}
+
+// `/bots` row — a durable bot identity. It outlives the integration installing
+// it: uninstall frees it, and the Add-integration picker offers it for reuse.
+// Metadata only, NEVER tokens.
+export interface BotDto {
+  id: string
+  name: string
+  platform: string
+  prebuilt: boolean
+  slackAppId: string | null // Slack app id (A…) — deep-links to api.slack.com/apps/{id}
+  discordAppId: string | null // Discord application (client) id — builds the "Add to Discord" invite URL
+  feishuAppId?: string | null // Lark/Feishu app id (cli_…) — optional while older control planes roll out
+  feishuRegion?: 'feishu' | 'lark' | null // matching developer-console region; legacy null ⇒ Feishu
+  createdBy: string | null // creator's userId (resolved to a name / "You" in the UI); null for prebuilt/CLI
+  // Inbound transport: 'socket' = daemon-owned long connection, 'http' = public
+  // callbacks. Only a Slack http bot may be shared. Missing (older CP) ⇒ socket.
+  transport: 'socket' | 'http'
+  shareable: boolean // shared-bot opt-in — when true it may serve many agents at once
+  inUseByAgentId: string | null // classic-bot occupancy; ALWAYS null for a shareable bot
+  agentIds: string[] // every agent currently installed on the bot (a shared bot may have many)
+  lastUsedAt: string | null // ISO-8601; stamped when last freed; null ⇒ never used
+  freedFromAgent: string | null // agent it was last freed from ("freed from support-bot")
+  releasedWhenFreed?: boolean // removing its last integration deletes it instead of freeing it
+  teamId?: string | null // Slack workspace id (T…) — platform-app installs only
+  workspaceId?: string | null // external workspace identity used only for Console grouping
+  workspaceName?: string | null // human-readable external workspace label
+  revokedAt?: string | null // workspace uninstalled the app / revoked tokens; null ⇒ live
+  revokedReason?: 'app_uninstalled' | 'tokens_revoked' | null // how that revocation was learned; null when not recorded
+  revokedEvidence?: 'event' | 'probe' | null // a platform lifecycle event, or a probe answering definitively
+  revokedCode?: string | null // the platform's own code recorded with that revocation, when one was
+  credentialRejectedAt?: string | null // an ambiguous check rejected the current credential (first seen); the bot stays live
+  credentialRejectedCode?: string | null // the platform's own code behind that rejection
+  externalAppId?: string | null // the platform's public app identity, such as a Google Chat project number
+  externalTenantId?: string | null // the tenant half of that identity, such as a Teams bot's Microsoft 365 tenant
+  platformConfig?: Record<string, string> | null // public row metadata, such as a Google Chat project ID
+  createdAt: string // ISO-8601
+}
+
+export interface SlackBotRefreshDto {
+  /** `deployment_update_required`: a built-in app's manifest, audited read-only, lacks required scopes; the Setup Server fixes it. */
+  manifest: 'synced' | 'manual_update_required' | 'deployment_update_required' | 'unknown'
+  /** The required bot scopes the manifest does not declare (`deployment_update_required` only). */
+  manifestMissingScopes: string[]
+  authorization: 'current' | 'reinstall_required' | 'invalid' | 'app_mismatch' | 'unknown'
+  /** Slack's own code behind `invalid` (`invalid_auth`, `token_revoked`, …); null otherwise. */
+  rejection: string | null
+  missingScopes: string[]
+  settingsUrl: string
+  manifestUrl: string
+  /** Slack's OAuth & Permissions editor for changing requested scopes. */
+  permissionsUrl: string
+  /** Slack's direct install/reinstall flow for the app. */
+  reinstallUrl: string
+}
+
+// PATCH /agents/:id body — at least one field. `null` clears description/model/displayName.
+export interface UpdateAgentInput {
+  name?: string // slug — the CP rejects anything but ^[a-z0-9]+(-[a-z0-9]+)*$
+  displayName?: string | null
+  icon?: AgentIcon | null // null clears back to the runtime-mark default
+  description?: string | null
+  runtime?: string
+  model?: string | null
+  modelProvider?: AgentModelProvider | null
+  reasoningEffort?: string | null
+  outputMode?: string | null
+  showFooter?: boolean
+  showStatusBar?: boolean
+  fastMode?: boolean | null
+  permissionMode?: string | null
+  chatActions?: ChatActions
+  /** Operational message-processing toggle; true ⇒ agent skips all messages; null clears. */
+  pause?: boolean | null
+  /** #536: self-introduce to peers on a genuine channel join (default off). */
+  introduceOnJoin?: boolean
+  /** What new rooms and group DMs start at; null restores the platform default. Existing conversations keep theirs. */
+  newConversationMode?: NewConversationMode | null
+  /** The managed computer mode, replaced wholesale; null clears (computer-use.md §4.1). */
+  computerUse?: AgentComputerSetting | null
+  /** The strategy new sessions run in, checked against the placement's table (409 with the reason when it cannot run there). */
+  execution?: string
+  /** Widen an existing App-backed GitHub workspace from read to write. */
+  gitAccess?: 'write'
+  /** Repository-relative ACP working directory; null selects the repository root. */
+  agentDir?: string | null
+  /** Replaced wholesale when provided; null clears all variables. */
+  env?: Record<string, string> | null
+  /** Write-only secrets, merged key-by-key: a string sets/replaces a secret, null
+   *  deletes it, an omitted key is left untouched. Values are never returned. */
+  secrets?: Record<string, string | null>
+  /** Live secrets (capability-requests.md §4.9.2), merged key-by-key like `secrets`; null deletes one. Values are never returned. */
+  liveSecrets?: Record<string, { value: string; description?: string } | null>
+  capabilities?: string[]
+  /** Replaced wholesale when provided; [] clears all servers. */
+  mcpServers?: string[]
+  /** Enabled shared-skills; replaced wholesale when provided; [] clears all. */
+  skills?: string[]
+  /** Enabled centrally accepted managed skill ids; replaced wholesale. */
+  managedSkills?: string[]
+  decisionIds?: string[]
+  modelSelection?: AgentModelSelection | null
+  /** The `auto` coordinator's model; null returns it to Default. */
+  coordinatorModel?: CoordinatorModel | null
+  /** True turns the coordinator off; false turns it back on. */
+  coordinatorDisabled?: boolean
+  /** The coordinator filter's Decision provider and model; null removes it. */
+  coordinatorFilter?: AgentCoordinatorFilter | null
+  /** The repository selector's Decision provider and model; null clears. */
+  repositorySelector?: AgentRepositorySelector | null
+  /** Memory backend; null clears (revert to managed default). */
+  memory?: AgentMemoryConfig | null
+  /** Assistant mode, replaced wholesale; turning it on is refused with a 409 when admission fails. */
+  assistantMode?: AssistantModePolicy | null
+  /** Accept a change the CP otherwise refuses with a 409, such as moving the memory home back to `daemon` (keeps no memory). */
+  force?: boolean
+}
+
+/** The ONE workspace input shape, shared verbatim by agent creation and workspace
+ *  replacement (git-workspace-model.md §5). Provenance is server-derived from the
+ *  address; `access` is a request (absent takes the highest tier the target carries:
+ *  write where credentials are minted for it, read for an anonymous checkout). */
+export type AgentWorkspaceInput =
+  | { mode: 'scratch' }
+  | {
+      mode: 'git'
+      /** Full cloneable https/ssh address; bare `owner/repo` is GitHub-only sugar. */
+      gitRepo: string
+      /** Absent lets the server use the target's current default branch. */
+      gitBranch?: string
+      agentDir?: string
+      worktree?: boolean
+      access?: 'read' | 'write'
+    }
+
+export type SetAgentWorkspaceInput = AgentWorkspaceInput
+
+export interface DaemonCapabilitiesDto {
+  platforms: string[]
+  runtimes: string[]
+  acp: boolean
+  features: string[]
+}
+
+// A runtime's discovered model × config capability matrix (protocol
+// `RuntimeModelCatalog` — one shape on the wire, in the CP's JSONB column, and
+// here). `efforts: []` = the model has no effort selector; absent = not yet
+// discovered. `fastMode` mirrors whether the fast toggle appears for the model.
+export interface RuntimeModelCatalogDto {
+  modelSwitching?: boolean
+  models: Array<{
+    id: string
+    name?: string
+    description?: string
+    efforts?: Array<{ value: string; name?: string; description?: string }>
+    defaultEffort?: string
+    fastMode?: boolean
+  }>
+  defaultModel?: string
+  permissionModes?: Array<{ value: string; name?: string; description?: string }>
+  defaultPermissionMode?: string
+  source: 'native' | 'acp'
+  observedAt: string
+}
+
+// Observed runtime capability the daemon reports (`facts/runtime-profile`). `models`
+// is the list the console offers per (machine, runtime) in the create-agent picker.
+export interface RuntimeProfileDto {
+  runtime: string
+  aliasOf?: string | null
+  version: string
+  models: string[]
+  contextWindow: number | null
+  acpSupport: string
+  acpProtocolVersion: number | null
+  toolCalling: boolean
+  // MCP transports the runtime accepts at session/new (from ACP initialize);
+  // null ⇒ not probed (older daemon) ⇒ assume stdio-only.
+  mcpCapabilities: { http: boolean; sse: boolean } | null
+  // Provenance of `models[]`: 'cached' = hydrated from the daemon's last-good
+  // local cache (no live probe this process yet); 'probed' = confirmed live.
+  // null/absent (older daemon) ⇒ probed semantics.
+  modelsSource?: 'cached' | 'probed' | null
+  // Discovered model × config capability matrix; null/absent ⇒ this daemon has
+  // no catalog for the runtime — the console falls back to its static tables.
+  modelCatalog?: RuntimeModelCatalogDto | null
+  // The daemon's last probe was rejected with the ACP auth-required error: the
+  // runtime is installed but needs a login on the daemon host. Absent (older
+  // CP) ⇒ no warning.
+  authRequired?: boolean
+  unavailableReason?: 'image-binary-missing' | 'host-binary-missing' | null
+  hostVersion?: string | null
+  hostAvailable?: boolean | null
+  credentialsConfigured?: boolean | null
+  // The runtime under each strategy the daemon offers; null/absent ⇒ a daemon that predates the entries.
+  strategies?: Record<string, RuntimeStrategyEntry> | null
+}
+
+// One daemon-configured MCP server (name + transport), reported in the
+// facts/daemon-runtimes snapshot (protocol `FactsMcpServer`). Derived from
+// daemon config — not probed.
+export interface McpServerDto {
+  name: string
+  transport: 'stdio' | 'http' | 'sse'
+}
+
+/** `GET /daemons` — the liveness half, without anything that only moves on connect/upgrade. */
+export type DaemonFleetDto = Omit<DaemonViewDto, 'capabilities' | 'runtimeProfiles' | 'mcpServers'>
+
+/** `GET /daemons/capabilities` — what each daemon can run. Each catalog keeps its
+ *  runtime-level answers (`defaultModel`, `permissionModes`) so the read-only model and
+ *  permission labels resolve for every agent, but its `models` matrix is empty: that part
+ *  is 75% of a catalog and only a surface configuring one daemon reads it. */
+export interface DaemonCapabilityDto {
+  daemonId: string
+  capabilities: DaemonCapabilitiesDto
+  runtimeProfiles: RuntimeProfileDto[]
+  mcpServers: McpServerDto[]
+}
+
+/** `GET /daemons/:id` — both halves, catalog included. */
+export interface DaemonViewDto {
+  approval?: DaemonRow['approval']
+  canManageApproval?: boolean
+  daemonId: string
+  host: string | null
+  name: string | null
+  agentVersion: string | null
+  /** Deployment's daemon release channel (npm dist-tag, e.g. `latest`/`rc`). */
+  releaseChannel: string
+  /** Latest daemon version published in `releaseChannel`; null when unresolved. */
+  latestVersion: string | null
+  /** Every published dist-tag version (upgrade picker options), newest-first. */
+  availableVersions: string[]
+  /** The most recent CP-commanded restart/upgrade op (cli-daemon-split.md §7), or null.
+   *  `status` is expiry-projected server-side. The console tracks its OWN command by `id`. */
+  lifecycleOp: DaemonLifecycleOpDto | null
+  status: string
+  /** An install-wide pool member — managed infrastructure shared by every org, one row
+   *  per pool member Pod. Absent from an older CP ⇒ treat as a plain daemon. */
+  cloud?: boolean
+  /** The member set this daemon is in, or null when it owns its agents outright. */
+  memberSetId?: string | null
+  health: string
+  capabilities: DaemonCapabilitiesDto
+  runtimeProfiles: RuntimeProfileDto[]
+  mcpServers: McpServerDto[]
+  load: { cpu: number; mem: number; agents: number } | null
+  sessionEpoch: number
+  maxAgents: number
+  activeSessions: number
+  /** Session environments live on this machine, its own plus any it hosts for the group
+   *  (session-executors.md §6). Null until it reports one; absent on an older CP. */
+  hostedSessions?: number | null
+  lastSeenAt: string | null
+  createdAt: string // ISO-8601
+  createdBy: string | null // creator's userId (resolved to a name / "You" in the UI); null for CLI/self-registered
+  lastModifiedAt: string // ISO-8601
+  lastModifiedBy: string | null // editor's userId (resolved to a name / "You" in the UI); null for CLI/self-registered
+  /** How long a finished session's row and transcript stay on the daemon (the cleanup row's "Session" picker). */
+  sessionRetention: DaemonSessionRetention
+  /** How long a finished session's workspace and sandbox stay, never past its row (the cleanup row's "Workspace" picker). */
+  workspaceRetention: DaemonSessionRetention
+  visibility: ResourceVisibility
+  sharedWith: string[]
+  canEdit: boolean
+  canManageSharing: boolean
+  /** Whether the caller may command restart/upgrade on this daemon (org owner only). */
+  canManageLifecycle: boolean
+  /** Whether the caller may obtain a replacement daemon credential. */
+  canIssueKey: boolean
+  /** The auto-upgrade switch; absent on an older CP ⇒ off. */
+  autoUpgrade?: boolean
+  /** The daemon advertised auto-upgrade support; absent on an older CP ⇒ unsupported. */
+  autoUpgradeSupported?: boolean
+  /** The most recent automatic upgrade; absent on an older CP ⇒ none. */
+  lastAutoUpgrade?: DaemonAutoUpgradeResultDto | null
+}
+
+/** The most recent automatic upgrade on a daemon (daemon-auto-upgrade.md §8). */
+export interface DaemonAutoUpgradeResultDto {
+  id: string
+  status: 'pending' | 'succeeded' | 'failed'
+  targetVersion: string | null
+  outcome: string | null
+  settledAt: string | null
+}
+
+/** The console-settable cleanup window (PATCH /daemons/:id): 'never' disables the sweep, else '<n>d'. */
+export type DaemonSessionRetention = 'never' | `${number}d`
+
+/** A CP-commanded daemon restart/upgrade (cli-daemon-split.md §7). Returned by the
+ *  upgrade/restart POSTs and embedded in each daemon's read model as its latest op. */
+export interface DaemonLifecycleOpDto {
+  id: string
+  op: 'restart' | 'upgrade'
+  status: 'pending' | 'succeeded' | 'failed'
+  phase?: import('@agentconnect.md/protocol').DaemonLifecyclePhase | null
+  targetVersion: string | null
+  outcome: string | null
+  /** Absent on an older CP ⇒ manual. */
+  trigger?: 'manual' | 'auto'
+}
+
+export interface CreateAgentInput {
+  /** The placement TARGET. `pool` is the API sugar for the install-wide member set; `set` names
+   *  one of the org's own groups through `setId`; omitting both pins the agent to `daemonId`. */
+  placementKind?: 'pool' | 'set'
+  /** The group a `set` placement names (daemon-groups.md §2). */
+  setId?: string
+  name: string // slug — the CP rejects anything but ^[a-z0-9]+(-[a-z0-9]+)*$
+  displayName?: string
+  icon?: AgentIcon // absent ⇒ the CP assigns a random glyph+color
+  runtime: string
+  description?: string
+  model?: string
+  modelProvider?: AgentModelProvider
+  reasoningEffort?: string
+  outputMode?: string // platform output verbosity: low | medium | high
+  showFooter?: boolean
+  showStatusBar?: boolean
+  fastMode?: boolean // runtime fast mode toggle
+  permissionMode?: string // runtime permission/approval mode
+  chatActions?: ChatActions // absent ⇒ the Control Plane's new-agent default
+  pause?: boolean // operational message-processing toggle; true ⇒ agent skips all messages
+  env?: Record<string, string>
+  secrets?: Record<string, string> // write-only secret env vars (initial set)
+  /** The owning daemon, if chosen at create. */
+  daemonId?: string
+  /** Where it runs; absent ⇒ the CP defaults to scratch. Immutable after create. */
+  workspace?: AgentWorkspaceInput
+  capabilities?: string[]
+  /** Daemon-configured MCP server names to attach at session/new; absent ⇒ none. */
+  mcpServers?: string[]
+  /** Enabled shared-skills "<source>/<skill>" / "<source>/*"; absent ⇒ none. */
+  skills?: string[]
+  /** Enabled centrally accepted managed skill ids; absent ⇒ none. */
+  managedSkills?: string[]
+  decisionIds?: string[]
+  modelSelection?: AgentModelSelection
+  coordinatorModel?: CoordinatorModel
+  coordinatorDisabled?: boolean
+  coordinatorFilter?: AgentCoordinatorFilter
+  /** Memory backend; absent ⇒ managed default. */
+  memory?: AgentMemoryConfig
+  /** The strategy sessions run in; absent ⇒ the Control Plane's default for the placement. */
+  execution?: string
+  /** Initial visibility (absent ⇒ 'org'); sharedWith is intersected with org members. */
+  visibility?: ResourceVisibility
+  sharedWith?: string[]
+  /** Initial agent-call policy (absent ⇒ the organization's default); allowedCallerAgentIds is
+   *  intersected with visible same-org peers and only bites when 'selected'. */
+  callPolicy?: AgentCallPolicy
+  allowedCallerAgentIds?: string[]
+  /** Outbound half (absent ⇒ the organization's default); intersected with visible peers server-side. */
+  outboundPolicy?: AgentCallPolicy
+  allowedTargetAgentIds?: string[]
+}
+
+// Response of `POST /daemons/token`: a fresh daemon identity + its one-time API key
+// and the copy-paste command that starts a daemon pointed at this CP. The full
+// `apiKey` is returned exactly once (not retrievable later); `displayTail` is the
+// non-secret label. The console polls `GET /daemons` for `daemonId` to confirm the
+// daemon came online.
+export interface DaemonConnectDto {
+  daemonId: string
+  apiKey: string
+  displayTail: string
+  command: string
+}
+
+// One org member (`/members`) — the membership joined with its user. Members
+// appear via JIT provisioning at first OIDC sign-in, or when an owner adds
+// them by email (POST /members — claimed at their first sign-in).
+export type MemberRole = 'owner' | 'collaborator' | 'viewer'
+
+export interface MemberDto {
+  userId: string
+  email: string | null // real email; null while the CP only knows a synthetic placeholder
+  name: string | null // displayName
+  picture: string | null // custom uploaded profile photo, or the OIDC `picture` fallback
+  role: MemberRole
+  isCurrentUser: boolean
+  joinedAt: string // ISO-8601 — when they joined THIS org
+}
+
+// What leaving / removing a member would do to Selected audiences.
+export type VisibilityResourceKind =
+  'agent' | 'daemon' | 'cron' | 'mcpProvider' | 'skillSource' | 'decision' | 'computer'
+
+export interface MemberRemovalPreviewDto {
+  replacement: MemberDto | null // null only when removal is refused (final organization owner)
+  resources: { kind: VisibilityResourceKind; selected: number; reassigned: number }[]
+}
+
+export interface OrgInviteLinkDto {
+  id: string
+  displayTail: string
+  status: 'active' | 'expired' | 'revoked'
+  expiresAt: string
+  revokedAt: string | null
+  createdAt: string
+}
+
+export interface CreatedOrgInviteLinkDto extends OrgInviteLinkDto {
+  /** One-time plaintext used to assemble `/join/<token>` in the current browser. */
+  token: string
+}
+
+export interface AcceptedOrgInviteLinkDto {
+  status: 'accepted' | 'already_member'
+  org: { id: string; slug: string; name: string | null }
+}
+
+export const ROLE_LABELS: Record<MemberRole, string> = {
+  owner: 'Owner',
+  collaborator: 'Collaborator',
+  viewer: 'Viewer'
+}
+
+// One org from the caller's perspective (`/orgs`) — the console picker/Settings.
+export interface OrgDto {
+  id: string
+  /** Optional display name; null ⇒ show `slug` instead. */
+  name: string | null
+  slug: string
+  /** Console avatar descriptor; null ⇒ generated default. `image` carries no url —
+   *  reassemble via withIconUrl(o.icon, o.iconUrl) at render sites. */
+  icon: AgentIcon | null
+  /** Resolved URL for an uploaded `image` org icon; null otherwise. */
+  iconUrl: string | null
+  /** Default applied to both directional policies of newly created agents. */
+  defaultAgentVisibility?: AgentCallPolicy
+  /** Auto-upgrade switch that daemons created in this org from now on start with. */
+  defaultDaemonAutoUpgrade?: boolean
+  /** Whether the object store is configured — the console shows Upload only when true. */
+  iconUploadEnabled: boolean
+  /** The signed-in user's role in this org. */
+  role: MemberRole
+  memberCount: number
+  /** Registered daemons in this org (any status); undefined on older CPs. */
+  daemonCount?: number
+  /** Onboarding wizard done (finish OR skip); undefined on older CPs ⇒ treat as done. */
+  onboardingCompleted?: boolean
+  /** Getting-started tutorial position: checklist steps passed (completed or skipped). */
+  gettingStartedStep?: number
+  createdAt: string // ISO-8601
+}
+
+// ── active org ────────────────────────────────────────────────────────────────
+// The CP API is path-scoped: every org resource lives under `/orgs/{orgId}/…`.
+// The OrgProvider resolves the URL's org slug to an id and hands it here; the
+// endpoint helpers below prefix their paths with it.
+let apiOrgId: string | null = null
+
+/** Set by the OrgProvider whenever the active org (from the URL) resolves. */
+export function setApiOrgId(orgId: string | null): void {
+  if (apiOrgId !== orgId) invalidateGithubRepoRosterCache()
+  apiOrgId = orgId
+}
+
+/** The active org's API prefix. Org-scoped calls before the org resolves are a
+ *  programming error (data pulls wait for the org context) — fail loudly. */
+export function orgBase(orgId?: string): string {
+  const resolved = orgId ?? apiOrgId
+  if (!resolved) throw new ApiError('no active organization', 0)
+  return `/orgs/${encodeURIComponent(resolved)}`
+}
+
+// A daemon's API key in the console list (never the secret or hash).
+export interface ApiKeyDto {
+  id: string
+  displayTail: string
+  name: string | null
+  createdAt: string
+  lastUsedAt: string | null
+  expiresAt: string | null
+  revokedAt: string | null
+}
+
+// `POST /daemons/:id/keys` response: the one-time plaintext + a ready-to-run command.
+export interface MintedKeyDto {
+  apiKeyId: string
+  apiKey: string
+  displayTail: string
+  command: string
+}
+
+// What a key may do (daemon-api-key-auth.md §6): `full` is the default, `read` admits reads only, `agent:chat` the agent chat API for its selected agents.
+export type ApiKeyPermission = 'full' | 'read' | 'agent:chat'
+
+export interface ApiKeyAgentRef {
+  id: string
+  name: string
+  displayName: string | null
+}
+
+// A personal (user) API key in the profile list — carries the org it acts in
+// (a user's keys span every org they belong to). Never the secret or hash.
+export interface UserApiKeyDto {
+  id: string
+  displayTail: string
+  name: string | null
+  orgId: string
+  orgSlug: string
+  orgName: string | null // null ⇒ fall back to the slug
+  permission: ApiKeyPermission
+  // The agent selection; meaningful for an agent-level permission only.
+  allAgents: boolean
+  agentIds: string[]
+  // The selected agents with their names; a deleted agent's row is already gone.
+  agents: ApiKeyAgentRef[]
+  createdAt: string
+  lastUsedAt: string | null
+  expiresAt: string | null
+  revokedAt: string | null
+}
+
+// `POST /me/keys` response: the one-time plaintext (shown once, never retrievable).
+export interface MintedUserKeyDto {
+  apiKeyId: string
+  apiKey: string
+  displayTail: string
+  permission: ApiKeyPermission
+  allAgents: boolean
+  agentIds: string[]
+}
+
+// ── fetch helpers ───────────────────────────────────────────────────────────
+async function authHeaders(extra?: Record<string, string>): Promise<Record<string, string>> {
+  const h: Record<string, string> = { ...extra }
+  // Live OIDC token (when configured) wins; otherwise fall back to the static one.
+  const token = (await getToken()) ?? TOKEN
+  if (token) h.authorization = `Bearer ${token}`
+  // Forward the signed-in user's real email. The CP verifies a resource access
+  // token that omits the email claim, so it uses this display-only hint to record
+  // (and upgrade) the creator's email on the user row — which the members list then
+  // resolves to a display name (creator rows key on userId, not this email).
+  const email = (await getUser())?.email
+  if (email) h['x-ac-user-email'] = email
+  // The signed id token — a VERIFIABLE identity hint. Logto access tokens for an
+  // API resource omit the email claim, so the CP checks this token's signature
+  // (same issuer) and takes email/name from it for JIT provisioning; the plain
+  // x-ac-user-email header above stays display-only.
+  const idToken = await getIdTokenRaw()
+  if (idToken) h['x-ac-id-token'] = idToken
+  return h
+}
+
+function bearerToken(headers: Record<string, string>): string | undefined {
+  return headers.authorization?.replace(/^Bearer\s+/i, '')
+}
+
+async function responseCode(response: Response): Promise<string | undefined> {
+  const body = (await response
+    .clone()
+    .json()
+    .catch(() => ({}))) as Record<string, unknown>
+  return typeof body.code === 'string' ? body.code : undefined
+}
+
+/** Retry one CP request with a forced Logto token refresh. A second 401 means
+ * the browser session cannot recover, so send it back through sign-in instead
+ * of leaving individual panels on a Retry button that replays the same token. */
+async function authenticatedFetch(
+  path: string,
+  init: Omit<RequestInit, 'headers'> = {},
+  extraHeaders?: Record<string, string>
+): Promise<Response> {
+  const url = `${cpBase()}${path}`
+  const firstHeaders = await authHeaders(extraHeaders)
+  const first = await fetch(url, { ...init, headers: firstHeaders })
+  if (first.status !== 401 || (await responseCode(first)) === 'ACCOUNT_GONE') return first
+
+  const refreshed = await refreshTokenAfterUnauthorized(bearerToken(firstHeaders))
+  if (!refreshed) {
+    await redirectExpiredSession()
+    return first
+  }
+
+  const retried = await fetch(url, { ...init, headers: await authHeaders(extraHeaders) })
+  if (retried.status === 401 && (await responseCode(retried)) !== 'ACCOUNT_GONE') await redirectExpiredSession()
+  return retried
+}
+
+async function apiGet<T>(path: string, init?: Omit<RequestInit, 'headers'>): Promise<T> {
+  const res = await authenticatedFetch(path, { cache: 'no-store', ...init })
+  // Parse the denial body like the write helpers do: reads carry machine-readable
+  // `code`s too (e.g. DAEMON_FEATURE_MISSING on a capability-gated route), and a
+  // status-only ApiError silently drops them.
+  if (!res.ok) throw await apiErrorFromResponse('GET', path, res)
+  return (await res.json()) as T
+}
+
+export interface SessionActivityDto {
+  sessionId: string
+  agentId: string
+  revision: string
+  ts: string
+}
+
+export type SessionActivityState = 'thinking' | 'tool_call' | 'awaiting_permission' | 'idle'
+
+/** A session's live wait-state change (`session-state` SSE event, slack-approval-dm.md §7). */
+export interface SessionStateDto {
+  sessionId: string
+  agentId: string
+  state: SessionActivityState
+  ts: string
+}
+
+export interface SessionEventHandlers {
+  onConnect: () => void
+  onSession: () => void
+  onActivity: (activity: SessionActivityDto) => void
+  /** Optional: a wait-state flip invalidates only the pending-approvals read. */
+  onState?: (state: SessionStateDto) => void
+}
+
+// Reopen the stream periodically so each cycle asks the SDK for a current OIDC
+// resource token without forcing a refresh while the cached token is valid.
+const SESSION_STREAM_REAUTH_MS = 5 * 60_000
+
+function waitBeforeReconnect(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', finish)
+      resolve()
+    }
+    const timer = setTimeout(finish, ms)
+    if (signal.aborted) finish()
+    else signal.addEventListener('abort', finish, { once: true })
+  })
+}
+
+async function readSessionEventStream(
+  orgId: string,
+  signal: AbortSignal,
+  handlers: SessionEventHandlers,
+  recoverGap: boolean
+): Promise<'ended' | 'reauth'> {
+  const request = new AbortController()
+  let reauth = false
+  const abort = () => request.abort(signal.reason)
+  if (signal.aborted) abort()
+  else signal.addEventListener('abort', abort, { once: true })
+  const reauthTimer = setTimeout(() => {
+    reauth = true
+    request.abort()
+  }, SESSION_STREAM_REAUTH_MS)
+  const path = `/orgs/${encodeURIComponent(orgId)}/stream`
+  try {
+    const res = await authenticatedFetch(
+      path,
+      { cache: 'no-store', signal: request.signal },
+      { accept: 'text/event-stream' }
+    )
+    if (!res.ok) throw new ApiError(`GET ${path} → ${res.status} ${res.statusText}`, res.status)
+    if (!res.body) throw new Error('session event stream is not readable')
+
+    // The sink has no replay/event ids, so an initial or recovered connection
+    // invalidates cached reads once. Planned token rotation is not a gap recovery.
+    if (recoverGap) handlers.onConnect()
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    const parser = createSseParser((event) => {
+      if (event.event === 'session') {
+        handlers.onSession()
+        return
+      }
+      if (event.event === 'session-state') {
+        try {
+          const state = (JSON.parse(event.data) as { state?: SessionStateDto }).state
+          if (state && typeof state.sessionId === 'string' && typeof state.agentId === 'string') {
+            handlers.onState?.(state)
+          }
+        } catch {
+          // A malformed optional signal is ignored; reconnect/focus refresh heals it.
+        }
+        return
+      }
+      if (event.event !== 'session-activity') return
+      try {
+        const activity = (JSON.parse(event.data) as { activity?: SessionActivityDto }).activity
+        if (
+          activity &&
+          typeof activity.sessionId === 'string' &&
+          typeof activity.agentId === 'string' &&
+          /^\d+$/.test(activity.revision) &&
+          typeof activity.ts === 'string'
+        )
+          handlers.onActivity(activity)
+      } catch {
+        // A malformed optional invalidation is ignored; reconnect/focus refresh heals it.
+      }
+    })
+
+    try {
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        parser.push(decoder.decode(value, { stream: true }))
+      }
+      parser.push(decoder.decode())
+    } finally {
+      reader.releaseLock()
+    }
+    return 'ended'
+  } catch (error) {
+    if (reauth && !signal.aborted) return 'reauth'
+    throw error
+  } finally {
+    clearTimeout(reauthTimer)
+    signal.removeEventListener('abort', abort)
+  }
+}
+
+/**
+ * Subscribe to the org's session SSE feed with the same auth headers as REST.
+ * Lifecycle events invalidate lists; activity events identify the transcript
+ * that should pull its daemon-local tail. Returns an abort cleanup.
+ */
+export function subscribeSessionEvents(
+  orgId: string,
+  handlers: SessionEventHandlers,
+  onError?: (error: unknown) => void
+): () => void {
+  const ctrl = new AbortController()
+  let retryMs = 1000
+  let recoverGap = true
+
+  void (async () => {
+    while (!ctrl.signal.aborted) {
+      try {
+        const ended = await readSessionEventStream(orgId, ctrl.signal, handlers, recoverGap)
+        retryMs = 1000
+        if (ended === 'reauth') {
+          recoverGap = false
+          continue
+        }
+      } catch (error) {
+        if (ctrl.signal.aborted) return
+        onError?.(error)
+      }
+      recoverGap = true
+      if (ctrl.signal.aborted) return
+      await waitBeforeReconnect(retryMs, ctrl.signal)
+      retryMs = Math.min(retryMs * 2, 30_000)
+    }
+  })()
+
+  return () => ctrl.abort()
+}
+
+async function apiPost<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await authenticatedFetch(
+    path,
+    {
+      method: 'POST',
+      body: JSON.stringify(body),
+      signal
+    },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) throw await apiErrorFromResponse('POST', path, res)
+  // Same split `apiDelete` makes, and for the same reason: a POST that COMMANDS rather
+  // than creates replies 204 No Content (leave a conversation, disconnect a workspace),
+  // while one that returns a row replies 200/201 with a body. Parsing unconditionally
+  // turned every SUCCESSFUL no-content write into a thrown SyntaxError — after the
+  // server had already done the thing.
+  if (res.status === 204) return undefined as T
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
+}
+
+// The CP rejects a malformed body with one generic message and puts the per-field zod
+// issues in `details.issues`; render those so a dialog names the field it refused.
+function schemaIssueMessage(body: Record<string, unknown>): string | null {
+  const issues = (body.details as { issues?: unknown } | undefined)?.issues
+  if (!Array.isArray(issues)) return null
+  const lines = issues
+    .slice(0, 3)
+    .map((raw) => {
+      const issue = raw as { instancePath?: unknown; message?: unknown }
+      if (typeof issue.message !== 'string' || !issue.message) return null
+      const field =
+        typeof issue.instancePath === 'string' ? issue.instancePath.split('/').filter(Boolean).pop() : undefined
+      // Most refinements already name their field; only prefix the ones that don't.
+      return field && !issue.message.includes(field) ? `${field}: ${issue.message}` : issue.message
+    })
+    .filter((line): line is string => line !== null)
+  return lines.length > 0 ? lines.join('; ') : null
+}
+
+async function apiErrorFromResponse(method: string, path: string, res: Response): Promise<ApiError> {
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>
+  const message =
+    (body.message === 'request does not match schema' ? schemaIssueMessage(body) : null) ??
+    (typeof body.message === 'string' && body.message.length > 0
+      ? body.message
+      : `${method} ${path} → ${res.status} ${res.statusText}`)
+  const code = typeof body.code === 'string' ? body.code : undefined
+  // The token is still valid but its account was deleted (admin action): nothing in
+  // the console can work, and no retry helps, so sign out instead of surfacing the
+  // failure on every panel. The error is still thrown for the in-flight caller.
+  if (res.status === 401 && code === 'ACCOUNT_GONE') void signOutDeletedAccount()
+  return new ApiError(message, res.status, code, body)
+}
+
+async function apiPatch<T>(path: string, body: unknown): Promise<T> {
+  const res = await authenticatedFetch(
+    path,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(body)
+    },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) {
+    // Surface the CP's human-readable denial (e.g. the shared-bot 409s: "no relay
+    // is connected…") instead of a bare status line.
+    throw await apiErrorFromResponse('PATCH', path, res)
+  }
+  return (await res.json()) as T
+}
+
+export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
+  const res = await authenticatedFetch(
+    path,
+    {
+      method: 'PUT',
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    },
+    body === undefined ? undefined : { 'content-type': 'application/json' }
+  )
+  if (!res.ok) throw await apiErrorFromResponse('PUT', path, res)
+  if (res.status === 204) return undefined as T
+  return (await res.json()) as T
+}
+
+async function apiDelete<T>(path: string, body?: unknown): Promise<T> {
+  const res = await authenticatedFetch(
+    path,
+    {
+      method: 'DELETE',
+      ...(body === undefined ? {} : { body: JSON.stringify(body) })
+    },
+    body === undefined ? undefined : { 'content-type': 'application/json' }
+  )
+  if (!res.ok) throw await apiErrorFromResponse('DELETE', path, res)
+  // Some deletes reply 204 No Content (daemon delete); others 200 with a body
+  // (key revoke). Parse a body only when there is one.
+  if (res.status === 204) return undefined as T
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
+}
+
+// ── OAuth consent (agent-assistant.md §7.3) ─────────────────────────────────
+// The consent page (app/oauth/consent) renders the approval screen for a remote
+// MCP client's browser login and mints the authorization code via these.
+
+export interface OAuthConsentContext {
+  clientId: string
+  clientName: string | null
+  scopes: string[]
+  organizations: { id: string; slug: string; name: string | null; role: string }[]
+}
+
+/** Approval-screen data for a pending /authorize request: who's asking, for what scopes, and which orgs can take the grant; the CP refuses an unregistered `redirectUri`. */
+export function getOAuthConsentContext(
+  clientId: string,
+  redirectUri: string,
+  scope?: string
+): Promise<OAuthConsentContext> {
+  const qs = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, ...(scope ? { scope } : {}) })
+  return apiGet<OAuthConsentContext>(`/oauth/consent/context?${qs.toString()}`)
+}
+
+export interface OAuthConsentInput {
+  clientId: string
+  redirectUri: string
+  codeChallenge: string
+  codeChallengeMethod: string
+  scope?: string
+  state?: string
+  resource?: string
+  orgId: string
+  decision: 'allow' | 'deny'
+  grantedScopes?: string[]
+}
+
+/** Submit the user's decision; returns the URL to bounce the browser back to the
+ *  MCP client (carrying `code` on approve, or `error=access_denied` on deny). */
+export function postOAuthConsent(input: OAuthConsentInput): Promise<{ redirectUrl: string }> {
+  return apiPost<{ redirectUrl: string }>('/oauth/consent', input)
+}
+
+// ── DTO → UI mappers ────────────────────────────────────────────────────────
+const PLACEHOLDER = '—'
+
+function toStatusKey(raw: string): ConnectionStatusKey {
+  const s = (raw || '').toLowerCase()
+  if (['online', 'running', 'active', 'ready', 'live', 'working', 'connected', 'idle', 'completed'].includes(s))
+    return 'online'
+  if (['paused', 'draining', 'awaiting', 'blocked', 'prompting', 'resuming', 'cancelling'].includes(s)) return 'paused'
+  if (
+    [
+      'waiting',
+      'connecting',
+      'authenticating',
+      'registering',
+      'inactive',
+      'offline',
+      'stopped',
+      'error',
+      'dead',
+      'failed',
+      'disconnected',
+      'unreachable',
+      'pending',
+      'provisioned',
+      'key-reaped'
+    ].includes(s)
+  )
+    return 'offline'
+  return 'offline'
+}
+
+function fmtTime(iso: string | null): string {
+  if (!iso) return PLACEHOLDER
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return PLACEHOLDER
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  const now = new Date()
+  if (d.toDateString() === now.toDateString()) return time
+
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  if (d.toDateString() === yesterday.toDateString()) return `Yesterday, ${time}`
+
+  const date =
+    d.getFullYear() === now.getFullYear()
+      ? d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+      : d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+  return `${date}, ${time}`
+}
+
+// Absolute calendar date for "Created"/"Member since" rows, e.g. "Mar 4, 2026".
+export function fmtDate(iso: string | null): string {
+  if (!iso) return PLACEHOLDER
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return PLACEHOLDER
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function fmtSeen(iso: string | null): string {
+  if (!iso) return PLACEHOLDER
+  const ms = Date.now() - new Date(iso).getTime()
+  if (!Number.isFinite(ms) || ms < 0) return PLACEHOLDER
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h`
+  return `${Math.floor(h / 24)}d`
+}
+
+// `gitRepo` is STORED as a full cloneable address (e.g. https://github.com/acme/infra
+// or git@github.com:acme/infra.git); pre-normalization rows may still carry the bare
+// "org/repo" shorthand. Split either form into host + org/repo path — the UI shows
+// only the short path and links to the browsable https URL.
+function repoParts(gitRepo: string): { host: string; path: string } | null {
+  const s = gitRepo
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\.git$/, '')
+  // scheme URLs: https://github.com/acme/infra, ssh://git@github.com/acme/infra
+  let m = /^[a-z][a-z0-9+.-]*:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/(.+)$/i.exec(s)
+  if (m) return { host: m[1]!, path: m[2]! }
+  // scp-like ssh: git@github.com:acme/infra
+  m = /^[\w.-]+@([\w.-]+):(.+)$/.exec(s)
+  if (m) return { host: m[1]!, path: m[2]!.replace(/^\/+/, '') }
+  const seg = s.split('/')
+  // host-prefixed shorthand: github.com/acme/infra
+  if (seg.length >= 3 && seg[0]!.includes('.')) return { host: seg[0]!, path: seg.slice(1).join('/') }
+  // bare org/repo (legacy shorthand)
+  if (seg.length === 2) return { host: 'github.com', path: s }
+  return null
+}
+
+/** Short `org/repo` display form of a stored git address. */
+export function repoLabel(gitRepo: string): string {
+  return repoParts(gitRepo)?.path ?? gitRepo
+}
+
+/** Browsable https URL of a stored git address (undefined when unparsable). */
+export function repoWebUrl(gitRepo: string): string | undefined {
+  const p = repoParts(gitRepo)
+  return p ? `https://${p.host}/${p.path}` : undefined
+}
+
+// Map the wire workspace (gitRepo/gitBranch/agentDir) into the richer UI shape.
+// The CP does not surface git state (commit/pull/dirty/files), so those render
+// as placeholders / empty until a daemon read model exists.
+function workspaceFromDto(w: AgentWorkspaceDto, workspaceRepoId?: string | null): Workspace {
+  if (w.mode === 'git') {
+    return {
+      mode: 'git',
+      worktree: w.worktree === true,
+      gitRepo: w.gitRepo,
+      repo: repoLabel(w.gitRepo),
+      ...(repoWebUrl(w.gitRepo) ? { repoUrl: repoWebUrl(w.gitRepo) } : {}),
+      ...(w.credential !== undefined ? { provider: w.credential.provider, gitAccess: w.credential.access } : {}),
+      ...(workspaceRepoId ? { repoId: workspaceRepoId } : {}),
+      branch: w.gitBranch || 'main',
+      agentDir: w.agentDir || '/',
+      lastPull: PLACEHOLDER,
+      commit: PLACEHOLDER,
+      commitMsg: '',
+      commitTime: '',
+      clean: true,
+      files: []
+    }
+  }
+  return { mode: 'scratch', created: PLACEHOLDER, size: PLACEHOLDER, files: [] }
+}
+
+// A member's display name: their CP displayName, else the email local-part. The CP
+// stores displayName null for social accounts with no profile name (a GitHub account
+// with Name unset carries no `name` claim) — the common case — so the local-part is the
+// real label. Shared with the Members list (SettingsView) so "Created by" and the roster
+// never drift.
+export function memberDisplayName(m: Pick<MemberDto, 'name' | 'email'>): string {
+  return m.name || m.email?.split('@')[0] || 'Member'
+}
+
+// Org-member directory (userId → display name), populated by the console data layer from
+// GET /orgs/:id/members. A module-level cache so creatorLabel stays a plain call the
+// render sites can use; consumers re-render when the members context value lands and
+// re-run the lookup.
+let memberNamesByUserId = new Map<string, string>()
+
+/** Refresh the userId→name directory creatorLabel consults. Called on each members pull. */
+export function setMemberDirectory(members: MemberDto[]): void {
+  const next = new Map<string, string>()
+  for (const m of members) next.set(m.userId, memberDisplayName(m))
+  memberNamesByUserId = next
+}
+
+// The CP returns a creator's userId (or null). Turn it into a human label, resolved
+// UNIFORMLY with session senders (see isSelfSender): "You" for the signed-in viewer, else
+// the org member's name (via the directory above), else the em-dash placeholder — used
+// both for no-creator (CLI/daemon) rows and a creator the directory doesn't know (e.g. a
+// member who has since left the org). `me` is the CP /me record — pass it from
+// useProfile() at the call site. Exported so render sites (bots, schedules, daemon/agent
+// detail) resolve at paint time and re-run once the member directory has loaded.
+export function creatorLabel(userId: string | null, me: MeDto | null): string {
+  if (!userId) return PLACEHOLDER
+  if (isSelfSender(userId, me)) return 'You'
+  // Mock/demo rows carry a display name here (not a real userId), so show it verbatim;
+  // real data shows "—" for an unknown id rather than leaking a raw `usr_…`.
+  return memberNamesByUserId.get(userId) ?? (MOCK_MODE ? userId : PLACEHOLDER)
+}
+
+export function agentFromDto(d: AgentDto): Agent {
+  const ws = workspaceFromDto(d.workspace, d.workspaceRepoId)
+  return {
+    id: d.id,
+    name: d.name,
+    ...(d.displayName ? { displayName: d.displayName } : {}),
+    ...(d.builtin ? { builtin: true } : {}),
+    icon: withIconUrl(d.icon, d.iconUrl),
+    // Blank when the agent has no explicit model — the UI shows "Default" (runtime
+    // default). Never fall back to the runtime id: that would fabricate a model.
+    model: d.model ?? '',
+    ...(d.computerUse ? { computerUse: d.computerUse } : {}),
+    modelSelection: d.modelSelection ?? null,
+    coordinatorModel: d.coordinatorModel ?? null,
+    coordinatorDisabled: d.coordinatorDisabled === true,
+    coordinatorFilter: d.coordinatorFilter ?? null,
+    repositorySelector: d.repositorySelector ?? null,
+    // Blank when the runtime is deferred (an unplaced preset) — mirrors the
+    // daemon '—' coalesce below; display sites render '—' for an empty runtime.
+    runtime: d.runtime ?? '',
+    desc: d.description ?? PLACEHOLDER,
+    // '—' when the CP has no explicit value: the daemon then falls back to the
+    // local agent.json (default 'low'). Session count is derived in the view from
+    // the fetched `/sessions` list, so it's not a field here.
+    outputMode: d.outputMode ?? PLACEHOLDER,
+    showFooter: d.showFooter ?? true,
+    showStatusBar: d.showStatusBar ?? false,
+    reasoning: d.reasoningEffort ?? '',
+    // Unset (null) reads as "Off" — the runtime default.
+    fastMode: d.fastMode ?? false,
+    // Unset (null) reads as not paused.
+    pause: d.pause ?? false,
+    // Memory backend (unset ⇒ managed default).
+    memoryProvider: d.memory?.provider ?? 'managed',
+    memoryAutoDistill: d.memory?.provider === 'managed' ? (d.memory.autoDistill ?? false) : false,
+    ...(d.memory?.provider === 'managed' && d.memory.dreaming ? { memoryDreaming: d.memory.dreaming } : {}),
+    ...(d.memory?.provider === 'managed' && d.memory.home ? { memoryHome: d.memory.home } : {}),
+    ...(d.memory?.provider === 'managed' && d.memory.homeMigration
+      ? { memoryHomeMigration: d.memory.homeMigration }
+      : {}),
+    ...(d.memory?.provider === 'external'
+      ? {
+          memoryConnectionId: d.memory.connectionId,
+          memoryRecall: d.memory.recall,
+          memoryCaptureMode: d.memory.capture?.mode ?? 'manual'
+        }
+      : {}),
+    ...(d.assistantMode ? { assistantMode: d.assistantMode } : {}),
+    permissionMode: d.permissionMode ?? '',
+    chatActions: d.chatActions ?? 'talk',
+    env: Object.entries(d.env ?? {}).map(([k, v]) => ({ k, v })),
+    secretKeys: d.secretKeys ?? [],
+    ...(d.liveSecrets ? { liveSecrets: d.liveSecrets } : {}),
+    // Inherited organization rows. Empty on an older CP, which renders exactly as
+    // the pre-feature console did.
+    organizationVariables: (d.organizationVariables ?? []).map((e) => ({ k: e.key, v: e.value })),
+    organizationSecretKeys: d.organizationSecretKeys ?? [],
+    // A `pool` placement names no member, on purpose: whichever member holds the agent's duty
+    // serves it, so the row carries the KIND and a server-computed readiness instead of a Pod id
+    // that a rollout invalidates.
+    placementKind: d.placementKind ?? 'daemon',
+    placementReady: d.placementReady ?? false,
+    ahpWebchat: d.ahpWebchat === true,
+    // The set id rides along: `daemon` alone cannot tell the pool from one of the org's own groups,
+    // and only a caller holding the org's set list can (daemon-groups.md §2).
+    setId: d.setId ?? null,
+    ...(d.holderDaemonId ? { holderDaemonId: d.holderDaemonId } : {}),
+    daemon: placementValueOf(d) ?? PLACEHOLDER,
+    ...(d.daemonName ? { daemonName: d.daemonName } : {}),
+    region: PLACEHOLDER,
+    repo: ws.mode !== 'scratch' ? ws.repo : PLACEHOLDER,
+    workdir: ws.mode !== 'scratch' ? ws.agentDir : PLACEHOLDER,
+    // A paused agent reads as "paused" regardless of placement — pause is a deliberate
+    // operator state, orthogonal to online/offline. Gives the "Paused" filter tab meaning.
+    status: d.pause ? 'paused' : toStatusKey(d.status),
+    tokens: PLACEHOLDER,
+    cost: PLACEHOLDER,
+    createdBy: d.createdBy ?? '', // creator userId; creatorLabel resolves it to a name / "You" at render
+    createdAt: fmtDate(d.createdAt),
+    lastModifiedBy: d.lastModifiedBy ?? '', // editor userId; creatorLabel resolves it to a name / "You" at render
+    lastModifiedAt: fmtDate(d.lastModifiedAt),
+    visibility: d.visibility,
+    sharedWith: d.sharedWith,
+    canEdit: d.canEdit,
+    canManageSharing: d.canManageSharing,
+    callPolicy: d.callPolicy ?? 'all',
+    allowedCallerAgentIds: d.allowedCallerAgentIds ?? [],
+    outboundPolicy: d.outboundPolicy ?? 'all',
+    allowedTargetAgentIds: d.allowedTargetAgentIds ?? [],
+    // Unset (older CP) reads as off — the product default.
+    introduceOnJoin: d.introduceOnJoin ?? false,
+    newConversationMode: d.newConversationMode ?? null,
+    githubAppId: d.githubAppId ?? null,
+    // An older CP that names no strategy is read as the unplaced agent's host-only table.
+    execution: d.execution ?? HOST_STRATEGY,
+    strategies: d.strategies ?? HOST_ONLY_TABLE,
+    hookKinds: d.hookKinds ?? [],
+    apiProtocols: d.apiProtocols ?? [],
+    integrations: [],
+    workspace: ws
+  }
+}
+
+// Compact count: 1_240_000 → "1.24M", 92_000 → "92K".
+export function fmtCountCompact(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return PLACEHOLDER
+  // Strip trailing zeros only AFTER a decimal point — never the integer part.
+  // A bare `/\.?0+$/` would turn "10" → "1", rendering 10M as "1M".
+  const trim = (s: string) => (s.includes('.') ? s.replace(/\.?0+$/, '') : s)
+  // Group the integer part — "B" is the largest unit, so past 1000B the digits keep going.
+  const fmt = (v: number, digits: number) =>
+    trim(v.toFixed(digits)).replace(/^-?\d+/, (i) => Number(i).toLocaleString('en-US'))
+  if (n >= 1_000_000_000) return fmt(n / 1_000_000_000, n >= 10_000_000_000 ? 0 : 2) + 'B'
+  if (n >= 1_000_000) return fmt(n / 1_000_000, n >= 10_000_000 ? 0 : 2) + 'M'
+  if (n >= 1_000) return fmt(n / 1_000, n >= 10_000 ? 0 : 1) + 'K'
+  return n.toLocaleString('en-US')
+}
+
+// Format the daemon-metered session cost. Currency is an ISO code (e.g. "USD");
+// fall back to prefixing the raw code when it isn't one we render with a symbol.
+export function fmtCost(amount: number | undefined, currency: string | undefined): string {
+  if (amount == null || !Number.isFinite(amount)) return PLACEHOLDER
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: currency || 'USD' }).format(amount)
+  } catch {
+    return `${currency ? currency + ' ' : ''}${amount}`
+  }
+}
+
+function sessionChannelLabel(
+  platform: string,
+  rawChannel: string,
+  channelName: string | null,
+  triggeredByName: string | null,
+  hookKind: HookKind | null | undefined
+): string {
+  // webchat's `channel` is its conversation id: show the API key that opened it, else "Playground"; channelId keeps the id for resume.
+  const isWebchat = platform === 'webchat'
+  const isDream = platform === 'dream'
+  // A headless webhook's `channel` is the hook id (and `thread` may be the delivery key),
+  // so render the CP-enriched hook name when present and otherwise hide the raw UUID.
+  const isHook = platform === 'hook'
+  // An unnamed hook still names its SOURCE — a GitLab delivery is "GitLab", not "Webhook".
+  const hookLabel = channelName?.trim() || hookSourceLabel(hookKind)
+  // Name-first display: "#general" when the daemon resolved a channel name, or the
+  // DM counterpart verbatim ("@Dana Reyes" — already @-prefixed by the daemon). A
+  // Slack DM ("D…" im id) the daemon hasn't labeled yet falls back to the
+  // triggering user so the raw id never shows as the channel.
+  const isSlackDm = platform === 'slack' && /^D/.test(rawChannel)
+  const dmFallback = isSlackDm ? (triggeredByName ? `@${triggeredByName}` : 'DM') : null
+  // The sigil is the platform's, not the channel convention's: a Linear room is a team
+  // named "<Workspace> / <Team>", and a Telegram or Lark group has no marker either.
+  return isWebchat
+    ? channelName?.trim() || 'Playground'
+    : isDream
+      ? 'Memory'
+      : isHook
+        ? hookLabel
+        : channelName
+          ? channelName.startsWith('@')
+            ? channelName
+            : `${chatRoomSigil(platform)}${channelName}`
+          : (dmFallback ?? (rawChannel || PLACEHOLDER))
+}
+
+export function sessionFromDto(d: SessionDto): Session {
+  const usage = d.usage ?? undefined
+  const rawChannel = d.sessionKey.channel
+  const platform = d.sessionKey.platform || 'slack'
+  const isWebchat = platform === 'webchat'
+  const isHook = platform === 'hook'
+  const isDream = platform === 'dream'
+  const channel = sessionChannelLabel(platform, rawChannel, d.channelName, d.triggeredByName, d.hookKind)
+  // A session that carries a whole conversation belongs to the room, not to whoever spoke
+  // first — and `triggeredBy` is frozen first-wins, so it would credit them for months.
+  const appendStartedAt = appendSessionStartedAt(d.sessionKey.thread)
+  const isSlackDm = platform === 'slack' && /^D/.test(rawChannel)
+  const dmFallback = isSlackDm ? (d.triggeredByName ? `@${d.triggeredByName}` : 'DM') : null
+  const user = isDream
+    ? d.triggeredBy === 'schedule'
+      ? 'Scheduled'
+      : d.triggeredBy === 'auto'
+        ? 'Automatic'
+        : 'Manual'
+    : (appendStartedAt && appendSessionLabel(appendStartedAt)) ||
+      d.triggeredByName ||
+      (isHook && d.triggeredBy?.startsWith('hook:') ? hookSourceLabel(d.hookKind) : d.triggeredBy) ||
+      PLACEHOLDER
+  return {
+    id: d.sessionId,
+    title: d.title || `Session ${d.sessionId.slice(0, 8)}`,
+    lastActivityAt: d.lastActivityAt,
+    time: fmtTime(d.lastActivityAt),
+    status: toStatusKey(d.status || ''),
+    platform,
+    channel,
+    ...((isWebchat || isHook || d.channelName || dmFallback) && rawChannel ? { channelId: rawChannel } : {}),
+    ...(d.threadUrl ? { threadUrl: d.threadUrl } : {}),
+    ...(isSubsessionCoordinate(d.sessionKey.thread) ? { subsession: true as const } : {}),
+    ...(isCoordinatorCoordinate(d.sessionKey.thread) ? { coordinator: true as const } : {}),
+    user,
+    ...(d.triggeredBy ? { triggeredBy: d.triggeredBy } : {}),
+    ...(d.triggeredByUserId ? { triggeredByUserId: d.triggeredByUserId } : {}),
+    ...(d.hookKind ? { hookKind: d.hookKind } : {}),
+    // Absent on legacy/pre-feature rows — the views treat undefined as 'org'.
+    ...(d.visibility != null ? { visibility: d.visibility } : {}),
+    duration: PLACEHOLDER,
+    tokens: fmtCountCompact(usage?.totalTokens),
+    cost: fmtCost(usage?.costAmount, usage?.costCurrency),
+    toolCount: PLACEHOLDER,
+    statusLabel: d.status || PLACEHOLDER,
+    ...(usage ? { usage } : {}),
+    // The transcript is a separate on-demand pull (fetchSessionMessages); the
+    // list row carries no bodies, so steps start empty.
+    steps: [],
+    agentId: d.agentId,
+    ...(d.agentName?.trim() ? { agentName: d.agentName.trim() } : {}),
+    // Session-recorded execution config (what this session actually ran with).
+    // Omitted on legacy rows — data-context then falls back to the agent's
+    // current config when flattening. `daemon` carries the daemonId (the views
+    // resolve it to the daemon's display name, as with the agent's placement).
+    ...(d.runtime !== null && d.runtime !== undefined ? { runtime: d.runtime } : {}),
+    ...(d.model !== null && d.model !== undefined ? { model: d.model } : {}),
+    ...(d.effort !== null && d.effort !== undefined ? { effort: d.effort } : {}),
+    ...(d.fastMode !== null && d.fastMode !== undefined ? { fastMode: d.fastMode } : {}),
+    ...(d.permissionMode !== null && d.permissionMode !== undefined ? { permissionMode: d.permissionMode } : {}),
+    ...(d.outputMode !== null && d.outputMode !== undefined ? { outputMode: d.outputMode } : {}),
+    ...(d.daemonId !== null && d.daemonId !== undefined ? { daemon: d.daemonId } : {}),
+    // Retention GC (#485): only ever set, never cleared to a falsy marker — the
+    // views treat "absent" as "content is still there".
+    ...(d.contentPurgedAt ? { contentPurgedAt: d.contentPurgedAt } : {}),
+    ...(d.workspaceIsolation !== null && d.workspaceIsolation !== undefined
+      ? { workspaceIsolation: d.workspaceIsolation }
+      : {})
+  }
+}
+
+/** Hydrate a session detail that was not present in the currently loaded list
+ *  pages. Detail carries its own latest usage snapshot so a direct link can show
+ *  this session's token/cost accounting without depending on list pagination. */
+export function sessionFromDetailDto(d: SessionDetailDto): Session {
+  // The adopted-session composer/header needs the conversation roster before any
+  // relay socket exists; short-id fallback mirrors the provider's ready-frame path.
+  const participants = d.participants?.length
+    ? d.participants.map((p) => ({
+        agentId: p.agentId,
+        name: p.name ?? p.agentId.slice(0, 8),
+        ...(p.primary ? { primary: true } : {})
+      }))
+    : undefined
+  const base = sessionFromDto({
+    sessionId: d.id,
+    sessionKey: {
+      platform: d.platform ?? 'slack',
+      channel: d.channel ?? '',
+      ...(d.thread !== null ? { thread: d.thread } : {})
+    },
+    agentId: d.agentId,
+    agentName: d.agentName ?? null,
+    title: d.title,
+    status: d.status,
+    lastActivityAt: d.lastActivityAt,
+    usage: d.usage,
+    triggeredBy: d.triggeredBy,
+    ...(d.hookKind !== undefined ? { hookKind: d.hookKind } : {}),
+    channelName: d.channelName,
+    triggeredByName: d.triggeredByName,
+    ...(d.triggeredByUserId ? { triggeredByUserId: d.triggeredByUserId } : {}),
+    threadUrl: d.threadUrl,
+    ...(d.visibility != null ? { visibility: d.visibility } : {}),
+    runtime: d.runtime,
+    model: d.model,
+    effort: d.effort,
+    fastMode: d.fastMode,
+    permissionMode: d.permissionMode,
+    outputMode: d.outputMode,
+    daemonId: d.daemonId,
+    contentPurgedAt: d.contentPurgedAt ?? null,
+    workspaceIsolation: d.workspaceIsolation
+  })
+  return participants ? { ...base, participants } : base
+}
+
+/** Keep local/live session fields while refreshing usage from the independently
+ *  polled detail endpoint. This closes the race where the list row arrived just
+ *  before the daemon's final cumulative usage report.
+ *
+ *  The retention-purge mark (#485) rides along on every path, including the early
+ *  returns: the detail endpoint refreshes faster than the list, so a cached
+ *  pre-purge row would otherwise keep the transcript view showing an unexplained
+ *  empty (or "daemon offline") state until a separate list refresh replaced it.
+ *  It is monotonic — the mark is only ever set, never cleared by a detail response
+ *  that predates it. */
+export function mergeSessionDetailUsage(local: Session, detail: Session | null): Session {
+  const withPurge = (session: Session): Session =>
+    detail?.contentPurgedAt && !session.contentPurgedAt
+      ? { ...session, contentPurgedAt: detail.contentPurgedAt }
+      : session
+  if (!detail?.usage) return withPurge(local)
+  if (local.usage) {
+    const localReportedAt = local.usage.reportedAt ? Date.parse(local.usage.reportedAt) : Number.NaN
+    const detailReportedAt = detail.usage.reportedAt ? Date.parse(detail.usage.reportedAt) : Number.NaN
+    // A live session can have usage without a persisted timestamp. Preserve that
+    // state unless the detail snapshot proves it is newer; never let a cached
+    // detail response move cumulative token/cost totals backward.
+    if (!Number.isFinite(detailReportedAt)) return withPurge(local)
+    if (!Number.isFinite(localReportedAt) || detailReportedAt <= localReportedAt) return withPurge(local)
+  }
+  return withPurge({
+    ...local,
+    usage: detail.usage,
+    tokens: detail.tokens,
+    cost: detail.cost
+  })
+}
+
+/** The detail refetches on every session event and a list row does not, so a detail that recorded a runtime replaces the row's whole run config. */
+export function mergeSessionDetailRunConfig(row: Session, detail: Session | null): Session {
+  if (detail?.runtime === undefined) return row
+  return {
+    ...row,
+    runtime: detail.runtime,
+    // A recorded runtime without a model ran its own default, as a freshly listed row reads it.
+    model: detail.model ?? '',
+    effort: detail.effort,
+    fastMode: detail.fastMode,
+    permissionMode: detail.permissionMode,
+    outputMode: detail.outputMode
+  }
+}
+
+/** What a liveness row knows before its capability read lands: nothing yet. Views gate on
+ *  `daemonsLoading` rather than reading this as "the daemon can do nothing". */
+const EMPTY_DAEMON_CAPS: DaemonCapabilitiesDto = { platforms: [], runtimes: [], acp: false, features: [] }
+
+/** Stitch a capability row onto its liveness row. The catalog arrives with an empty
+ *  `models` list — `modelCapability()` then reads as "not discovered" and falls back to the
+ *  static tables, which is exactly what a surface that has not read one daemon should see. */
+export function withDaemonCapability(row: DaemonRow, cap: DaemonCapabilityDto | undefined): DaemonRow {
+  if (!cap) return row
+  return {
+    ...row,
+    caps: cap.capabilities,
+    runtimeModels: cap.runtimeProfiles.map((p) => ({
+      runtime: p.runtime,
+      aliasOf: p.aliasOf ?? null,
+      version: p.version,
+      hostVersion: p.hostVersion ?? null,
+      hostAvailable: p.hostAvailable ?? null,
+      credentialsConfigured: p.credentialsConfigured ?? null,
+      models: p.models,
+      acpProtocolVersion: p.acpProtocolVersion,
+      mcpCapabilities: p.mcpCapabilities ?? null,
+      modelCatalog: p.modelCatalog ?? null,
+      authRequired: p.authRequired ?? false,
+      unavailableReason: p.unavailableReason ?? null,
+      strategies: p.strategies ?? null
+    })),
+    mcpServers: cap.mcpServers
+  }
+}
+
+export function daemonFromDto(
+  d: DaemonFleetDto & Partial<Pick<DaemonViewDto, 'capabilities' | 'runtimeProfiles' | 'mcpServers'>>
+): DaemonRow {
+  // `cloud` is the CP DTO's field name (a REST contract); the console's own word is `pool`.
+  const pool = d.cloud ?? false
+  // A relaunch that has not reconnected within the offline grace is an offline daemon, however long the op's deadline still runs.
+  const liveOp = d.status === 'offline' && lifecycleStatus(d.lifecycleOp) === 'restarting' ? null : d.lifecycleOp
+  const lifecycleOp = liveOp ? { ...liveOp, trigger: liveOp.trigger ?? 'manual' } : null
+  return {
+    daemonId: d.daemonId,
+    pool,
+    memberSetId: d.memberSetId ?? null,
+    // Display label: the daemon name (the CP seeds it from the hostname on first
+    // register, so a connected daemon always has one), else a short id for a
+    // provisioned-but-never-connected row. Never the raw hostname. A pool member's
+    // name is its Pod, which is meaningless outside the cluster and changes on every
+    // roll — the pool is one managed thing everywhere it is named, so use that label.
+    name: pool ? poolLabel() : d.name || d.daemonId.slice(0, 8),
+    version: d.agentVersion || PLACEHOLDER,
+    latestVersion: d.latestVersion,
+    releaseChannel: d.releaseChannel,
+    availableVersions: d.availableVersions ?? [],
+    lifecycleOp,
+    lifecycleStatus: lifecycleStatus(lifecycleOp) ?? null,
+    canManageLifecycle: d.canManageLifecycle ?? false,
+    canIssueKey: d.canIssueKey,
+    approval: d.approval,
+    canManageApproval: d.canManageApproval ?? false,
+    sessionEpoch: d.sessionEpoch,
+    autoUpgrade: d.autoUpgrade ?? false,
+    autoUpgradeSupported: d.autoUpgradeSupported ?? false,
+    lastAutoUpgrade: d.lastAutoUpgrade ?? null,
+    // Flag an available upgrade only when both versions parse and latest > running.
+    upgradeAvailable: isUpgradeAvailable(d.agentVersion, d.latestVersion),
+    // Operational readiness, so `connecting` stays offline for every decision; only presentation reads `reconnecting`.
+    status: toStatusKey(d.status),
+    reconnecting: d.status === 'connecting',
+    host: d.host ?? PLACEHOLDER,
+    // `load.{cpu,mem}` are 0..1 fractions; surface them as percentages.
+    cpu: d.load ? Math.round(d.load.cpu * 100) : 0,
+    mem: d.load ? Math.round(d.load.mem * 100) : 0,
+    loadAgents: d.load?.agents ?? 0,
+    caps: d.capabilities ?? EMPTY_DAEMON_CAPS,
+    // Per-runtime available models, observed from the daemon's runtime profiles.
+    runtimeModels: (d.runtimeProfiles ?? []).map((p) => ({
+      runtime: p.runtime,
+      aliasOf: p.aliasOf ?? null,
+      version: p.version,
+      hostVersion: p.hostVersion ?? null,
+      hostAvailable: p.hostAvailable ?? null,
+      credentialsConfigured: p.credentialsConfigured ?? null,
+      models: p.models,
+      acpProtocolVersion: p.acpProtocolVersion,
+      mcpCapabilities: p.mcpCapabilities ?? null,
+      modelCatalog: p.modelCatalog ?? null,
+      authRequired: p.authRequired ?? false,
+      unavailableReason: p.unavailableReason ?? null,
+      strategies: p.strategies ?? null
+    })),
+    mcpServers: d.mcpServers ?? [],
+    activeSessions: String(d.activeSessions),
+    hostedSessions: d.hostedSessions ?? null,
+    conns: String(d.maxAgents),
+    uptime: fmtSeen(d.lastSeenAt),
+    createdBy: d.createdBy ?? '', // creator userId; creatorLabel resolves it to a name / "You" at render
+    createdAt: fmtDate(d.createdAt),
+    lastModifiedBy: d.lastModifiedBy ?? '', // editor userId; creatorLabel resolves it to a name / "You" at render
+    lastModifiedAt: fmtDate(d.lastModifiedAt),
+    sessionRetention: d.sessionRetention,
+    workspaceRetention: d.workspaceRetention,
+    visibility: d.visibility,
+    sharedWith: d.sharedWith,
+    canEdit: d.canEdit,
+    canManageSharing: d.canManageSharing
+  }
+}
+
+// ── endpoints ───────────────────────────────────────────────────────────────
+export async function fetchAgents(orgId?: string): Promise<Agent[]> {
+  return (await apiGet<AgentDto[]>(`${orgBase(orgId)}/agents`)).map(agentFromDto)
+}
+
+// Delete an agent: drops the CP spec and tells the owning daemon to tear down its
+// local replica (agent/remove, best-effort). 204 on success, 404 if already gone.
+export async function deleteAgent(agentId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/agents/${encodeURIComponent(agentId)}`)
+  track('agent_deleted', { org_id: apiOrgId, agent_id: agentId })
+}
+
+export async function fetchSessions(
+  cursor?: string,
+  limit = 50,
+  orgId?: string,
+  filters: SessionListFilters = {}
+): Promise<SessionListPage> {
+  // The CP's default response shape is the GROUPED conversation list
+  // (merged-conversation-view.md §5.2); this fetcher serves the flat-row
+  // consumers (rails, agent pages), so it pins the escape hatch explicitly.
+  const q = new URLSearchParams({ limit: String(limit), view: 'flat' })
+  if (cursor) q.set('cursor', cursor)
+  appendSessionFilters(q, filters)
+  const page = await apiGet<SessionListPageDto>(`${orgBase(orgId)}/sessions?${q.toString()}`)
+  return {
+    sessions: (page.sessions ?? []).map(sessionFromDto),
+    total: page.total,
+    nextCursor: page.nextCursor,
+    ...(page.orgHasSessions !== undefined ? { orgHasSessions: page.orgHasSessions } : {}),
+    ...(page.accessSyncDegraded !== undefined ? { accessSyncDegraded: page.accessSyncDegraded } : {}),
+    ...(page.accessIssues !== undefined ? { accessIssues: page.accessIssues } : {})
+  }
+}
+
+/** A session parked on a human approval, as the bell needs it (slack-approval-dm.md §7). */
+export interface PendingApprovalSession {
+  sessionId: string
+  agentId: string
+  agentName: string | null
+  title: string | null
+}
+
+/** The org's sessions waiting on an approval — the bell's one cross-agent read. Flat rows, newest first. */
+export async function fetchPendingApprovalSessions(orgId?: string): Promise<PendingApprovalSession[]> {
+  const q = new URLSearchParams({ view: 'flat', activityState: 'awaiting_permission', limit: '200' })
+  const page = await apiGet<SessionListPageDto>(`${orgBase(orgId)}/sessions?${q.toString()}`)
+  return (page.sessions ?? []).map((s) => ({
+    sessionId: s.sessionId,
+    agentId: s.agentId,
+    agentName: s.agentName ?? null,
+    title: s.title
+  }))
+}
+
+/** What the key-addressed resolver answered for one conversation. */
+export interface ConversationResolution {
+  /** The conversation's currently visible member sessions, or null when the
+   *  caller can see none of them. */
+  conversation: ConversationDto | null
+  /** Whether an external access check could not be completed for this answer.
+   *  The CP fails those CLOSED — a member whose visibility it could not
+   *  determine is omitted — so a degraded empty answer means "we could not
+   *  check", NOT "you cannot see it". Dropping this flag is what made a Slack
+   *  API blip read as a permanent authorization verdict. */
+  accessSyncDegraded: boolean
+  accessIssues: SessionAccessIssue[]
+}
+
+/** Resolve one conversation's current visible member sessions by its §5.1 key
+ *  (the bounded key-addressed resolver). An empty answer is only a real
+ *  "nothing here you can see" when `accessSyncDegraded` is false — see above;
+ *  a caller that reports absence must consult it. */
+export async function fetchConversationByKey(key: string, orgId?: string): Promise<ConversationResolution> {
+  const q = new URLSearchParams({ conversationKey: key })
+  const page = await apiGet<SessionListPageDto>(`${orgBase(orgId)}/sessions?${q.toString()}`)
+  return {
+    conversation: page.conversations?.[0] ?? null,
+    accessSyncDegraded: page.accessSyncDegraded === true,
+    accessIssues: page.accessIssues ?? []
+  }
+}
+
+/** The grouped sessions list (merged-conversation-view.md §5.2): one row per
+ *  conversation. Each conversation is projected onto its REPRESENTATIVE member
+ *  session (the newest visible one) so the list pipeline renders it exactly
+ *  like a session row; multi-participant conversations additionally carry
+ *  `participants` (one per member agent, representative first) and the §5.1
+ *  `conversationKey`. */
+export async function fetchConversations(
+  cursor?: string,
+  limit = 50,
+  orgId?: string,
+  filters: SessionListFilters = {}
+): Promise<SessionListPage> {
+  const q = new URLSearchParams({ limit: String(limit) })
+  if (cursor) q.set('cursor', cursor)
+  appendSessionFilters(q, filters)
+  const page = await apiGet<SessionListPageDto>(`${orgBase(orgId)}/sessions?${q.toString()}`)
+  const sessions = (page.conversations ?? []).map((conversation) => {
+    const members = conversation.sessions.map(sessionFromDto)
+    const rep = members[0]!
+    // Conversation IDENTITY rides along whatever the member count. Filtering to a
+    // single participant still returns the conversation, only with fewer rows, and
+    // a row that dropped its key there could not be recognised as the same
+    // conversation the reader has open. Membership comes from `memberSessionIds`,
+    // which the CP reports over everything the caller can see — `sessions` is
+    // narrowed by the filter, so counting it would lose a participant exactly when
+    // the filter is what made the row ambiguous. An older CP omits it; its
+    // filtered rows are then the best membership on offer.
+    const memberSessionIds = conversation.memberSessionIds ?? members.map((member) => member.id)
+    // Retention GC (#485): the purge mark belongs to the MEMBERS, not to the
+    // representative, so projecting only `rep` would hide a purged peer entirely.
+    // Earliest wins — the row states when this conversation's history first started
+    // going away. Visible only for the members the filter returned, the same limit
+    // `participants` carries.
+    const purgedAt = members
+      .map((member) => member.contentPurgedAt)
+      .filter((at): at is string => !!at)
+      .sort()[0]
+    const purge = purgedAt
+      ? {
+          contentPurgedAt: purgedAt,
+          // Whether SOME of the row's history survives decides the wording: a
+          // partial purge must not read as "this whole conversation is gone".
+          ...(members.some((member) => !member.contentPurgedAt) ? { contentPurgedPartial: true } : {})
+        }
+      : {}
+    const identity = {
+      ...(conversation.key !== null ? { conversationKey: conversation.key } : {}),
+      memberSessionIds
+    }
+    if (memberSessionIds.length <= 1) return { ...rep, ...identity, ...purge }
+    return {
+      ...rep,
+      ...identity,
+      ...purge,
+      // The members the FILTER returned, which is what the row can name. Each
+      // Session DTO carries a safe display projection even when the owning Agent
+      // itself is hidden from the caller.
+      participants: members.map((member, i) => ({
+        agentId: member.agentId ?? '',
+        name: member.agentName ?? member.agentId ?? '',
+        ...(i === 0 ? { primary: true } : {})
+      }))
+    }
+  })
+  return {
+    sessions,
+    total: page.total,
+    nextCursor: page.nextCursor,
+    ...(page.orgHasSessions !== undefined ? { orgHasSessions: page.orgHasSessions } : {}),
+    ...(page.accessSyncDegraded !== undefined ? { accessSyncDegraded: page.accessSyncDegraded } : {}),
+    ...(page.accessIssues !== undefined ? { accessIssues: page.accessIssues } : {})
+  }
+}
+
+function appendSessionFilters(q: URLSearchParams, filters: SessionListFilters): void {
+  // Repeated `agentId` is the multi-agent form the CP reads as a conversation
+  // participant filter; a lone id serializes identically to the old single form.
+  for (const agentId of typeof filters.agentId === 'string' ? [filters.agentId] : (filters.agentId ?? [])) {
+    if (agentId) q.append('agentId', agentId)
+  }
+  if (filters.platform) q.set('platform', filters.platform)
+  if (filters.integration) q.set('integration', filters.integration)
+  if (filters.channel) q.set('channel', filters.channel)
+  if (filters.triggeredBy) q.set('triggeredBy', filters.triggeredBy)
+  if (filters.githubRepoId) q.set('githubRepoId', filters.githubRepoId)
+  if (filters.excludeTasks) q.set('tasks', 'exclude')
+}
+
+export async function fetchSessionFacets(orgId?: string, filters: SessionListFilters = {}): Promise<SessionFacets> {
+  const q = new URLSearchParams()
+  appendSessionFilters(q, filters)
+  const query = q.toString()
+  const suffix = query ? `?${query}` : ''
+  const facets = await apiGet<SessionFacetsDto>(`${orgBase(orgId)}/sessions/facets${suffix}`)
+  return {
+    agentIds: facets.agents,
+    agentNames: facets.agentNames ?? {},
+    integrations: facets.integrations,
+    channels: facets.channels.map((channel) => ({
+      value: channel.value,
+      label: sessionChannelLabel(
+        channel.platform,
+        channel.value,
+        channel.name,
+        channel.triggeredByName,
+        hookKindFromIntegration(channel.integration)
+      ),
+      platform: channel.integration
+    })),
+    triggers: facets.triggers.map((trigger) => ({
+      value: trigger.value,
+      ...(trigger.name ? { name: trigger.name } : {}),
+      platform: trigger.integration,
+      ...(trigger.hookKind ? { hookKind: trigger.hookKind } : {}),
+      ...(trigger.githubRepoId ? { githubRepoId: trigger.githubRepoId } : {}),
+      ...(trigger.userId ? { userId: trigger.userId } : {})
+    }))
+  }
+}
+
+/** CP-stored detail metadata used for session-family navigation. The linked
+ *  rows are already filtered by each Session's audience on the server. */
+export function fetchSessionDetail(sessionId: string, orgId?: string): Promise<SessionDetailDto> {
+  return apiGet<SessionDetailDto>(`${orgBase(orgId)}/sessions/${encodeURIComponent(sessionId)}`)
+}
+
+// PUT /sessions/:id/visibility response. `state` is the §5.1 cutover: 'pending'
+// until every affected daemon has acked the new `visibilityRev`, then 'applied'.
+export interface SessionVisibilityResultDto {
+  id: string
+  visibility: SessionVisibility
+  visibilityRev: number
+  state: 'pending' | 'applied'
+}
+
+// Set a session's visibility (PUT /sessions/:id/visibility). Gated server-side to
+// the identity-matched session owner only (`canChangeVisibility` in the detail
+// DTO); invisible sessions 404 — never 403 (no existence oracle).
+export async function putSessionVisibility(
+  sessionId: string,
+  visibility: MutableSessionVisibility
+): Promise<SessionVisibilityResultDto> {
+  return apiPut<SessionVisibilityResultDto>(`${orgBase()}/sessions/${encodeURIComponent(sessionId)}/visibility`, {
+    visibility
+  })
+}
+
+export type SessionAccessProvider =
+  'slack' | 'github' | 'gitlab' | 'feishu' | 'telegram' | 'discord' | 'googlechat' | 'msteams'
+export type SessionProfileProvider =
+  Exclude<SessionAccessProvider, 'googlechat' | 'msteams'> | 'lark' | 'google' | 'azuread'
+
+export interface SessionExternalAccessDto {
+  provider: SessionAccessProvider
+  available: boolean
+  enabled: boolean
+  state: 'disabled' | 'enabling' | 'enabled' | 'degraded'
+  currentRevision: string
+  readFenceRevision: string | null
+  /** Owner-only migration diagnostic. */
+  hiddenSessions?: number
+}
+
+export function fetchSessionExternalAccess(
+  provider: SessionAccessProvider,
+  orgId?: string
+): Promise<SessionExternalAccessDto> {
+  return apiGet<SessionExternalAccessDto>(`${orgBase(orgId)}/session-access/${provider}`)
+}
+
+export function putSessionExternalAccess(
+  provider: SessionAccessProvider,
+  enabled: boolean,
+  orgId?: string
+): Promise<SessionExternalAccessDto> {
+  return apiPut<SessionExternalAccessDto>(`${orgBase(orgId)}/session-access/${provider}`, { enabled })
+}
+
+// One page of a session's transcript, proxied live from the daemon recorded on
+// SessionMeta. Content ownership stays pinned there when the agent moves.
+export async function fetchSessionMessages(
+  sessionId: string,
+  options: { cursor?: string; after?: string; limit?: number; view?: 'roots'; signal?: AbortSignal } = {}
+): Promise<SessionHistoryDto> {
+  const q = new URLSearchParams({ limit: String(options.limit ?? 50) })
+  if (options.cursor) q.set('cursor', options.cursor)
+  if (options.after) q.set('after', options.after)
+  if (options.view) q.set('view', options.view)
+  return apiGet<SessionHistoryDto>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/messages?${q.toString()}`,
+    options.signal ? { signal: options.signal } : undefined
+  )
+}
+
+// One page of a thread's record read through the session that received its root; 404 for a root it never received, 409 `DAEMON_FEATURE_MISSING` from a daemon without thread reads.
+export async function fetchSessionThreadMessages(
+  sessionId: string,
+  rootId: string,
+  options: { cursor?: string; after?: string; limit?: number; signal?: AbortSignal } = {}
+): Promise<SessionThreadMessagesDto> {
+  const q = new URLSearchParams({ limit: String(options.limit ?? 50) })
+  if (options.cursor) q.set('cursor', options.cursor)
+  if (options.after) q.set('after', options.after)
+  return apiGet<SessionThreadMessagesDto>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(rootId)}/messages?${q.toString()}`,
+    options.signal ? { signal: options.signal } : undefined
+  )
+}
+
+// One frame-budgeted byte slice of a tool call's FULL ToolBody JSON (mirrors the
+// protocol `SessionToolBodyChunk`). `nextOffset` absent ⇒ this was the last chunk.
+export interface SessionToolBodyChunkDto {
+  sessionId: string
+  toolCallId: string
+  data: string // UTF-8-boundary-safe byte slice of the full ToolBody JSON
+  totalBytes: number
+  nextOffset?: number | null
+}
+
+// Pull a tool call's FULL (untruncated) ToolBody JSON, proxied live from the
+// owning daemon. The inline `SessionMessageDto.body` preview is capped at 32 KiB;
+// when `bodyTruncated` the console pages the whole body back through
+// `GET /sessions/:id/tool-body` by offset, concatenating the byte slices into the
+// complete JSON string (the caller JSON.parse's the result). 503 if the owning
+// daemon is offline / the agent is unplaced (same resolution as the messages route).
+export async function fetchToolBody(sessionId: string, toolCallId: string): Promise<string> {
+  let out = ''
+  let offset = 0
+  // Guard against a daemon that never advances `nextOffset` (defensive bound).
+  for (;;) {
+    const q = new URLSearchParams({ toolCallId, offset: String(offset) })
+    const chunk = await apiGet<SessionToolBodyChunkDto>(
+      `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/tool-body?${q.toString()}`
+    )
+    out += chunk.data
+    if (chunk.nextOffset == null || chunk.nextOffset <= offset) break
+    offset = chunk.nextOffset
+  }
+  return out
+}
+
+/** One stored Computer screenshot (computer-use.md §9) with a short-lived signed URL. */
+export interface ComputerScreenshotDto {
+  ref: string
+  sha256: string
+  computerId: string
+  agentId: string
+  takenAt: string
+  bytes: number
+  contentType: string
+  expiresAt: string
+  url: string
+  urlExpiresAt: string
+}
+
+// Resolves a tool result's `sha256:<hex>` screenshot reference; 404 when expired, never stored, or not visible to the caller.
+export async function fetchComputerScreenshot(sessionId: string, sha256: string): Promise<ComputerScreenshotDto> {
+  return apiGet<ComputerScreenshotDto>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/computer-screenshots/${encodeURIComponent(sha256)}`
+  )
+}
+
+// ── Computers (computer-use.md §2.2, §3.6, §4.1, §10) ──────────────────────────
+
+/** One registered Computer as the console reads it. */
+export interface ComputerDto {
+  id: string
+  name: string
+  ownerUserId: string
+  kind: 'self-hosted' | 'managed'
+  isolation: 'none' | 'container' | 'vm'
+  os: 'macos' | 'windows' | 'linux'
+  osVersion: string
+  session: ComputerSession
+  status: ComputerStatus
+  capabilities: ComputerCapabilities
+  doctor: ComputerDoctorReport | null
+  desktopDaemonVersion: string
+  driverVersion: string
+  policy: ComputerPolicy
+  visibility: ResourceVisibility
+  sharedWith: string[]
+  lastSeenAt: string | null
+  revokedAt: string | null
+  stoppedAt: string | null
+  stoppedByUserId: string | null
+  createdAt: string
+  updatedAt: string
+  canEdit: boolean
+  screenshotRetentionDays: number
+  canEditPolicy: boolean
+  /** Which agents may use it (computer-use.md §4.1); absent only on an older Control Plane. */
+  agentAccess?: ComputerAgentAccess
+  /** The caller may change its agent access: any editor, except of a per-agent or ephemeral computer. */
+  canEditAgentAccess?: boolean
+  /** A managed computer's allocation mode (computer-use.md §15.1); null for a self-hosted one. */
+  allocation?: ComputerAllocation | null
+  ownerAgentId?: string | null
+  /** The session an `ephemeral` computer was made for. */
+  poolSessionId?: string | null
+  poolPhase?: ComputerPoolPhase | null
+  poolError?: string | null
+  /** The pool actions the caller may take now (computer-use.md §10); absent on an older Control Plane. */
+  poolActions?: { wake: boolean; sleep: boolean; reset: boolean }
+  /** The session that holds the control lease now (computer-use.md §4.4). */
+  lease?: { sessionId: string; agentId: string; agentName: string | null; acquiredAt: string } | null
+  /** The sessions waiting in line for the lease, first in line first. */
+  waiting?: Array<{ sessionId: string; agentId: string; since: string }>
+  /** Its running agent desktops, each with its own lease and line (computer-use.md §3.9); null while agents share one desktop. */
+  desktops?: ComputerDesktopDto[] | null
+}
+
+/** One agent desktop of a Computer with per-agent desktops (computer-use.md §3.9). */
+export interface ComputerDesktopDto {
+  /** The desktop daemon's id for it, which the viewer opens. */
+  id: string
+  agentId: string
+  status: ComputerStatus
+  lease: { sessionId: string; agentId: string; agentName: string | null; acquiredAt: string } | null
+  waiting: Array<{ sessionId: string; agentId: string; since: string }>
+}
+
+export type ComputerAllocation = 'ephemeral' | 'per-agent' | 'manual'
+
+export type ComputerPoolPhase =
+  'provisioning' | 'registering' | 'awake' | 'sleeping' | 'waking' | 'failed' | 'reclaiming' | 'resetting'
+
+/** Whether the deployment runs managed computers, and whether a pool member can start one now. */
+export interface ComputerPoolStatusDto {
+  enabled: boolean
+  available: boolean
+}
+
+export interface ComputerAuditEntryDto {
+  id: string
+  at: string
+  tool: string
+  client: string
+  agentId: string | null
+  sessionId: string | null
+  outcome: 'ok' | 'error'
+  code: string | null
+  approval: 'not_required' | 'allowed' | 'allowed_session' | null
+  args: Record<string, unknown>
+  textLength: number | null
+  ms: number
+  screenshotRef: string | null
+}
+
+export interface ComputerAuditPageDto {
+  entries: ComputerAuditEntryDto[]
+  nextCursor: string | null
+}
+
+export interface ComputerRegistrationDto {
+  registrationId: string
+  token: string
+  displayTail: string
+  name: string | null
+  expiresAt: string
+  exchangeUrl: string
+  /** The desktop image at this CP's version; absent from a CP older than the Docker option. */
+  computerImage?: string
+  /** The npm channel of the CP's release; absent from a CP older than the npm-only install, which reads as rc. */
+  cliChannel?: 'stable' | 'rc'
+}
+
+export interface ComputerRegistrationStatusDto {
+  registrationId: string
+  expiresAt: string
+  consumedAt: string | null
+  computerId: string | null
+}
+
+const computerPath = (id: string, orgId?: string) => `${orgBase(orgId)}/computers/${encodeURIComponent(id)}`
+
+export async function fetchComputers(orgId?: string): Promise<ComputerDto[]> {
+  return apiGet<ComputerDto[]>(`${orgBase(orgId)}/computers`)
+}
+
+export async function fetchComputer(id: string, orgId?: string): Promise<ComputerDto> {
+  return apiGet<ComputerDto>(computerPath(id, orgId))
+}
+
+export async function fetchComputerAudit(
+  id: string,
+  opts: { cursor?: string; limit?: number } = {}
+): Promise<ComputerAuditPageDto> {
+  const q = new URLSearchParams()
+  if (opts.limit) q.set('limit', String(opts.limit))
+  if (opts.cursor) q.set('cursor', opts.cursor)
+  const qs = q.toString()
+  return apiGet<ComputerAuditPageDto>(`${computerPath(id)}/audit${qs ? `?${qs}` : ''}`)
+}
+
+export async function createComputerRegistration(body: {
+  name?: string
+  ttlMinutes?: number
+  visibility?: SharingInput['visibility']
+  sharedWith?: string[]
+}): Promise<ComputerRegistrationDto> {
+  return apiPost<ComputerRegistrationDto>(`${orgBase()}/computers/registrations`, body)
+}
+
+export async function fetchComputerRegistration(registrationId: string): Promise<ComputerRegistrationStatusDto> {
+  return apiGet<ComputerRegistrationStatusDto>(
+    `${orgBase()}/computers/registrations/${encodeURIComponent(registrationId)}`
+  )
+}
+
+export async function fetchComputerPool(orgId?: string): Promise<ComputerPoolStatusDto> {
+  return apiGet<ComputerPoolStatusDto>(`${orgBase(orgId)}/computers/pool`)
+}
+
+/** Where the organization's managed computers' browser traffic leaves (computer-use.md §15.4); never the password. */
+export interface ComputerEgressDto {
+  mode: 'deployment' | 'proxy'
+  url: string | null
+  username: string | null
+  passwordSet: boolean
+  orgProxyAllowed: boolean
+  description: string | null
+  canEdit: boolean
+}
+
+export type ComputerEgressUpdate =
+  { mode: 'deployment' } | { mode: 'proxy'; url: string; username?: string | null; password?: string | null }
+
+export interface ComputerUsageRowDto {
+  runningSeconds: number
+  sleepingSeconds: number
+  volumeGibSeconds: number
+  relayedBytes: number
+}
+
+/** Metered Computer use over a window (computer-use.md §15.5). */
+export interface ComputerUsageDto {
+  from: string
+  to: string
+  totals: ComputerUsageRowDto
+  allocations: Array<ComputerUsageRowDto & { allocation: string }>
+  days: Array<ComputerUsageRowDto & { day: string }>
+  computers: Array<
+    ComputerUsageRowDto & { computerId: string; name: string | null; kind: string; allocation: string | null }
+  >
+  screenshots: { written: { count: number; bytes: number }; stored: { count: number; bytes: number } }
+}
+
+export async function fetchComputerEgress(orgId?: string): Promise<ComputerEgressDto> {
+  return apiGet<ComputerEgressDto>(`${orgBase(orgId)}/computers/egress`)
+}
+
+export async function setComputerEgress(update: ComputerEgressUpdate): Promise<ComputerEgressDto> {
+  return apiPut<ComputerEgressDto>(`${orgBase()}/computers/egress`, update)
+}
+
+export async function fetchComputerUsage(range: UsageRange, orgId?: string): Promise<ComputerUsageDto> {
+  const { from, to } = usageWindow(range)
+  return apiGet<ComputerUsageDto>(`${orgBase(orgId)}/usage/computers?${new URLSearchParams({ from, to }).toString()}`)
+}
+
+/** A `manual` computer from the deployment's pool (computer-use.md §15.1); the caller becomes its owner. */
+export async function createPoolComputer(body: {
+  name: string
+  agentAccess?: ComputerAgentAccess
+  visibility?: SharingInput['visibility']
+  sharedWith?: string[]
+}): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${orgBase()}/computers/pool`, body)
+}
+
+export async function wakeComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/wake`, {})
+}
+
+export async function sleepComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/sleep`, {})
+}
+
+/** Deletes a pool computer's pod and volume and provisions it again, empty. */
+export async function resetComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/reset`, {})
+}
+
+export async function setComputerPolicy(id: string, policy: ComputerPolicy): Promise<ComputerDto> {
+  return apiPut<ComputerDto>(`${computerPath(id)}/policy`, policy)
+}
+
+export async function setComputerAgentAccess(id: string, access: ComputerAgentAccess): Promise<ComputerDto> {
+  return apiPut<ComputerDto>(`${computerPath(id)}/agent-access`, access)
+}
+
+/** Gives one agent access to a Computer, from the agent's side of the same relation. */
+export async function addComputerAgent(id: string, agentId: string): Promise<ComputerDto> {
+  return apiPut<ComputerDto>(`${computerPath(id)}/agent-access/agents/${encodeURIComponent(agentId)}`)
+}
+
+export async function removeComputerAgent(id: string, agentId: string): Promise<ComputerDto> {
+  return apiDelete<ComputerDto>(`${computerPath(id)}/agent-access/agents/${encodeURIComponent(agentId)}`)
+}
+
+export async function setComputerSharing(id: string, body: SharingInput): Promise<ComputerDto> {
+  return apiPut<ComputerDto>(`${computerPath(id)}/sharing`, body)
+}
+
+export async function stopComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/stop`, {})
+}
+
+export async function resumeComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/resume`, {})
+}
+
+export async function revokeComputer(id: string): Promise<ComputerDto> {
+  return apiPost<ComputerDto>(`${computerPath(id)}/revoke`, {})
+}
+
+export async function deleteComputer(id: string): Promise<void> {
+  await apiDelete<void>(computerPath(id))
+}
+
+/** A short-lived viewer credential (computer-use.md §7, §10): signaling goes to a relay, never through the CP. */
+export interface ComputerViewerGrantDto {
+  token: string
+  expiresAt: string
+  expiresInMs: number
+  mode: 'view' | 'control'
+  relays: string[]
+  iceServers: { urls: string[]; username: string; credential: string }[]
+  // The relays' STUN servers for hole punching; empty when none serve STUN or the Computer's policy turns it off.
+  stunUrls: string[]
+  // False when the desktop has no UDP a browser can reach (a managed computer's pod), so the viewer starts at TURN.
+  directMedia?: boolean
+}
+
+// `desktop` names an agent desktop (§3.9); omitted or `main`, the main desktop.
+export async function openComputerViewer(id: string, desktop?: string): Promise<ComputerViewerGrantDto> {
+  const query = desktop && desktop !== 'main' ? `?desktop=${encodeURIComponent(desktop)}` : ''
+  return apiPost<ComputerViewerGrantDto>(`${computerPath(id)}/viewer${query}`, {})
+}
+
+// Fetch one agent's raw spec (GET /agents/:id). Returns the wire DTO (not the
+// lean UI `Agent`) because the edit form needs fields the UI shape drops — notably
+// `description`.
+export async function fetchAgentDto(agentId: string, orgId?: string): Promise<AgentDto> {
+  return apiGet<AgentDto>(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}`)
+}
+
+export interface AgentDecisionDto {
+  id: string
+  name: string
+  providerId: string
+  model: string
+  questionType: 'boolean' | 'choice' | 'score'
+}
+
+export async function fetchAgentDecisions(
+  agentId: string,
+  orgId?: string,
+  purpose?: 'model_selection'
+): Promise<AgentDecisionDto[]> {
+  return apiGet(
+    `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/decisions${purpose ? `?purpose=${purpose}` : ''}`
+  )
+}
+
+// ── workspace file browsing ─────────────────────────────────────────────────
+// One entry of a workspace directory listing (`GET /agents/:id/workspace/files`).
+export interface WorkspaceEntryDto {
+  name: string
+  type: 'dir' | 'file' | 'symlink' | 'other'
+  size: number | null
+  mtime: string | null // ISO-8601
+}
+
+export interface WorkspaceListingDto {
+  path: string
+  exists: boolean
+  entries: WorkspaceEntryDto[]
+  nextCursor: string | null
+}
+
+// One slice of a workspace file (`GET /agents/:id/workspace/file`).
+// `encoding: 'none'` means binary — the daemon withholds the bytes.
+export interface WorkspaceFileDto {
+  path: string
+  exists: boolean
+  type: 'file' | 'dir' | null // what the path IS; 'dir' ⇒ no content to show (null from an older daemon)
+  size: number | null
+  mtime: string | null
+  encoding: 'utf8' | 'none' | null
+  content: string | null
+  offset: number | null
+  nextOffset: number | null // byte offset to request next; do NOT recompute from content
+  truncated: boolean | null
+}
+
+/** Mirrors the daemon wire ceiling; base64 expansion still fits one control frame. */
+export const MAX_WORKSPACE_EDIT_BYTES = 180_000
+
+// One page of a workspace directory listing (GET /agents/:id/workspace/files),
+// proxied live from the agent's owning daemon — the CP never stores workspace
+// bytes (body-locality). 503 when that daemon is offline / the agent is unplaced.
+// `repo` names one of the agent's authorized additional repositories, browsing that
+// secondary root instead of the primary workspace; 404 when it authorizes no such repo.
+export async function fetchWorkspaceFiles(
+  agentId: string,
+  opts: { path: string; cursor?: string; limit?: number; sessionId?: string; repo?: string }
+): Promise<WorkspaceListingDto> {
+  const q = new URLSearchParams({ path: opts.path })
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  if (opts.cursor) q.set('cursor', opts.cursor)
+  if (opts.limit) q.set('limit', String(opts.limit))
+  return apiGet<WorkspaceListingDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/files?${q.toString()}`
+  )
+}
+
+// ── local skill inventory ───────────────────────────────────────────────────
+export type LocalSkillOrigin = 'dream-accepted' | 'managed' | 'git-source' | 'repo'
+
+// One skill the agent's workspace can load (GET /agents/:id/skills/local).
+export interface LocalSkillDto {
+  name: string
+  description: string | null
+  origin: LocalSkillOrigin
+  path: string
+}
+
+// The agent's workspace skill inventory. `materialized` is false when the
+// workspace has not been prepared yet, so an empty list then means "unknown",
+// not "no skills". Proxied live from the owning daemon; 503 when offline.
+export interface LocalSkillsDto {
+  materialized: boolean
+  skills: LocalSkillDto[]
+}
+
+export async function fetchAgentLocalSkills(agentId: string): Promise<LocalSkillsDto> {
+  return apiGet<LocalSkillsDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/skills/local`)
+}
+
+// ── runtime slash commands ──────────────────────────────────────────────────
+// One command the agent's ACP runtime advertised it can be asked to run
+// (GET /agents/:id/commands) — skills, plugin skills and the harness's own
+// built-ins arrive in one list, so this is what the runtime actually exposes
+// rather than what a workspace scan finds.
+export interface RuntimeCommandDto {
+  name: string
+  description: string
+  /** Argument hint, or null when the command takes no argument. */
+  hint: string | null
+  /** Record-time skill classification (daemon-side, pre-truncation); absent on older daemons. */
+  skill?: boolean
+}
+
+// `reported:false` means no session has advertised a list yet, so an empty list
+// then means "unknown", not "no commands". Proxied live from the owning daemon;
+// 409 when the daemon predates this read, 503 when it is offline.
+export interface RuntimeCommandsDto {
+  reported: boolean
+  updatedAt?: string
+  sessionId?: string
+  commands: RuntimeCommandDto[]
+}
+
+export async function fetchAgentRuntimeCommands(agentId: string): Promise<RuntimeCommandsDto> {
+  return apiGet<RuntimeCommandsDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/commands`)
+}
+
+// One slice of a workspace file (GET /agents/:id/workspace/file), proxied live
+// from the owning daemon like the listing — file bytes never touch the CP store.
+// 503 when the daemon is offline / the agent is unplaced.
+export async function fetchWorkspaceFile(
+  agentId: string,
+  opts: { path: string; offset?: number; limit?: number; sessionId?: string; repo?: string }
+): Promise<WorkspaceFileDto> {
+  const q = new URLSearchParams({ path: opts.path })
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  if (opts.offset) q.set('offset', String(opts.offset))
+  if (opts.limit) q.set('limit', String(opts.limit))
+  return apiGet<WorkspaceFileDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/file?${q.toString()}`)
+}
+
+/** A workspace file's original bytes (≤ 8 MiB); `sha256` pins a share's digest. The CP proxies and stores nothing. */
+export async function downloadSessionFile(
+  agentId: string,
+  opts: { path: string; sessionId?: string; repo?: string; sha256?: string }
+): Promise<Blob> {
+  const q = new URLSearchParams({ path: opts.path })
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  if (opts.sha256) q.set('sha256', opts.sha256)
+  const path = `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/file/download?${q.toString()}`
+  const res = await authenticatedFetch(path, { cache: 'no-store' })
+  if (!res.ok) throw await apiErrorFromResponse('GET', path, res)
+  return await res.blob()
+}
+
+/** Resolve a shared image's cached original for this viewer: its current state and, when ready, a fresh temporary GET. */
+export function resolveSharedImageOriginal(
+  sessionId: string,
+  attachmentId: string
+): Promise<{ original: SharedImageOriginal; download?: SharedImageDownload }> {
+  return apiPost(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/shared-images/${encodeURIComponent(attachmentId)}/original`,
+    {}
+  )
+}
+
+/** A presigned object-store GET for one workspace file (binary or large text); the daemon uploads it first when needed. */
+export interface WorkspaceTransferDto {
+  path: string
+  size: number
+  url: string
+  expiresAt: string
+  cached: boolean
+}
+
+/** A transfer whose daemon is still uploading; poll it by `operationId`. */
+interface WorkspaceTransferPendingDto {
+  operationId: string
+  path: string
+  size: number
+}
+
+/** Poll cadence for a running transfer, and how many failed polls in a row (a CP failover) it rides out. */
+const TRANSFER_POLL_MS = 1_000
+const TRANSFER_POLL_FAILURES = 5
+
+export async function transferWorkspaceFile(
+  agentId: string,
+  opts: { path: string; sessionId?: string; repo?: string; sha256?: string },
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+): Promise<WorkspaceTransferDto> {
+  const base = `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/file/transfer`
+  let state = await apiPost<WorkspaceTransferDto | WorkspaceTransferPendingDto>(base, {
+    path: opts.path,
+    ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+    ...(opts.repo ? { repo: opts.repo } : {}),
+    ...(opts.sha256 ? { sha256: opts.sha256 } : {}),
+    poll: true
+  })
+  const query = opts.sha256 ? `?sha256=${encodeURIComponent(opts.sha256)}` : ''
+  let failures = 0
+  while ('operationId' in state) {
+    await wait(TRANSFER_POLL_MS)
+    try {
+      state = await apiGet<WorkspaceTransferDto | WorkspaceTransferPendingDto>(
+        `${base}/${encodeURIComponent(state.operationId)}${query}`
+      )
+      failures = 0
+    } catch (err) {
+      // The operation lives in the database, so a poll that fails in transit is retried; the CP's own answers are not.
+      if ((err instanceof ApiError && err.status < 500) || ++failures >= TRANSFER_POLL_FAILURES) throw err
+    }
+  }
+  return state
+}
+
+/** A presigned object-store request: send exactly these headers (a browser sets content-length itself). */
+export interface SignedRequestDto {
+  url: string
+  headers: Record<string, string>
+}
+
+export interface PartUrlDto extends SignedRequestDto {
+  partNumber: number
+}
+
+/** One chat upload's grant: a single PUT of `size` bytes, or a multipart upload's first part PUTs and its complete. */
+export type FileUploadGrantDto = { uploadId: string; expiresAt: string } & (
+  SignedRequestDto | { multipart: { multipartId: string; parts: PartUrlDto[]; complete: SignedRequestDto } }
+)
+
+export function reserveFileUpload(
+  agentId: string,
+  body: {
+    name: string
+    mimeType: string
+    size: number
+    sha256: string
+    parts?: { partBytes: number; sha256: string[] }
+  }
+): Promise<FileUploadGrantDto> {
+  return apiPost<FileUploadGrantDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/uploads`, body)
+}
+
+/** More, or fresh, part PUTs (at most 100) and a fresh complete for a multipart chat upload. */
+export function signFileUploadParts(
+  agentId: string,
+  uploadId: string,
+  body: {
+    multipartId: string
+    size: number
+    partBytes: number
+    parts: Array<{ partNumber: number; sha256: string }>
+  }
+): Promise<{ parts: PartUrlDto[]; complete: SignedRequestDto; expiresAt: string }> {
+  return apiPost(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/uploads/${encodeURIComponent(uploadId)}/parts`,
+    body
+  )
+}
+
+/** Read one workspace text file whole before editing it. Every slice must describe
+ * the same mtime so a multi-page load cannot assemble two agent revisions. */
+export async function fetchWorkspaceFileFull(
+  agentId: string,
+  path: string,
+  opts: { repo?: string } = {}
+): Promise<WorkspaceFileDto> {
+  let offset = 0
+  let content = ''
+  let mtime: string | null | undefined
+  for (let page = 0; page < 16; page++) {
+    const slice = await fetchWorkspaceFile(agentId, { path, offset, ...(opts.repo ? { repo: opts.repo } : {}) })
+    if (!slice.exists || slice.encoding !== 'utf8') return slice
+    if ((slice.size ?? 0) > MAX_WORKSPACE_EDIT_BYTES) {
+      throw new Error('Files larger than 180 KB cannot be edited here.')
+    }
+    if (mtime === undefined) mtime = slice.mtime
+    else if (slice.mtime !== mtime) throw new Error('The file changed while it was loading. Open it again to edit.')
+    content += slice.content ?? ''
+    if (!slice.truncated) {
+      return { ...slice, content, offset: 0, nextOffset: slice.size, truncated: false }
+    }
+    if (slice.nextOffset == null || slice.nextOffset <= offset) break
+    offset = slice.nextOffset
+  }
+  throw new Error('The workspace file is too large to load safely.')
+}
+
+export function writeWorkspaceFile(
+  agentId: string,
+  path: string,
+  body: { content: string; ifMatchMtime?: string }
+): Promise<{ path: string; size: number; mtime: string }> {
+  return apiPut<{ path: string; size: number; mtime: string }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/file?path=${encodeURIComponent(path)}`,
+    body
+  )
+}
+
+/** Create one empty folder (and missing parents) in a scratch workspace; an existing path is a 409. */
+export function createWorkspaceDir(agentId: string, path: string): Promise<{ path: string }> {
+  const q = new URLSearchParams({ path })
+  return apiPost<{ path: string }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/dir?${q.toString()}`,
+    {}
+  )
+}
+
+export function deleteWorkspaceFile(agentId: string, path: string, ifMatchMtime: string): Promise<{ path: string }> {
+  const q = new URLSearchParams({ path, ifMatchMtime })
+  return apiDelete<{ path: string }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/file?${q.toString()}`
+  )
+}
+
+// One slice of an agent's memory file (GET /agents/:id/memory) — a single markdown
+// file at the agent root, proxied live from the owning daemon (never stored on the
+// CP). A not-yet-created file is data (exists:false). 503 when unplaced / offline.
+export interface AgentMemoryDto {
+  path: string
+  exists: boolean
+  size: number | null
+  mtime: string | null
+  content: string | null
+  offset: number | null
+  nextOffset: number | null // byte offset to request next; do NOT recompute from content
+  truncated: boolean | null
+}
+
+// One file in the memory dir (the index or a topic file).
+export interface MemoryFileEntry {
+  name: string
+  size: number
+  mtime: string
+}
+export interface MemoryFilesDto {
+  exists: boolean
+  files: MemoryFileEntry[]
+}
+
+// List the files in the agent's memory dir (MEMORY.md index + topic files).
+/** A conversation whose memory has a place layer of its own. */
+export interface MemoryChannelDto {
+  channelKey: string
+  channel: string | null
+  transportScope: string | null
+  /** The conversation's platform id; absent from a Control Plane older than names. */
+  platform?: string | null
+  /** The conversation's display name, when the daemon or one of its sessions has one. */
+  name?: string | null
+  /** False for an organization owner's entry of a layer whose conversation shows them no session. */
+  visible?: boolean
+  /** The caller may clear this layer. */
+  clearable?: boolean
+}
+export interface MemoryChannelsDto {
+  channels: MemoryChannelDto[]
+}
+
+/** Whether the agent may switch assistant mode on as it stands, and every reason it may not. */
+export async function fetchAgentAssistantModeAdmission(agentId: string): Promise<AssistantModeAdmission> {
+  return apiGet<AssistantModeAdmission>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/assistant-mode/admission`)
+}
+
+/** The member an assistant-mode agent asks when no person is behind the work; null when no member may edit it. */
+export async function fetchAgentAssistantResponsibleUser(agentId: string): Promise<{ userId: string | null }> {
+  return apiGet<{ userId: string | null }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/assistant-mode/responsible-user`
+  )
+}
+
+/** List the conversations whose memory has a place layer of its own. */
+export async function fetchAgentMemoryChannels(agentId: string): Promise<MemoryChannelsDto> {
+  return apiGet<MemoryChannelsDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/channels`)
+}
+
+/** Delete one conversation's place layer whole; the answer says only whether there was one. */
+export async function clearAgentMemoryChannel(agentId: string, channelKey: string): Promise<{ cleared: boolean }> {
+  return apiDelete<{ cleared: boolean }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/channels/${encodeURIComponent(channelKey)}`
+  )
+}
+
+/** List the files of the signed-in user's own memory layer for this agent. */
+export async function listMyAgentMemory(agentId: string): Promise<MemoryFilesDto> {
+  return apiGet<MemoryFilesDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/mine/files`)
+}
+
+/** Read a file of the signed-in user's own memory layer whole, paging every slice. */
+export async function fetchMyAgentMemoryFull(
+  agentId: string,
+  path: string
+): Promise<{ exists: boolean; content: string; mtime: string | null }> {
+  let offset = 0
+  let content = ''
+  let exists = false
+  let mtime: string | null = null
+  for (let guard = 0; guard < 4096; guard++) {
+    const q = new URLSearchParams({ path, offset: String(offset) })
+    const slice = await apiGet<AgentMemoryDto>(
+      `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/mine/file?${q.toString()}`
+    )
+    exists = slice.exists
+    mtime = slice.mtime
+    if (!slice.exists) break
+    content += slice.content ?? ''
+    if (!slice.truncated || slice.nextOffset == null || slice.nextOffset <= offset) break
+    offset = slice.nextOffset
+  }
+  return { exists, content, mtime }
+}
+
+export async function listAgentMemory(agentId: string, channelKey?: string): Promise<MemoryFilesDto> {
+  const q = channelKey ? `?channelKey=${encodeURIComponent(channelKey)}` : ''
+  return apiGet<MemoryFilesDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/files${q}`)
+}
+
+// Read one memory file (`path` defaults to the MEMORY.md index).
+export async function fetchAgentMemory(
+  agentId: string,
+  opts: { path?: string; offset?: number; limit?: number; channelKey?: string } = {}
+): Promise<AgentMemoryDto> {
+  const q = new URLSearchParams()
+  if (opts.channelKey) q.set('channelKey', opts.channelKey)
+  if (opts.path) q.set('path', opts.path)
+  if (opts.offset) q.set('offset', String(opts.offset))
+  if (opts.limit) q.set('limit', String(opts.limit))
+  const qs = q.toString()
+  // …/memory/file?path=… for a named topic; …/memory (the index) otherwise.
+  const base = `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory${opts.path ? '/file' : ''}`
+  return apiGet<AgentMemoryDto>(`${base}${qs ? `?${qs}` : ''}`)
+}
+
+// Read a memory file WHOLE — pages every slice until the daemon reports no more.
+// The console edits by PUTting the whole file, so it must load the whole file first
+// (a partial read would let Save clobber the tail). Returns { exists, content }.
+export async function fetchAgentMemoryFull(
+  agentId: string,
+  path?: string,
+  channelKey?: string
+): Promise<{ exists: boolean; content: string; mtime: string | null }> {
+  let offset = 0
+  let content = ''
+  let exists = false
+  let mtime: string | null = null
+  // Bounded loop: nextOffset strictly advances while truncated, so this terminates.
+  for (let guard = 0; guard < 4096; guard++) {
+    const slice = await fetchAgentMemory(agentId, {
+      offset,
+      ...(path ? { path } : {}),
+      ...(channelKey ? { channelKey } : {})
+    })
+    exists = slice.exists
+    mtime = slice.mtime
+    if (!slice.exists) break
+    content += slice.content ?? ''
+    if (!slice.truncated || slice.nextOffset == null || slice.nextOffset <= offset) break
+    offset = slice.nextOffset
+  }
+  return { exists, content, mtime }
+}
+
+// Replace one memory file (`path` defaults to the MEMORY.md index); returns the
+// written path/size/mtime. Requires edit permission on the agent (403 otherwise).
+// `ifMatchMtime` is optimistic concurrency — the write 409s if the file changed.
+export async function updateAgentMemory(
+  agentId: string,
+  content: string,
+  path?: string,
+  ifMatchMtime?: string | null,
+  channelKey?: string
+): Promise<{ path: string; size: number; mtime: string }> {
+  const q = new URLSearchParams()
+  if (channelKey) q.set('channelKey', channelKey)
+  if (path) q.set('path', path)
+  const qs = q.toString()
+  return apiPut<{ path: string; size: number; mtime: string }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/file${qs ? `?${qs}` : ''}`,
+    ifMatchMtime ? { content, ifMatchMtime } : { content }
+  )
+}
+
+// ── memory dreaming (docs/designs/memory-dreaming.md §10) — offline consolidation jobs ──
+
+export type DreamStatus =
+  'pending' | 'running' | 'completed' | 'failed' | 'canceled' | 'adopted' | 'discarded' | 'superseded'
+
+export interface DreamDto {
+  dreamId: string
+  agentId: string
+  status: DreamStatus
+  trigger: 'manual' | 'schedule' | 'auto'
+  sessionIds: string[]
+  snapshotDigest: string
+  executionSessionId: string | null
+  runtime: string | null
+  model: string | null
+  stopReason: string | null
+  instructions: string | null
+  skills: { name: string; description: string; state: 'proposed' | 'accepted' | 'dismissed' }[] | null
+  usage: (SessionUsageDto & { inputBytes: number; outputBytes: number }) | null
+  error: { type: string; message: string } | null
+  createdAt: string
+  endedAt: string | null
+}
+
+export interface DreamFilesDto {
+  exists: boolean
+  files: MemoryFileEntry[]
+  /** Same-bytes review fence token (task #36 Phase B); present only when `exists`. */
+  reviewToken?: string
+}
+
+/** One file a dream corrected, dropped or moved, with its reason; `problem` set means the daemon did not apply it. */
+export interface DreamRevisionDto {
+  path: string
+  change: 'corrected' | 'dropped' | 'moved'
+  why?: 'contradicted' | 'transient' | 'expired' | 'secret'
+  note: string
+  sessionIds: string[]
+  into: string[]
+  problem?: string
+}
+
+export interface DreamRevisionsDto {
+  /** false ⇒ the dream kept no revisions log (an older dream, or one before the latest adoption). */
+  exists: boolean
+  revisions: DreamRevisionDto[]
+}
+
+/** A dream is terminal (won't change) once it reaches one of these states. */
+export function isDreamTerminal(status: DreamStatus): boolean {
+  return status !== 'pending' && status !== 'running'
+}
+
+const dreamBase = (agentId: string) => `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/dreams`
+
+/** Start a manual dream (per-run overrides of the agent's dreaming policy). */
+export async function startDream(
+  agentId: string,
+  opts: { sessionWindow?: number; instructions?: string } = {}
+): Promise<DreamDto> {
+  return apiPost<DreamDto>(dreamBase(agentId), opts)
+}
+
+export async function listDreams(
+  agentId: string,
+  limit?: number,
+  opts: { pendingSkills?: boolean } = {}
+): Promise<DreamDto[]> {
+  const params = new URLSearchParams()
+  if (limit) params.set('limit', String(limit))
+  if (opts.pendingSkills) params.set('pendingSkills', '1')
+  const q = params.toString() ? `?${params.toString()}` : ''
+  return (await apiGet<{ dreams: DreamDto[] }>(`${dreamBase(agentId)}${q}`)).dreams
+}
+
+export async function getDream(agentId: string, dreamId: string): Promise<DreamDto> {
+  return apiGet<DreamDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}`)
+}
+
+export async function cancelDream(agentId: string, dreamId: string): Promise<DreamDto> {
+  return apiPost<DreamDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/cancel`, {})
+}
+
+/** Adopt a completed dream's staged store. `force` overrides the snapshot fence. */
+export async function adoptDream(
+  agentId: string,
+  dreamId: string,
+  force = false,
+  reviewToken?: string
+): Promise<DreamDto> {
+  // Echo the review token from listDreamFiles so the daemon binds adoption to the
+  // exact bytes reviewed (task #36 Phase B same-bytes fence).
+  return apiPost<DreamDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/adopt`, {
+    ...(force ? { force } : {}),
+    ...(reviewToken ? { reviewToken } : {})
+  })
+}
+
+export interface DreamSkillContentDto {
+  name: string
+  exists: boolean
+  skill: string | null
+  scripts: { path: string; content: string }[]
+  /** Same-bytes review fence token (task #36 Phase B); present only when `exists`. */
+  reviewToken?: string
+}
+
+/** Read a candidate's FULL staged body — what accepting would install. */
+export async function fetchDreamSkill(agentId: string, dreamId: string, name: string): Promise<DreamSkillContentDto> {
+  return apiGet<DreamSkillContentDto>(
+    `${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/skills/${encodeURIComponent(name)}`
+  )
+}
+
+/** Accept one mined skill candidate — installs it for this agent (design §7). */
+export async function acceptDreamSkill(
+  agentId: string,
+  dreamId: string,
+  name: string,
+  reviewToken?: string
+): Promise<DreamDto> {
+  // Echo the review token from fetchDreamSkill so the daemon binds publication to
+  // the exact reviewed bytes (task #36 Phase B same-bytes fence).
+  return apiPost<DreamDto>(
+    `${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/skills/${encodeURIComponent(name)}/accept`,
+    reviewToken ? { reviewToken } : {}
+  )
+}
+
+/** Dismiss one mined skill candidate — drops its staging and records the call. */
+export async function dismissDreamSkill(agentId: string, dreamId: string, name: string): Promise<DreamDto> {
+  return apiPost<DreamDto>(
+    `${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/skills/${encodeURIComponent(name)}/dismiss`,
+    {}
+  )
+}
+
+export async function discardDream(agentId: string, dreamId: string): Promise<DreamDto> {
+  return apiPost<DreamDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/discard`, {})
+}
+
+/** List a dream's staged output files (the review surface). */
+export async function listDreamFiles(agentId: string, dreamId: string): Promise<DreamFilesDto> {
+  return apiGet<DreamFilesDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/files`)
+}
+
+/** Why a dream changed each file it named — an explanation only, never a gate on adoption. */
+export async function listDreamRevisions(agentId: string, dreamId: string): Promise<DreamRevisionsDto> {
+  return apiGet<DreamRevisionsDto>(`${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/revisions`)
+}
+
+/** Read a staged dream file WHOLE (pages every slice, like fetchAgentMemoryFull). */
+export async function fetchDreamFileFull(
+  agentId: string,
+  dreamId: string,
+  path: string
+): Promise<{ exists: boolean; content: string }> {
+  let offset = 0
+  let content = ''
+  let exists = false
+  for (let guard = 0; guard < 4096; guard++) {
+    const q = new URLSearchParams({ path, offset: String(offset) })
+    const slice = await apiGet<AgentMemoryDto>(
+      `${dreamBase(agentId)}/${encodeURIComponent(dreamId)}/file?${q.toString()}`
+    )
+    exists = slice.exists
+    if (!slice.exists) break
+    content += slice.content ?? ''
+    if (!slice.truncated || slice.nextOffset == null || slice.nextOffset <= offset) break
+    offset = slice.nextOffset
+  }
+  return { exists, content }
+}
+
+// One changed path in a git status. `index`/`workingDir` are git's per-file XY
+// status chars (' ', 'M', 'A', 'D', 'R', 'C', 'U', '?', …).
+export interface WorkspaceGitFileDto {
+  path: string
+  index: string
+  workingDir: string
+  // `git diff HEAD --numstat` — this file's change against HEAD, staged and unstaged
+  // together. null ⇒ untracked, a binary change, or a daemon too old to count: a
+  // count of 0 is a different fact (a file changed in the other direction only).
+  additions: number | null
+  deletions: number | null
+}
+
+// The HEAD commit of the workspace checkout.
+export interface WorkspaceGitCommitDto {
+  sha: string
+  shortSha: string
+  subject: string
+  committedAt: string // RFC3339
+}
+
+// git status of an agent's workspace (GET /agents/:id/workspace/gitstatus).
+// `isRepo:false` ⇒ a from-scratch workspace (git ops N/A). `repo`/`agentDir` come
+// from the agent config; branch/commit/clean are live from the owning daemon's
+// checkout. Proxied live; 503 when the daemon is offline / the agent is unplaced.
+export interface WorkspaceGitStatusDto {
+  isRepo: boolean
+  clean: boolean
+  repo: string | null // full remote address (github mode)
+  agentDir: string | null // subdir within the repo the agent runs in
+  branch: string | null
+  tracking: string | null
+  ahead: number | null
+  behind: number | null
+  files: WorkspaceGitFileDto[]
+  truncated: boolean // true ⇒ the files list was capped
+  lastCommit: WorkspaceGitCommitDto | null // null ⇒ no commits yet
+  lastFetchAt: string | null // RFC3339; when the checkout last fetched/pulled
+}
+
+// Outcome of a workspace sync (POST /agents/:id/workspace/gitpull). A refused
+// sync is `ok:false` + `detail` (data), not an HTTP error.
+export interface WorkspaceGitPullDto {
+  isRepo: boolean
+  ok: boolean
+  detail: string | null
+  changed: number | null
+  insertions: number | null
+  deletions: number | null
+}
+
+// Report whether the agent's workspace checkout is clean. Read-only; proxied live
+// from the owning daemon (no CP storage). 503 when the daemon is offline.
+export async function fetchWorkspaceGitStatus(
+  agentId: string,
+  sessionId?: string,
+  repo?: string
+): Promise<WorkspaceGitStatusDto> {
+  const q = new URLSearchParams()
+  if (sessionId) q.set('sessionId', sessionId)
+  if (repo) q.set('repo', repo)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiGet<WorkspaceGitStatusDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitstatus${query}`)
+}
+
+// Which side of the index one diff read describes. A closed vocabulary rather than a
+// boolean, because the CP's querystring `staged=false` would coerce to `true`.
+export type WorkspaceDiffScope = 'unstaged' | 'staged'
+
+// One path's unified diff (GET /agents/:id/workspace/gitdiff). Every degraded answer
+// is data: `isRepo:false` a from-scratch workspace, `exists:false` a path this
+// checkout does not have, `diff:null` a path with no changes in this scope,
+// `binary:true` a change git has no text for, `truncated` a diff cut to the frame cap.
+export interface WorkspaceGitDiffDto {
+  path: string
+  isRepo: boolean
+  exists: boolean
+  diff: string | null // unified-diff text exactly as git emits it
+  binary: boolean
+  truncated: boolean
+}
+
+// One commit of the checked-out branch (GET /agents/:id/workspace/gitlog).
+export interface WorkspaceGitLogCommitDto {
+  sha: string
+  shortSha: string
+  subject: string
+  author: string
+  committedAt: string // RFC3339
+  pushed: boolean // true ⇒ the branch's upstream ref already contains it
+}
+
+// The newest commits of the workspace checkout, newest first. An empty repo is data
+// (`commits: []`); `tracking:null` means the branch tracks nothing, so every `pushed`
+// reads false and the console must not draw unpushed markers from it. `base` names the
+// ref the listing EXCLUDES — a session branch lists `<base>..HEAD`, its own work — and is
+// null when the checkout sits on that base branch, where the list is its full history.
+export interface WorkspaceGitLogDto {
+  isRepo: boolean
+  commits: WorkspaceGitLogCommitDto[]
+  truncated: boolean // true ⇒ this range has more commits than the requested limit
+  tracking: string | null
+  base: string | null
+}
+
+// One path's unified diff, proxied live from the owning daemon (no CP storage). 409
+// `DAEMON_FEATURE_MISSING` ⇒ that daemon is too old for git review reads; 400 with a
+// `WORKSPACE_*` code ⇒ the daemon rejected the path; 503 ⇒ offline or unplaced.
+export async function fetchWorkspaceGitDiff(
+  agentId: string,
+  opts: { path: string; scope?: WorkspaceDiffScope; sessionId?: string; repo?: string }
+): Promise<WorkspaceGitDiffDto> {
+  const q = new URLSearchParams({ path: opts.path })
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  if (opts.scope) q.set('scope', opts.scope)
+  return apiGet<WorkspaceGitDiffDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitdiff?${q.toString()}`
+  )
+}
+
+// The newest commits of the checkout, proxied live from the owning daemon. Same
+// failure surface as the diff read above. `limit` is capped at 50 by the CP (the
+// wire's MAX_WORKSPACE_LOG_COMMITS); past that the request is a 400.
+export async function fetchWorkspaceGitLog(
+  agentId: string,
+  opts: { limit?: number; sessionId?: string } = {}
+): Promise<WorkspaceGitLogDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.limit) q.set('limit', String(opts.limit))
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiGet<WorkspaceGitLogDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitlog${query}`)
+}
+
+// Sync the agent's checkout to its remote branch on the owning daemon now. A refused sync
+// returns `ok:false` + detail; 409 while the agent works in the checkout, 503 when daemon offline.
+export async function workspaceGitPull(agentId: string, opts: { repo?: string } = {}): Promise<WorkspaceGitPullDto> {
+  const query = opts.repo ? `?repo=${encodeURIComponent(opts.repo)}` : ''
+  return apiPost<WorkspaceGitPullDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitpull${query}`,
+    {}
+  )
+}
+
+// ── workspace git writes (executed only on the owning daemon; the CP stores nothing) ──
+// Why a git write did not do what was asked, as a closed vocabulary: the console offers a
+// different next action for each (stage something, pull before pushing, commit from the
+// agent instead). Mirrors the wire's `WorkspaceGitWriteReason`; `null` when `ok`.
+export type WorkspaceGitWriteReason =
+  | 'not-a-repo'
+  | 'nothing-staged'
+  | 'empty-message'
+  | 'no-identity'
+  | 'detached-head'
+  | 'no-upstream'
+  | 'unsafe-origin'
+  | 'unsafe-config'
+  | 'diverged'
+  | 'rejected'
+  | 'failed'
+
+// Outcome of one commit (POST /agents/:id/workspace/gitcommit). Nothing staged, a blank
+// message, a daemon with no registered commit identity and a git refusal are all
+// `ok:false` + `reason` (data), never HTTP errors.
+export interface WorkspaceGitCommitResultDto {
+  isRepo: boolean
+  ok: boolean
+  sha: string | null // full hash of the new commit; null unless ok
+  detail: string | null // daemon-written summary or refusal (host paths stripped)
+  reason: WorkspaceGitWriteReason | null
+}
+
+// Outcome of one push (POST /agents/:id/workspace/gitpush). A diverged branch, a detached
+// HEAD, a branch with no upstream and a remote rejection are all `ok:false` + `reason`;
+// a push with nothing to send is `ok:true` with `ahead:0`.
+export interface WorkspaceGitPushResultDto {
+  isRepo: boolean
+  ok: boolean
+  detail: string | null
+  ahead: number | null // commits STILL ahead of the upstream (0 once pushed)
+  reason: WorkspaceGitWriteReason | null
+}
+
+// A commit message drafted on the AGENT's own runtime (POST /agents/:id/workspace/gitmessage).
+// The CP never calls a model provider (§2), so every way the draft can fail to appear is data:
+// nothing staged, a runtime that declines or answers prose, a timeout.
+export interface WorkspaceGitMessageResultDto {
+  ok: boolean
+  message: string | null // conventional-commit subject + optional body
+  detail: string | null
+}
+
+// Move the named paths INTO the index of the agent's checkout (or of an authorized session
+// worktree). Answers with the FRESH git status, so the caller draws the result of its own
+// action without a second read. 409 ⇒ the agent is busy in that workspace, or the daemon is
+// too old (`DAEMON_FEATURE_MISSING`); 403 ⇒ no edit access; 503 ⇒ offline or unplaced.
+export async function stageWorkspacePaths(
+  agentId: string,
+  opts: { paths: string[]; sessionId?: string; repo?: string }
+): Promise<WorkspaceGitStatusDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiPost<WorkspaceGitStatusDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitstage${query}`,
+    { paths: opts.paths }
+  )
+}
+
+// The same, out of the index. The working tree is never touched, so nothing the agent wrote
+// is lost. Same fresh-status answer and same failure surface as staging.
+export async function unstageWorkspacePaths(
+  agentId: string,
+  opts: { paths: string[]; sessionId?: string; repo?: string }
+): Promise<WorkspaceGitStatusDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  if (opts.repo) q.set('repo', opts.repo)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiPost<WorkspaceGitStatusDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitunstage${query}`,
+    { paths: opts.paths }
+  )
+}
+
+// Commit whatever is staged as the agent's commit identity, never the console user; a refusal is `ok:false` + `reason`, not an HTTP error.
+export async function commitWorkspace(
+  agentId: string,
+  opts: { message: string; sessionId?: string }
+): Promise<WorkspaceGitCommitResultDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiPost<WorkspaceGitCommitResultDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitcommit${query}`,
+    { message: opts.message }
+  )
+}
+
+// Push the checked-out branch to the remote the owning daemon authorizes. The daemon derives
+// the refspec and never forces, so every rejection comes back as data.
+export async function pushWorkspace(
+  agentId: string,
+  opts: { sessionId?: string } = {}
+): Promise<WorkspaceGitPushResultDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiPost<WorkspaceGitPushResultDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitpush${query}`,
+    {}
+  )
+}
+
+// Ask the owning daemon to draft a commit message from the staged diff, on the agent's own
+// runtime. It spends model tokens, so it is only ever sent for an explicit press (§5.1) and
+// writes nothing — the reader edits the draft and commits it separately.
+export async function draftWorkspaceCommitMessage(
+  agentId: string,
+  opts: { sessionId?: string } = {}
+): Promise<WorkspaceGitMessageResultDto> {
+  const q = new URLSearchParams()
+  if (opts.sessionId) q.set('sessionId', opts.sessionId)
+  const query = q.size ? `?${q.toString()}` : ''
+  return apiPost<WorkspaceGitMessageResultDto>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace/gitmessage${query}`,
+    {}
+  )
+}
+
+// ── session background tasks (proxied live from the owning daemon's lease) ────
+// What the daemon can know about a task, and nothing more. No `queued`: the runtime lifecycle
+// feed's only start edge is `task_started`, so a task is either live in the lease or gone. `done`
+// means "settled with no reported failure" rather than "reported successful", because most settle
+// edges carry no status at all — `detail` carries one when the runtime named it.
+export type AgentTaskState = 'running' | 'done' | 'failed'
+
+// One background task of one ACP session. `subagent` is the runtime's own internal Task
+// invocation; the wire carries those rather than filtering them, because the same records fence
+// host reclaim — so this panel shows them marked instead of hiding them (webchat-side-panels.md §3.5).
+export interface AgentTaskDto {
+  id: string
+  description: string | null // null ⇒ the runtime named none
+  state: AgentTaskState
+  subagent: boolean
+  startedAt: string // RFC3339
+  endedAt: string | null // RFC3339; null ⇒ still running
+  detail: string | null // the terminal status the runtime reported, when it named one
+}
+
+// GET /agents/:id/tasks?sessionId=… — live tasks first, then the daemon's bounded settled
+// history. `tracked:false` means that daemon holds no lease for the session (a runtime that
+// reports no task lifecycle, or one that has not yet), which is a different answer from an empty
+// list and the panel says so.
+export interface AgentTasksDto {
+  sessionId: string
+  tracked: boolean
+  tasks: AgentTaskDto[]
+  truncated: boolean // true ⇒ the daemon held more tasks than this page carries
+}
+
+// Read one ACP session's background tasks. `sessionId` is REQUIRED, unlike the workspace reads:
+// the lease is per (agent, ACP session) and there is no per-agent aggregate to answer with. There
+// is no cancel counterpart — no agent-protocol primitive can address a single background task.
+// POST /agents/:id/wake — bring a sandbox to Running WITHOUT a turn: the agent's, or with `sessionId` that isolated session's own; `starting` means poll the read.
+export type AgentWakeState = 'running' | 'starting' | 'unsupported'
+export interface AgentWakeDto {
+  state: AgentWakeState
+}
+
+export async function wakeAgent(agentId: string, sessionId?: string): Promise<AgentWakeDto> {
+  const q = sessionId ? `?${new URLSearchParams({ sessionId }).toString()}` : ''
+  return apiPost<AgentWakeDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/wake${q}`, {})
+}
+
+export async function fetchAgentTasks(agentId: string, sessionId: string): Promise<AgentTasksDto> {
+  const q = new URLSearchParams({ sessionId })
+  return apiGet<AgentTasksDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/tasks?${q.toString()}`)
+}
+
+// ── session pull request (identity from the CP's own records; live state proxied from GitHub, never stored) ──
+// One check on the PR's head commit, over one vocabulary regardless of which kind of check reported it.
+export interface SessionPullRequestCheckDto {
+  name: string
+  state: 'success' | 'failure' | 'pending' | 'skipped' | 'neutral'
+  detail: string | null // GitHub's own word for it, verbatim
+  startedAt: string | null
+  completedAt: string | null
+  url: string | null
+}
+
+// One reviewer's CURRENT review, not one review event; `isBot` ⇒ a GitHub App identity, not a person.
+export interface SessionPullRequestReviewDto {
+  author: string
+  state: 'approved' | 'changes_requested' | 'commented' | 'dismissed' | 'pending'
+  isBot: boolean
+}
+
+// One UNRESOLVED review thread. Bodies are user content: proxied through the CP, never persisted.
+export interface SessionPullRequestThreadDto {
+  location: string // `path:line`, the path alone, or a PR-level thread
+  body: string
+  author: string
+  isOutdated: boolean
+}
+
+// GET /sessions/:id/pull-request — the PR this session was dispatched for. `degraded` makes a GitHub
+// failure DATA: identity survives, the live lists come back empty, and the nullable fields fall back
+// to what the CP already knows (or null). A session with NO linked run 404s, which hides the tab.
+export interface SessionPullRequestDto {
+  repoFullName: string
+  pullNumber: number
+  title: string
+  body: string // the PR description as plain text; empty while degraded
+  state: 'open' | 'closed' | 'merged' | null // null only degraded with no stored fact
+  isDraft: boolean | null
+  url: string
+  headRef: string
+  baseRef: string
+  additions: number | null // null while degraded — no stored line counts to fall back on
+  deletions: number | null
+  reviewDecision: 'approved' | 'changes_requested' | 'review_required' | null
+  checks: SessionPullRequestCheckDto[]
+  checksTruncated: boolean
+  reviews: SessionPullRequestReviewDto[]
+  threads: SessionPullRequestThreadDto[]
+  unresolvedCount: number // a floor when `threadsTruncated`
+  threadsTruncated: boolean
+  /** Whether a merge-when-ready watcher is armed at the EDGE right now; null ⇒ nobody could be asked (no live daemon, or one too old to serve the read), which the panel draws as unknown rather than as "off". */
+  autoMergeArmed: boolean | null
+  /** Where that watcher runs, and so how long it lives: `sandbox` dies with the agent's pod, `daemon` with the daemon process. Null when nothing is armed. */
+  autoMergePlacement?: 'sandbox' | 'daemon' | null
+  /** The watcher's own last verdict — "checks running: build", "changes requested", "conflicts with the base branch". */
+  autoMergeWaitingOn?: string | null
+  /** A GitHub refusal or unreachable GitHub on the last tick. The watcher stays armed through it. */
+  autoMergeError?: string | null
+  /** Whether an arm from this session names it, so this session's own wake starts the pod a sleeping arm is refused for; absent from a CP that predates it, which reads as no. */
+  autoMergeSessionPlaced?: boolean
+  canArmAutoMerge: boolean // the owning agent's clamp allows the write; false renders a disabled control
+  degraded: boolean
+  degradedReason: 'rate_limited' | 'denied' | 'unreachable' | null
+  /** The agent's own recorded review, present ONLY on a degraded answer — the one review state the deployment knows without GitHub. */
+  agentReview: 'approved' | 'changes_requested' | 'commented' | null
+  /** Which source named this PR: the owning review run, or this session's own head branch. Optional — a CP that predates the branch source sends neither this nor the two fields below. */
+  linkedBy?: 'run' | 'head-branch'
+  /** The head branch a `head-branch` link resolved through; null for a run-linked PR. */
+  linkBranch?: string | null
+  /** Whose checkout that branch was read from: this session's own worktree, or the agent's `shared` primary tree, where every session on the agent works. */
+  linkScope?: 'session' | 'shared' | null
+  /** true ⇒ that branch has more than one OPEN pull request and this is the first of them. */
+  linkAmbiguous?: boolean
+}
+
+// Read the session's PR projection. `refresh` bypasses the CP's short TTL but not its in-flight
+// coalescing, so a double press is still one GitHub read; plain reads ride the cache.
+export async function fetchSessionPullRequest(
+  sessionId: string,
+  opts: { refresh?: boolean } = {}
+): Promise<SessionPullRequestDto> {
+  const query = opts.refresh ? '?refresh=true' : ''
+  return apiGet<SessionPullRequestDto>(`${orgBase()}/sessions/${encodeURIComponent(sessionId)}/pull-request${query}`)
+}
+
+/** The edge watcher's state after an arm/disarm. */
+export interface SessionPullRequestAutoMergeDto {
+  armed: boolean
+  placement: 'sandbox' | 'daemon' | null
+  waitingOn: string | null
+  error: string | null
+}
+
+// Arm/disarm merge-when-ready on the session's PR. The watcher runs at the EDGE — in the agent's
+// sandbox, or its daemon's process — and squash-merges once the PR is open, undrafted, conflict-free,
+// with no failing or running check and no requested changes. Deliberately NOT GitHub's own
+// auto-merge, which refuses every PR that is not BLOCKED and so can never be armed on a repository
+// without required checks. Nothing is persisted: the armed set is in memory at the edge, so a
+// reclaimed sandbox or a restarted daemon reads back unchecked. 409 ⇒ no daemon, or an image with no
+// watcher; 503 ⇒ the daemon is offline.
+export async function setSessionPullRequestAutoMerge(
+  sessionId: string,
+  enabled: boolean
+): Promise<SessionPullRequestAutoMergeDto> {
+  return apiPost<SessionPullRequestAutoMergeDto>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/pull-request/auto-merge`,
+    { enabled }
+  )
+}
+
+/** What the edge is holding this session's sandbox for, and for how long. */
+export interface SessionSandboxKeepAliveDto {
+  held: boolean
+  reasons: Array<'uncommitted-files' | 'auto-merge-armed'>
+  ttlMs: number | null
+  placement: 'sandbox' | 'daemon' | null
+  asleep: boolean
+}
+
+// Renew this page's lease on the session agent's sandbox pod, so the idle sweep does not suspend work
+// the page is watching. The DAEMON decides whether to hold — uncommitted files in this session's
+// worktree, or an armed merge-when-ready watcher, which for a cluster agent lives inside that very pod.
+// A lease, not a flag: there is nothing to release, and it lapses within one TTL once this stops being
+// called (page closed, tab backgrounded, machine asleep). Never wakes a suspended pod.
+export async function keepSessionSandboxAlive(sessionId: string): Promise<SessionSandboxKeepAliveDto> {
+  return apiPost<SessionSandboxKeepAliveDto>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/sandbox-keep-alive`,
+    {}
+  )
+}
+
+// Merge the session's PR (squash) now, under the owning agent's clamped grant. A 409 relays GitHub
+// declining the merge (not mergeable, checks failing); an already-merged PR succeeds idempotently.
+export async function mergeSessionPullRequest(sessionId: string): Promise<{ merged: boolean }> {
+  return apiPost<{ merged: boolean }>(`${orgBase()}/sessions/${encodeURIComponent(sessionId)}/pull-request/merge`, {})
+}
+
+// ── usage dashboard (GET /usage) — real historical aggregates from the CP's
+// persisted per-session usage store, summed over a window this client computes. ──
+/** The console's window presets. The ROUTE takes an explicit `[from, to)`; these are
+ *  purely this client's shorthand, resolved at fetch time. */
+export type UsageRange = 'd1' | 'd7' | 'd30' | 'd90'
+const RANGE_DAYS: Record<UsageRange, number> = { d1: 1, d7: 7, d30: 30, d90: 90 }
+
+/** Which authenticated ingress metered a session. */
+export type UsageSource = 'daemon' | 'gateway'
+
+export interface UsageAgentDto {
+  agentId: string
+  sessions: number
+  totalTokens: number
+  inputTokens: number
+  outputTokens: number
+  thoughtTokens: number
+  cachedReadTokens: number
+  cachedWriteTokens: number
+  /** Exact decimal string — the CP never rounds a cost. Format it; add with
+   *  `sumAmounts` from `lib/amount` rather than as a float. */
+  costAmount: string
+}
+
+export interface UsageModelDto extends Omit<UsageAgentDto, 'agentId'> {
+  model: string | null
+}
+
+export interface UsageSourceDto extends Omit<UsageAgentDto, 'agentId'> {
+  source: UsageSource
+}
+
+export interface UsageDto {
+  /** The window the CP aggregated, echoed back. */
+  from: string
+  to: string
+  accessSyncDegraded?: boolean
+  accessIssues?: SessionAccessIssue[]
+  totals: { sessions: number; totalTokens: number; costAmount: string; costCurrency: string | null }
+  agents: UsageAgentDto[]
+  models: UsageModelDto[]
+  sources: UsageSourceDto[]
+  // Usage withheld by resource or session access, with no IDs; owners receive complete attribution and no residual.
+  // Attributed agents/models plus this independently summed rollup equal totals, including zero-cost withheld rows.
+  unattributed?: Omit<UsageAgentDto, 'agentId'>
+  /** The part of each agent's row its Auto coordinators spent (auto-session-mode.md §4.6); absent from an older Control Plane. */
+  coordinators?: UsageAgentDto[]
+  // Zero-filled hourly (up to two days) or daily buckets; start is a UTC ISO instant and model '' means unreported.
+  // Optional agent/model groupings preserve compatibility with older servers.
+  // Series follows attribution: complete for owners, otherwise excluding the unattributed residual from every bucket.
+  series: {
+    bucket: 'hour' | 'day'
+    points: {
+      start: string
+      costAmount: string
+      byAgent?: Record<string, string>
+      byModel?: Record<string, string>
+    }[]
+  }
+}
+
+/** Resolve a preset to the half-open window the route wants. Exported for the tests
+ *  that pin the preset → window arithmetic. */
+export function usageWindow(range: UsageRange, now: Date = new Date()): { from: string; to: string } {
+  const to = now
+  const from = new Date(to.getTime() - RANGE_DAYS[range] * 24 * 60 * 60 * 1000)
+  return { from: from.toISOString(), to: to.toISOString() }
+}
+
+export async function fetchUsage(range: UsageRange, orgId?: string, source?: UsageSource): Promise<UsageDto> {
+  // Send the viewer's tz offset so the CP buckets the spend series to local
+  // day/hour (getTimezoneOffset ⇒ UTC − local; stable per client, not in the key).
+  const tz = new Date().getTimezoneOffset()
+  const { from, to } = usageWindow(range)
+  const query = new URLSearchParams({ from, to, tz: String(tz), ...(source ? { source } : {}) })
+  return apiGet<UsageDto>(`${orgBase(orgId)}/usage?${query.toString()}`)
+}
+
+// Edit an agent's spec (PATCH /agents/:id). The CP persists it and hot-syncs the
+// owning daemon's replica.
+export async function updateAgent(agentId: string, patch: UpdateAgentInput): Promise<Agent> {
+  const agent = agentFromDto(await apiPatch<AgentDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}`, patch))
+  track('agent_updated', { org_id: apiOrgId, agent_id: agent.id, runtime: agent.runtime, model: agent.model ?? null })
+  return agent
+}
+
+export interface AgentPermissionRequestDto {
+  id: string
+  agentId: string
+  sessionId?: string
+  createdAt: string
+  requesterId: string | null
+  requesterName: string | null
+  command: string
+  status: 'pending' | 'allowed' | 'denied' | 'expired'
+  resolvedAt: string | null
+  resolvedBy?: string | null
+  resolvedByName?: string | null
+  /** The live request's own options; absent for an elicitation, a settled request, or an older daemon. */
+  options?: AgentPermissionOptionDto[]
+  /** Set on background work's request: the conversation it belongs to, which shows it too. */
+  parentSessionId?: string
+  /** A pending confirmation before the bot joins a channel, answered only by a person behind its turn, at any chat level. */
+  kind?: 'join'
+}
+
+export interface AgentPermissionOptionDto {
+  optionId: string
+  name: string
+  kind: 'allow_once' | 'allow_always' | 'reject_once' | 'reject_always'
+}
+
+/** Live daemon-owned approval queue. The CP proxies it and never persists the rows. */
+export async function fetchAgentPermissionRequests(agentId: string): Promise<AgentPermissionRequestDto[]> {
+  const page = await apiGet<{ requests: AgentPermissionRequestDto[] }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/permission-requests`
+  )
+  return page.requests
+}
+
+export async function decideAgentPermissionRequest(
+  agentId: string,
+  requestId: string,
+  decision: 'allow' | 'deny',
+  optionId?: string
+): Promise<void> {
+  await apiPost<{ ok: true }>(
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/permission-requests/${encodeURIComponent(requestId)}/decision`,
+    optionId ? { decision, optionId } : { decision }
+  )
+}
+
+/** One webchat conversation's requests and its background work's, for its owner where people in chat may approve, and for editors. */
+export async function fetchSessionPermissionRequests(sessionId: string): Promise<AgentPermissionRequestDto[]> {
+  const page = await apiGet<{ requests: AgentPermissionRequestDto[] }>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/permission-requests`
+  )
+  return page.requests
+}
+
+/** Decide one of a conversation's requests, bound to that conversation; the first answer from any surface wins. */
+export async function decideSessionPermissionRequest(
+  sessionId: string,
+  requestId: string,
+  decision: 'allow' | 'deny',
+  optionId?: string
+): Promise<void> {
+  await apiPost<{ ok: true }>(
+    `${orgBase()}/sessions/${encodeURIComponent(sessionId)}/permission-requests/${encodeURIComponent(requestId)}/decision`,
+    optionId ? { decision, optionId } : { decision }
+  )
+}
+
+// ── Assistant-mode Activity (assistant-mode.md §1.7, §5.11): read from the agent's daemon, kept nowhere else ──
+
+/** A follow-up's state (assistant-mode.md §5.12); `paused` stopped after five failed checks until it is messaged. */
+export type AssistantFollowUpStatus = 'waiting' | 'checking' | 'paused' | 'done' | 'stopped'
+
+/** What happened on a watched object (assistant-mode.md §5.14): the first six change its state, the rest are discussion. */
+export type AssistantFollowUpEvent =
+  'merged' | 'closed' | 'reopened' | 'approved' | 'changes_requested' | 'checks' | 'comment' | 'review' | 'commits'
+
+/** One finished check: when, what it saw, whether it reported, and what started it, from a daemon that says. */
+export interface AssistantFollowUpCheckDto {
+  at: string
+  observation: string
+  reported: boolean
+  startedBy?: 'time' | 'message' | 'wake'
+  /** The events it took from a wake. */
+  events?: AssistantFollowUpEvent[]
+}
+
+/** The one object a follow-up watches (assistant-mode.md §5.14); `target` is its label once taken, `reason` why it is not watched. */
+export interface AssistantFollowUpWatchDto {
+  url: string
+  target: string | null
+  state: 'pending' | 'watching' | 'refused' | 'ended'
+  reason: string | null
+}
+
+export interface AssistantFollowUpDto {
+  /** Its own id where the row is visible, from a daemon that ends a follow-up by it. */
+  id?: string
+  status: AssistantFollowUpStatus
+  /** When it checks next; null when none is scheduled or it has ended. */
+  nextCheck: string | null
+  /** Null where the row is not visible. */
+  doneWhen: string | null
+  /** Newest first, at most five; empty where the row is not visible. */
+  recentChecks: AssistantFollowUpCheckDto[]
+  /** A getting-to-know task of its conversation (assistant-mode.md §5.13), which ends after one check. */
+  gettingToKnow?: boolean
+  /** What it watches; only where the row is visible. */
+  watch?: AssistantFollowUpWatchDto
+}
+
+export interface AssistantSubsessionDto {
+  /** Present only when the viewer may open it. */
+  sessionId: string | null
+  /** A follow-up's label. */
+  title: string | null
+  /** A follow-up is `open` until it is done or stopped. */
+  state: 'open' | 'done' | 'failed'
+  startedAt: string
+  visible: boolean
+  /** The viewer may stop its current turn, or end a follow-up. */
+  canStop: boolean
+  parent: { sessionId: string; title: string | null; platform: string | null; channelName: string | null } | null
+  /** Where it runs, from its own session, while its conversation has no session yet (a getting-to-know task before it reports). */
+  place?: { platform: string | null; channelName: string | null }
+  /** Absent from a daemon without `follow-up-tasks-v1`. */
+  kind?: 'delegated' | 'follow-up' | 'approved-proposal'
+  /** Present on a follow-up. */
+  followUp?: AssistantFollowUpDto
+  /** The task's own summary and when it wrote it (auto-session-mode.md §6.7), read from its daemon; only where `visible`. */
+  summary?: string
+  summaryUpdatedAt?: string
+  /** The start of the message it was opened with, shown until it writes a summary; only where `visible`. */
+  background?: string
+  /** A platform thread is attached: people talk to it there, and it reports nothing to this conversation. */
+  threaded?: boolean
+  /** Messages its people and the task posted after the one that opened it, counted by its daemon; only where `visible`. */
+  replies?: number
+  /** When the newest of those replies landed. */
+  lastReplyAt?: string
+  /** The platform id of the message a coordinator opened it for (a Slack ts, a webchat post id); only where `visible`. */
+  openedForMessageId?: string
+  /** The platform id of the thread a getting-to-know task is shown with, its introduction's; only where `visible`. */
+  shownThreadId?: string
+}
+
+export interface AssistantSubsessionsPageDto {
+  subsessions: AssistantSubsessionDto[]
+  truncated: boolean
+  /** The next page of one conversation's background work; null on its last page and for the agent-wide list. */
+  nextCursor: string | null
+}
+
+/** The follow-up a proposal's follow-up form takes once approved, in place of running a task (assistant-mode.md §5.13). */
+export interface AssistantProposalFollowUpDto {
+  title: string
+  doneWhen: string
+  /** Its first check; null waits until it is messaged. */
+  nextCheck: string | null
+  /** The URL it would watch. */
+  watch?: string
+}
+
+/** What a scheduled check proposes to do: the sentence its card leads with, why, and the item it serves. */
+export interface AssistantProposalDto {
+  sentence: string
+  why: string
+  itemId: string
+  itemTitle: string | null
+  /** The follow-up form: approving takes this follow-up, and `text` is its title. */
+  followUp?: AssistantProposalFollowUpDto
+}
+
+/** The follow-up an approved follow-up form took, with its conversation where the viewer may open it. */
+export interface AssistantTakenFollowUpDto {
+  id: string
+  conversation: { sessionId: string; title: string | null; platform: string | null; channelName: string | null } | null
+}
+
+export interface AssistantDraftDto {
+  id: string
+  /** `task` is a proposal: its text is the task, run in the conversation its item was taken in once approved. */
+  kind: 'reply' | 'elsewhere' | 'task'
+  target: {
+    platform: string
+    /** Null only for a proposal in a webchat conversation. */
+    integrationId: string | null
+    channel: string
+    thread: string | null
+    name: string | null
+    dm: boolean
+    external: boolean
+  }
+  text: string
+  approver: {
+    kind: 'member' | 'conversation'
+    integrationId: string
+    channel: string
+    userId: string | null
+    consoleUserId: string | null
+    name: string | null
+  } | null
+  proposal?: AssistantProposalDto
+  /** A webchat proposal, decided on its conversation's page by whoever may continue it; `approver` is then null. */
+  inConversation?: boolean
+  createdAt: string
+  expiresAt: string
+}
+
+export type AssistantDraftDecision = 'approve' | 'discard'
+
+/** What a decision did: `succeeded` posted, `denied` discarded, `failed` sent nothing, `outcome_unknown` may have posted; an approved proposal is `executing`, and an approved follow-up form `succeeded`. */
+export interface AssistantDraftOutcomeDto {
+  status: 'succeeded' | 'failed' | 'outcome_unknown' | 'denied' | 'executing'
+  failure: string | null
+  /** The follow-up an approved follow-up form took. */
+  followUp?: AssistantTakenFollowUpDto
+}
+
+const assistantBase = (agentId: string) => `${orgBase()}/agents/${encodeURIComponent(agentId)}/assistant`
+
+/** The agent's background work, or with `parentSessionId` only what that conversation started, newest first, a page at a time. */
+export async function fetchAssistantSubsessions(
+  agentId: string,
+  opts: { parentSessionId?: string; cursor?: string; limit?: number } = {}
+): Promise<AssistantSubsessionsPageDto> {
+  const q = new URLSearchParams()
+  if (opts.parentSessionId) q.set('parentSessionId', opts.parentSessionId)
+  if (opts.cursor) q.set('cursor', opts.cursor)
+  if (opts.limit) q.set('limit', String(opts.limit))
+  const query = q.toString()
+  return apiGet(`${assistantBase(agentId)}/subsessions${query ? `?${query}` : ''}`)
+}
+
+/** One task by its own session id, as the list carries it; a daemon without `assistant-task-handle-v1` answers 409. */
+export async function fetchAssistantSubsession(agentId: string, sessionId: string): Promise<AssistantSubsessionDto> {
+  return apiGet(`${assistantBase(agentId)}/subsessions/${encodeURIComponent(sessionId)}`)
+}
+
+/** Interrupt background work's current turn, or end a follow-up; `not_running` when there was nothing to stop. */
+export async function stopAssistantSubsession(
+  agentId: string,
+  sessionId: string
+): Promise<{ result: 'stopped' | 'not_running' }> {
+  return apiPost(`${assistantBase(agentId)}/subsessions/${encodeURIComponent(sessionId)}/stop`, {})
+}
+
+/** End a follow-up by its id under the conversation its row is listed in, which works before its first check too. */
+export async function stopAssistantFollowUp(
+  agentId: string,
+  followUpId: string,
+  parentSessionId: string
+): Promise<{ result: 'stopped' | 'not_running' }> {
+  return apiPost(`${assistantBase(agentId)}/follow-ups/${encodeURIComponent(followUpId)}/stop`, { parentSessionId })
+}
+
+/** Background work's runtime permission request waiting on an answer; decided like any approval request. */
+export interface AssistantPermissionRequestDto {
+  requestId: string
+  tool: string
+  createdAt: string
+  /** When it is denied and the background work stops, unless someone answers first. */
+  expiresAt: string
+  options?: AgentPermissionOptionDto[]
+  /** Present only when the viewer may open it. */
+  subsession: { sessionId: string; title: string | null } | null
+  parent: { sessionId: string; title: string | null; platform: string | null; channelName: string | null } | null
+}
+
+export async function fetchAssistantDrafts(agentId: string): Promise<{
+  drafts: AssistantDraftDto[]
+  truncated: boolean
+  /** Absent before the Control Plane listed them. */
+  permissionRequests?: AssistantPermissionRequestDto[]
+}> {
+  return apiGet(`${assistantBase(agentId)}/drafts`)
+}
+
+export async function decideAssistantDraft(
+  agentId: string,
+  draftId: string,
+  decision: AssistantDraftDecision
+): Promise<AssistantDraftOutcomeDto> {
+  return apiPost(`${assistantBase(agentId)}/drafts/${encodeURIComponent(draftId)}/decision`, { decision })
+}
+
+/** A proposal waiting in one webchat conversation, for whoever may continue it and the agent's editors (assistant-mode.md §5.10). */
+export interface AssistantConversationProposalDto {
+  id: string
+  sentence: string
+  why: string
+  /** What a background session would carry out once approved; a follow-up form's title. */
+  task: string
+  itemId: string
+  itemTitle: string | null
+  /** The follow-up form: approving takes this follow-up instead of running a task. */
+  followUp?: AssistantProposalFollowUpDto
+  createdAt: string
+  expiresAt: string
+}
+
+export async function fetchAssistantConversationProposals(
+  agentId: string,
+  sessionId: string
+): Promise<{ proposals: AssistantConversationProposalDto[]; truncated: boolean }> {
+  return apiGet(`${assistantBase(agentId)}/conversations/${encodeURIComponent(sessionId)}/proposals`)
+}
+
+/** Approve (start its task, or take a follow-up form's follow-up) or deny one; `executing` started it, `succeeded` took the follow-up, `failed` ran nothing. */
+export async function decideAssistantConversationProposal(
+  agentId: string,
+  sessionId: string,
+  draftId: string,
+  decision: 'approve' | 'deny'
+): Promise<AssistantDraftOutcomeDto> {
+  return apiPost(
+    `${assistantBase(agentId)}/conversations/${encodeURIComponent(sessionId)}/proposals/${encodeURIComponent(draftId)}/decision`,
+    { decision }
+  )
+}
+
+/** The icon upload/delete result — the new descriptor + resolved display URL. */
+export interface IconResult {
+  icon: AgentIcon | null
+  iconUrl: string | null
+}
+
+// Raw image/* PUT (docs/designs/icon-uploads.md): the CP proxies the upload to the
+// object store, so we send the resized blob directly (not JSON). Returns the new
+// icon descriptor + resolved store URL, reassembled into {kind:'image',url} for callers.
+async function putIconBlob(path: string, blob: Blob): Promise<IconResult> {
+  const res = await authenticatedFetch(
+    path,
+    { method: 'PUT', body: blob },
+    { 'content-type': blob.type || 'application/octet-stream' }
+  )
+  if (!res.ok) throw await apiErrorFromResponse('PUT', path, res)
+  const d = (await res.json()) as IconResult
+  return { icon: withIconUrl(d.icon, d.iconUrl), iconUrl: d.iconUrl }
+}
+
+async function deleteIcon(path: string): Promise<IconResult> {
+  const res = await authenticatedFetch(path, { method: 'DELETE' })
+  if (!res.ok) throw await apiErrorFromResponse('DELETE', path, res)
+  const d = (await res.json()) as IconResult
+  return { icon: withIconUrl(d.icon, d.iconUrl), iconUrl: d.iconUrl }
+}
+
+export function uploadAgentIcon(agentId: string, blob: Blob): Promise<IconResult> {
+  return putIconBlob(`${orgBase()}/agents/${encodeURIComponent(agentId)}/icon`, blob)
+}
+export function deleteAgentIcon(agentId: string): Promise<IconResult> {
+  return deleteIcon(`${orgBase()}/agents/${encodeURIComponent(agentId)}/icon`)
+}
+export function uploadOrgIcon(blob: Blob, orgId?: string): Promise<IconResult> {
+  return putIconBlob(`${orgBase(orgId)}/icon`, blob)
+}
+export function deleteOrgIcon(orgId?: string): Promise<IconResult> {
+  return deleteIcon(`${orgBase(orgId)}/icon`)
+}
+
+/** Acknowledged cold workspace edit. */
+export async function setAgentWorkspace(agentId: string, input: SetAgentWorkspaceInput): Promise<Agent> {
+  return agentFromDto(await apiPut<AgentDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/workspace`, input))
+}
+
+// Hard-cut an agent over to another daemon. A normal move coordinates an
+// acknowledged source fence/cancel and destination activation; `force` is the
+// explicit recovery path when the source cannot ACK. This stays separate from
+// the ordinary spec PATCH because placement changes have runtime side effects.
+/** A move target: one machine, the pool as a whole (submitted as the `pool` sugar), or one of the
+ *  org's own groups. Both set kinds name the SET — whichever member holds the duty serves it. */
+export type AgentPlacementTarget =
+  { kind: 'daemon'; daemonId: string } | { kind: 'pool' } | { kind: 'set'; setId: string }
+
+export async function moveAgent(
+  agentId: string,
+  target: AgentPlacementTarget,
+  options: { force?: boolean } = {}
+): Promise<Agent> {
+  const moved = agentFromDto(
+    await apiPut<AgentDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/daemon`, {
+      ...(target.kind === 'pool'
+        ? { placementKind: 'pool' }
+        : target.kind === 'set'
+          ? { placementKind: 'set', setId: target.setId }
+          : { daemonId: target.daemonId }),
+      ...(options.force ? { force: true } : {})
+    })
+  )
+  track('agent_moved', {
+    org_id: apiOrgId,
+    agent_id: moved.id,
+    to_daemon_id: target.kind === 'pool' ? 'pool' : target.kind === 'set' ? `set:${target.setId}` : target.daemonId,
+    force: options.force === true
+  })
+  return moved
+}
+
+// Set an agent's visibility + share set (PUT /agents/:id/sharing). Separate from the
+// content PATCH; gated server-side by canManageSharing.
+export async function updateAgentSharing(agentId: string, body: SharingInput): Promise<Agent> {
+  return agentFromDto(await apiPut<AgentDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/sharing`, body))
+}
+
+// Set both directions of agent-to-agent visibility/call authorization. Uses the
+// normal agent edit gate (`canEdit` in the DTO).
+export async function updateAgentCallPolicy(agentId: string, body: AgentCallPolicyInput): Promise<Agent> {
+  return agentFromDto(await apiPut<AgentDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/call-policy`, body))
+}
+
+// The fleet reads split by change rate: `/daemons` is polled for liveness, `/daemons/
+// capabilities` moves only when a daemon connects/upgrades/re-probes, and a runtime's
+// model catalog is read one daemon at a time. `DaemonRow` is stitched back together in
+// the data context, so views still see one object.
+export async function fetchDaemons(orgId?: string): Promise<DaemonRow[]> {
+  return (await apiGet<DaemonFleetDto[]>(`${orgBase(orgId)}/daemons`)).map(daemonFromDto)
+}
+
+export async function changeDaemonApproval(daemon: DaemonRow, status: 'approved' | 'revoked'): Promise<void> {
+  await apiPost(`${orgBase()}/daemons/${encodeURIComponent(daemon.daemonId)}/approval`, {
+    status,
+    revision: daemon.approval?.revision,
+    sessionEpoch: daemon.sessionEpoch
+  })
+}
+
+/** Fleet-wide capability, keyed by daemon id — merged onto the liveness rows. */
+export async function fetchDaemonCapabilities(orgId?: string): Promise<Map<string, DaemonCapabilityDto>> {
+  const rows = await apiGet<DaemonCapabilityDto[]>(`${orgBase(orgId)}/daemons/capabilities`)
+  return new Map(rows.map((r) => [r.daemonId, r]))
+}
+
+/** One daemon in full — the only read that carries each runtime's model catalog. */
+export async function fetchDaemon(daemonId: string): Promise<DaemonRow> {
+  return daemonFromDto(await apiGet<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`))
+}
+
+// Assign a human-friendly display name to a connected daemon.
+export async function renameDaemon(daemonId: string, name: string): Promise<DaemonRow> {
+  return daemonFromDto(await apiPatch<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`, { name }))
+}
+
+// Set how long the daemon keeps finished sessions before deleting them ("Expire
+// sessions"). The CP hot-pushes the window to a connected daemon.
+export async function updateDaemonSessionRetention(
+  daemonId: string,
+  sessionRetention: DaemonSessionRetention
+): Promise<DaemonRow> {
+  return daemonFromDto(
+    await apiPatch<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`, { sessionRetention })
+  )
+}
+
+// Set how long a finished session's workspace and sandbox stay (the cleanup row's "Workspace" picker); the CP hot-pushes it.
+export async function updateDaemonWorkspaceRetention(
+  daemonId: string,
+  workspaceRetention: DaemonSessionRetention
+): Promise<DaemonRow> {
+  return daemonFromDto(
+    await apiPatch<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`, { workspaceRetention })
+  )
+}
+
+// Turn the daemon's auto-upgrade on or off; the CP answers 409 when the daemon does not support it.
+export async function updateDaemonAutoUpgrade(daemonId: string, autoUpgrade: boolean): Promise<DaemonRow> {
+  return daemonFromDto(
+    await apiPatch<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`, { autoUpgrade })
+  )
+}
+
+// Set a daemon's visibility + share set (PUT /daemons/:id/sharing).
+export async function updateDaemonSharing(daemonId: string, body: SharingInput): Promise<DaemonRow> {
+  return daemonFromDto(
+    await apiPut<DaemonViewDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}/sharing`, body)
+  )
+}
+
+export async function createAgent(input: CreateAgentInput): Promise<Agent> {
+  const agent = agentFromDto(await apiPost<AgentDto>(`${orgBase()}/agents`, { capabilities: [], ...input }))
+  track('agent_created', {
+    org_id: apiOrgId,
+    agent_id: agent.id,
+    runtime: agent.runtime,
+    model: agent.model ?? null,
+    has_workspace: agent.workspace?.mode !== 'scratch'
+  })
+  return agent
+}
+
+// Provision a NEW daemon (a `provisioned` row + its first API key) and render the
+// start command. The daemon flips to `ready` in `fetchDaemons()` once it authenticates.
+export async function provisionDaemon(): Promise<DaemonConnectDto> {
+  return apiPost<DaemonConnectDto>(`${orgBase()}/daemons/token`, {})
+}
+
+// List a daemon's API keys (never the secret/hash) for the console.
+export async function fetchDaemonKeys(daemonId: string): Promise<ApiKeyDto[]> {
+  return apiGet<ApiKeyDto[]>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}/keys`)
+}
+
+// Mint an additional key for an existing daemon (rotate / "Regenerate"). Returns the
+// one-time plaintext + a ready-to-run command.
+export async function mintDaemonKey(daemonId: string): Promise<MintedKeyDto> {
+  const minted = await apiPost<MintedKeyDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}/keys`, {})
+  track('api_key_issued', { org_id: apiOrgId, daemon_id: daemonId })
+  return minted
+}
+
+// Revoke a key (kill switch). The next reconnect with it fails closed (4401).
+export async function revokeDaemonKey(daemonId: string, keyId: string): Promise<ApiKeyDto> {
+  const view = await apiDelete<ApiKeyDto>(
+    `${orgBase()}/daemons/${encodeURIComponent(daemonId)}/keys/${encodeURIComponent(keyId)}`
+  )
+  track('api_key_revoked', { org_id: apiOrgId, daemon_id: daemonId, key_id: keyId })
+  return view
+}
+
+// Remove a daemon from the fleet. The CP refuses (409) while it is online — only an
+// offline daemon can be deleted (mirrors the console's offline-only delete action).
+export async function deleteDaemon(daemonId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}`)
+}
+
+// Command a daemon to drain + relaunch on the SAME version (supervisor restart). Returns
+// the opened lifecycle op (with its id) — the 202 only means the daemon accepted; success
+// shows up as that op reaching `succeeded` in the fleet read model's lifecycleOp. Owner-only;
+// 503 offline, 409 in-flight/declined.
+export async function restartDaemon(daemonId: string): Promise<DaemonLifecycleOpDto> {
+  return apiPost<DaemonLifecycleOpDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}/restart`, {})
+}
+
+export interface PoolRuntimeProbeDto {
+  state: 'probing' | 'unsupported'
+  members: number
+}
+
+// Ask the self-hosted pool to re-probe its runtime image; the refreshed runtimes land in the capability read minutes later. Owner-only.
+export async function probePoolRuntimes(): Promise<PoolRuntimeProbeDto> {
+  return apiPost<PoolRuntimeProbeDto>(`${orgBase()}/daemons/pool/runtime-probe`, {})
+}
+
+// Command a daemon to install `version` via its CLI, then drain + relaunch onto it.
+// Returns the opened op; same track-by-id contract as restart above.
+export async function upgradeDaemon(daemonId: string, version: string): Promise<DaemonLifecycleOpDto> {
+  return apiPost<DaemonLifecycleOpDto>(`${orgBase()}/daemons/${encodeURIComponent(daemonId)}/upgrade`, { version })
+}
+
+// Poll a specific lifecycle op by id (status expiry-projected). The modal tracks the
+// op it commanded through THIS, not the fleet read model's single latest-op slot — so a
+// newer op from another client can't strand its polling. 404 ⇒ null (unknown/foreign id).
+export async function getDaemonLifecycleOp(daemonId: string, opId: string): Promise<DaemonLifecycleOpDto | null> {
+  try {
+    return await apiGet<DaemonLifecycleOpDto>(
+      `${orgBase()}/daemons/${encodeURIComponent(daemonId)}/lifecycle/${encodeURIComponent(opId)}`
+    )
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null
+    throw e
+  }
+}
+
+// ── integrations ──────────────────────────────────────────────────────────────
+export async function fetchIntegrations(orgId?: string): Promise<IntegrationDto[]> {
+  return apiGet<IntegrationDto[]>(`${orgBase(orgId)}/integrations`)
+}
+
+// Install a platform connection (`POST /integrations`). The response is metadata only
+// (never the tokens); the CP delivers the tokens to the owning agent's daemon.
+export async function createIntegration(input: CreateIntegrationInput): Promise<IntegrationDto> {
+  return apiPost<IntegrationDto>(`${orgBase()}/integrations`, input)
+}
+
+/** Validate a pasted Telegram token and its Group Privacy Mode without storing it. */
+export async function checkTelegramBot(botToken: string): Promise<TelegramBotCheckDto> {
+  return apiPost<TelegramBotCheckDto>(`${orgBase()}/integrations/telegram/check`, { botToken })
+}
+
+// ── Feishu/Lark one-click app registration ──
+// Start the official device flow and receive a normal browser deeplink. The CP
+// keeps polling and installs the returned credentials without exposing them here.
+export async function startFeishuRegistration(
+  input: StartFeishuRegistrationInput
+): Promise<FeishuRegistrationStartDto> {
+  return apiPost<FeishuRegistrationStartDto>(`${orgBase()}/integrations/feishu/app`, input)
+}
+export async function getFeishuRegistration(id: string): Promise<FeishuRegistrationStatusDto> {
+  return apiGet<FeishuRegistrationStatusDto>(`${orgBase()}/integrations/feishu/app/${encodeURIComponent(id)}`)
+}
+
+// ── WeChat QR login ──
+/** `POST /integrations/wechat/login`: start a QR login for an agent; `botId` re-scans that bot in place. */
+export interface StartWeChatLoginInput {
+  agentId: string
+  botId?: string
+  name?: string
+}
+/** One WeChat QR login; the CP runs it and installs the bot itself, so no token reaches the browser. */
+export interface WeChatLoginDto {
+  id: string
+  status: 'waiting' | 'scanned' | 'verify_code' | 'completed' | 'failed'
+  qrUrl: string | null
+  expiresAt: string
+  failureReason: 'expired' | 'verify_code_blocked' | 'agent_unavailable' | 'setup_failed' | null
+  integrationId: string | null
+  botId: string | null
+  wechatUserTail: string | null
+}
+export async function startWeChatLogin(input: StartWeChatLoginInput): Promise<WeChatLoginDto> {
+  return apiPost<WeChatLoginDto>(`${orgBase()}/integrations/wechat/login`, input)
+}
+/** The CP holds this request for WeChat's long poll (up to ~25 s), so callers poll back-to-back. */
+export async function getWeChatLogin(
+  id: string,
+  options: { verifyCode?: string; signal?: AbortSignal } = {}
+): Promise<WeChatLoginDto> {
+  const query = options.verifyCode ? `?verifyCode=${encodeURIComponent(options.verifyCode)}` : ''
+  return apiGet<WeChatLoginDto>(
+    `${orgBase()}/integrations/wechat/login/${encodeURIComponent(id)}${query}`,
+    options.signal ? { signal: options.signal } : undefined
+  )
+}
+
+// ── Slack auto-install funnel ──
+// Start the funnel: the CP creates the app from a manifest and returns the OAuth
+// install URL. Throws ApiError(404) when the server hasn't enabled the funnel
+// (no PUBLIC_CP_URL) — the modal falls back to the manual manifest flow.
+export async function startSlackInstall(input: StartSlackInstallInput): Promise<SlackInstallStartDto> {
+  return apiPost<SlackInstallStartDto>(`${orgBase()}/integrations/slack/app`, input)
+}
+// Poll funnel progress while the user approves the install in the other tab.
+export async function getSlackInstall(installId: string): Promise<SlackInstallStatusDto> {
+  return apiGet<SlackInstallStatusDto>(`${orgBase()}/integrations/slack/app/${encodeURIComponent(installId)}`)
+}
+// Finalize the auto-install. Socket: hand the CP the pasted app-level token, which
+// it combines with the OAuth-obtained bot token to create the bot + integration.
+// Http: no app-level token — the CP reads the app's signing secret via the caller's
+// config token, so finalize is fully automatic. Metadata only back.
+export async function finalizeSlackInstall(
+  installId: string,
+  opts?: { appToken?: string; shareable?: boolean }
+): Promise<IntegrationDto> {
+  return apiPost<IntegrationDto>(`${orgBase()}/integrations/slack/app/${encodeURIComponent(installId)}/finalize`, {
+    ...(opts?.appToken ? { appToken: opts.appToken } : {}),
+    ...(opts?.shareable ? { shareable: true } : {})
+  })
+}
+
+// ── Platform-published "Add to Slack" app (preset-agents.md §5.3) ──
+// Mint a pending install of the deployment's distributed Slack app and get the
+// slack.com authorize URL to open. A generic install may select an agent (the CP
+// otherwise defaults to the org preset); Settings supplies `botId` to fence a
+// reauthorization to the bot's existing workspace. The callback finishes the
+// install server-side; the console polls the row below to learn when it landed.
+export async function startSlackPlatformInstall(
+  input: { agentId?: string; botId?: string } = {}
+): Promise<SlackPlatformInstallDto> {
+  return apiPost<SlackPlatformInstallDto>(`${orgBase()}/integrations/slack/platform-install`, input)
+}
+
+// Poll one platform-app install to completion. The ROW's terminal state is the
+// signal, deliberately not "did a new integration appear": re-authorizing a
+// workspace the agent already has only rotates the token, creating no
+// integration, so list growth would never fire on that path.
+export async function getSlackPlatformInstall(id: string): Promise<SlackPlatformInstallStatusDto> {
+  return apiGet<SlackPlatformInstallStatusDto>(`${orgBase()}/integrations/slack/platform-install/${id}`)
+}
+
+// ── Slack org config token (Settings) ──
+// The org's stored App Configuration token. Present ⇒ the create modal forces the
+// auto-install flow; absent ⇒ manual. GET never returns the token.
+export async function fetchSlackConfig(): Promise<SlackConfigDto> {
+  return apiGet<SlackConfigDto>(`${orgBase()}/slack/config`)
+}
+export async function saveSlackConfig(input: SlackConfigInput): Promise<SlackConfigDto> {
+  return apiPut<SlackConfigDto>(`${orgBase()}/slack/config`, input)
+}
+export async function deleteSlackConfig(): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/slack/config`)
+}
+
+// ── Linear workspace connect funnel (linear-integration.md §7.1, §7.4) ──
+// A Linear bot IS one connected workspace, and agents are members of it. The
+// funnel mints a one-shot OAuth state bound to this org and the workspace's chosen
+// default agent; no bot or integration row exists until the callback completes.
+
+/** A started connect round trip: the funnel row id (which IS the OAuth `state`)
+ *  and the linear.app authorize URL to open. */
+export interface LinearConnectStartDto {
+  id: string
+  connectUrl: string
+}
+
+/** Poll answer for one connect round trip. `failureReason` is a short server code
+ *  (`denied` / `expired` / `workspace_taken` / `wrong_workspace` /
+ *  `default_agent_required` / `agent_missing` / `error`), never prose. */
+export interface LinearConnectStatusDto {
+  id: string
+  status: 'pending' | 'completed' | 'failed'
+  failureReason: string | null
+  botId: string | null
+}
+
+// Start connecting a workspace. `agentId` becomes its default agent — the member a
+// bare delegation starts a session with. Throws ApiError(404) when the deployment
+// has no Linear app, which is the console's only signal that it is unconfigured.
+export async function startLinearConnect(agentId: string): Promise<LinearConnectStartDto> {
+  return apiPost<LinearConnectStartDto>(`${orgBase()}/integrations/linear/connect`, { agentId })
+}
+
+// Poll one connect row while the user authorizes in the other tab. The ROW's
+// terminal state is the signal: the OAuth tab is a throwaway, so a tail refusal
+// (workspace claimed elsewhere, wrong workspace) has no other channel back.
+export async function getLinearConnect(id: string): Promise<LinearConnectStatusDto> {
+  return apiGet<LinearConnectStatusDto>(`${orgBase()}/integrations/linear/connect/${encodeURIComponent(id)}`)
+}
+
+// Restart the funnel against an already-connected workspace whose grant died. The
+// nonce is bound to this bot, so authorizing a different workspace is refused.
+export async function reconnectLinearWorkspace(botId: string): Promise<LinearConnectStartDto> {
+  return apiPost<LinearConnectStartDto>(`${orgBase()}/bots/${encodeURIComponent(botId)}/linear/reconnect`, {})
+}
+
+// Disconnect a workspace for the whole organization: every membership and then the bot
+// itself, in ONE call. The console must NOT loop `deleteIntegration` here — the list it
+// would loop over is visibility-filtered, so a member on an agent outside the caller's
+// audience is invisible to it and the workspace would be left half unlinked.
+export async function disconnectLinearWorkspace(botId: string): Promise<void> {
+  await apiPost<void>(`${orgBase()}/bots/${encodeURIComponent(botId)}/linear/disconnect`, {})
+}
+
+// Uninstall an integration (`DELETE /integrations/:id`): drops the CP record and
+// tells the owning daemon to close the connection. The BOT survives (freed) — it
+// shows up in the Add-integration picker for reuse.
+export async function deleteIntegration(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/integrations/${encodeURIComponent(id)}`)
+}
+
+// ── Hooks (inbound webhook triggers — webhook-triggers-and-github-events.md) ──
+
+// A hook definition row. `url` is the full public ingress URL (relay-pool based),
+// a capability URL the CP surfaces only to callers with edit rights.
+// The hook-kind vocabulary is the shared wire contract's, not a copy: a new code
+// host widens it there and every mapping over it in the console must be extended.
+export type { HookKind }
+export type GithubCommentFamily = 'issues' | 'pull_request'
+/** GitLab's own note families — the merge-request counterpart of a pull request. */
+export type GitlabCommentFamily = 'issues' | 'merge_request'
+/** The subject family ONE code-host row covers: a row is `(agent, repo, family)`,
+ *  each with its own cadence and mention gate, and the family is immutable. */
+export type GithubHookFamily = 'pull_request' | 'issues' | 'push' | 'deployment' | 'release'
+export type GitlabHookFamily = 'merge_request' | 'issues' | 'push' | 'release'
+/** Gitea rows speak the GitLab family vocabulary (gitea-integration.md §8): a pull request
+ *  is stored as the `merge_request` family, and the relay maps its event types onto it. */
+export type GiteaHookFamily = GitlabHookFamily
+export type GiteaCommentFamily = GitlabCommentFamily
+/** The stored union across code hosts; each row carries only its own host's subset. */
+export type HookCommentFamily = GithubCommentFamily | GitlabCommentFamily
+export type HookReviewPolicy = 'off' | 'comment' | 'request_changes' | 'full'
+// `check` is GitHub's informational Check and GitLab's run note; `status` is Gitea's commit status.
+export type HookReportingMode = 'off' | 'check' | 'status'
+// `required` remains server-rejected until the R2b acceptance gates pass.
+export type HookGateMode = 'informational'
+
+export interface HookDto {
+  id: string
+  agentId: string | null // null ⇒ orphaned by agent delete (inert)
+  kind: HookKind
+  name: string
+  sessionMode: 'perDelivery' | 'perThread' | 'perSubject' | 'shared'
+  enabled: boolean
+  instructions?: string | null // webhook kind: put ahead of each delivery's payload
+  url: string | null
+  hmacConfigured: boolean
+  targetPlatform?: string
+  targetChannel?: string | null
+  targetIntegrationId?: string | null
+  // ── code-host kinds ── repo/project + subscription (empty/null on webhook kind)
+  repoId?: string | null // GitHub numeric repo id, or the GitLab numeric project id
+  repoFullName: string | null // owner/repo as GitHub cases it, or the GitLab project path
+  installationAccount?: string | null // an installation row's account: every repository of its GitHub App installation
+  family: string | null // the one subject family this row covers; null on webhook kind and legacy-inert rows
+  events: string[] // 'issues:*' / 'issue_comment:created' / 'merge_request:*' / …
+  commentFamilies: HookCommentFamily[] // thread kinds whose replies may fire this hook
+  labelFilter: string[]
+  skipDrafts: boolean // GitHub pull-request rows: draft revisions wait until the PR is marked ready
+  mentionOnly: boolean // P3: authored event text must @-mention the agent or App
+  configRevision: string // BigInt JSON/wire form; CP-owned, monotonic
+  reviewPolicy: HookReviewPolicy
+  reportingMode: HookReportingMode
+  gateMode: HookGateMode
+  lastFiredAt: string | null
+  createdBy: string | null
+  createdAt: string
+}
+
+/** Create response: the DTO plus the ONE-TIME signing-secret echo — never
+ *  retrievable again after this response. */
+export interface CreatedHookDto extends HookDto {
+  hmacSecret: string | null
+}
+
+// One delivery's run row. `running` = the relay accepted the dispatch and the
+// daemon's completion report hasn't landed yet.
+export interface HookRunDto {
+  id: string
+  deliveryKey: string
+  event: string | null
+  startedAt: string
+  status: 'running' | 'success' | 'failed'
+  durationMs: number | null
+  sessionId: string | null // Console session id, when the delivery has a related session
+  reason: string | null
+}
+
+export interface CreateHookInput {
+  agentId: string
+  name: string
+  /** Session continuity: per delivery (default), caller-keyed via X-AC-Session-Key, or one shared session. */
+  sessionMode?: 'perDelivery' | 'perSubject' | 'shared'
+  /** What the agent does with each delivery; the payload then follows as data. */
+  instructions?: string
+  /** Add X-AC-Signature verification on top of the capability URL. */
+  hmac?: boolean
+}
+
+// github kind: one repository inside one of the org's GitHub App installations, or every repository of one account's.
+export interface CreateGithubHookInput {
+  agentId: string
+  name: string
+  enabled?: boolean
+  // Exactly one: the repository, or an installation account with the agent's installation grant.
+  repoFullName?: string
+  githubAccount?: string
+  family: GithubHookFamily // one row per family; every event pattern must belong to it
+  events: string[] // 'issues:*' etc — at least one
+  commentFamilies?: GithubCommentFamily[]
+  labelFilter?: string[]
+  skipDrafts?: boolean // pull-request rows only
+  mentionOnly?: boolean // require authored event text to @-mention the agent or App
+  reviewPolicy?: HookReviewPolicy
+  reportingMode?: HookReportingMode
+  // R1/R2a callers can only send the informational literal.
+  gateMode?: HookGateMode
+}
+
+// gitlab kind: the project must already be a managed binding in the org — the CP
+// validates the numeric id against its own row and derives the path from it.
+export interface CreateGitlabHookInput {
+  agentId: string
+  name: string
+  enabled?: boolean
+  projectId: string // numeric GitLab project id
+  family: GitlabHookFamily // one row per family; every event pattern must belong to it
+  events: string[] // 'issues:*' / 'merge_request:*' / 'push:*' — at least one
+  commentFamilies?: GitlabCommentFamily[]
+  labelFilter?: string[] // non-empty ⇒ the subject's current labels must intersect it (case-insensitive)
+  mentionOnly?: boolean
+  reviewPolicy?: HookReviewPolicy
+  // 'check' publishes the merge-request run note; no gateMode — GitLab has no required gate.
+  reportingMode?: HookReportingMode
+}
+
+// gitea kind: the repository must already be a managed binding in the org — the CP
+// validates the numeric id against its own row and derives the path from it.
+export interface CreateGiteaHookInput {
+  agentId: string
+  name: string
+  enabled?: boolean
+  repoId: string // numeric Gitea repository id
+  family: GiteaHookFamily // one row per family; every event pattern must belong to it
+  events: string[] // 'issues:*' / 'merge_request:*' / 'push:*' — at least one
+  commentFamilies?: GiteaCommentFamily[]
+  labelFilter?: string[] // non-empty ⇒ the subject's current labels must intersect it (case-insensitive)
+  mentionOnly?: boolean
+  reviewPolicy?: HookReviewPolicy
+  // 'status' publishes the pull request's commit status; no gateMode — a required check is the operator's choice.
+  reportingMode?: HookReportingMode
+}
+
+/** Azure DevOps rows speak the same family vocabulary, narrowed to pull requests and pushes (azure-devops-integration.md §11.4). */
+export type AzureDevOpsHookFamily = 'merge_request' | 'push'
+export type AzureDevOpsCommentFamily = 'merge_request'
+
+// azure-devops kind: the repository must already be bound and authorized for the agent; no label filter exists.
+export interface CreateAzureDevOpsHookInput {
+  agentId: string
+  name: string
+  enabled?: boolean
+  repoId: string // the bound repository's surrogate numeric id
+  family: AzureDevOpsHookFamily
+  events: string[] // 'merge_request:opened' / 'merge_request:*' / 'push:*'
+  commentFamilies?: AzureDevOpsCommentFamily[]
+  mentionOnly?: boolean
+  reviewPolicy?: HookReviewPolicy
+  // 'status' publishes the pull request's status.
+  reportingMode?: HookReportingMode
+}
+
+// The family is immutable, so no update body carries it — changing a row's
+// family is a delete plus a create.
+export type UpdateGithubHookInput = Omit<CreateGithubHookInput, 'family'>
+export type UpdateGitlabHookInput = Omit<CreateGitlabHookInput, 'family'>
+export type UpdateGiteaHookInput = Omit<CreateGiteaHookInput, 'family'>
+export type UpdateAzureDevOpsHookInput = Omit<CreateAzureDevOpsHookInput, 'family'>
+
+// ── trusted users ── the per-repository vouch list a code-host hook's settings edit.
+// Reached through a hook (that is the row the console holds), stored per repository: every
+// hook row on the repository shares it. `actorId` is the host's numeric user id — what the
+// gates match; `login` is display only and refreshes on re-add.
+export interface TrustedActorDto {
+  id: string
+  provider: CodeHostProvider
+  repoId: string
+  actorId: string
+  login: string
+  addedBy: string | null
+  createdAt: string
+}
+
+export async function fetchTrustedActors(hookId: string, orgId?: string): Promise<TrustedActorDto[]> {
+  return apiGet<TrustedActorDto[]>(`${orgBase(orgId)}/hooks/${encodeURIComponent(hookId)}/trusted-actors`)
+}
+
+// Not apiPost: the denial body is what the field words inline — 404 for a login the host does
+// not know, 409 when no credential this deployment holds can ask the host right now.
+export async function addTrustedActor(hookId: string, login: string): Promise<TrustedActorDto> {
+  const path = `${orgBase()}/hooks/${encodeURIComponent(hookId)}/trusted-actors`
+  const res = await authenticatedFetch(
+    path,
+    { method: 'POST', body: JSON.stringify({ login }) },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    throw new ApiError(body.message ?? `POST ${path} → ${res.status} ${res.statusText}`, res.status, body.code)
+  }
+  return (await res.json()) as TrustedActorDto
+}
+
+export async function removeTrustedActor(hookId: string, actorId: string): Promise<void> {
+  const path = `${orgBase()}/hooks/${encodeURIComponent(hookId)}/trusted-actors/${encodeURIComponent(actorId)}`
+  const res = await authenticatedFetch(path, { method: 'DELETE' })
+  if (!res.ok && res.status !== 404) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    throw new ApiError(body.message ?? `DELETE ${path} → ${res.status} ${res.statusText}`, res.status, body.code)
+  }
+}
+
+// A hook is subordinate to its agent (like an Integration), so there is no
+// org-wide hook list — you fetch ONE agent's hooks, gated server-side by that
+// agent's visibility (404 for an agent you can't see).
+export async function fetchAgentHooks(agentId: string, orgId?: string): Promise<HookDto[]> {
+  return apiGet<HookDto[]>(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/hooks`)
+}
+
+// ── agent chat APIs (the API card on the Integrations tab, shared-bot-relay.md §10.4) ──
+export type { AgentApiProtocol }
+
+export interface AgentApiEntryDto {
+  protocol: AgentApiProtocol
+  createdBy: string | null
+  createdAt: string
+  /** The Decision a turn over this API must pass; absent from a CP without gates. */
+  gate?: ChannelDecisionGate | null
+}
+
+const agentApiBase = (agentId: string, orgId?: string) => `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/api`
+
+export async function fetchAgentApiEntries(agentId: string, orgId?: string): Promise<AgentApiEntryDto[]> {
+  return (await apiGet<{ entries: AgentApiEntryDto[] }>(agentApiBase(agentId, orgId))).entries
+}
+
+export async function addAgentApi(agentId: string, protocol: AgentApiProtocol): Promise<AgentApiEntryDto> {
+  return apiPut<AgentApiEntryDto>(`${agentApiBase(agentId)}/${protocol}`)
+}
+
+export async function removeAgentApi(agentId: string, protocol: AgentApiProtocol): Promise<void> {
+  await apiDelete<void>(`${agentApiBase(agentId)}/${protocol}`)
+}
+
+/** Gate turns over this API by a Decision, or `null` to admit every turn. */
+export async function setAgentApiGate(
+  agentId: string,
+  protocol: AgentApiProtocol,
+  gate: ChannelDecisionGate | null
+): Promise<AgentApiEntryDto> {
+  return apiPut<AgentApiEntryDto>(`${agentApiBase(agentId)}/${protocol}/gate`, { gate })
+}
+
+/** The verdicts this API's gate reached, newest first, read from the agent's serving daemon. */
+export function fetchAgentApiGateEvaluations(
+  agentId: string,
+  protocol: AgentApiProtocol,
+  page: { cursor?: number; limit?: number; decisionId?: string } = {},
+  orgId?: string
+): Promise<DecisionEvaluationRecordPage> {
+  const query = new URLSearchParams()
+  if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+  if (page.limit !== undefined) query.set('limit', String(page.limit))
+  if (page.decisionId) query.set('decisionId', page.decisionId)
+  const suffix = query.toString()
+  return apiGet(`${agentApiBase(agentId, orgId)}/${protocol}/evaluations${suffix ? `?${suffix}` : ''}`)
+}
+
+/** Try a draft gate on this API against a sample call, on a daemon serving the agent; writes nothing. */
+export function previewAgentApiGate(
+  agentId: string,
+  protocol: AgentApiProtocol,
+  input: ApiGatePreviewInput,
+  orgId?: string
+): Promise<DecisionGatePreviewResult> {
+  return apiPost(`${agentApiBase(agentId, orgId)}/${protocol}/gate/preview`, input)
+}
+
+export function fetchAgentApiGateEvaluation(
+  agentId: string,
+  protocol: AgentApiProtocol,
+  seq: number,
+  orgId?: string
+): Promise<DecisionEvaluationRecordDetail> {
+  return apiGet(`${agentApiBase(agentId, orgId)}/${protocol}/evaluations/${encodeURIComponent(String(seq))}`)
+}
+
+// The capability URL is sufficient by default. HMAC is an optional second
+// factor, with its signing secret revealed once by the create response.
+export async function createHook(input: CreateHookInput): Promise<CreatedHookDto> {
+  const hook = await apiPost<CreatedHookDto>(`${orgBase()}/hooks`, { kind: 'webhook', ...input })
+  track('hook_created', { org_id: apiOrgId, agent_id: hook.agentId, hook_kind: hook.kind, hook_id: hook.id })
+  return hook
+}
+
+/** Change a generic webhook's instructions; the rest of the whole-definition PUT echoes the stored hook. */
+export async function updateWebhookInstructions(hook: HookDto, instructions: string): Promise<HookDto> {
+  return apiPut<HookDto>(`${orgBase()}/hooks/${encodeURIComponent(hook.id)}`, {
+    kind: 'webhook',
+    agentId: hook.agentId,
+    name: hook.name,
+    enabled: hook.enabled,
+    sessionMode: hook.sessionMode,
+    instructions: instructions.trim() || null,
+    ...(hook.targetPlatform ? { targetPlatform: hook.targetPlatform } : {}),
+    ...(hook.targetChannel ? { targetChannel: hook.targetChannel } : {}),
+    ...(hook.targetIntegrationId ? { targetIntegrationId: hook.targetIntegrationId } : {})
+  })
+}
+
+// GitHub subscription — no URL, no secret (the App webhook signs deliveries
+// pool-wide); events ride through the relay to this agent, one session per
+// issue/PR thread.
+export async function createGithubHook(input: CreateGithubHookInput): Promise<CreatedHookDto> {
+  const hook = await apiPost<CreatedHookDto>(`${orgBase()}/hooks`, { kind: 'github', ...input })
+  track('hook_created', { org_id: apiOrgId, agent_id: hook.agentId, hook_kind: hook.kind, hook_id: hook.id })
+  return hook
+}
+
+// Update a github hook's subscription (event pills / labels / repo re-target).
+// The body re-sends the full github block — PUT is whole-definition.
+export async function updateGithubHook(id: string, input: UpdateGithubHookInput, orgId?: string): Promise<HookDto> {
+  return apiPut<HookDto>(`${orgBase(orgId)}/hooks/${encodeURIComponent(id)}`, { kind: 'github', ...input })
+}
+
+// GitLab subscription — no URL, no secret: the managed project webhook signs its
+// own deliveries. Events ride through the relay, one session per issue/MR thread.
+export async function createGitlabHook(input: CreateGitlabHookInput): Promise<CreatedHookDto> {
+  const hook = await apiPost<CreatedHookDto>(`${orgBase()}/hooks`, { kind: 'gitlab', ...input })
+  track('hook_created', { org_id: apiOrgId, agent_id: hook.agentId, hook_kind: hook.kind, hook_id: hook.id })
+  return hook
+}
+
+// Update a gitlab hook's subscription. Whole-definition PUT, like the github one.
+export async function updateGitlabHook(id: string, input: UpdateGitlabHookInput, orgId?: string): Promise<HookDto> {
+  return apiPut<HookDto>(`${orgBase(orgId)}/hooks/${encodeURIComponent(id)}`, { kind: 'gitlab', ...input })
+}
+
+// Gitea subscription — no URL, no secret: the managed repository webhook signs its own
+// deliveries. Events ride through the relay, one session per issue/pull-request thread.
+export async function createGiteaHook(input: CreateGiteaHookInput): Promise<CreatedHookDto> {
+  const hook = await apiPost<CreatedHookDto>(`${orgBase()}/hooks`, { kind: 'gitea', ...input })
+  track('hook_created', { org_id: apiOrgId, agent_id: hook.agentId, hook_kind: hook.kind, hook_id: hook.id })
+  return hook
+}
+
+// Update a gitea hook's subscription. Whole-definition PUT, like the other two.
+export async function updateGiteaHook(id: string, input: UpdateGiteaHookInput, orgId?: string): Promise<HookDto> {
+  return apiPut<HookDto>(`${orgBase(orgId)}/hooks/${encodeURIComponent(id)}`, { kind: 'gitea', ...input })
+}
+
+// Azure DevOps subscription — no URL, no secret: the service hook subscriptions carry their own key. One session per pull request.
+export async function createAzureDevOpsHook(input: CreateAzureDevOpsHookInput): Promise<CreatedHookDto> {
+  const hook = await apiPost<CreatedHookDto>(`${orgBase()}/hooks`, { kind: 'azure-devops', ...input })
+  track('hook_created', { org_id: apiOrgId, agent_id: hook.agentId, hook_kind: hook.kind, hook_id: hook.id })
+  return hook
+}
+
+// Update an azure-devops hook's subscription. Whole-definition PUT, like the others.
+export async function updateAzureDevOpsHook(
+  id: string,
+  input: UpdateAzureDevOpsHookInput,
+  orgId?: string
+): Promise<HookDto> {
+  return apiPut<HookDto>(`${orgBase(orgId)}/hooks/${encodeURIComponent(id)}`, { kind: 'azure-devops', ...input })
+}
+
+export async function deleteHook(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/hooks/${encodeURIComponent(id)}`)
+  track('hook_deleted', { org_id: apiOrgId, hook_id: id })
+}
+
+export async function fetchHookRuns(id: string, orgId?: string): Promise<HookRunDto[]> {
+  return apiGet<HookRunDto[]>(`${orgBase(orgId)}/hooks/${encodeURIComponent(id)}/runs`)
+}
+
+// A code-host repository's decision routing for one subject family (code-host-decisions.md §3.1, §7).
+export type { CodeHostRoutingFamily, CodeHostRoutingProvider }
+
+/** `needs_review` after a Decision edit made the rules incompatible; `access_revoked` once the Decision is unusable. */
+export type CodeHostRoutingStatus = 'enabled' | 'needs_review' | 'access_revoked'
+
+/** One routing's address: provider, the provider's numeric repository or project id, and the family its hook rows store. */
+export interface CodeHostRoutingKey {
+  provider: CodeHostRoutingProvider
+  repoId: string
+  family: CodeHostRoutingFamily
+}
+
+export interface CodeHostRoutingDto extends CodeHostRoutingKey {
+  repoFullName: string
+  /** `otherwise: default_agent` means every candidate agent. */
+  config: SharedBotDecisionRouting | null
+  status: CodeHostRoutingStatus | null
+  /** The agents with an enabled hook of this provider on this repository and family: the only valid rule targets. */
+  // `name` is null for a member agent the caller cannot view.
+  members: Array<{ agentId: string; hookId: string; name: string | null }>
+  evaluationAgentId: string | null
+}
+
+const codeHostRoutingPath = ({ provider, repoId, family }: CodeHostRoutingKey, orgId?: string) =>
+  `${orgBase(orgId)}/decision-routing/${encodeURIComponent(provider)}/${encodeURIComponent(repoId)}/${encodeURIComponent(family)}`
+
+export function fetchCodeHostRouting(scope: CodeHostRoutingKey, orgId?: string): Promise<CodeHostRoutingDto> {
+  return apiGet(codeHostRoutingPath(scope, orgId))
+}
+
+// 400 carries `issues` at decisionRoutingIssues paths, 404 DECISION_NOT_FOUND a Decision this org cannot use.
+export function saveCodeHostRouting(
+  scope: CodeHostRoutingKey,
+  config: SharedBotDecisionRouting,
+  orgId?: string
+): Promise<CodeHostRoutingDto> {
+  return apiPut(codeHostRoutingPath(scope, orgId), { config })
+}
+
+export function deleteCodeHostRouting(scope: CodeHostRoutingKey, orgId?: string): Promise<void> {
+  return apiDelete(codeHostRoutingPath(scope, orgId))
+}
+
+// A routing's Recent evaluations, proxied from its evaluation host; 503 when that daemon is offline or too old.
+export function fetchCodeHostRoutingEvaluations(
+  scope: CodeHostRoutingKey,
+  page: { cursor?: number; limit?: number; decisionId?: string } = {},
+  orgId?: string
+): Promise<DecisionEvaluationRecordPage> {
+  const query = new URLSearchParams()
+  if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+  if (page.limit !== undefined) query.set('limit', String(page.limit))
+  if (page.decisionId) query.set('decisionId', page.decisionId)
+  const suffix = query.toString()
+  return apiGet(`${codeHostRoutingPath(scope, orgId)}/evaluations${suffix ? `?${suffix}` : ''}`)
+}
+
+// Try a draft routing against a sample event on the scope's evaluation host; writes nothing.
+export function previewCodeHostRouting(
+  scope: CodeHostRoutingKey,
+  input: CodeHostRoutingPreviewInput,
+  orgId?: string
+): Promise<CodeHostRoutingPreviewResult> {
+  return apiPost(`${codeHostRoutingPath(scope, orgId)}/preview`, input)
+}
+
+export function fetchCodeHostRoutingEvaluation(
+  scope: CodeHostRoutingKey,
+  seq: number,
+  orgId?: string
+): Promise<DecisionEvaluationRecordDetail> {
+  return apiGet(`${codeHostRoutingPath(scope, orgId)}/evaluations/${encodeURIComponent(String(seq))}`)
+}
+
+export function fetchAgentModelEvaluations(
+  agentId: string,
+  page: { cursor?: number; limit?: number; decisionId?: string; sessionId?: string } = {},
+  orgId?: string
+): Promise<DecisionModelEvaluationRecordPage> {
+  const query = new URLSearchParams()
+  if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+  if (page.limit !== undefined) query.set('limit', String(page.limit))
+  if (page.decisionId) query.set('decisionId', page.decisionId)
+  if (page.sessionId) query.set('sessionId', page.sessionId)
+  const suffix = query.toString()
+  return apiGet(
+    `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/model-evaluations${suffix ? `?${suffix}` : ''}`
+  )
+}
+
+export function fetchAgentModelEvaluation(
+  agentId: string,
+  seq: number,
+  orgId?: string
+): Promise<DecisionModelEvaluationRecordDetail> {
+  return apiGet(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/model-evaluations/${seq}`)
+}
+
+// PATCH a conversation's trigger (By decision with its gate), session mode or default agent; Off/Mention/Any clear the gate server-side.
+export async function updateIntegrationChannel(
+  integrationId: string,
+  channelId: string,
+  patch: IntegrationChannelPatch,
+  orgId?: string
+): Promise<IntegrationChannelDto> {
+  return apiPatch<IntegrationChannelDto>(
+    `${orgBase(orgId)}/integrations/${encodeURIComponent(integrationId)}/channels/${encodeURIComponent(channelId)}`,
+    patch
+  )
+}
+
+/** Forget a conversation row (DELETE …/channels/:channelId). Cleanup only — the bot
+ *  is not touched on the platform, and the row returns on the next authoritative
+ *  listing if it is still a member there. */
+export async function forgetIntegrationChannel(integrationId: string, channelId: string): Promise<void> {
+  await apiDelete<void>(
+    `${orgBase()}/integrations/${encodeURIComponent(integrationId)}/channels/${encodeURIComponent(channelId)}`
+  )
+}
+
+/** Withdraw the bot from a conversation, or (Discord) a whole server, at the PLATFORM.
+ *  Rejects with the platform's own message when it refuses — a missing scope, a
+ *  last-member channel — which the caller shows verbatim. */
+export async function leaveIntegrationConversation(
+  integrationId: string,
+  target: { kind: 'conversation'; channel: string } | { kind: 'space'; spaceId: string }
+): Promise<void> {
+  await apiPost<void>(`${orgBase()}/integrations/${encodeURIComponent(integrationId)}/leave`, { target })
+}
+
+/** Flip a bot's shared-bot opt-in (PATCH /bots/:id). */
+export async function updateBot(id: string, patch: { shareable: boolean }): Promise<BotDto> {
+  return apiPatch<BotDto>(`${orgBase()}/bots/${encodeURIComponent(id)}`, patch)
+}
+
+/** Sync one user-managed Slack app's manifest and re-check the scopes granted to
+ *  its current workspace installation. Token material stays inside the CP. */
+export async function refreshSlackBot(id: string): Promise<SlackBotRefreshDto> {
+  return apiPost<SlackBotRefreshDto>(`${orgBase()}/bots/${encodeURIComponent(id)}/slack/refresh`, {})
+}
+
+/** Replace a custom Slack app's bot token in place (POST /bots/:id/slack/token); returns the updated bot. */
+export async function replaceSlackBotToken(id: string, botToken: string): Promise<BotDto> {
+  return apiPost<BotDto>(`${orgBase()}/bots/${encodeURIComponent(id)}/slack/token`, { botToken })
+}
+
+// ── Google Chat (google-chat-integration.md §3) ──
+/** `GET /integrations/googlechat/app`: the deployment app's project number, null when the deployment has none. */
+export interface GoogleChatDeploymentAppDto {
+  projectNumber: string | null
+}
+export async function fetchGoogleChatDeploymentApp(orgId?: string): Promise<GoogleChatDeploymentAppDto> {
+  return apiGet<GoogleChatDeploymentAppDto>(`${orgBase(orgId)}/integrations/googlechat/app`)
+}
+/** Replace a per-agent Chat app's service-account key under the create path's validation; the key is write-only. */
+export async function replaceGoogleChatKey(botId: string, serviceAccountKey: string): Promise<BotDto> {
+  return apiPut<BotDto>(`${orgBase()}/bots/${encodeURIComponent(botId)}/googlechat/key`, { serviceAccountKey })
+}
+// ── Microsoft Teams (teams-integration.md §5) ──
+/** Replace a Teams bot's client secret under the create path's live check; the secret is write-only. */
+export async function replaceMsTeamsSecret(botId: string, clientSecret: string): Promise<BotDto> {
+  return apiPut<BotDto>(`${orgBase()}/bots/${encodeURIComponent(botId)}/msteams/credentials`, { clientSecret })
+}
+/** The integration's Teams app package (a zip) to upload in the Teams admin center. */
+export async function downloadMsTeamsAppPackage(integrationId: string): Promise<Blob> {
+  const path = `${orgBase()}/integrations/${encodeURIComponent(integrationId)}/msteams/app-package`
+  const res = await authenticatedFetch(path, { cache: 'no-store' })
+  if (!res.ok) throw await apiErrorFromResponse('GET', path, res)
+  return await res.blob()
+}
+/** Whether Teams holds the package the integration would build now (teams-integration.md §5.1). */
+export async function fetchMsTeamsAppPackageStatus(integrationId: string): Promise<{ current: boolean }> {
+  return apiGet<{ current: boolean }>(
+    `${orgBase()}/integrations/${encodeURIComponent(integrationId)}/msteams/app-package/status`
+  )
+}
+/** `GET /integrations/msteams/app`: the deployment Teams app's ID, null when the deployment has none (teams-integration.md §8). */
+export interface MsTeamsDeploymentAppDto {
+  appId: string | null
+}
+export async function fetchMsTeamsDeploymentApp(orgId?: string): Promise<MsTeamsDeploymentAppDto> {
+  return apiGet<MsTeamsDeploymentAppDto>(`${orgBase(orgId)}/integrations/msteams/app`)
+}
+/** Microsoft's sign-in page for connecting the organization's tenant to the deployment Teams app for `agentId`. */
+/** Start connecting a tenant; `tenantId` pins a Teams Store install's tenant, so nothing is published or installed. */
+export async function startMsTeamsConnect(
+  orgId: string,
+  agentId: string,
+  tenantId?: string,
+  /** Ask the tenant-wide consent even where the organization's tenant recorded it. */
+  consent?: boolean
+): Promise<{ authorizeUrl: string }> {
+  return apiPost<{ authorizeUrl: string }>(`${orgBase(orgId)}/integrations/msteams/connect`, {
+    agentId,
+    ...(tenantId ? { tenantId } : {}),
+    ...(consent ? { consent: true } : {})
+  })
+}
+/** A request for an agent's own Teams bot from a person who may not publish, waiting for a Teams administrator to publish its package. */
+export interface MsTeamsAgentBotRequestDto {
+  id: string
+  agentId: string
+  tenantId: string
+  status: 'pending' | 'needs_sign_in' | 'rejected'
+  reason: string | null
+  createdAt: string
+  adminCenterUrl: string
+}
+export interface MsTeamsConnectResultDto {
+  /** Absent while the agent's own bot is still to be created. */
+  integrationId?: string
+  agentId: string
+  /** The tenant already serves another agent: `ticket` goes to {@link createMsTeamsAgentBot}, which answers the integration. */
+  agentBot?: boolean
+  /** `app`: updated to the published package, not installed, or not updated (the package stays pending). */
+  teams: { id: string; name: string; app: 'updated' | 'none' | 'failed' }[]
+  /** Absent for a Teams Store install, which has no install step. */
+  ticket?: string
+  store: boolean
+  /** The request waiting for an administrator: one the agent-bot step just made, or one this sign-in renewed. */
+  request?: MsTeamsAgentBotRequestDto
+  /** A silent sign-in to go to instead: the person signed in at another tenant than the organization's one. */
+  authorizeUrl?: string
+}
+/** Redeem the code Microsoft returned: connects the tenant and answers the administrator's teams. */
+export async function finishMsTeamsConnect(
+  orgId: string,
+  code: string,
+  state: string
+): Promise<MsTeamsConnectResultDto> {
+  return apiPost<MsTeamsConnectResultDto>(`${orgBase(orgId)}/integrations/msteams/connect/callback`, { code, state })
+}
+/** After the tenant-wide consent Microsoft returns the state and no code: answers the sign-in that follows. */
+export async function continueMsTeamsConnect(orgId: string, state: string): Promise<{ authorizeUrl: string }> {
+  return apiPost<{ authorizeUrl: string }>(`${orgBase(orgId)}/integrations/msteams/connect/consented`, { state })
+}
+/** Create a further agent's own bot, publish its package and install its row; safe to repeat. */
+export async function createMsTeamsAgentBot(orgId: string, ticket: string): Promise<MsTeamsConnectResultDto> {
+  return apiPost<MsTeamsConnectResultDto>(`${orgBase(orgId)}/integrations/msteams/connect/agent-bot`, { ticket })
+}
+/** The agent's requests still waiting for approval. */
+export async function fetchMsTeamsAgentBotRequests(
+  orgId: string,
+  agentId: string
+): Promise<MsTeamsAgentBotRequestDto[]> {
+  const { requests } = await apiGet<{ requests: MsTeamsAgentBotRequestDto[] }>(
+    `${orgBase(orgId)}/integrations/msteams/requests?agentId=${encodeURIComponent(agentId)}`
+  )
+  return requests
+}
+/** Read the package's state now; answers the integration once it was approved and installed. */
+export async function checkMsTeamsAgentBotRequest(
+  orgId: string,
+  id: string
+): Promise<{ integrationId?: string; request?: MsTeamsAgentBotRequestDto }> {
+  return apiPost(`${orgBase(orgId)}/integrations/msteams/requests/${encodeURIComponent(id)}/check`, {})
+}
+/** Withdraw the submission and remove the bot made for it. */
+export async function cancelMsTeamsAgentBotRequest(orgId: string, id: string): Promise<void> {
+  await apiDelete(`${orgBase(orgId)}/integrations/msteams/requests/${encodeURIComponent(id)}`)
+}
+/** Install the connected app into the chosen teams. */
+export async function installMsTeamsTeams(
+  orgId: string,
+  ticket: string,
+  teamIds: string[]
+): Promise<{ installed: number }> {
+  return apiPost<{ installed: number }>(`${orgBase(orgId)}/integrations/msteams/connect/install`, { ticket, teamIds })
+}
+
+export function startMsTeamsRecovery(orgId: string, tenantId: string, agentId: string) {
+  return apiPost<{ authorizeUrl: string; state: string }>(`${orgBase(orgId)}/integrations/msteams/recovery/start`, {
+    tenantId,
+    agentId
+  })
+}
+
+export function verifyMsTeamsRecovery(orgId: string, state: string, code: string) {
+  return apiPost<{ ticket: string }>(`${orgBase(orgId)}/integrations/msteams/recovery/verify`, { state, code })
+}
+
+export function confirmMsTeamsRecovery(orgId: string, ticket: string) {
+  return apiPost<{ agentId: string }>(`${orgBase(orgId)}/integrations/msteams/recovery/confirm`, { ticket })
+}
+/** Claim the caller's Google Workspace for `orgId` on the deployment's Chat app; returns where Chat continues, when the prompt carried a completion URL. */
+export async function claimGoogleChatCustomer(orgId: string, state: string): Promise<{ redirect?: string }> {
+  return apiPost<{ redirect?: string }>(`${orgBase(orgId)}/integrations/googlechat/claim`, { state })
+}
+
+export function startGoogleChatRecovery(orgId: string, state: string) {
+  return apiPost<{ authorizeUrl: string; state: string }>(`${orgBase(orgId)}/integrations/googlechat/recovery/start`, {
+    state
+  })
+}
+
+export function verifyGoogleChatRecovery(orgId: string, state: string, code: string) {
+  return apiPost<{ ticket: string }>(`${orgBase(orgId)}/integrations/googlechat/recovery/verify`, { state, code })
+}
+
+export function confirmGoogleChatRecovery(orgId: string, ticket: string) {
+  return apiPost<{ redirect?: string }>(`${orgBase(orgId)}/integrations/googlechat/recovery/confirm`, { ticket })
+}
+
+// ── members ───────────────────────────────────────────────────────────────────
+// The active org's members for the Settings page (GET /members).
+export async function fetchMembers(orgId?: string): Promise<MemberDto[]> {
+  return apiGet<MemberDto[]>(`${orgBase(orgId)}/members`)
+}
+
+// Change one member's role (PATCH /members/:id, owner-only). Multiple owners are
+// allowed; demoting the last owner is refused (409).
+export async function updateMemberRole(userId: string, role: MemberRole): Promise<MemberDto> {
+  return apiPatch<MemberDto>(`${orgBase()}/members/${encodeURIComponent(userId)}`, { role })
+}
+
+// Add a member directly by email (POST /members, owner-only). No email is sent —
+// an unknown address becomes an invited row, claimed at their first SSO sign-in.
+export async function addMember(email: string, role: MemberRole): Promise<MemberDto> {
+  const member = await apiPost<MemberDto>(`${orgBase()}/members`, { email, role })
+  track('member_added', { org_id: apiOrgId, role })
+  return member
+}
+
+// What that removal would do, for the confirmation dialog (GET
+// /members/:id/removal-preview). Same authorization as the removal itself.
+export async function fetchMemberRemovalPreview(userId: string): Promise<MemberRemovalPreviewDto> {
+  return apiGet<MemberRemovalPreviewDto>(`${orgBase()}/members/${encodeURIComponent(userId)}/removal-preview`)
+}
+
+// Remove a membership. Any member can remove themselves; only owners can remove
+// another member. Removing the last owner is refused (409).
+export async function removeMember(userId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/members/${encodeURIComponent(userId)}`)
+  track('member_removed', { org_id: apiOrgId, removed_user_id: userId })
+}
+
+// ── organization invite link ─────────────────────────────────────────────────
+// One fixed collaborator link, valid for seven days and usable by unlimited
+// distinct accounts. Only the create response contains the plaintext token.
+export async function fetchOrgInviteLink(orgId?: string): Promise<OrgInviteLinkDto | null> {
+  return apiGet<OrgInviteLinkDto | null>(`${orgBase(orgId)}/invite-links`)
+}
+
+export async function createOrgInviteLink(orgId?: string): Promise<CreatedOrgInviteLinkDto> {
+  const created = await apiPost<CreatedOrgInviteLinkDto>(`${orgBase(orgId)}/invite-links`, {})
+  track('invite_link_created', { org_id: orgId ?? apiOrgId })
+  return created
+}
+
+export async function revokeOrgInviteLink(id: string, orgId?: string): Promise<void> {
+  await apiDelete<void>(`${orgBase(orgId)}/invite-links/${encodeURIComponent(id)}`)
+}
+
+/** Root-scoped because the signed-in caller is not a member of the target org yet. */
+export async function acceptOrgInviteLink(token: string): Promise<AcceptedOrgInviteLinkDto> {
+  return apiPost<AcceptedOrgInviteLinkDto>('/invite-links/accept', { token })
+}
+
+// ── me (the caller's own profile) ─────────────────────────────────────────────
+// The signed-in user's CP profile (GET /me — root-scoped like /orgs). The console
+// overlays it on the id-token claims (see lib/profile): profile edits land here,
+// and the token stays stale until the next sign-in.
+export interface MeDto {
+  userId: string
+  email: string | null // immutable on this surface — the OIDC provider owns it
+  name: string | null // displayName
+  picture: string | null // custom uploaded profile photo, or the OIDC `picture` fallback
+  pictureCustom: boolean
+  pictureUploadEnabled: boolean
+}
+
+export async function fetchMe(): Promise<MeDto> {
+  return apiGet<MeDto>('/me')
+}
+
+// Edit the display name (PATCH /me). Name only — the CP's strict schema 400s a
+// request carrying `email` (or anything else). Profile photos use their own raw
+// image endpoint so arbitrary URLs never enter the user record.
+export async function updateMe(patch: { name: string }): Promise<MeDto> {
+  return apiPatch<MeDto>('/me', patch)
+}
+
+// The account's linked sign-in methods (GET /me/social-identities). Served by the
+// CP rather than read from the identity provider in the browser: the CP caches the
+// upstream lookup and makes it from next to the provider, which is worth ~2s on a
+// cold profile load. Already narrowed for rendering — no connector `rawData` here.
+export interface MySocialIdentityDto {
+  target: string
+  userId: string
+  name?: string
+  email?: string
+  avatar?: string
+  /** Where this account lives at its provider, when that is addressable. */
+  profileUrl?: string
+  /** Slack only. `url` is absent when Slack sent no domain — the `T…` id alone
+   *  does not address a workspace, so the label renders as plain text. */
+  workspace?: { teamId: string; name?: string; domain?: string; url?: string }
+}
+
+export interface MySocialAccountDto {
+  identities: MySocialIdentityDto[]
+  githubRepoIdentity?: { githubUserId: string; login: string }
+  githubRepoAccessAvailable?: boolean
+  /** Drives whether linking has to collect an ownership code first; Logto
+   *  answers 403 to an identity change the caller has not re-proven. */
+  hasSecurityVerificationMethod: boolean
+  primaryEmail?: string
+}
+
+export async function fetchMySocialAccount(): Promise<MySocialAccountDto> {
+  return apiGet<MySocialAccountDto>('/me/social-identities')
+}
+
+export type MySlackIdentityDto =
+  | { linked: false }
+  | {
+      linked: true
+      teamId: string
+      userId: string
+      teamName?: string
+      teamDomain?: string
+    }
+
+/** Narrow linked/not-linked status used by supported provider profile-linking hints. */
+export async function fetchMySessionIdentity(provider: SessionProfileProvider): Promise<{ linked: boolean }> {
+  if (provider === 'slack') return apiGet<MySlackIdentityDto>('/me/social-identities/slack')
+  const account = await fetchMySocialAccount()
+  return { linked: account.identities.some((identity) => identity.target === provider) }
+}
+
+// Refresh identities after provider-side linking, including automatic linking during sign-in.
+export async function refreshMySocialIdentities(signal?: AbortSignal): Promise<void> {
+  await apiPost('/me/social-identities/refresh', {}, signal)
+  // Repository rosters are identity-filtered. A successful GitHub link must
+  // not leave the public-only result cached when the user reopens a picker.
+  invalidateGithubRepoRosterCache()
+}
+
+async function putMyProfilePicture(blob: Blob): Promise<MeDto> {
+  const path = '/me/picture'
+  const res = await authenticatedFetch(
+    path,
+    { method: 'PUT', body: blob },
+    { 'content-type': blob.type || 'application/octet-stream' }
+  )
+  if (!res.ok) throw await apiErrorFromResponse('PUT', path, res)
+  return (await res.json()) as MeDto
+}
+
+export function uploadMyProfilePicture(blob: Blob): Promise<MeDto> {
+  return putMyProfilePicture(blob)
+}
+
+export async function deleteMyProfilePicture(): Promise<MeDto> {
+  return apiDelete<MeDto>('/me/picture')
+}
+
+// ── my social sign-in methods ────────────────────────────────────────────────
+// The tenant's connector id for a provider target. Only the CP can resolve this
+// (it holds the Logto Management credential, which never reaches the browser);
+// the authorization itself is then driven browser-side against the Account API,
+// because the Management API gives the connector no session — see
+// lib/logto-account.ts#createSocialVerification.
+export function resolveMySocialConnectorId(target: SocialLoginTarget): Promise<{ connectorId: string }> {
+  return apiGet(`/me/social-identities/connectors/${encodeURIComponent(target)}`)
+}
+
+/** How this provider must be linked, decided by the CP asking Logto — never by
+ *  the console keeping a list of which connectors need a session. */
+export type MySocialAuthorizationDto =
+  { mode: 'direct'; connectorId: string; authorizationUri: string } | { mode: 'verified'; connectorId: string }
+
+export function createMySocialIdentityAuthorization(
+  target: SocialLoginTarget,
+  state: string
+): Promise<MySocialAuthorizationDto> {
+  return apiPost('/me/social-identities/authorization-uri', { target, state })
+}
+
+/** Complete a `direct` link server-side. No ownership proof: the CP's own
+ *  credential is the authority on this path. */
+export async function linkMySocialIdentity(connectorId: string, connectorData: Record<string, string>): Promise<void> {
+  await apiPost('/me/social-identities', { connectorId, connectorData })
+}
+
+export async function unlinkMySocialIdentity(target: string): Promise<void> {
+  await apiDelete(`/me/social-identities/${encodeURIComponent(target)}`)
+}
+
+export function createMyGithubRepoAccessAuthorization(): Promise<{ state: string; authorizationUri: string }> {
+  return apiPost('/me/social-identities/github/repo-access/authorization', {})
+}
+
+export function linkMyGithubRepoAccess(code: string, state: string): Promise<{ githubUserId: string; login: string }> {
+  return apiPost('/me/social-identities/github/repo-access', { code, state })
+}
+
+export async function unlinkMyGithubRepoAccess(): Promise<void> {
+  await apiDelete('/me/social-identities/github/repo-access')
+}
+
+// ── closed-beta admission (waitlist-and-login.md) ─────────────────────────────
+// The signed-in user's app-admission state (GET /me/access — root-scoped like /me).
+// `status` drives post-login routing: `active` ⇒ enter the console; anything else
+// ⇒ the /waitlist page. When `waitlistMode` is false the status is always `active`,
+// so the console behaves exactly as before.
+export interface MeAccessDto {
+  waitlistMode: boolean
+  status: 'active' | 'approved' | 'pending' | 'none'
+  activated: boolean
+  orgCount: number
+  email: string | null
+}
+
+export function getMyAccess(): Promise<MeAccessDto> {
+  return apiGet<MeAccessDto>('/me/access')
+}
+
+/** Applicant intake stored alongside the waitlist entry. Name / company / team-size /
+ *  at least one platform are required (only the use-case is optional), matching the
+ *  server contract. The email is NEVER taken from here — it always comes from the
+ *  verified identity server-side. */
+export interface WaitlistIntake {
+  name: string
+  company: string
+  platform: ('slack' | 'telegram' | 'discord')[]
+  teamSize: string
+  useCase?: string
+}
+
+/** Add the signed-in user's own verified email to the waitlist (POST /waitlist).
+ *  `intake` is stored as applicant context; the email is server-derived. */
+export function joinWaitlist(intake: WaitlistIntake): Promise<{ status: 'pending' | 'approved' | 'rejected' }> {
+  return apiPost<{ status: 'pending' | 'approved' | 'rejected' }>('/waitlist', intake)
+}
+
+/** Redeem a waitlist activation link (POST /waitlist/redeem) → become a formal user.
+ *  Root-scoped: the caller may not belong to any org yet. `expectSubject` asserts
+ *  WHICH signed-in identity the caller means: the CP refuses (409 IDENTITY_CHANGED)
+ *  if the verified bearer belongs to someone else, so a tab that switched accounts
+ *  mid-flow cannot get its own account activated by this link. */
+export function redeemWaitlistLink(token: string, expectSubject?: string): Promise<{ activated: true }> {
+  return apiPost<{ activated: true }>('/waitlist/redeem', { token, ...(expectSubject ? { expectSubject } : {}) })
+}
+
+// ── personal API keys (the caller's own credentials; identity-scoped `/me/keys`) ──
+// Active keys the signed-in user owns, across all their orgs.
+export async function fetchMyApiKeys(): Promise<UserApiKeyDto[]> {
+  return apiGet<UserApiKeyDto[]>('/me/keys')
+}
+
+// Mint a personal key in one of the caller's orgs (default 90-day expiry; pass
+// `expiresInDays: null` for a non-expiring key). The plaintext comes back exactly
+// once — never retrievable afterward.
+export async function createMyApiKey(input: {
+  orgId: string
+  name?: string
+  expiresInDays?: number | null
+  permission?: ApiKeyPermission
+  // Required for an agent-level permission: every agent, or the chosen agent ids.
+  agents?: 'all' | string[]
+}): Promise<MintedUserKeyDto> {
+  return apiPost<MintedUserKeyDto>('/me/keys', input)
+}
+
+// Edit one of the caller's own keys in place; the secret is unchanged. `name: null` clears the label,
+// `expiresInDays` is a new lifetime from now (or `null` for non-expiring), `agents` replaces the selection.
+export async function updateMyApiKey(
+  id: string,
+  patch: {
+    name?: string | null
+    expiresInDays?: number | null
+    permission?: ApiKeyPermission
+    agents?: 'all' | string[]
+  }
+): Promise<UserApiKeyDto> {
+  return apiPatch<UserApiKeyDto>(`/me/keys/${encodeURIComponent(id)}`, patch)
+}
+
+// Replace a key's secret under the same row and settings; the old value stops working at once and the new
+// plaintext comes back exactly once.
+export async function regenerateMyApiKey(id: string): Promise<MintedUserKeyDto> {
+  return apiPost<MintedUserKeyDto>(`/me/keys/${encodeURIComponent(id)}/regenerate`, {})
+}
+
+// Revoke one of the caller's own keys (kill switch).
+export async function revokeMyApiKey(id: string): Promise<UserApiKeyDto> {
+  return apiDelete<UserApiKeyDto>(`/me/keys/${encodeURIComponent(id)}`)
+}
+
+// ── service accounts ─────────────────────────────────────────────────────────
+// Org members that never sign in; owners manage them and mint their keys (daemon-api-key-auth.md §6).
+export type ServiceAccountRole = Exclude<MemberRole, 'owner'>
+
+export interface ServiceAccountDto {
+  userId: string
+  name: string // fixed: part of `email`
+  email: string
+  displayName: string
+  role: ServiceAccountRole
+  createdAt: string
+}
+
+const serviceAccountBase = (orgId: string, id?: string) =>
+  `${orgBase(orgId)}/service-accounts${id ? `/${encodeURIComponent(id)}` : ''}`
+
+export async function fetchServiceAccounts(orgId: string): Promise<ServiceAccountDto[]> {
+  return apiGet<ServiceAccountDto[]>(serviceAccountBase(orgId))
+}
+
+export async function createServiceAccount(
+  orgId: string,
+  input: { name: string; role: ServiceAccountRole }
+): Promise<ServiceAccountDto> {
+  return apiPost<ServiceAccountDto>(serviceAccountBase(orgId), input)
+}
+
+export async function updateServiceAccount(
+  orgId: string,
+  id: string,
+  patch: { displayName?: string; role?: ServiceAccountRole }
+): Promise<ServiceAccountDto> {
+  return apiPatch<ServiceAccountDto>(serviceAccountBase(orgId, id), patch)
+}
+
+export async function deleteServiceAccount(orgId: string, id: string): Promise<void> {
+  await apiDelete<void>(serviceAccountBase(orgId, id))
+}
+
+// A service account's keys, with the /me/keys shapes minus the org the path already fixes.
+export const serviceAccountKeysApi = (orgId: string, id: string) => {
+  const base = `${serviceAccountBase(orgId, id)}/keys`
+  const one = (keyId: string) => `${base}/${encodeURIComponent(keyId)}`
+  return {
+    list: () => apiGet<UserApiKeyDto[]>(base),
+    create: ({ orgId: _orgId, ...body }: Parameters<typeof createMyApiKey>[0]) => apiPost<MintedUserKeyDto>(base, body),
+    update: (keyId: string, patch: Parameters<typeof updateMyApiKey>[1]) => apiPatch<UserApiKeyDto>(one(keyId), patch),
+    regenerate: (keyId: string) => apiPost<MintedUserKeyDto>(`${one(keyId)}/regenerate`, {}),
+    revoke: (keyId: string) => apiDelete<UserApiKeyDto>(one(keyId))
+  }
+}
+
+// ── orgs ──────────────────────────────────────────────────────────────────────
+// Every org the signed-in user belongs to (GET /orgs) — the picker + Settings.
+export async function fetchOrgs(): Promise<OrgDto[]> {
+  return apiGet<OrgDto[]>('/orgs')
+}
+
+export async function fetchSlackWorkspaceInstall(id: string): Promise<{ workspaceName: string; slackUrl: string }> {
+  return apiGet(`/integrations/slack/workspace-install/${encodeURIComponent(id)}`)
+}
+
+export async function connectSlackWorkspace(orgId: string, id: string, agentId: string): Promise<{ botId: string }> {
+  return apiPost(`${orgBase(orgId)}/integrations/slack/workspace-install/${encodeURIComponent(id)}/connect`, {
+    agentId
+  })
+}
+
+// Persist the caller's active org on their membership. The browser cookie is
+// only a stale-link fallback; this preference restores bare entries after
+// sign-out and on other devices.
+export async function selectOrg(orgId: string): Promise<void> {
+  await apiPut<void>(`/orgs/${encodeURIComponent(orgId)}/selection`)
+}
+
+// Create an org (POST /orgs); the caller becomes its first owner. The display
+// name is optional — omit it to fall back to the slug.
+export async function createOrg(input: { name?: string; slug: string }): Promise<OrgDto> {
+  const org = await apiPost<OrgDto>('/orgs', input)
+  track('organization_created', { org_id: org.id, org_slug: org.slug })
+  return org
+}
+
+// Update org settings (PATCH /orgs/:id, owner of that org only).
+export async function updateOrg(
+  orgId: string,
+  patch: {
+    name?: string
+    slug?: string
+    icon?: AgentIcon | null
+    defaultAgentVisibility?: AgentCallPolicy
+    defaultDaemonAutoUpgrade?: boolean
+    /** One-way — the onboarding wizard sets it on finish or skip. */
+    onboardingCompleted?: true
+    /** Getting-started tutorial position — advanced by the console drawer. */
+    gettingStartedStep?: number
+  }
+): Promise<OrgDto> {
+  return apiPatch<OrgDto>(`/orgs/${encodeURIComponent(orgId)}`, patch)
+}
+
+// Delete an org (DELETE /orgs/:id, owner-only). Refused (409) while it still
+// has daemons; agents/crons/integrations/bots/keys/memberships cascade.
+export async function deleteOrg(orgId: string): Promise<void> {
+  await apiDelete<void>(`/orgs/${encodeURIComponent(orgId)}`)
+}
+
+// ── bots ──────────────────────────────────────────────────────────────────────
+// The durable bot identities (freed + in-use) — the Add-integration picker and
+// the Settings "Bots" card both read this roster.
+export async function fetchBots(orgId?: string): Promise<BotDto[]> {
+  return apiGet<BotDto[]>(`${orgBase(orgId)}/bots`)
+}
+
+// Forget a bot: drops the CP record + its stored tokens. The CP refuses (409)
+// while the bot is installed on an agent — uninstall the integration first. The
+// Slack app itself keeps existing on Slack's side.
+export async function deleteBot(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/bots/${encodeURIComponent(id)}`)
+}
+
+// ── external-memory plugin connections (memory-evolution M-5A) ──────────────
+// Installation is the owner-reviewed code/endpoint trust decision. Connection
+// is one org account/config on that installation. Secret VALUES are write-only;
+// reads expose only logical key names and body-free probe facts.
+export interface MemoryPluginSecretHeaderDto {
+  name: string
+  header: string
+  required: boolean
+}
+
+export interface MemoryPluginInstallationDto {
+  id: string
+  pluginId: string
+  transport: 'streamable-http' | 'stdio'
+  endpoint: string | null
+  commandRef: string | null
+  pinnedProfileMajor: 1
+  expectedManifestDigest: string | null
+  secretHeaders: MemoryPluginSecretHeaderDto[]
+  createdBy: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export interface ExternalMemoryConnectionDto {
+  id: string
+  installationId: string
+  config: Record<string, unknown>
+  secretKeys: string[]
+  status: 'probing' | 'ready' | 'degraded' | 'invalid'
+  revision: number
+  probedRevision: number | null
+  pluginVersion: string | null
+  profile: string | null
+  manifestDigest: string | null
+  capabilities: Record<string, unknown> | null
+  /** The plugin's bounded settings schema, known once a probe has reported; null until then. */
+  configSchema: Record<string, unknown> | null
+  declaredEgressHosts: string[]
+  reasonCode: string | null
+  createdBy: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+interface CreateMemoryPluginInstallationInputBase {
+  pluginId: string
+  expectedManifestDigest?: string
+  secretHeaders: MemoryPluginSecretHeaderDto[]
+}
+
+export type CreateMemoryPluginInstallationInput = CreateMemoryPluginInstallationInputBase &
+  (
+    | { transport: 'streamable-http'; endpoint: string; commandRef?: never }
+    | { transport: 'stdio'; commandRef: string; endpoint?: never }
+  )
+
+export interface CreateExternalMemoryConnectionInput {
+  installationId: string
+  config: Record<string, unknown>
+  secrets: Record<string, string>
+}
+
+export async function fetchMemoryPluginInstallations(orgId?: string): Promise<MemoryPluginInstallationDto[]> {
+  return apiGet<MemoryPluginInstallationDto[]>(`${orgBase(orgId)}/memory-plugin-installations`)
+}
+
+export function createMemoryPluginInstallation(
+  input: CreateMemoryPluginInstallationInput
+): Promise<MemoryPluginInstallationDto> {
+  return apiPost<MemoryPluginInstallationDto>(`${orgBase()}/memory-plugin-installations`, input)
+}
+
+export async function deleteMemoryPluginInstallation(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/memory-plugin-installations/${encodeURIComponent(id)}`)
+}
+
+export async function fetchExternalMemoryConnections(orgId?: string): Promise<ExternalMemoryConnectionDto[]> {
+  return apiGet<ExternalMemoryConnectionDto[]>(`${orgBase(orgId)}/external-memory-connections`)
+}
+
+export function createExternalMemoryConnection(
+  input: CreateExternalMemoryConnectionInput
+): Promise<ExternalMemoryConnectionDto> {
+  return apiPost<ExternalMemoryConnectionDto>(`${orgBase()}/external-memory-connections`, input)
+}
+
+export function updateExternalMemoryConnection(
+  id: string,
+  patch: { config?: Record<string, unknown>; secrets?: Record<string, string> }
+): Promise<ExternalMemoryConnectionDto> {
+  return apiPatch<ExternalMemoryConnectionDto>(
+    `${orgBase()}/external-memory-connections/${encodeURIComponent(id)}`,
+    patch
+  )
+}
+
+export function rotateExternalMemoryConnectionGrant(id: string): Promise<ExternalMemoryConnectionDto> {
+  return apiPost<ExternalMemoryConnectionDto>(
+    `${orgBase()}/external-memory-connections/${encodeURIComponent(id)}/grant/rotate`,
+    {}
+  )
+}
+
+export async function deleteExternalMemoryConnection(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/external-memory-connections/${encodeURIComponent(id)}`)
+}
+
+// ── MCP providers (centralized-tool-management.md §4-§7) ─────────────────────
+// Org-level upstream MCP servers the CP proxies to agents through a relay. Read
+// DTOs expose header NAMES only — the upstream header VALUES and the bearer grant
+// key are secrets that go in on create/update and never come back (the grant key
+// is echoed exactly once by createMcpProvider).
+export interface McpProviderDto {
+  id: string
+  name: string
+  /** 'custom' = operator-entered upstream; 'open_connector' = an open-connector connection. */
+  kind: string
+  transport: string
+  /** Open-connector service slug (e.g. "stripe") for kind='open_connector' — used to
+   *  resolve the provider's catalog icon. Absent for custom providers. */
+  service?: string
+  /** Credential state reported by the connector, independently of the proxy's header authentication. */
+  connectorStatus?: 'connected' | 'reauth_required' | 'pending' | 'unknown'
+  visibility: ResourceVisibility // 'org' = everyone; 'restricted' = sharedWith plus organization owners
+  sharedWith: string[] // explicit app_user.id audience when restricted
+  createdBy: string | null // immutable creator audit
+  canEdit: boolean // whether THIS caller may change non-sharing provider settings
+  canManageSharing: boolean // whether THIS caller may change the provider's sharing
+  url: string
+  /** MCP Apps: the owning daemon hosts this provider itself so it can render the server's
+   *  `ui://` interfaces in webchat, instead of handing it to the runtime. */
+  ui: boolean
+  /** Upstream auth header keys; values are secret and never returned. */
+  headerNames: string[]
+  /** 'headers' = the operator's own credential; 'oauth2' = a CP-held OAuth grant. */
+  auth: string
+  /** Present only for auth='oauth2'. Non-secret state — never the tokens. */
+  oauth?: {
+    /** 'pending' (not connected yet, or disconnected) | 'connected' | 'reauth_required'. */
+    status: string
+    issuer: string
+    scopes: string[]
+    clientSource: string // 'preregistered' | 'dynamic'
+    expiresAt: string | null // ISO-8601 access-token expiry, when the server advertises one
+  }
+  createdAt: string // ISO-8601
+}
+
+// POST /mcp-providers response: the provider plus its freshly-minted bearer grant
+// key, returned EXACTLY ONCE (like a personal API key) and never retrievable after.
+export interface McpProviderCreatedDto extends McpProviderDto {
+  grantKey: string
+}
+
+// One upstream auth header the CP injects on the relay's outbound call. The value
+// is a secret (apikey/bearer/…) — write-only.
+export interface McpHeaderInput {
+  name: string
+  value: string
+}
+
+export interface CreateMcpProviderInput {
+  name: string
+  url: string
+  /** 'oauth2' defers the credential to the authorization funnel — `headers` must be empty. */
+  auth?: 'headers' | 'oauth2'
+  headers: McpHeaderInput[]
+  /** Host this provider on the daemon so its `ui://` interfaces render in webchat. Absent ⇒ false. */
+  ui?: boolean
+  // Initial visibility; absent ⇒ 'org'. `sharedWith` only bites when 'restricted'.
+  visibility?: ResourceVisibility
+  sharedWith?: string[]
+}
+
+// PATCH body — every field optional (the CP requires at least one). `headers`
+// REPLACES the stored set wholesale; omit it to keep the current headers. Name is
+// immutable (agents bind by name; no atomic rename) — recreate to rename.
+export interface UpdateMcpProviderInput {
+  url?: string
+  headers?: McpHeaderInput[]
+  /** Re-homes the provider: hosted by the daemon rather than attached to the runtime. Also renames
+   *  its tools, so it is a deliberate change rather than something inferred. */
+  ui?: boolean
+}
+
+export async function fetchMcpProviders(orgId?: string): Promise<McpProviderDto[]> {
+  return apiGet<McpProviderDto[]>(`${orgBase(orgId)}/mcp-providers`)
+}
+
+// Register an upstream MCP server; the response carries the one-time grant key.
+export async function createMcpProvider(input: CreateMcpProviderInput): Promise<McpProviderCreatedDto> {
+  const provider = await apiPost<McpProviderCreatedDto>(`${orgBase()}/mcp-providers`, input)
+  track('mcp_provider_created', {
+    org_id: apiOrgId,
+    provider_id: provider.id,
+    provider_name: provider.name,
+    transport: provider.transport
+  })
+  return provider
+}
+
+export async function updateMcpProvider(id: string, patch: UpdateMcpProviderInput): Promise<McpProviderDto> {
+  return apiPatch<McpProviderDto>(`${orgBase()}/mcp-providers/${encodeURIComponent(id)}`, patch)
+}
+
+export async function deleteMcpProvider(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/mcp-providers/${encodeURIComponent(id)}`)
+}
+
+// Start the OAuth funnel for an `auth: 'oauth2'` provider. The returned url is opened in
+// a popup: it continues on the CP's public origin and finally redirects back to the console
+// with `?mcpOauth=<outcome>`. Supplying a clientId uses a pre-registered OAuth client
+// instead of dynamic registration.
+export async function startMcpProviderOauth(
+  id: string,
+  body: { returnPath?: string; clientId?: string; clientSecret?: string } = {}
+): Promise<{ url: string }> {
+  return apiPost<{ url: string }>(`${orgBase()}/mcp-providers/${encodeURIComponent(id)}/oauth/start`, body)
+}
+
+// Drop the stored grant and stop projecting it. The provider and its grant key stay, so
+// re-authorizing later does not disturb any agent's selection.
+export async function disconnectMcpProviderOauth(id: string): Promise<void> {
+  await apiPost<void>(`${orgBase()}/mcp-providers/${encodeURIComponent(id)}/oauth/disconnect`, {})
+}
+
+// Set a provider's visibility + share set (PUT /mcp-providers/:id/sharing). Separate
+// from the content PATCH; gated server-side by canManageSharing.
+export async function updateMcpProviderSharing(id: string, body: SharingInput): Promise<McpProviderDto> {
+  return apiPut<McpProviderDto>(`${orgBase()}/mcp-providers/${encodeURIComponent(id)}/sharing`, body)
+}
+
+// ── shared-skills sources (docs/designs/shared-skills.md) ────────────────────
+// Org-level skills sources the daemon installs via `npx skills`. Pure metadata —
+// nothing secret. The daemon fetches content directly from the source.
+export interface SkillSourceDto {
+  id: string
+  name: string
+  source: string // the string fed to `npx skills add`
+  githubRepoId: string | null // BigInt rendered as string
+  ref: string | null // branch/tag/commit
+  subDir: string | null
+  skills: string[] // the source's own skill filter ([] ⇒ install all)
+  private: boolean // private repo — acquired through the org GitHub App's read-only token
+  credential?: SkillSourceCredentialDto | null // null ⇒ anonymous; absent on CPs that predate it
+  visibility: ResourceVisibility
+  sharedWith: string[]
+  createdBy: string | null
+  canEdit: boolean
+  canManageSharing: boolean
+  createdAt: string // ISO-8601
+}
+
+// The code-host credential a source is acquired through (source-cache.md §5).
+export interface SkillSourceCredentialDto {
+  provider: 'github' | 'gitlab'
+  repoId?: string
+}
+
+export interface CreateSkillSourceInput {
+  name: string
+  source: string
+  githubRepoId?: string
+  ref?: string
+  subDir?: string
+  skills?: string[]
+  visibility?: ResourceVisibility
+  sharedWith?: string[]
+}
+
+// PATCH body — at least one field. `skills` REPLACES the stored filter wholesale.
+// Name is immutable (agents bind by name; recreate to rename).
+export interface UpdateSkillSourceInput {
+  source?: string
+  githubRepoId?: string | null
+  ref?: string | null
+  subDir?: string | null
+  skills?: string[]
+}
+
+// POST /skill-sources/preview — a GitHub repo by installation, or an HTTPS address (GitLab is scanned, other hosts never read).
+export type PreviewSkillSourceInput =
+  | { installationId: string; owner: string; repo: string; ref?: string }
+  | { source: string; ref?: string; subDir?: string }
+export interface SkillSourcePreviewDto {
+  resolvable?: boolean // false ⇒ the CP did not read the repository; absent on older CPs, which only scanned GitHub
+  branches: string[]
+  tags: string[]
+  skills: Array<{ name: string; dirPath: string }>
+}
+
+// ── member sets (docs/designs/daemon-groups.md) ──────────────────────────────
+// A named set of the organization's own daemons within which an agent's duty may be claimed:
+// point an agent at the set instead of one machine and it survives losing any single member.
+// The install-wide pool is the ORG-LESS set and is never listed here — the console renders it as
+// AgentConnect Cloud from the daemon fleet, not from this endpoint.
+
+export interface MemberSetDto {
+  setId: string
+  name: string
+  /** Daemon ids currently enrolled. A daemon is in at most one set. */
+  memberDaemonIds: string[]
+  /** Agents placed on the set — the count shown beside Cloud's and a cluster's. */
+  agentCount: number
+  /** Whether the set's agents may run their isolated sessions on members other than their holder
+   *  (session-executors.md §10). Off by default; absent on a CP that predates the switch. */
+  spreadSessions?: boolean
+}
+
+export async function fetchMemberSets(orgId?: string): Promise<MemberSetDto[]> {
+  return apiGet<MemberSetDto[]>(`${orgBase(orgId)}/member-sets`)
+}
+
+export async function createMemberSet(name: string): Promise<MemberSetDto> {
+  return apiPost<MemberSetDto>(`${orgBase()}/member-sets`, { name })
+}
+
+export async function renameMemberSet(setId: string, name: string): Promise<MemberSetDto> {
+  return apiPatch<MemberSetDto>(`${orgBase()}/member-sets/${encodeURIComponent(setId)}`, { name })
+}
+
+/** The group admin's half of the two consents: may the set's agents run their isolated sessions on
+ *  members other than their holder. Each machine's own `sandbox.share` is the other half. */
+export async function setMemberSetSpreadSessions(setId: string, enabled: boolean): Promise<MemberSetDto> {
+  return apiPut<MemberSetDto>(`${orgBase()}/member-sets/${encodeURIComponent(setId)}/spread-sessions`, { enabled })
+}
+
+export async function deleteMemberSet(setId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/member-sets/${encodeURIComponent(setId)}`)
+}
+
+/** Enroll a daemon. Agents pinned to it stay pinned and keep running — a pin narrows to exactly
+ *  one machine, so joining changes how it holds them, not who serves them. 409 only when it is
+ *  already in another set. */
+export async function enrollDaemonInMemberSet(setId: string, daemonId: string): Promise<MemberSetDto> {
+  return apiPut<MemberSetDto>(
+    `${orgBase()}/member-sets/${encodeURIComponent(setId)}/members/${encodeURIComponent(daemonId)}`
+  )
+}
+
+/** Withdraw a daemon. 409 while it still holds a live duty lease — drain it first. */
+export async function withdrawDaemonFromMemberSet(setId: string, daemonId: string): Promise<MemberSetDto> {
+  return apiDelete<MemberSetDto>(
+    `${orgBase()}/member-sets/${encodeURIComponent(setId)}/members/${encodeURIComponent(daemonId)}`
+  )
+}
+
+export async function fetchSkillSources(orgId?: string): Promise<SkillSourceDto[]> {
+  return apiGet<SkillSourceDto[]>(`${orgBase(orgId)}/skill-sources`)
+}
+
+// A source's discovered SKILL.md manifest for the agent editor's per-skill picker.
+// `resolvable:false` (empty skills) ⇒ the source isn't a scannable GitHub repo, so
+// the UI offers whole-source enablement only.
+export interface SkillSourceSkillsDto {
+  resolvable: boolean
+  skills: Array<{ name: string; dirPath: string }>
+}
+export async function fetchSkillSourceSkills(id: string): Promise<SkillSourceSkillsDto> {
+  return apiGet<SkillSourceSkillsDto>(`${orgBase()}/skill-sources/${encodeURIComponent(id)}/skills`)
+}
+
+// The sources an agent's enable-list references, resolved server-side from the refs.
+// Gated on viewing the AGENT, so a source that sharing hides from the org registry
+// list still resolves here — the agent card can show what it actually installs
+// instead of a bare name. Sources that no longer exist are simply omitted.
+export interface AgentSkillSourceDto {
+  id: string
+  name: string
+  source: string
+  ref: string | null
+  subDir: string | null
+  skills: string[]
+  private: boolean
+  credential?: { provider: 'github' | 'gitlab' } | null // null ⇒ anonymous; absent on CPs that predate it
+}
+export async function fetchAgentSkillSources(agentId: string): Promise<AgentSkillSourceDto[]> {
+  return apiGet<AgentSkillSourceDto[]>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/skill-sources`)
+}
+
+// Each enabled source's latest install failure as its daemon reported it (source-cache.md §11).
+export interface AgentSkillSourceStatusDto {
+  sources: Array<{ name: string; code: SkillSourceFailureCode; reportedAt: string }>
+}
+export async function fetchAgentSkillSourceStatus(agentId: string): Promise<AgentSkillSourceStatusDto> {
+  return apiGet<AgentSkillSourceStatusDto>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/skill-source-status`)
+}
+
+// One hit from the public skills.sh index (GET /skill-sources/registry/search).
+// The CP proxies the lookup — skills.sh sends no CORS headers — and normalizes each
+// row into the two strings a source create needs: `source` (owner/repo) and `name`
+// (the skill dir, which becomes a one-entry `skills` filter). `reachable:false`
+// means the index could not be read, NOT that nothing matched.
+export interface SkillRegistryHitDto {
+  id: string // registry slug `<owner>/<repo>/<skill>` — the skills.sh page
+  name: string
+  source: string
+  installs: number | null
+}
+export interface SkillRegistrySearchDto {
+  reachable: boolean
+  skills: SkillRegistryHitDto[]
+}
+
+export async function searchSkillRegistry(q: string, owner?: string): Promise<SkillRegistrySearchDto> {
+  const params = new URLSearchParams({ q })
+  if (owner) params.set('owner', owner)
+  return apiGet<SkillRegistrySearchDto>(`${orgBase()}/skill-sources/registry/search?${params.toString()}`)
+}
+
+export async function previewSkillSource(input: PreviewSkillSourceInput): Promise<SkillSourcePreviewDto> {
+  return apiPost<SkillSourcePreviewDto>(`${orgBase()}/skill-sources/preview`, input)
+}
+
+export async function createSkillSource(input: CreateSkillSourceInput): Promise<SkillSourceDto> {
+  return apiPost<SkillSourceDto>(`${orgBase()}/skill-sources`, input)
+}
+
+export async function updateSkillSource(id: string, patch: UpdateSkillSourceInput): Promise<SkillSourceDto> {
+  return apiPatch<SkillSourceDto>(`${orgBase()}/skill-sources/${encodeURIComponent(id)}`, patch)
+}
+
+export async function deleteSkillSource(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/skill-sources/${encodeURIComponent(id)}`)
+}
+
+export async function updateSkillSourceSharing(id: string, body: SharingInput): Promise<SkillSourceDto> {
+  return apiPut<SkillSourceDto>(`${orgBase()}/skill-sources/${encodeURIComponent(id)}/sharing`, body)
+}
+
+// ── organization variables & secrets (organization-secrets-and-variables.md) ──
+// Owner-only registry. A secret VALUE is write-only: it is accepted on create and
+// on replace, and no response ever carries it back.
+
+export type OrganizationEnvironmentKind = 'variable' | 'secret'
+/** UI labels: 'all' = "All agents", 'selected' = "Selected agents". */
+export type OrganizationEnvironmentAudience = 'all' | 'selected'
+
+export interface OrganizationEnvironmentEntryDto {
+  id: string
+  key: string
+  kind: OrganizationEnvironmentKind
+  /** Present only for variables. */
+  variableValue?: string
+  /** Present only for secrets: whether material is stored. Never the value. */
+  secretConfigured?: boolean
+  audience: OrganizationEnvironmentAudience
+  /**
+   * Bindings whose agents the CALLER can view. Assignments to other private
+   * agents are neither listed nor removed when this selection is edited, and
+   * whether any exist is deliberately not disclosed.
+   */
+  visibleAgentIds: string[]
+  /** Editor-conflict fence — echo it as `expectedVersion` on the next save. */
+  version: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface CreateOrganizationEnvironmentEntryInput {
+  key: string
+  kind: OrganizationEnvironmentKind
+  value: string
+  audience: OrganizationEnvironmentAudience
+  /** Initial selection; `selected` audience only. */
+  agentIds?: string[]
+}
+
+export interface UpdateOrganizationEnvironmentEntryInput {
+  expectedVersion: number
+  /** Omit to leave the value unchanged — how "Replace value" keeps an existing secret. */
+  value?: string
+  audience?: OrganizationEnvironmentAudience
+}
+
+export async function fetchOrganizationEnvironment(orgId?: string): Promise<OrganizationEnvironmentEntryDto[]> {
+  return apiGet<OrganizationEnvironmentEntryDto[]>(`${orgBase(orgId)}/environment`)
+}
+
+export async function createOrganizationEnvironmentEntry(
+  input: CreateOrganizationEnvironmentEntryInput
+): Promise<OrganizationEnvironmentEntryDto> {
+  return apiPost<OrganizationEnvironmentEntryDto>(`${orgBase()}/environment`, input)
+}
+
+export async function updateOrganizationEnvironmentEntry(
+  entryId: string,
+  patch: UpdateOrganizationEnvironmentEntryInput
+): Promise<OrganizationEnvironmentEntryDto> {
+  return apiPatch<OrganizationEnvironmentEntryDto>(`${orgBase()}/environment/${encodeURIComponent(entryId)}`, patch)
+}
+
+export async function deleteOrganizationEnvironmentEntry(entryId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/environment/${encodeURIComponent(entryId)}`)
+}
+
+/** Idempotent per-agent binding. Bindings are edited one agent at a time so two
+ *  owners adding different agents cannot overwrite each other's work. */
+export async function assignOrganizationEnvironmentEntry(
+  entryId: string,
+  agentId: string
+): Promise<OrganizationEnvironmentEntryDto> {
+  return apiPut<OrganizationEnvironmentEntryDto>(
+    `${orgBase()}/environment/${encodeURIComponent(entryId)}/agents/${encodeURIComponent(agentId)}`
+  )
+}
+
+export async function unassignOrganizationEnvironmentEntry(
+  entryId: string,
+  agentId: string
+): Promise<OrganizationEnvironmentEntryDto> {
+  return apiDelete<OrganizationEnvironmentEntryDto>(
+    `${orgBase()}/environment/${encodeURIComponent(entryId)}/agents/${encodeURIComponent(agentId)}`
+  )
+}
+
+// ── open-connector connectors (docs: connectors integration) ─────────────────
+// The CP brokers every open-connector call; the web only ever hits these CP routes.
+// A created connection is recorded as an `open_connector` McpProvider (above).
+export interface ConnectorAuthDefinition {
+  type: 'no_auth' | 'api_key' | 'custom_credential' | 'oauth2'
+  [key: string]: unknown
+}
+export interface ConnectorProviderDto {
+  service: string
+  displayName: string
+  description?: string
+  categories: string[]
+  authTypes: string[]
+  auth: ConnectorAuthDefinition[]
+  homepageUrl?: string
+  iconUrl?: string
+}
+export interface CreateConnectorConnectionInput {
+  service: string
+  connectionName: string
+  authType: ConnectorAuthDefinition['type']
+  values?: Record<string, string>
+  // Initial console visibility of the recorded open_connector provider (absent ⇒ 'org').
+  visibility?: ResourceVisibility
+  sharedWith?: string[]
+}
+// Response extends the created MCP provider (grant key once) with an optional OAuth
+// popup URL (present iff authType is oauth2).
+export interface ConnectorConnectionCreatedDto extends McpProviderCreatedDto {
+  authorizationUrl?: string
+}
+
+// Whether the open-connector integration is configured on the CP (gates the menu).
+export async function fetchConnectorsConfig(orgId?: string): Promise<{ enabled: boolean }> {
+  return apiGet<{ enabled: boolean }>(`${orgBase(orgId)}/connectors/config`)
+}
+
+export async function fetchConnectorCatalog(orgId?: string): Promise<{ providers: ConnectorProviderDto[] }> {
+  return apiGet<{ providers: ConnectorProviderDto[] }>(`${orgBase(orgId)}/connectors/catalog`)
+}
+
+export async function createConnectorConnection(
+  input: CreateConnectorConnectionInput
+): Promise<ConnectorConnectionCreatedDto> {
+  return apiPost<ConnectorConnectionCreatedDto>(`${orgBase()}/connectors/connections`, input)
+}
+
+// Re-run authorization (oauth2) or re-save credentials (api-key/custom) for an existing
+// open_connector connection — its provider row / grant / relay binding are untouched, so
+// only the auth material rides here. oauth2 returns an authorizationUrl to open in a popup.
+export interface ReconnectConnectorConnectionInput {
+  authType: ConnectorAuthDefinition['type']
+  values?: Record<string, string>
+}
+export interface ReconnectConnectorConnectionResult {
+  authorizationUrl?: string
+}
+export async function reconnectConnectorConnection(
+  id: string,
+  input: ReconnectConnectorConnectionInput
+): Promise<ReconnectConnectorConnectionResult> {
+  return apiPost<ReconnectConnectorConnectionResult>(
+    `${orgBase()}/connectors/connections/${encodeURIComponent(id)}/reconnect`,
+    input
+  )
+}
+
+// ── github app (github-app workspaces) ───────────────────────────────────────
+// The deployment GitHub App powering the Add-agent repo picker + credential-free
+// daemon git. Feature is deployment-config opt-in: when the CP has no GITHUB_APP_*
+// env its routes aren't registered at all and every call 404s — mapped to
+// `enabled: false` here so callers get a clean tri-state instead of throws.
+
+export interface GithubInstallationDto {
+  id: string // CP row id — what an agent workspace references as `installationId`
+  installationId: number // GitHub-side id
+  accountLogin: string // e.g. "example-org"
+  accountType: string // "Organization" | "User"
+  repositorySelection: string // "all" | "selected"
+  suspended: boolean
+  permissionsStatus: 'current' | 'outdated' | 'unknown'
+  pullRequestsPermission: 'read' | 'write' | 'missing' | 'unknown'
+  checksPermission: 'write' | 'missing' | 'unknown'
+  settingsUrl: string // canonical GitHub page for reviewing/updating this installation
+  createdAt: string
+}
+
+export interface GithubRepoDto {
+  repoId?: string // GitHub numeric id as a lossless wire string (absent on an older CP)
+  fullName: string // owner/repo
+  private: boolean
+  defaultBranch: string // preselect this in the branch picker — never assume 'main'
+  description: string | null
+  updatedAt: string | null // last push — the picker row's "updated 3d ago"
+}
+
+export type GithubInstalledRepoDto = GithubRepoDto & { installationId: string }
+
+/** Installations list doubles as the enabled-probe: it is viewer-readable (the
+ *  install-link route is not — minting a state is a write), and 404 ⇒ the
+ *  feature is off on this deployment. */
+/** The built-in App's installations, or those of the organization App `appId` names. */
+export async function fetchGithubInstallations(
+  orgId?: string,
+  appId?: string | null
+): Promise<{
+  enabled: boolean
+  installations: GithubInstallationDto[]
+}> {
+  try {
+    const installations = await apiGet<GithubInstallationDto[]>(
+      `${orgBase(orgId)}/github/installations${appId ? `?app=${encodeURIComponent(appId)}` : ''}`
+    )
+    return { enabled: true, installations }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return { enabled: false, installations: [] }
+    throw e
+  }
+}
+
+/** One-shot org-bound install deep link (mints a signed state — viewer gets 403).
+ *  Fetch fresh per click; a stored URL's state may already be consumed/expired. */
+export async function fetchGithubInstallUrl(): Promise<string | null> {
+  try {
+    const app = await apiGet<{ enabled: boolean; slug: string | null; installUrl: string | null }>(
+      `${orgBase()}/github/app`
+    )
+    return app.installUrl
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 403)) return null
+    throw e
+  }
+}
+
+/** The built-in App's slug and GitHub-side id; null when GitHub is not configured. */
+export async function fetchBuiltinGithubApp(orgId?: string): Promise<{ slug: string; appId: number | null } | null> {
+  try {
+    const { slug, appId } = await apiGet<{ slug: string | null; appId: number | null }>(`${orgBase(orgId)}/github/app`)
+    return slug ? { slug, appId } : null
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 403)) return null
+    throw e
+  }
+}
+
+/** An organization GitHub App: one agent works through it at a time, free when `agentId` is null. */
+export interface GithubOrgAppDto {
+  id: string
+  appId: number
+  slug: string // the bot is `<slug>[bot]`
+  botUserId: number | null
+  agentId: string | null
+  installations: Array<{
+    id: string
+    installationId: number
+    accountLogin: string
+    accountType: string
+    repositorySelection: string
+    suspended: boolean
+  }>
+  createdAt: string
+}
+
+/** The organization's GitHub Apps; 404 ⇒ the feature is off (empty). */
+export async function fetchGithubApps(orgId?: string): Promise<GithubOrgAppDto[]> {
+  try {
+    return await apiGet<GithubOrgAppDto[]>(`${orgBase(orgId)}/github/apps`)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return []
+    throw e
+  }
+}
+
+export interface GithubAppOwners {
+  personal: string
+  organizations: string[]
+}
+
+export function authorizeGithubAppOwners(agentId: string, state: string, challenge: string, orgId?: string) {
+  return apiPost<{ authorizationUri: string }>(
+    `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/github-app/owners/authorize`,
+    { state, challenge }
+  )
+}
+
+export function fetchGithubAppOwners(agentId: string, code: string, verifier: string, orgId?: string) {
+  return apiPost<GithubAppOwners>(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/github-app/owners`, {
+    code,
+    verifier
+  })
+}
+
+/** Re-pulls an organization App's installations from GitHub. */
+export async function syncGithubApp(appId: string): Promise<void> {
+  await apiPost(`${orgBase()}/github/apps/${encodeURIComponent(appId)}/sync`, {})
+  invalidateGithubRepoRosterCache()
+}
+
+/** Forgets a free organization App and its key; one an agent uses, or with a Check still to close, is refused (409). */
+export async function deleteGithubApp(appId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/github/apps/${encodeURIComponent(appId)}`)
+}
+
+/** One thing the agent works on through GitHub, and whether an App reaches it. */
+export interface GithubAppCoverageItem {
+  target: string // `owner/repo`, or an account login
+  kind: 'workspace' | 'repository' | 'review' | 'installation'
+  covered: boolean
+}
+
+/** Whether `appId` (absent ⇒ the built-in App) reaches everything the agent works on. */
+export async function fetchGithubAppCoverage(agentId: string, appId: string | null): Promise<GithubAppCoverageItem[]> {
+  const query = appId ? `?app=${encodeURIComponent(appId)}` : ''
+  return (
+    await apiGet<{ coverage: GithubAppCoverageItem[] }>(
+      `${orgBase()}/agents/${encodeURIComponent(agentId)}/github-app/coverage${query}`
+    )
+  ).coverage
+}
+
+/** Moves the agent to `githubAppId` (null ⇒ built-in); a 409 carries the uncovered items. */
+export async function switchAgentGithubApp(agentId: string, githubAppId: string | null): Promise<void> {
+  await apiPut(`${orgBase()}/agents/${encodeURIComponent(agentId)}/github-app`, { githubAppId })
+}
+
+/** The form to post to GitHub's create-App-from-manifest page for this agent. */
+export async function startGithubAppManifest(
+  agentId: string,
+  organization: string | null
+): Promise<{ action: string; manifest: Record<string, unknown> }> {
+  return apiPost(`${orgBase()}/agents/${encodeURIComponent(agentId)}/github-app/manifest`, { organization })
+}
+
+/** A GitHub App's own logo (GitHub's generated pattern when none is uploaded), sized for a `px` box at 2x. */
+export function githubAppLogoUrl(appId: number, px: number): string {
+  return `https://avatars.githubusercontent.com/in/${appId}?s=${px * 2}`
+}
+
+/** An organization GitHub App's public page on GitHub. */
+export function githubAppPageUrl(slug: string): string {
+  return `https://github.com/apps/${encodeURIComponent(slug)}`
+}
+
+/** Where to install the App an agent works through: the built-in App's org-bound link, or an organization App's own page. */
+export async function githubInstallUrlFor(appId: string | null | undefined): Promise<string | null> {
+  if (!appId) return fetchGithubInstallUrl()
+  const app = (await fetchGithubApps()).find((row) => row.id === appId)
+  return app ? `${githubAppPageUrl(app.slug)}/installations/new` : null
+}
+
+/** Refresh the existing claims of the built-in App, or of the organization App `appId` names, from GitHub. */
+export async function syncGithubInstallations(appId?: string | null): Promise<GithubInstallationDto[]> {
+  let installations: GithubInstallationDto[]
+  if (appId) {
+    await apiPost(`${orgBase()}/github/apps/${encodeURIComponent(appId)}/sync`, {})
+    installations = (await fetchGithubInstallations(undefined, appId)).installations
+  } else {
+    installations = await apiPost<GithubInstallationDto[]>(`${orgBase()}/github/installations/sync`, {})
+  }
+  invalidateGithubRepoRosterCache()
+  return installations
+}
+
+/** Remove the GitHub App from one account and revoke this installation's
+ *  repository access. Owner-only; the CP also retires the local installation. */
+export async function uninstallGithubInstallation(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/github/installations/${encodeURIComponent(id)}`)
+  invalidateGithubRepoRosterCache(id)
+}
+
+// Smaller pages make the first permission-filtered results visible sooner;
+// later pages stream in under the shared request limiter.
+const GITHUB_REPO_PAGE_SIZE = 50
+const GITHUB_REPO_REQUEST_CONCURRENCY = 4
+const GITHUB_REPO_ROSTER_CACHE_MS = 5 * 60_000
+// GitHub-side 5xx/429 blips are common during incidents; a page read gets two
+// quick retries so a transient failure heals before the picker surfaces it.
+const GITHUB_REPO_RETRY_DELAYS_MS = [250, 750] as const
+
+type GithubRepoRequestWaiter = {
+  resolve: () => void
+  reject: (reason?: unknown) => void
+  signal?: AbortSignal
+  onAbort?: () => void
+}
+
+let activeGithubRepoRequests = 0
+const githubRepoRequestWaiters: GithubRepoRequestWaiter[] = []
+type GithubRepoPage = {
+  repos: GithubRepoDto[]
+  totalCount: number
+  privateReposHidden: boolean
+}
+
+type GithubRepoRoster = {
+  repos: GithubRepoDto[]
+  privateReposHidden: boolean
+}
+
+const githubRepoRosterCache = new Map<string, GithubRepoRoster & { expiresAt: number }>()
+
+export function invalidateGithubRepoRosterCache(installationId?: string): void {
+  if (installationId) githubRepoRosterCache.delete(installationId)
+  else githubRepoRosterCache.clear()
+}
+
+function githubRepoAbortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+}
+
+/** Abort-aware sleep between repository-page retry attempts. */
+function githubRepoRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(githubRepoAbortReason(signal))
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(githubRepoAbortReason(signal!))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+async function acquireGithubRepoRequest(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw githubRepoAbortReason(signal)
+  if (activeGithubRepoRequests < GITHUB_REPO_REQUEST_CONCURRENCY) {
+    activeGithubRepoRequests += 1
+    return
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const waiter: GithubRepoRequestWaiter = { resolve, reject, signal }
+    if (signal) {
+      waiter.onAbort = () => {
+        const index = githubRepoRequestWaiters.indexOf(waiter)
+        if (index < 0) return
+        githubRepoRequestWaiters.splice(index, 1)
+        reject(githubRepoAbortReason(signal))
+      }
+      signal.addEventListener('abort', waiter.onAbort, { once: true })
+    }
+    githubRepoRequestWaiters.push(waiter)
+  })
+}
+
+function releaseGithubRepoRequest(): void {
+  activeGithubRepoRequests -= 1
+  const next = githubRepoRequestWaiters.shift()
+  if (!next) return
+  if (next.signal && next.onAbort) next.signal.removeEventListener('abort', next.onAbort)
+  activeGithubRepoRequests += 1
+  next.resolve()
+}
+
+async function withGithubRepoRequestLimit<T>(run: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  await acquireGithubRepoRequest(signal)
+  try {
+    if (signal?.aborted) throw githubRepoAbortReason(signal)
+    return await run()
+  } finally {
+    releaseGithubRepoRequest()
+  }
+}
+
+/** One page of installation repositories. GitHub offers no server-side search
+ *  on this listing; picker components should normally use
+ *  fetchGithubRepoRoster. */
+export async function fetchGithubRepos(
+  installationId: string,
+  page = 1,
+  signal?: AbortSignal
+): Promise<GithubRepoPage> {
+  // Not apiGet: rolling deployments can still return the former machine-coded
+  // identity denial, which the aggregate below degrades to the same explicit
+  // private-repositories-hidden state.
+  const path = `${orgBase()}/github/installations/${encodeURIComponent(installationId)}/repositories?page=${page}&perPage=${GITHUB_REPO_PAGE_SIZE}`
+  return withGithubRepoRequestLimit(async () => {
+    for (let attempt = 0; ; attempt++) {
+      const res = await authenticatedFetch(path, { cache: 'no-store', signal })
+      if (res.ok) {
+        const body = (await res.json()) as Omit<GithubRepoPage, 'privateReposHidden'> & {
+          privateReposHidden?: boolean
+        }
+        return { ...body, privateReposHidden: body.privateReposHidden ?? false }
+      }
+      const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+      // Only upstream trouble (5xx, rate-limit) is worth retrying — a 4xx
+      // verdict (403 identity gate, 404) would just repeat.
+      const retryDelay = res.status === 429 || res.status >= 500 ? GITHUB_REPO_RETRY_DELAYS_MS[attempt] : undefined
+      if (retryDelay === undefined) {
+        throw new ApiError(body.message ?? `GET ${path} → ${res.status}`, res.status, body.code)
+      }
+      await githubRepoRetryDelay(retryDelay, signal)
+    }
+  }, signal)
+}
+
+function mergeGithubRepoPages(pages: Array<GithubRepoPage | undefined>): GithubRepoDto[] {
+  const unique = new Map<string, GithubRepoDto>()
+  for (const repo of pages.flatMap((page) => page?.repos ?? [])) {
+    const key = repo.fullName.toLowerCase()
+    if (!unique.has(key)) unique.set(key, repo)
+  }
+  return [...unique.values()]
+}
+
+/** Load the complete App-visible repository roster for client-side searching.
+ *  Page 1 and every later page are published as soon as they arrive, while the
+ *  completed roster is cached across picker components for five minutes. */
+export async function fetchAllGithubRepos(
+  installationId: string,
+  signal?: AbortSignal,
+  onProgress?: (repos: GithubRepoDto[]) => void
+): Promise<GithubRepoRoster> {
+  const cached = githubRepoRosterCache.get(installationId)
+  if (cached && cached.expiresAt > Date.now()) {
+    onProgress?.(cached.repos)
+    return { repos: cached.repos, privateReposHidden: cached.privateReposHidden }
+  }
+  if (cached) githubRepoRosterCache.delete(installationId)
+
+  const first = await fetchGithubRepos(installationId, 1, signal)
+  const pageCount = Math.ceil(first.totalCount / GITHUB_REPO_PAGE_SIZE)
+  const pages: Array<GithubRepoPage | undefined> = Array.from({
+    length: Math.max(1, pageCount)
+  })
+  pages[0] = first
+  onProgress?.(mergeGithubRepoPages(pages))
+  await Promise.all(
+    Array.from({ length: Math.max(0, pageCount - 1) }, (_, index) =>
+      fetchGithubRepos(installationId, index + 2, signal).then((page) => {
+        pages[index + 1] = page
+        onProgress?.(mergeGithubRepoPages(pages))
+      })
+    )
+  )
+
+  const repos = mergeGithubRepoPages(pages)
+  const privateReposHidden = pages.some((page) => page?.privateReposHidden)
+  githubRepoRosterCache.set(installationId, {
+    repos,
+    privateReposHidden,
+    expiresAt: Date.now() + GITHUB_REPO_ROSTER_CACHE_MS
+  })
+  return { repos, privateReposHidden }
+}
+
+function mergeGithubInstallationRosters(
+  installations: readonly Pick<GithubInstallationDto, 'id'>[],
+  rosters: ReadonlyMap<string, GithubRepoDto[]>
+): GithubInstalledRepoDto[] {
+  const unique = new Map<string, GithubInstalledRepoDto>()
+  for (const installation of installations) {
+    for (const repo of rosters.get(installation.id) ?? []) {
+      const key = repo.fullName.toLowerCase()
+      if (!unique.has(key)) unique.set(key, { ...repo, installationId: installation.id })
+    }
+  }
+  return [...unique.values()]
+}
+
+/** Merge every installation while retaining partial pages and per-installation
+ * failures. Pickers can render the first available page instead of waiting for
+ * the slowest organization. */
+export async function fetchGithubRepoRoster(
+  installations: readonly Pick<GithubInstallationDto, 'id'>[],
+  signal?: AbortSignal,
+  onProgress?: (repos: GithubInstalledRepoDto[]) => void
+): Promise<{ repos: GithubInstalledRepoDto[]; privateReposHidden: boolean; failed: boolean }> {
+  const rosters = new Map<string, GithubRepoDto[]>()
+  const hiddenByInstallation = new Map<string, boolean>()
+  const publish = (installationId: string, repos: GithubRepoDto[]) => {
+    rosters.set(installationId, repos)
+    onProgress?.(mergeGithubInstallationRosters(installations, rosters))
+  }
+  const errors = await Promise.all(
+    installations.map(async (installation) => {
+      try {
+        const result = await fetchAllGithubRepos(installation.id, signal, (partial) =>
+          publish(installation.id, partial)
+        )
+        hiddenByInstallation.set(installation.id, result.privateReposHidden)
+        publish(installation.id, result.repos)
+        return null
+      } catch (error) {
+        return error
+      }
+    })
+  )
+  return {
+    repos: mergeGithubInstallationRosters(installations, rosters),
+    privateReposHidden:
+      [...hiddenByInstallation.values()].some(Boolean) ||
+      errors.some((error) => error instanceof ApiError && error.code === 'GITHUB_IDENTITY_REQUIRED'),
+    failed: errors.some(
+      (error) => error !== null && !(error instanceof ApiError && error.code === 'GITHUB_IDENTITY_REQUIRED')
+    )
+  }
+}
+
+/** Resolve one repository through an App installation. Unlike the paged roster,
+ * this reaches private repositories and repositories beyond the first 100 rows. */
+export async function fetchGithubInstallationRepo(
+  installationId: string,
+  owner: string,
+  repo: string,
+  signal?: AbortSignal
+): Promise<GithubRepoDto> {
+  const path = `${orgBase()}/github/installations/${encodeURIComponent(installationId)}/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`
+  return withGithubRepoRequestLimit(async () => {
+    const res = await authenticatedFetch(path, { cache: 'no-store', signal })
+    if (!res.ok) {
+      const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+      throw new ApiError(body.message ?? `GET ${path} → ${res.status}`, res.status, body.code)
+    }
+    return (await res.json()) as GithubRepoDto
+  }, signal)
+}
+
+export async function fetchGithubBranches(installationId: string, owner: string, repo: string): Promise<string[]> {
+  const rows = await apiGet<Array<{ name: string }>>(
+    `${orgBase()}/github/installations/${encodeURIComponent(installationId)}/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`
+  )
+  return rows.map((r) => r.name)
+}
+
+/** The caller's OWN effective access to a picked repo (per-user authz gate).
+ *  `gated: false` ⇒ this deployment has no per-user gating (the route 404s) —
+ *  the picker behaves as before. A 403 carries the CP's machine `code`
+ *  (GITHUB_IDENTITY_REQUIRED | USER_NO_ACCESS) so the modal can word the note. */
+export interface GithubRepoAccess {
+  gated: boolean
+  canRead: boolean
+  canWrite: boolean
+  identityRequired: boolean
+  denied?: string
+  message?: string
+}
+
+export async function fetchGithubRepoAccess(
+  installationId: string,
+  owner: string,
+  repo: string
+): Promise<GithubRepoAccess> {
+  const path = `${orgBase()}/github/installations/${encodeURIComponent(installationId)}/repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/access`
+  const res = await authenticatedFetch(path, { cache: 'no-store' })
+  if (res.status === 404) return { gated: false, canRead: true, canWrite: true, identityRequired: false }
+  if (res.status === 403) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    return {
+      gated: true,
+      canRead: false,
+      canWrite: false,
+      identityRequired: body.code === 'GITHUB_IDENTITY_REQUIRED',
+      denied: body.code ?? 'USER_NO_ACCESS',
+      ...(body.message ? { message: body.message } : {})
+    }
+  }
+  if (!res.ok) throw new ApiError(`GET ${path} → ${res.status} ${res.statusText}`, res.status)
+  const body = (await res.json()) as { canRead: boolean; canWrite: boolean; identityRequired?: boolean }
+  return {
+    gated: true,
+    canRead: body.canRead,
+    canWrite: body.canWrite,
+    identityRequired: body.identityRequired ?? false
+  }
+}
+
+// ── gitlab.com connections and project bindings ──────────────────────────────
+// The org's GitLab.com OAuth connections and the projects they manage
+// (gitlab-com-integration.md §18.2). Deployment-config opt-in like the GitHub
+// App: without a GitLab OAuth application the CP registers none of these routes
+// and every call 404s — mapped to `enabled: false` so callers get a tri-state
+// instead of throws. No token material crosses this surface, ever.
+
+/** One organization GitLab.com connection — the administration identity only. */
+export interface GitlabConnectionDto {
+  id: string
+  gitlabUserId: string // numeric GitLab.com user id, losslessly as a string
+  gitlabUsername: string
+  state: 'connected' | 'reauth_required' | 'disconnected'
+  scopes: string[]
+  connectedBy: string | null // AgentConnect user id; null after user deletion
+  /** Whether this connection is the CALLER's own: takeover and reconnect act on
+   *  their own GitLab account, and the CP answers so the console compares no ids. */
+  mine: boolean
+  accessExpiresAt: string | null
+  assignedProjects: number // managed projects this connection still administers
+  /** The instance this deployment talks to — the same on every connection, because
+   *  one deployment has exactly one host axis. Never secret. */
+  instanceUrl: string
+  /** What that instance last reported, and whether it clears the floor the CP
+   *  enforces. Both null until the first credentialed contact. */
+  instanceVersion: string | null
+  instanceVersionSupported: boolean | null
+  instanceVersionFloor: string
+  createdAt: string
+}
+
+/** Deleting a connection twice means two things: the first call releases it and
+ *  returns the retained row, the second removes the row entirely. */
+export interface GitlabConnectionDeleteDto {
+  removed: boolean
+  connection: GitlabConnectionDto | null
+}
+
+/** One accessible project in the picker — metadata only, never installability. */
+export interface GitlabProjectDto {
+  projectId: string // numeric id, losslessly as a string
+  path: string // current namespaced path — display only, renames are expected
+  defaultBranch: string | null
+  lastActivityAt: string | null
+}
+
+/** The managed webhook's state. `not_needed` is a normal resting state — a project with no
+ *  enabled trigger wants no ingress — not a condition anyone has to act on. */
+export type GitlabWebhookState = 'not_needed' | 'installed' | 'repairing' | 'failed'
+
+export type GitlabProjectBindingState =
+  'provisioning' | 'ready' | 'admin_degraded' | 'runtime_degraded' | 'cleanup_pending'
+
+/** One managed project — its lifecycle state and non-secret external identity. */
+/** A bot account's own health: the binding vocabulary plus the one state only an
+ *  account can be in — the instance withdrew authority to create service accounts. */
+export type GitlabAgentAccountState = GitlabProjectBindingState | 'service_account_creation_forbidden'
+
+/** One agent's GitLab identity on a managed project. */
+export interface GitlabProjectAccountDto {
+  agentId: string
+  username: string
+  displayName: string | null
+  userId: string | null
+  /** The account's OWN health: an agent's identity can be broken on a ready project. */
+  state: GitlabAgentAccountState
+  stateReason: string | null
+}
+
+export interface GitlabProjectBindingDto {
+  id: string
+  projectId: string
+  projectPath: string
+  defaultBranch: string | null
+  state: GitlabProjectBindingState
+  stateReason: string | null
+  /** The connection administering this project; null once it was removed. A
+   *  project whose administering connection is not connected can neither be
+   *  repaired nor removed — it is reconnected or transferred first. */
+  installerConnectionId: string | null
+  /** The per-agent service accounts bound to this project: each agent acts on
+   *  GitLab as its own user, so a project has a member list, not one bot. */
+  accounts: GitlabProjectAccountDto[]
+  webhookState: GitlabWebhookState
+  credentialEpoch: string
+  createdAt: string
+}
+
+/** Removing a project can leave external cleanup unfinished; the binding then
+ *  stays listed as `cleanup_pending` instead of disappearing (§19.4). */
+export interface GitlabProjectRemovalDto {
+  removed: boolean
+  state?: GitlabProjectBindingState
+  stateReason?: string | null
+}
+
+/** The connection list doubles as the enabled-probe: it is viewer-readable (the
+ *  OAuth start route is not — minting a state is a write), and 404 ⇒ the feature
+ *  is off on this deployment. */
+export async function fetchGitlabConnections(): Promise<{ enabled: boolean; connections: GitlabConnectionDto[] }> {
+  try {
+    const body = await apiGet<{ connections: GitlabConnectionDto[] }>(`${orgBase()}/gitlab/connections`)
+    return { enabled: true, connections: body.connections }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return { enabled: false, connections: [] }
+    throw e
+  }
+}
+
+/** One-shot org-bound authorization URL. Mints a state the begin hop consumes,
+ *  so fetch it fresh per click; `returnPath` is where the callback lands back. */
+export function startGitlabOauth(returnPath?: string): Promise<string> {
+  return apiPost<{ url: string }>(`${orgBase()}/gitlab/oauth/start`, returnPath ? { returnPath } : {}).then(
+    (r) => r.url
+  )
+}
+
+/** Two-step release. On a live connection this revokes the OAuth grant, drops the
+ *  stored tokens, and keeps the row so its projects can still be listed; on an
+ *  already-disconnected one that administers nothing it removes the row. Removal
+ *  is refused (409) while any project is still assigned to the connection. */
+export function disconnectGitlabConnection(id: string): Promise<GitlabConnectionDeleteDto> {
+  return apiDelete<GitlabConnectionDeleteDto>(`${orgBase()}/gitlab/connections/${encodeURIComponent(id)}`)
+}
+
+/** Server-side paginated project search. `nextPage` is null on the last page. */
+export function searchGitlabProjects(
+  connectionId: string,
+  input: { search?: string; page?: number } = {}
+): Promise<{ projects: GitlabProjectDto[]; nextPage: number | null }> {
+  const params = new URLSearchParams()
+  if (input.search?.trim()) params.set('search', input.search.trim())
+  if (input.page) params.set('page', String(input.page))
+  const query = params.toString()
+  return apiGet<{ projects: GitlabProjectDto[]; nextPage: number | null }>(
+    `${orgBase()}/gitlab/connections/${encodeURIComponent(connectionId)}/projects${query ? `?${query}` : ''}`
+  )
+}
+
+export function fetchGitlabProjects(orgId?: string): Promise<GitlabProjectBindingDto[]> {
+  return apiGet<{ bindings: GitlabProjectBindingDto[] }>(`${orgBase(orgId)}/gitlab/projects`).then((r) => r.bindings)
+}
+
+/** Bind a project. The server re-fetches it and requires current Maintainer or
+ *  Owner access, so the returned binding — not the picked row — is the truth. */
+export function createGitlabProject(input: {
+  connectionId: string
+  projectId: string
+}): Promise<GitlabProjectBindingDto> {
+  return apiPost<GitlabProjectBindingDto>(`${orgBase()}/gitlab/projects`, input)
+}
+
+/** Re-run provisioning: identity, service account, credentials, and webhook. */
+export function repairGitlabProject(id: string): Promise<GitlabProjectBindingDto> {
+  return apiPost<GitlabProjectBindingDto>(`${orgBase()}/gitlab/projects/${encodeURIComponent(id)}/repair`, {})
+}
+
+/** Take over a project whose administering account can no longer act: the CP
+ *  re-verifies the caller's own Maintainer-or-Owner access live, through the
+ *  caller's own connection, and re-runs provisioning under it. Refusals carry a
+ *  `GITLAB_*` code on the ApiError. */
+export function transferGitlabProject(id: string): Promise<GitlabProjectBindingDto> {
+  return apiPost<GitlabProjectBindingDto>(`${orgBase()}/gitlab/projects/${encodeURIComponent(id)}/transfer`, {})
+}
+
+export function deleteGitlabProject(id: string): Promise<GitlabProjectRemovalDto> {
+  return apiDelete<GitlabProjectRemovalDto>(`${orgBase()}/gitlab/projects/${encodeURIComponent(id)}`)
+}
+
+/** One organization bot for the Integrations card: the service account an agent acts as, one per
+ *  top-level group it has a bound project in, with the projects it is a member of. A project bound
+ *  to two agents therefore appears under both bots, once per membership. */
+export interface GitlabOrgAccountDto {
+  id: string
+  agentId: string
+  rootGroupId: string // numeric top-level group id, losslessly as a string
+  rootGroupPath: string | null // that group's current path, read off a bound project
+  username: string
+  displayName: string | null
+  userId: string | null // numeric GitLab user id; null until the account exists
+  state: GitlabAgentAccountState
+  stateReason: string | null
+  lifecycle: 'active' | 'retiring'
+  /** The bound projects this account is a member of — which, not how: a project is managed
+   *  where it is used, and this only tells a held binding from an orphaned one. */
+  bindingIds: string[]
+}
+
+/** The organization's bots, plus whether account convergence still owes it work — the console
+ *  cannot judge that itself, so it asks again only while the answer is yes.
+ *  Same enabled-probe shape as the connection list: 404 ⇒ no GitLab app. */
+export async function fetchGitlabAccounts(
+  orgId?: string
+): Promise<{ enabled: boolean; accounts: GitlabOrgAccountDto[]; converging: boolean }> {
+  try {
+    const body = await apiGet<{ accounts: GitlabOrgAccountDto[]; converging: boolean }>(
+      `${orgBase(orgId)}/gitlab/accounts`
+    )
+    return { enabled: true, accounts: body.accounts, converging: body.converging }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return { enabled: false, accounts: [], converging: false }
+    throw e
+  }
+}
+
+// ── gitea connection and repository bindings ─────────────────────────────────
+// The organization's ONE Gitea bot connection and the repositories it manages
+// (gitea-integration.md §4, §5, §12). Deployment-config opt-in like the GitHub
+// App: without a configured instance the CP registers none of these routes and
+// every call 404s — mapped to `enabled: false` so callers get a tri-state
+// instead of throws. The bot token is write-only: it is verified, sealed and
+// never echoed by any route on this surface.
+
+/** The organization's Gitea bot connection — identity facts only, never the token. */
+export interface GiteaConnectionDto {
+  id: string
+  botUserId: string // numeric Gitea user id, losslessly as a string
+  botUsername: string
+  botDisplayName: string | null
+  state: 'connected' | 'token_rejected' | 'disconnecting'
+  connectedBy: string | null // AgentConnect user id; null after user deletion
+  credentialEpoch: string
+  /** Managed repositories this connection administers; removal walks each one (§6). */
+  boundRepositories: number
+  /** The instance this deployment talks to (§3) — the same for every connection. */
+  instanceUrl: string
+  /** What that instance last reported through this connection, and whether it clears the
+   *  floor the CP enforces. Both null until the first credentialed contact. */
+  instanceVersion: string | null
+  instanceVersionSupported: boolean | null
+  /** The product that version names, decided by the CP; `gitea` until first contact. */
+  instanceProduct: 'gitea' | 'forgejo'
+  instanceVersionFloor: string
+  /** The token scopes the connect step verifies (§4.1) — shown beside the input. */
+  requiredScopes: string[]
+  lastVerifiedAt: string | null
+  createdAt: string
+}
+
+/** Removal walks every binding first (§6): `removed` is true only once the row itself is gone. */
+export interface GiteaConnectionDeleteDto {
+  removed: boolean
+  /** Bindings still parked in cleanup_pending, whose webhook removal is owed. */
+  pendingRepositories: number
+  connection: GiteaConnectionDto | null
+}
+
+/** One repository the bot ADMINISTERS, for the picker (§4.4, §6) — metadata only. */
+export interface GiteaRepositoryDto {
+  repoId: string // numeric id, losslessly as a string
+  path: string // current owner/repo — display only, renames are expected
+  cloneUrl: string | null
+  defaultBranch: string | null
+  private: boolean
+}
+
+/** The managed webhook's state. `not_needed` is a normal resting state — a repository with
+ *  no enabled trigger wants no ingress — not a condition anyone has to act on. */
+export type GiteaWebhookState = 'not_needed' | 'installed' | 'repairing' | 'failed'
+
+export type GiteaRepositoryBindingState =
+  'provisioning' | 'ready' | 'admin_degraded' | 'runtime_degraded' | 'cleanup_pending'
+
+/** One managed repository — its lifecycle state and non-secret external identity. */
+export interface GiteaRepositoryBindingDto {
+  id: string
+  connectionId: string
+  repoId: string
+  repoPath: string
+  cloneUrl: string | null
+  defaultBranch: string | null
+  state: GiteaRepositoryBindingState
+  /** `token_rejected`, `admin_lost`, `webhook_unverified`, or another bounded repair category. */
+  stateReason: string | null
+  webhookState: GiteaWebhookState
+  /** When the relay last verified a delivery; null until the test delivery arrived. */
+  lastVerifiedDeliveryAt: string | null
+  createdAt: string
+}
+
+/** Removing a repository can leave external cleanup unfinished; the binding then stays
+ *  listed as `cleanup_pending` instead of disappearing (§6). */
+export interface GiteaRepositoryRemovalDto {
+  removed: boolean
+  state?: GiteaRepositoryBindingState
+  stateReason?: string | null
+}
+
+/** The rotation outcome (§7): `promoted` says whether the relay already verified a delivery
+ *  under the successor's key, which is what retires the old webhook. */
+export interface GiteaWebhookRotationDto {
+  rotated: boolean
+  promoted: boolean
+  reason: string | null
+}
+
+/** The connection list doubles as the enabled-probe: 404 ⇒ a control plane without Gitea support. */
+export async function fetchGiteaConnections(
+  orgId?: string
+): Promise<{ enabled: boolean; connections: GiteaConnectionDto[]; instanceUrl?: string }> {
+  try {
+    const body = await apiGet<{ connections: GiteaConnectionDto[]; instanceUrl?: string }>(
+      `${orgBase(orgId)}/gitea/connections`
+    )
+    return { enabled: true, connections: body.connections, instanceUrl: body.instanceUrl }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return { enabled: false, connections: [] }
+    throw e
+  }
+}
+
+/** Connect the organization's bot (§4.1). The token is verified against the instance,
+ *  sealed, and never returned; refusals carry a machine `code` the card words itself. */
+export function connectGitea(token: string): Promise<GiteaConnectionDto> {
+  return apiPost<GiteaConnectionDto>(`${orgBase()}/gitea/connections`, { token })
+}
+
+/** Replace the bot's token (§4.3) — the same checks, the same numeric bot user, then an
+ *  atomic switch and a credential-epoch bump. The old token is revoked by a human. */
+export function replaceGiteaToken(id: string, token: string): Promise<GiteaConnectionDto> {
+  return apiPost<GiteaConnectionDto>(`${orgBase()}/gitea/connections/${encodeURIComponent(id)}/token`, { token })
+}
+
+/** Disconnect: every managed repository's removal path runs first (§6), so a binding that
+ *  cannot finish keeps the row until a replacement token or a manual webhook removal clears it. */
+export function disconnectGiteaConnection(id: string): Promise<GiteaConnectionDeleteDto> {
+  return apiDelete<GiteaConnectionDeleteDto>(`${orgBase()}/gitea/connections/${encodeURIComponent(id)}`)
+}
+
+/** The picker's candidates: every repository the bot holds `admin` on, keyed by numeric id. */
+export function fetchGiteaConnectionRepositories(connectionId: string): Promise<GiteaRepositoryDto[]> {
+  return apiGet<{ repositories: GiteaRepositoryDto[] }>(
+    `${orgBase()}/gitea/connections/${encodeURIComponent(connectionId)}/repositories`
+  ).then((r) => r.repositories)
+}
+
+export function fetchGiteaRepositories(orgId?: string): Promise<GiteaRepositoryBindingDto[]> {
+  return apiGet<{ bindings: GiteaRepositoryBindingDto[] }>(`${orgBase(orgId)}/gitea/repositories`).then(
+    (r) => r.bindings
+  )
+}
+
+/** Bind a repository. The server re-fetches it by id and requires the bot to hold `admin`
+ *  right now, so the returned binding — not the picked row — is the truth. */
+export function createGiteaRepository(input: { repoId: string }): Promise<GiteaRepositoryBindingDto> {
+  return apiPost<GiteaRepositoryBindingDto>(`${orgBase()}/gitea/repositories`, input)
+}
+
+/** Re-run convergence: repository facts, the bot's `admin`, and the managed webhook. */
+export function repairGiteaRepository(id: string): Promise<GiteaRepositoryBindingDto> {
+  return apiPost<GiteaRepositoryBindingDto>(`${orgBase()}/gitea/repositories/${encodeURIComponent(id)}/repair`, {})
+}
+
+/** Rotate the managed webhook's signing secret (§7). A webhook's secret is set at creation
+ *  only, so the key is rotated by replacing the webhook under a successor key. */
+export function rotateGiteaWebhookSecret(id: string): Promise<GiteaWebhookRotationDto> {
+  return apiPost<GiteaWebhookRotationDto>(
+    `${orgBase()}/gitea/repositories/${encodeURIComponent(id)}/rotate-webhook-secret`,
+    {}
+  )
+}
+
+export function deleteGiteaRepository(id: string): Promise<GiteaRepositoryRemovalDto> {
+  return apiDelete<GiteaRepositoryRemovalDto>(`${orgBase()}/gitea/repositories/${encodeURIComponent(id)}`)
+}
+
+// ── azure devops connection, connect flow and repositories (azure-devops-integration.md §3, §5, §8); no route returns a secret ──
+
+export type AzureDevOpsStateReason = 'secret_rejected' | 'access_revoked' | 'repository_unavailable'
+
+/** One Azure DevOps connection: identity facts only. */
+export interface AzureDevOpsConnectionDto {
+  id: string
+  organization: string
+  organizationInstanceId: string
+  tenantId: string
+  identityId: string
+  identityName: string | null
+  credentialSource: 'deployment' | 'own'
+  /** The own application's client ID; null for the deployment application. */
+  clientId: string | null
+  state: 'connected' | 'degraded'
+  stateReason: AzureDevOpsStateReason | null
+  credentialEpoch: string
+  boundRepositories: number
+  connectedBy: string | null
+  lastVerifiedAt: string | null
+  createdAt: string
+}
+
+/** One repository the connection's identity can see, keyed by GUID; `bindingId` is set once it is bound here. */
+export interface AzureDevOpsRepositoryDto {
+  repositoryId: string
+  projectId: string
+  path: string // {organization}/{project}/{repository}, display only
+  cloneUrl: string
+  defaultBranch: string | null
+  repoId: string | null
+  bindingId: string | null
+}
+
+/** Why a repository's service hook subscriptions are not known to deliver (azure-devops-integration.md §11.2). */
+export type AzureDevOpsHookReason =
+  'webhook_unverified' | 'triggers_not_allowed' | 'relay_url_unconfigured' | 'subscriptions_failed'
+
+/** One service hook subscription the Control Plane manages: its delivery kind and Azure DevOps's last observed status. */
+export interface AzureDevOpsHookSubscriptionDto {
+  kind: string
+  status: string | null
+}
+
+/** One bound repository: a catalog row, an identity, and the subscriptions its triggers need. */
+export interface AzureDevOpsRepositoryBindingDto {
+  id: string
+  connectionId: string
+  repoId: string
+  repositoryId: string
+  projectId: string
+  repoPath: string
+  cloneUrl: string
+  defaultBranch: string | null
+  state: 'ready' | 'runtime_degraded'
+  stateReason: AzureDevOpsStateReason | null
+  /** Absent from a Control Plane without Azure DevOps triggers. */
+  hookReason?: AzureDevOpsHookReason | null
+  lastVerifiedDeliveryAt?: string | null
+  subscriptions?: AzureDevOpsHookSubscriptionDto[]
+  createdAt: string
+}
+
+/** A key rotation's progress: the new key takes over once every subscription switched and a delivery verifies under it. */
+export interface AzureDevOpsHookKeyRotationDto {
+  rotated: boolean
+  switched: number
+  total: number
+  reason: string | null
+}
+
+export type AzureDevOpsProjectGroup = 'readers' | 'contributors'
+
+export interface AzureDevOpsMembershipDto {
+  projectId: string
+  projectName: string
+  group: AzureDevOpsProjectGroup
+  outcome: 'added' | 'already_member' | 'refused' | 'failed' | 'group_missing' | 'not_attempted'
+}
+
+/** A finished sign-in: the flow's id and its sealed ticket, which the page keeps in memory for the flow alone. */
+export interface AzureDevOpsConnectFlowDto {
+  flowId: string
+  ticket: string
+  tenantId: string
+  /** Set for Manage project access, with the connection's organization. */
+  connectionId: string | null
+  organization: string | null
+  expiresAt: string
+}
+
+export interface AzureDevOpsProjectsDto {
+  /** The ticket with the organization recorded; the next step sends this one. */
+  ticket: string
+  organization: string
+  /** `access` is what the application already holds in the project. */
+  projects: Array<{ id: string; name: string; access?: { group: AzureDevOpsProjectGroup; allowTriggers: boolean } }>
+  /** Access to every project, including ones created later, when the application holds it. */
+  allProjects?: { group: AzureDevOpsProjectGroup; allowTriggers: boolean }
+}
+
+/** Allow triggers on one project (§11.1): granted, refused for the caller's role, or failed. */
+export interface AzureDevOpsTriggerGrantDto {
+  projectId: string
+  projectName: string
+  outcome: 'granted' | 'refused' | 'failed'
+}
+
+export interface AzureDevOpsConnectResultDto {
+  connection: AzureDevOpsConnectionDto
+  memberships: AzureDevOpsMembershipDto[]
+  /** One entry per project with Allow triggers on; absent from a Control Plane without triggers. */
+  triggers?: AzureDevOpsTriggerGrantDto[]
+  /** What is left to do by hand, such as Allow triggers the caller's role could not grant. */
+  checklist?: string[]
+}
+
+/** The connection list doubles as the enabled-probe: 404 ⇒ a Control Plane without Azure DevOps. */
+export async function fetchAzureDevOpsConnections(
+  orgId?: string
+): Promise<{ enabled: boolean; connections: AzureDevOpsConnectionDto[]; deploymentApplication: boolean }> {
+  try {
+    const body = await apiGet<{ connections: AzureDevOpsConnectionDto[]; deploymentApplication: boolean }>(
+      `${orgBase(orgId)}/azure-devops/connections`
+    )
+    return { enabled: true, connections: body.connections, deploymentApplication: body.deploymentApplication }
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404)
+      return { enabled: false, connections: [], deploymentApplication: false }
+    throw e
+  }
+}
+
+/** Use your own application instead (§3.2): the secret is verified, sealed and never returned. */
+export function connectAzureDevOps(input: {
+  organization: string
+  tenantId: string
+  clientId: string
+  clientSecret: string
+}): Promise<AzureDevOpsConnectionDto> {
+  return apiPost<AzureDevOpsConnectionDto>(`${orgBase()}/azure-devops/connections`, input)
+}
+
+export function replaceAzureDevOpsSecret(id: string, clientSecret: string): Promise<AzureDevOpsConnectionDto> {
+  return apiPost<AzureDevOpsConnectionDto>(`${orgBase()}/azure-devops/connections/${encodeURIComponent(id)}/secret`, {
+    clientSecret
+  })
+}
+
+export function disconnectAzureDevOps(id: string): Promise<void> {
+  return apiDelete<void>(`${orgBase()}/azure-devops/connections/${encodeURIComponent(id)}`)
+}
+
+export function fetchAzureDevOpsConnectionRepositories(connectionId: string): Promise<AzureDevOpsRepositoryDto[]> {
+  return apiGet<{ repositories: AzureDevOpsRepositoryDto[] }>(
+    `${orgBase()}/azure-devops/connections/${encodeURIComponent(connectionId)}/repositories`
+  ).then((body) => body.repositories)
+}
+
+export function fetchAzureDevOpsRepositories(orgId?: string): Promise<AzureDevOpsRepositoryBindingDto[]> {
+  return apiGet<{ bindings: AzureDevOpsRepositoryBindingDto[] }>(`${orgBase(orgId)}/azure-devops/repositories`).then(
+    (body) => body.bindings
+  )
+}
+
+/** Re-key a repository's service hook subscriptions; the old key stays accepted for 36 hours after the new one takes over. */
+export function rotateAzureDevOpsHookKey(id: string): Promise<AzureDevOpsHookKeyRotationDto> {
+  return apiPost<AzureDevOpsHookKeyRotationDto>(
+    `${orgBase()}/azure-devops/repositories/${encodeURIComponent(id)}/rotate-hook-key`,
+    {}
+  )
+}
+
+/** Connect with Microsoft, or with a connection id Manage project access: Microsoft's sign-in URL to send the browser to. */
+export function startAzureDevOpsConnect(connectionId?: string, orgId?: string): Promise<{ authorizeUrl: string }> {
+  return apiPost<{ authorizeUrl: string }>(
+    `${orgBase(orgId)}/azure-devops/connect`,
+    connectionId ? { connectionId } : {}
+  )
+}
+
+export function startAzureDevOpsUserIdentity(connectionId: string): Promise<{ authorizeUrl: string }> {
+  return apiPost(`${orgBase()}/azure-devops/identity/authorization`, { connectionId })
+}
+
+export function finishAzureDevOpsUserIdentity(orgId: string, state: string, code: string): Promise<void> {
+  return apiPost(`${orgBase(orgId)}/azure-devops/identity/callback`, { state, code })
+}
+
+/** The connect page posts what Microsoft returned, a code or an error, with the state. */
+export function finishAzureDevOpsSignIn(
+  orgId: string,
+  input: { state: string; code?: string; error?: string; error_description?: string }
+): Promise<AzureDevOpsConnectFlowDto> {
+  return apiPost<AzureDevOpsConnectFlowDto>(`${orgBase(orgId)}/azure-devops/connect/callback`, input)
+}
+
+// The flow ticket rides in a header on every later step, never in a path or query.
+async function azureDevOpsFlowStep<T>(
+  method: 'GET' | 'POST',
+  orgId: string,
+  flowId: string,
+  step: string,
+  ticket: string,
+  body?: unknown
+): Promise<T> {
+  const path = `${orgBase(orgId)}/azure-devops/connect/${encodeURIComponent(flowId)}/${step}`
+  const res = await authenticatedFetch(
+    path,
+    { method, cache: 'no-store', ...(method === 'POST' ? { body: JSON.stringify(body ?? {}) } : {}) },
+    {
+      'x-azure-devops-flow-ticket': ticket,
+      ...(method === 'POST' ? { 'content-type': 'application/json' } : {})
+    }
+  )
+  if (!res.ok) throw await apiErrorFromResponse(method, path, res)
+  return (await res.json()) as T
+}
+
+export function listAzureDevOpsConnectOrganizations(
+  orgId: string,
+  flowId: string,
+  ticket: string
+): Promise<Array<{ id: string; name: string }>> {
+  return azureDevOpsFlowStep<{ organizations: Array<{ id: string; name: string }> }>(
+    'GET',
+    orgId,
+    flowId,
+    'organizations',
+    ticket
+  ).then((body) => body.organizations)
+}
+
+export function chooseAzureDevOpsConnectOrganization(
+  orgId: string,
+  flowId: string,
+  ticket: string,
+  organization: string
+): Promise<AzureDevOpsProjectsDto> {
+  return azureDevOpsFlowStep('POST', orgId, flowId, 'organization', ticket, { organization })
+}
+
+export function applyAzureDevOpsConnectProjects(
+  orgId: string,
+  flowId: string,
+  ticket: string,
+  projects: Array<{ projectId: string; group: AzureDevOpsProjectGroup; allowTriggers?: boolean }>,
+  allProjects?: { group: AzureDevOpsProjectGroup; allowTriggers: boolean } | null
+): Promise<AzureDevOpsConnectResultDto> {
+  return azureDevOpsFlowStep('POST', orgId, flowId, 'projects', ticket, {
+    projects,
+    ...(allProjects ? { allProjects } : {})
+  })
+}
+
+export function verifyAzureDevOpsConnect(
+  orgId: string,
+  flowId: string,
+  ticket: string
+): Promise<AzureDevOpsConnectResultDto> {
+  return azureDevOpsFlowStep('POST', orgId, flowId, 'verify', ticket)
+}
+
+// ── agent repository authorizations (agent-multi-repo-authorization.md) ──────
+// Explicit non-workspace repo grants on an agent — the detail page's
+// Repositories card. The workspace repo is implicit and never listed here; the
+// CP mints per-repo tokens at the tier's capability levels. No tokens on this
+// surface, ever.
+
+/** Access tier of one grant: `comment` = contents:read + issues/PR:write (the
+ *  hook write-back shape); `read`/`write` are uniform across capabilities. */
+export type RepoAccess = 'read' | 'comment' | 'write'
+
+/** How sessions stand in a grant: `always` checks it out as a secondary root, `on-demand` grants credentials only. */
+export type RepoMaterialize = 'always' | 'decision' | 'on-demand'
+
+export interface AgentRepoAuthDto {
+  id: string
+  /** Which host numbers `repoId`. Absent on an older CP, where every grant is GitHub. */
+  provider?: CodeHostProvider
+  repoId?: string // rename-proof numeric repository/project id (absent on an older CP)
+  repoFullName: string // owner/repo as GitHub cases it, or the GitLab project path (refreshed on rename)
+  access: RepoAccess
+  /** Absent on an older CP, where every grant is checked out. */
+  materialize?: RepoMaterialize
+  createdBy: string | null // authorizer's userId (resolved to a name / "You" in the UI); null for key-created
+  createdAt: string // ISO-8601
+  /** Set while the member who vouched for the grant fails re-attestation; absent on an older CP. */
+  stale?: { since: string; reason: RepoGrantStaleReason } | null
+  /** The connection an `azure-devops` grant is served through; absent on every other host. */
+  connectionId?: string
+}
+
+/** Why re-attestation suspended a grant. */
+export type RepoGrantStaleReason = 'access_lost' | 'identity_unlinked' | 'attester_removed'
+
+/** Which host a grant row names — an older CP omits the field and means GitHub. */
+export function repoAuthProvider(row: AgentRepoAuthDto): CodeHostProvider {
+  return row.provider ?? 'github'
+}
+
+/** How a grant row is materialized — an older CP omits the field and means `always`. */
+export function repoAuthMaterialize(row: AgentRepoAuthDto): RepoMaterialize {
+  return row.materialize ?? 'always'
+}
+
+// Gated by the agent's visibility server-side (404 for an agent you can't see) —
+// same contract as fetchAgentHooks.
+export async function fetchAgentRepos(agentId: string, orgId?: string): Promise<AgentRepoAuthDto[]> {
+  return apiGet<AgentRepoAuthDto[]>(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/repos`)
+}
+
+// Not apiPost: the denial body carries the CP's human-readable message (400
+// repo-not-covered / 409 duplicate-or-workspace) and, for the per-user
+// identity-assertion gate, a machine `code` (GITHUB_IDENTITY_REQUIRED |
+// USER_NO_ACCESS) that the add-repo modal words inline.
+export async function createAgentRepo(
+  agentId: string,
+  // One arm per host: a GitHub repository by full name, a GitLab project or a Gitea
+  // repository by its numeric id (a display path is never a match key).
+  input:
+    | { repoFullName: string; access: RepoAccess; materialize?: RepoMaterialize }
+    | { provider: 'gitlab'; projectId: string; access: RepoAccess; materialize?: RepoMaterialize }
+    | { provider: 'gitea'; repoId: string; access: RepoAccess; materialize?: RepoMaterialize }
+    | {
+        provider: 'azure-devops'
+        connectionId: string
+        repositoryId: string
+        access: RepoAccess
+        materialize?: RepoMaterialize
+      }
+): Promise<AgentRepoAuthDto> {
+  const path = `${orgBase()}/agents/${encodeURIComponent(agentId)}/repos`
+  const res = await authenticatedFetch(
+    path,
+    { method: 'POST', body: JSON.stringify(input) },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    throw new ApiError(body.message ?? `POST ${path} → ${res.status} ${res.statusText}`, res.status, body.code)
+  }
+  return (await res.json()) as AgentRepoAuthDto
+}
+
+export async function updateAgentRepo(
+  agentId: string,
+  repoAuthId: string,
+  // Either field alone, or both; the CP requires at least one.
+  input: { access: RepoAccess; materialize?: RepoMaterialize } | { access?: RepoAccess; materialize: RepoMaterialize }
+): Promise<AgentRepoAuthDto> {
+  const path = `${orgBase()}/agents/${encodeURIComponent(agentId)}/repos/${encodeURIComponent(repoAuthId)}`
+  const res = await authenticatedFetch(
+    path,
+    { method: 'PATCH', body: JSON.stringify(input) },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    throw new ApiError(body.message ?? `PATCH ${path} → ${res.status} ${res.statusText}`, res.status, body.code)
+  }
+  return (await res.json()) as AgentRepoAuthDto
+}
+
+// Revoke a grant (204). Already-minted tokens live out their ≤1h expiry; the
+// next credential request for the repo is denied.
+export async function deleteAgentRepo(agentId: string, repoAuthId: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/repos/${encodeURIComponent(repoAuthId)}`)
+}
+
+// ── agent installation grants (agent-multi-repo-authorization.md decision 10) ─
+
+/** How an installation grant's repositories materialize — never `always` (multi-repository-workspaces.md decision 14). */
+export type InstallationMaterialize = Exclude<RepoMaterialize, 'always'>
+
+/** Every repository one of the organization's GitHub App installations covers, at one tier. */
+export interface AgentInstallationAuthDto {
+  id: string
+  provider: 'github'
+  installationId: number // GitHub-side id, matching GithubInstallationDto.installationId
+  accountLogin: string
+  access: RepoAccess
+  materialize: InstallationMaterialize
+  createdBy: string | null
+  createdAt: string // ISO-8601
+}
+
+/** Gated by the agent's visibility; a CP without the route (404) reads as no grants. */
+export async function fetchAgentInstallations(agentId: string, orgId?: string): Promise<AgentInstallationAuthDto[]> {
+  try {
+    return await apiGet<AgentInstallationAuthDto[]>(
+      `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/installations`
+    )
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return []
+    throw e
+  }
+}
+
+async function sendAgentInstallation(
+  method: 'POST' | 'PATCH',
+  path: string,
+  input: object
+): Promise<AgentInstallationAuthDto> {
+  const res = await authenticatedFetch(
+    path,
+    { method, body: JSON.stringify(input) },
+    { 'content-type': 'application/json' }
+  )
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { code?: string; message?: string }
+    throw new ApiError(body.message ?? `${method} ${path} → ${res.status} ${res.statusText}`, res.status, body.code)
+  }
+  return (await res.json()) as AgentInstallationAuthDto
+}
+
+// Owner-only: the 403 / 400 / 409 denial message is surfaced verbatim.
+export function createAgentInstallation(
+  agentId: string,
+  input: { installationId: number; access: RepoAccess; materialize?: InstallationMaterialize }
+): Promise<AgentInstallationAuthDto> {
+  return sendAgentInstallation('POST', `${orgBase()}/agents/${encodeURIComponent(agentId)}/installations`, input)
+}
+
+// Access only rises (a lower tier is 409); at least one field is required.
+export function updateAgentInstallation(
+  agentId: string,
+  id: string,
+  input:
+    | { access: RepoAccess; materialize?: InstallationMaterialize }
+    | { access?: RepoAccess; materialize: InstallationMaterialize }
+): Promise<AgentInstallationAuthDto> {
+  return sendAgentInstallation(
+    'PATCH',
+    `${orgBase()}/agents/${encodeURIComponent(agentId)}/installations/${encodeURIComponent(id)}`,
+    input
+  )
+}
+
+export async function deleteAgentInstallation(agentId: string, id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/agents/${encodeURIComponent(agentId)}/installations/${encodeURIComponent(id)}`)
+}
+
+// ── crons ─────────────────────────────────────────────────────────────────────
+export async function fetchCrons(orgId?: string): Promise<CronDto[]> {
+  return apiGet<CronDto[]>(`${orgBase(orgId)}/crons`)
+}
+
+// Create-or-update a cron. `PUT /crons/:id` is an idempotent upsert keyed on the
+// UUID, so a create just mints a fresh id client-side (see data-context).
+export async function upsertCron(id: string, body: UpsertCronInput): Promise<CronDto> {
+  return apiPut<CronDto>(`${orgBase()}/crons/${encodeURIComponent(id)}`, body)
+}
+
+// Set a cron's visibility + share set (PUT /crons/:id/sharing).
+export async function updateCronSharing(id: string, body: SharingInput): Promise<CronDto> {
+  return apiPut<CronDto>(`${orgBase()}/crons/${encodeURIComponent(id)}/sharing`, body)
+}
+
+export async function deleteCron(id: string): Promise<void> {
+  await apiDelete<void>(`${orgBase()}/crons/${encodeURIComponent(id)}`)
+}
+
+// One daemon-reported fire (detail-page run history). `running` = fire seen,
+// completion not yet (or lost while the CP was down — display-only).
+export interface CronRunDto {
+  id: string
+  startedAt: string // ISO-8601
+  status: 'running' | 'success' | 'failed'
+  durationMs: number | null
+  sessionId: string | null // ACP session id — deep-links to the session page
+  reason: string | null // short failure text
+}
+
+export async function fetchCronRuns(id: string, orgId?: string): Promise<CronRunDto[]> {
+  return apiGet<CronRunDto[]>(`${orgBase(orgId)}/crons/${encodeURIComponent(id)}/runs`)
+}
+
+// Console "Run now" — the daemon fires the cron immediately; 202 only means it
+// accepted, the outcome lands in the run history asynchronously.
+export async function runCronNow(id: string): Promise<void> {
+  await apiPost<null>(`${orgBase()}/crons/${encodeURIComponent(id)}/run`, {})
+}
+
+// ── organization knowledge + managed skills ─────────────────────────────────
+
+/** `entry` is an ordinary entry; the other three are the organization record, the Handbook (assistant-mode.md §5.16). */
+export type KnowledgeKind = 'entry' | 'organization' | 'channels' | 'people'
+export type KnowledgeVisibility = 'all' | 'selected'
+export type KnowledgeSource = 'manual' | 'dream' | 'agent' | 'migration'
+export type KnowledgeWriterKind = 'research' | 'getting-to-know' | 'conversation' | 'person'
+
+export interface OrganizationKnowledgeDto {
+  id: string
+  title: string
+  content: string
+  summary: string | null
+  tags: string[]
+  currentRevision: number
+  digest: string
+  source: KnowledgeSource
+  writerKind: KnowledgeWriterKind | null
+  kind: KnowledgeKind
+  visibility: KnowledgeVisibility
+  /** Agent ids that read the entry under `selected`. */
+  readers: string[]
+  sourceAgentId: string | null
+  sourceDreamId: string | null
+  sourceSessionIds: string[]
+  createdByUserId: string | null
+  reviewedByUserId: string | null
+  archivedAt: string | null
+  createdAt: string
+  updatedAt: string
+  revisionCreatedAt: string
+  canManage: boolean
+}
+
+export interface OrganizationKnowledgeRevisionDto {
+  knowledgeId: string
+  revision: number
+  content: string
+  summary: string | null
+  tags: string[]
+  digest: string
+  source: KnowledgeSource
+  writerKind: KnowledgeWriterKind | null
+  sourceAgentId: string | null
+  sourceDreamId: string | null
+  sourceSessionIds: string[]
+  createdByUserId: string | null
+  reviewedByUserId: string | null
+  createdAt: string
+}
+
+/** The Handbook: research's status and the record's three entries. */
+export interface OrganizationRecordDto {
+  research: { agentId: string | null; researchedAt: string | null; runningSince: string | null }
+  entries: OrganizationKnowledgeDto[]
+}
+
+/** The caller's own People entries and the keys they may write theirs under. */
+export interface MyPeopleEntriesDto {
+  revision: number
+  entries: { key: string; text: string }[]
+  keys: string[]
+}
+
+export interface ManagedSkillDto {
+  id: string
+  name: string
+  description: string
+  currentRevision: number
+  digest: string
+  compressedBytes: number
+  expandedBytes: number
+  fileCount: number
+  manifest: {
+    name?: string
+    description?: string
+    files?: Array<{ path: string; bytes: number; digest: string }>
+    [key: string]: unknown
+  }
+  archivedAt: string | null
+  createdAt: string
+  updatedAt: string
+  canManage: boolean
+}
+
+export interface ManagedSkillRevisionDto {
+  managedSkillId: string
+  revision: number
+  digest: string
+  compressedBytes: number
+  expandedBytes: number
+  fileCount: number
+  manifest: ManagedSkillDto['manifest']
+  source: 'manual' | 'dream'
+  sourceAgentId: string | null
+  sourceDreamId: string | null
+  sourceSessionIds: string[]
+  createdByUserId: string | null
+  reviewedByUserId: string | null
+  createdAt: string
+}
+
+export interface OrganizationSuggestionDto {
+  id: string
+  sourceAgentId: string
+  sourceAgentName: string | null
+  sourceDaemonId: string | null
+  dreamId: string
+  candidateId: string
+  kind: 'knowledge' | 'skill'
+  operation: 'create' | 'update'
+  targetArtifactId: string | null
+  targetRevision: number | null
+  title: string
+  summary: string | null
+  tags: string[]
+  digest: string
+  contentBytes: number
+  sessionIds: string[]
+  state: 'pending' | 'accepted' | 'rejected'
+  contentAvailable: boolean
+  reviewedAt: string | null
+  reviewReason: string | null
+  acceptedArtifactId: string | null
+  acceptedArtifactRevision: number | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type OrganizationSuggestionContentDto =
+  | {
+      kind: 'knowledge'
+      digest: string
+      snapshotToken: string
+      content: string
+      summary: string | null
+      tags: string[]
+    }
+  | {
+      kind: 'skill'
+      digest: string
+      snapshotToken: string
+      files: Array<{ path: string; encoding: 'utf8' | 'base64'; content: string }>
+    }
+
+export function listOrganizationKnowledge(includeArchived = false): Promise<OrganizationKnowledgeDto[]> {
+  return apiGet<OrganizationKnowledgeDto[]>(
+    `${orgBase()}/knowledge?includeArchived=${includeArchived ? 'true' : 'false'}`
+  )
+}
+
+export function getOrganizationKnowledge(id: string): Promise<OrganizationKnowledgeDto> {
+  return apiGet<OrganizationKnowledgeDto>(`${orgBase()}/knowledge/${encodeURIComponent(id)}`)
+}
+
+export function listOrganizationKnowledgeRevisions(id: string): Promise<OrganizationKnowledgeRevisionDto[]> {
+  return apiGet<OrganizationKnowledgeRevisionDto[]>(`${orgBase()}/knowledge/${encodeURIComponent(id)}/revisions`)
+}
+
+export function createOrganizationKnowledge(input: {
+  title: string
+  content: string
+  summary?: string
+  tags?: string[]
+  visibility?: KnowledgeVisibility
+  readers?: string[]
+}): Promise<OrganizationKnowledgeDto> {
+  return apiPost<OrganizationKnowledgeDto>(`${orgBase()}/knowledge`, input)
+}
+
+export function updateOrganizationKnowledge(
+  id: string,
+  input: { title: string; content: string; summary?: string; tags?: string[]; expectedRevision: number }
+): Promise<OrganizationKnowledgeDto> {
+  return apiPatch<OrganizationKnowledgeDto>(`${orgBase()}/knowledge/${encodeURIComponent(id)}`, input)
+}
+
+export function setOrganizationKnowledgeArchived(id: string, archived: boolean): Promise<OrganizationKnowledgeDto> {
+  return apiPost<OrganizationKnowledgeDto>(`${orgBase()}/knowledge/${encodeURIComponent(id)}/archive`, { archived })
+}
+
+export function getOrganizationRecord(): Promise<OrganizationRecordDto> {
+  return apiGet<OrganizationRecordDto>(`${orgBase()}/knowledge/organization`)
+}
+
+/** Which agents read an entry; owners only, and About and Channels refuse it. */
+export function setKnowledgeVisibility(
+  id: string,
+  input: { visibility: KnowledgeVisibility; readers: string[] }
+): Promise<{ visibility: KnowledgeVisibility; readers: string[]; canManage: boolean }> {
+  return apiPut(`${orgBase()}/knowledge/${encodeURIComponent(id)}/visibility`, input)
+}
+
+export function fetchMyPeopleEntries(peopleId: string): Promise<MyPeopleEntriesDto> {
+  return apiGet<MyPeopleEntriesDto>(`${orgBase()}/knowledge/${encodeURIComponent(peopleId)}/people/mine`)
+}
+
+export function writeMyPeopleEntry(
+  peopleId: string,
+  input: { text: string; expectedRevision: number }
+): Promise<{ revision: number }> {
+  return apiPut(`${orgBase()}/knowledge/${encodeURIComponent(peopleId)}/people/mine`, input)
+}
+
+/** Remove the caller's own entry, which keeps them out of People until they write it again. */
+export function removeMyPeopleEntry(peopleId: string): Promise<{ revision: number; cleared?: boolean }> {
+  return apiDelete(`${orgBase()}/knowledge/${encodeURIComponent(peopleId)}/people/mine`)
+}
+
+export function updatePeopleEntry(
+  peopleId: string,
+  key: string,
+  input: { text: string; expectedRevision: number }
+): Promise<{ revision: number }> {
+  return apiPut(`${orgBase()}/knowledge/${encodeURIComponent(peopleId)}/people/${encodeURIComponent(key)}`, input)
+}
+
+/** An owner's clear of one person's entry, which keeps them out as their own removal does. */
+export function clearPeopleEntry(peopleId: string, key: string): Promise<{ revision: number; cleared?: boolean }> {
+  return apiDelete(`${orgBase()}/knowledge/${encodeURIComponent(peopleId)}/people/${encodeURIComponent(key)}`)
+}
+
+export function listManagedSkills(includeArchived = false, orgId?: string): Promise<ManagedSkillDto[]> {
+  return apiGet<ManagedSkillDto[]>(
+    `${orgBase(orgId)}/managed-skills?includeArchived=${includeArchived ? 'true' : 'false'}`
+  )
+}
+
+export function listManagedSkillRevisions(id: string): Promise<ManagedSkillRevisionDto[]> {
+  return apiGet<ManagedSkillRevisionDto[]>(`${orgBase()}/managed-skills/${encodeURIComponent(id)}/revisions`)
+}
+
+export function setManagedSkillArchived(id: string, archived: boolean): Promise<ManagedSkillDto> {
+  return apiPost<ManagedSkillDto>(`${orgBase()}/managed-skills/${encodeURIComponent(id)}/archive`, { archived })
+}
+
+export function listOrganizationSuggestions(
+  filters: {
+    kind?: 'knowledge' | 'skill'
+    state?: 'pending' | 'accepted' | 'rejected'
+    query?: string
+  } = {}
+): Promise<OrganizationSuggestionDto[]> {
+  const params = new URLSearchParams()
+  if (filters.kind) params.set('kind', filters.kind)
+  if (filters.state) params.set('state', filters.state)
+  if (filters.query?.trim()) params.set('query', filters.query.trim())
+  const query = params.toString()
+  return apiGet<OrganizationSuggestionDto[]>(`${orgBase()}/knowledge-suggestions${query ? `?${query}` : ''}`)
+}
+
+export function fetchOrganizationSuggestionContent(id: string): Promise<OrganizationSuggestionContentDto> {
+  return apiGet<OrganizationSuggestionContentDto>(
+    `${orgBase()}/knowledge-suggestions/${encodeURIComponent(id)}/content`
+  )
+}
+
+export function reviewOrganizationSuggestion(
+  id: string,
+  decision: 'accept',
+  snapshotToken: string
+): Promise<OrganizationSuggestionDto>
+export function reviewOrganizationSuggestion(
+  id: string,
+  decision: 'reject',
+  reason?: string
+): Promise<OrganizationSuggestionDto>
+export function reviewOrganizationSuggestion(
+  id: string,
+  decision: 'accept' | 'reject',
+  detail?: string
+): Promise<OrganizationSuggestionDto> {
+  return apiPost<OrganizationSuggestionDto>(`${orgBase()}/knowledge-suggestions/${encodeURIComponent(id)}/review`, {
+    decision,
+    ...(decision === 'accept' ? { snapshotToken: detail } : detail?.trim() ? { reason: detail.trim() } : {})
+  })
+}
+
+function memoryEntryUrl(agentId: string, suffix: string, channelKey?: string, query: Record<string, string> = {}) {
+  const params = new URLSearchParams({ ...query, ...(channelKey ? { channelKey } : {}) })
+  return `${orgBase()}/agents/${encodeURIComponent(agentId)}/memory/${suffix}${params.size ? `?${params}` : ''}`
+}
+export function describeAgentMemoryEntries(agentId: string, channelKey?: string) {
+  return apiGet<import('@agentconnect.md/protocol').MemoryEntryCapabilities>(
+    memoryEntryUrl(agentId, 'capabilities', channelKey)
+  )
+}
+export function listAgentMemoryEntries(agentId: string, channelKey?: string, cursor?: string) {
+  return apiGet<import('@agentconnect.md/protocol').MemoryEntryListResult>(
+    memoryEntryUrl(agentId, 'entries', channelKey, { limit: '20', ...(cursor ? { cursor } : {}) })
+  )
+}
+export function getAgentMemoryEntry(agentId: string, ref: string, channelKey?: string, cursor?: string) {
+  return apiGet<import('@agentconnect.md/protocol').MemoryEntryContent | null>(
+    memoryEntryUrl(agentId, `entries/${encodeURIComponent(ref)}`, channelKey, {
+      maxBytes: '32768',
+      ...(cursor ? { cursor } : {})
+    })
+  )
+}
+export function searchAgentMemoryEntries(agentId: string, query: string, channelKey?: string) {
+  return apiPost<import('@agentconnect.md/protocol').MemoryEntrySearchResult>(
+    memoryEntryUrl(agentId, 'entries/search', channelKey),
+    { query, limit: 20 }
+  )
+}
+export function listAgentMemoryEntryHistory(agentId: string, ref: string, channelKey?: string, cursor?: string) {
+  return apiGet<import('@agentconnect.md/protocol').MemoryEntryHistoryResult>(
+    memoryEntryUrl(agentId, `entries/${encodeURIComponent(ref)}/history`, channelKey, {
+      limit: '5',
+      ...(cursor ? { cursor } : {})
+    })
+  )
+}
+export function createAgentMemoryEntry(
+  agentId: string,
+  request: import('@agentconnect.md/protocol').MemoryEntryCreateRequest,
+  channelKey?: string
+) {
+  return apiPost<import('@agentconnect.md/protocol').MemoryEntryMutationReceipt>(
+    memoryEntryUrl(agentId, 'entries', channelKey),
+    request
+  )
+}
+export function updateAgentMemoryEntry(
+  agentId: string,
+  request: import('@agentconnect.md/protocol').MemoryEntryUpdateRequest,
+  channelKey?: string
+) {
+  return apiPatch<import('@agentconnect.md/protocol').MemoryEntryMutationReceipt>(
+    memoryEntryUrl(agentId, 'entries', channelKey),
+    request
+  )
+}
+export function deleteAgentMemoryEntry(
+  agentId: string,
+  request: import('@agentconnect.md/protocol').MemoryEntryDeleteRequest,
+  channelKey?: string
+) {
+  return apiDelete<import('@agentconnect.md/protocol').MemoryEntryMutationReceipt>(
+    memoryEntryUrl(agentId, 'entries', channelKey),
+    request
+  )
+}
+
+// Provider key requests capture the organization explicitly, including mutations.
+export function fetchProviderKeys(orgId: string): Promise<ProviderKeyStatus[]> {
+  return apiGet<ProviderKeyStatus[]>(`${orgBase(orgId)}/provider-keys`)
+}
+
+export function setProviderKey(
+  orgId: string,
+  provider: ProviderKeyProvider,
+  input: SetProviderKeyInput
+): Promise<ProviderKeyStatus> {
+  return apiPut<ProviderKeyStatus>(`${orgBase(orgId)}/provider-keys/${encodeURIComponent(provider)}`, input)
+}
+
+export function deleteProviderKey(orgId: string, provider: ProviderKeyProvider): Promise<void> {
+  return apiDelete<void>(`${orgBase(orgId)}/provider-keys/${encodeURIComponent(provider)}`)
+}
+
+// Every operation captures its organization; changing the active org cannot redirect an in-flight mutation.
+export function createDecisionApi(orgId: string): DecisionApi {
+  const base = () => `${orgBase(orgId)}/decisions`
+  const path = (id: string) => `${base()}/${encodeURIComponent(id)}`
+  const conversation = (ref: DecisionConversationRef) =>
+    `${orgBase(orgId)}/integrations/${encodeURIComponent(ref.integrationId)}/channels/${encodeURIComponent(ref.channelId)}`
+  const routing = (botId: string) => `${orgBase(orgId)}/bots/${encodeURIComponent(botId)}/decision-routing`
+  // Live bindings save through updateIntegrationChannel; listBots, listChannels and saveChannel back only the mock.
+  const unsupported = async (): Promise<never> => {
+    throw new ApiError('This Decision consumer API is only available in mock mode.', 501)
+  }
+  return {
+    mode: 'live',
+    listProviders: (daemonId) =>
+      apiGet(`${base()}/providers${daemonId ? `?daemonId=${encodeURIComponent(daemonId)}` : ''}`),
+    listDecisions: () => apiGet(base()),
+    getDecision: (id) => apiGet(path(id)),
+    createDecision: (draft) => apiPost(base(), draft),
+    updateDecision: (id, draft) => apiPatch(path(id), draft),
+    deleteDecision: (id) => apiDelete(path(id)),
+    preview: (input) => apiPost(`${base()}/preview`, input),
+    previewGate: (ref, input) => apiPost(`${conversation(ref)}/decision-preview`, input),
+    listEvaluations: (ref, page = {}) => {
+      const query = new URLSearchParams()
+      if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+      if (page.limit !== undefined) query.set('limit', String(page.limit))
+      if (page.decisionId) query.set('decisionId', page.decisionId)
+      const suffix = query.toString()
+      return apiGet(`${conversation(ref)}/decision-evaluations${suffix ? `?${suffix}` : ''}`)
+    },
+    getEvaluation: (ref, seq) => apiGet(`${conversation(ref)}/decision-evaluations/${encodeURIComponent(String(seq))}`),
+    listBots: unsupported,
+    listChannels: unsupported,
+    saveChannel: unsupported,
+    getRouting: (botId) => apiGet(routing(botId)),
+    saveRouting: (botId, input) => apiPut(routing(botId), input),
+    previewRouting: (botId, input) => apiPost(`${routing(botId)}/preview`, input),
+    listRoutingEvaluations: (botId, page = {}) => {
+      const query = new URLSearchParams()
+      if (page.channelId !== undefined) query.set('channelId', page.channelId)
+      if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+      if (page.limit !== undefined) query.set('limit', String(page.limit))
+      if (page.decisionId) query.set('decisionId', page.decisionId)
+      const suffix = query.toString()
+      return apiGet(`${routing(botId)}/evaluations${suffix ? `?${suffix}` : ''}`)
+    },
+    getRoutingEvaluation: (botId, ref) =>
+      apiGet(
+        `${routing(botId)}/evaluations/${encodeURIComponent(String(ref.seq))}?channelId=${encodeURIComponent(ref.channelId)}`
+      )
+  }
+}
+
+// ── capability requests (capability-requests.md §4.5): an agent's ask, completed or declined by a person ──
+
+export type CapabilityRequestKind =
+  'agent-settings' | 'mcp-server' | 'skill' | 'repository' | 'connection' | 'secret' | 'cron'
+export type CapabilityRequestStatus = 'open' | 'completed' | 'declined' | 'expired' | 'withdrawn'
+
+/** The `agent-settings` fields an agent may ask for: the agent form's plain values (§4.12). */
+export interface CapabilitySettingsWant {
+  model?: string
+  reasoningEffort?: string
+  fastMode?: boolean
+  outputMode?: 'none' | 'minimal' | 'low' | 'medium' | 'high'
+  permissionMode?: string
+  runtime?: string
+  execution?: string
+  chatActions?: 'talk' | 'approve' | 'settings'
+  introduceOnJoin?: boolean
+  showFooter?: boolean
+  showStatusBar?: boolean
+  displayName?: string
+}
+
+/** A scheduled task: a new cron of the agent, or with `cronId` a change to one of its own; `trigger` is its prompt. */
+export interface CapabilityCronWant {
+  cronId?: string
+  name?: string
+  schedule: string
+  timezone?: string
+  trigger: string
+}
+
+/** A repository on a code host and the tier wanted; `host` names a self-managed GitLab. */
+export interface CapabilityRepositoryWant {
+  provider: 'github' | 'gitlab'
+  host?: string
+  repository: string
+  access: 'read' | 'write'
+}
+
+/** A connection the console makes through a browser redirect. */
+export type CapabilityConnectionWant =
+  | { type: 'mcp-oauth'; server: string }
+  | { type: 'code-host'; provider: 'github' | 'gitlab'; host?: string }
+  | { type: 'chat-integration'; platform: string }
+
+/** A secret by name and purpose, never its value; the route says whether the agent can read it. */
+export interface CapabilitySecretWant {
+  name: string
+  description: string
+  use: { route: 'mcp-header'; server: string } | { route: 'live' }
+}
+
+export type CapabilityRequestWant =
+  | CapabilitySettingsWant
+  | { server: string }
+  | { skill: string }
+  | CapabilityRepositoryWant
+  | CapabilityConnectionWant
+  | CapabilitySecretWant
+  | CapabilityCronWant
+
+export interface CapabilityRequestAskerDto {
+  kind: 'console' | 'member'
+  userId: string
+  name: string | null
+  platform: string | null
+}
+
+export interface CapabilityRequestOriginDto {
+  sessionId: string
+  platform: string
+  placeLabel: string | null
+  external: boolean
+  askers: CapabilityRequestAskerDto[]
+  nobody: boolean
+  askedAt: string
+  wake: 'none' | 'pending' | 'delivered' | 'gone'
+  wakeReason: string | null
+}
+
+export interface CapabilityRequestDto {
+  id: string
+  orgId: string
+  agentId: string
+  agentName: string
+  kind: CapabilityRequestKind
+  target: string
+  want: CapabilityRequestWant
+  summary: string
+  reason: string
+  status: CapabilityRequestStatus
+  generation: number
+  createdAt: string
+  expiresAt: string
+  settledAt: string | null
+  settledBy:
+    { kind: 'console'; userId: string; name: string } | { kind: 'member'; platform: string; name: string } | null
+  outcome: string | null
+  differs: boolean
+  note: string | null
+  origins: CapabilityRequestOriginDto[]
+  current: Record<string, unknown>
+  /** Optional hints for completing it (a provider id, a start route); the page falls back to the console's own flows. */
+  completion?: Record<string, unknown> | null
+  warnings: string[]
+  viewer: {
+    canComplete: boolean
+    canDecline: boolean
+    canReopen: boolean
+    canForward: boolean
+    missing: string | null
+    whoCan: Array<{ userId: string; name: string }>
+  }
+}
+
+const capabilityRequestPath = (id: string, orgId?: string) =>
+  `${orgBase(orgId)}/capability-requests/${encodeURIComponent(id)}`
+
+export async function fetchCapabilityRequests(
+  filter: { agentId?: string; status?: CapabilityRequestStatus } = {},
+  orgId?: string
+): Promise<CapabilityRequestDto[]> {
+  const query = new URLSearchParams()
+  if (filter.agentId) query.set('agentId', filter.agentId)
+  if (filter.status) query.set('status', filter.status)
+  const suffix = query.toString()
+  const page = await apiGet<{ requests: CapabilityRequestDto[] }>(
+    `${orgBase(orgId)}/capability-requests${suffix ? `?${suffix}` : ''}`
+  )
+  return page.requests
+}
+
+export async function fetchCapabilityRequest(id: string, orgId?: string): Promise<CapabilityRequestDto> {
+  return apiGet<CapabilityRequestDto>(capabilityRequestPath(id, orgId))
+}
+
+/** Set (or replace) one of an agent's live secrets through the agent PATCH: write-only, read by its shell at use time (capability-requests.md §4.9.2). A name taken by a variable or a spawn-time secret answers 409. */
+export async function saveAgentLiveSecret(
+  agentId: string,
+  secret: { name: string; value: string; description?: string },
+  orgId?: string
+): Promise<void> {
+  const patch: UpdateAgentInput = {
+    liveSecrets: {
+      [secret.name]: { value: secret.value, ...(secret.description ? { description: secret.description } : {}) }
+    }
+  }
+  await apiPatch<AgentDto>(`${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}`, patch)
+}
+
+/** Asks for the request to be settled once the change was saved; the outcome is what the server observes, not what was clicked. */
+export async function settleCapabilityRequest(
+  id: string,
+  orgId?: string,
+  saved?: { cronId: string }
+): Promise<CapabilityRequestDto> {
+  return apiPost<CapabilityRequestDto>(`${capabilityRequestPath(id, orgId)}/settle`, saved ?? {})
+}
+
+export async function declineCapabilityRequest(
+  id: string,
+  note: string | undefined,
+  orgId?: string
+): Promise<CapabilityRequestDto> {
+  return apiPost<CapabilityRequestDto>(`${capabilityRequestPath(id, orgId)}/decline`, note ? { note } : {})
+}
+
+export async function reopenCapabilityRequest(id: string, orgId?: string): Promise<CapabilityRequestDto> {
+  return apiPost<CapabilityRequestDto>(`${capabilityRequestPath(id, orgId)}/reopen`, {})
+}
+
+export async function forwardCapabilityRequest(
+  id: string,
+  userId: string | undefined,
+  orgId?: string
+): Promise<{ forwarded: 'dm' | 'activity' }> {
+  return apiPost<{ forwarded: 'dm' | 'activity' }>(
+    `${capabilityRequestPath(id, orgId)}/forward`,
+    userId ? { userId } : {}
+  )
+}
+
+const coordinatorFilterBase = (agentId: string, orgId?: string) =>
+  `${orgBase(orgId)}/agents/${encodeURIComponent(agentId)}/coordinator-filter/evaluations`
+
+/** The agent's coordinator filter verdicts, newest first (auto-session-mode.md §4.7); read through from its daemon. */
+export function fetchCoordinatorFilterEvaluations(
+  agentId: string,
+  page: { cursor?: number; limit?: number } = {},
+  orgId?: string
+): Promise<DecisionEvaluationRecordPage> {
+  const query = new URLSearchParams()
+  if (page.cursor !== undefined) query.set('cursor', String(page.cursor))
+  if (page.limit !== undefined) query.set('limit', String(page.limit))
+  const suffix = query.toString()
+  return apiGet(`${coordinatorFilterBase(agentId, orgId)}${suffix ? `?${suffix}` : ''}`)
+}
+
+export function fetchCoordinatorFilterEvaluation(
+  agentId: string,
+  seq: number,
+  orgId?: string
+): Promise<DecisionEvaluationRecordDetail> {
+  return apiGet(`${coordinatorFilterBase(agentId, orgId)}/${encodeURIComponent(String(seq))}`)
+}

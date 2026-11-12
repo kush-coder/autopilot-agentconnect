@@ -1,0 +1,6645 @@
+import { DecisionBindingDenied, ModelSelectionInvalid } from '../../persistence/decision-binding-fence.js'
+import {
+  DecisionToolDefinition,
+  modelSelectionDecisionIds,
+  MemoryEntryCreateRequest,
+  MemoryEntryUpdateRequest,
+  MemoryEntryDeleteRequest,
+  MemoryEntryMutationReceipt,
+  type MemoryEntriesWriteReq,
+  MemoryEntryCapabilities,
+  MemoryEntryListRequest,
+  MemoryEntryListResult,
+  MemoryEntrySearchRequest,
+  MemoryEntrySearchResult,
+  MemoryEntryHistoryRequest,
+  MemoryEntryHistoryResult,
+  MemoryEntryGetRequest,
+  MemoryEntryContent,
+  type MemoryEntriesReadReq,
+  WorkspaceListPage,
+  WorkspaceReadContent,
+  WorkspaceGitStatus,
+  WorkspaceGitDiffResult,
+  WorkspaceGitLog,
+  WorkspaceGitPullResult,
+  WorkspaceGitCommitResult,
+  WorkspaceGitPushResult,
+  WorkspaceGitMessageResult,
+  TaskList,
+  MemoryReadContent,
+  MemoryListPage,
+  MemoryHistoryPage,
+  MemorySurfaceInfo,
+  MemoryRecordListPage,
+  MemoryRecordSearchPage,
+  MemoryRecordGetResult,
+  MemoryRecordCreateResult,
+  MemoryRecordUpdateResult,
+  MemoryRecordDeleteResult,
+  MemoryRecordHistoryPage,
+  DreamInfo,
+  DreamListPage,
+  DreamFilesPage,
+  DreamRevisionsPage,
+  DreamFileReadContent,
+  agentComputerUseOf,
+  LIVE_SECRETS_MAX
+} from '@agentconnect.md/protocol'
+/**
+ * `http/routes/agents.ts` (design §2.1) — CRUD for agent definitions through the
+ * C6 `AgentRepo`. The CP mints the agent UUID (the wire id used across
+ * `route/*`, `agent/*`, `event/session`). Scoped to the caller's org (the
+ * devAuth/OIDC principal). Placement/launch happen over the WS edge — not here.
+ */
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
+import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
+import type { GitlabLiveProject } from '../../gitlab/provisioner.js'
+import { gitlabAccountUnavailableMessage } from '../../gitlab/account.service.js'
+import {
+  MAX_WORKSPACE_EDIT_BYTES,
+  AGENT_CONFIG_REVISION_FEATURE,
+  ORGANIZATION_KNOWLEDGE_FEATURE,
+  MEMORY_PERSON_LAYER_FEATURE,
+  MEMORY_PLACE_CLEAR_FEATURE,
+  MemoryChannelKey,
+  WORKSPACE_SESSION_READ_FEATURE,
+  WORKSPACE_FILE_DOWNLOAD_FEATURE,
+  FILE_TRANSFER_FEATURE,
+  WORKSPACE_UPLOAD_BEGIN_FEATURE,
+  WORKSPACE_REPO_SCOPE_FEATURE,
+  WORKSPACE_GIT_MESSAGE_FEATURE,
+  WORKSPACE_GIT_REVIEW_FEATURE,
+  WORKSPACE_GIT_WRITE_FEATURE,
+  TASK_LIST_FEATURE,
+  RUNTIME_COMMANDS_FEATURE,
+  AGENT_WAKE_FEATURE,
+  WorkspaceErrorReason,
+  TaskErrorReason,
+  gitRepoLabel,
+  isCodeHostHookKind,
+  type ExecutorStrategyTable
+} from '@agentconnect.md/protocol'
+import type { ZodTypeProvider } from '../plugins/zod.js'
+import type { HttpDeps } from '../deps.js'
+import {
+  FileTransferRefusal,
+  isTransferPending,
+  type WorkspaceDownload,
+  type WorkspaceTransferResult
+} from '../../file-transfer/service.js'
+import {
+  type AgentMoveOpts,
+  type AgentRecord,
+  type AgentSkillSourceFence,
+  type AgentWorkspace,
+  type AssignedOrganizationMetadata,
+  type McpProviderRecord,
+  type SecretPatchValue,
+  isSyntheticEmail
+} from '../../persistence/ports.js'
+import {
+  deriveWorkspaceCredential,
+  workspaceFromDerived,
+  WorkspaceCredentialRefused,
+  type DerivedWorkspace
+} from './workspace-credential.js'
+import type { DaemonView } from '../../ports.js'
+import { AgentId, DaemonId, OrgId, SessionId } from '../../domain/ids.js'
+import { derivedComputerIds } from '../../domain/computer.js'
+import { advertises, requiredDaemonFeatures } from '../../domain/daemon-features.js'
+import { UNPLACED, placementStrategies, resolveExecution } from '../../domain/execution.js'
+import { codeHostProviders, codeHostsOf } from '../../codehost/registry.js'
+import {
+  dutyEligibility,
+  onSet,
+  placementLabel,
+  placementTargetOf,
+  type PlacementTarget
+} from '../../domain/placement.js'
+import type { ResolvableAgent } from '../../orchestrator/placementResolver.js'
+import { currentMcpGrant, mcpProxyDef, relayHttpOrigin } from '../../orchestrator/mcpProvider.js'
+import { serializeByProviderNames } from './mcp-providers.js'
+
+/** Thrown inside the provider-name fence when the in-fence visibility re-check
+ *  refuses an enable-list name; the route maps it to a 403. */
+class McpEnableDenied extends Error {}
+/** The skill-source twin: thrown inside the source-name fence when the in-fence
+ *  visibility re-check refuses a submitted skill-ref; the route maps it to a 403. */
+class SkillEnableDenied extends Error {}
+import {
+  parseSkillRef,
+  redactSourceCredentials,
+  resolveGitlabSkillSourceProjects
+} from '../../orchestrator/skillSource.js'
+import { memoryConnectionSpec, stdioMemoryConnectionSpec } from '../../orchestrator/memoryConnection.js'
+import {
+  MemoryHomeRefusedError,
+  SET_MOVE_NEEDS_CP_HOME,
+  memoryHomedInControlPlane,
+  resolveMemoryBindingOnCreate,
+  resolveMemoryBindingOnUpdate,
+  resolveMemoryHomeOnMove
+} from '../../agent-memory/home.js'
+import { memoryHistoryRoot, toHistoryEvent } from '../../agent-memory/history.js'
+import { memoryHomeUnavailable, SANDBOX_UNAVAILABLE_CODE } from '../../agent-memory/unavailable.js'
+import { MemoryStorePathError } from '../../agent-memory/paths.js'
+import { orgOf, denyViewerWrite, ctxOf } from '../rbac.js'
+import { refreshMutationAgent as refreshAgentUnderMutation } from '../mutation-agent.js'
+import {
+  AuthorizationAction,
+  can,
+  canView,
+  canViewSession,
+  canEdit,
+  canManageSharing,
+  type ViewCtx
+} from '../../authorization/policy.js'
+import { makeSessionAccessResolver } from '../session-access.js'
+import { makeMemoryPlaceAccess } from '../memory-place-access.js'
+import { servesAhpWebchat } from '../webchat-attachment.js'
+import { makeMemorySources, type MemorySource } from '../memory-source.js'
+import { resolveShareSet } from '../sharing.js'
+import { resolveAgentIconUrl, type IconUrlBases } from '../../agents/agent-icon.js'
+import { coordinatorFilterRefusal, repositorySelectorRefusal } from '../../agents/repository-selector.js'
+import {
+  ASSISTANT_MODE_NOT_ADMITTED,
+  AssistantModeAdmissionRefused,
+  assistantModeAdmissionOf,
+  assistantModeEditNeedsAdmission,
+  assistantModeRefusalMessage,
+  assistantResponsibleUser,
+  onboardingHintsFor
+} from '../../agents/assistant-mode.js'
+import { readySetMembers, usesDecisionMaterialize } from '../repository-selection.js'
+import { NoConnection } from '../../orchestrator/outbound.js'
+import { AgentMoveConflict, AgentMoveFailed } from '../../orchestrator/agentMove.js'
+import { AgentWakeCoordinator, agentWakeRequest } from '../../orchestrator/agentWake.js'
+import { convergeIntegrationGating } from '../../orchestrator/integrationPush.js'
+import { isAssistantModeAgent } from '../../orchestrator/placement.js'
+import { reconcileAgentLinkedDms } from '../../orchestrator/linkedDmReconcile.js'
+import { ProtocolError } from '../../domain/errors.js'
+import {
+  AGENT_WORKSPACE_INTEGRATION_CONFLICT_MESSAGE,
+  AgentSetPlacementDenied,
+  DaemonPlacementInSet,
+  CodeHostBindingUnavailable,
+  MemoryConnectionBusy,
+  MemoryConnectionMissing
+} from '../../persistence/errors.js'
+import { OrganizationEnvironmentAdmissionError } from '../../persistence/repositories/organization-environment-fence.js'
+import {
+  CreateAgentBody,
+  SetAgentWorkspaceBody,
+  UpdateAgentBody,
+  SetAgentDaemonBody,
+  SetSharingBody,
+  SetAgentCallPolicyBody,
+  AgentDto,
+  AgentPermissionRequestPageDto,
+  toPermissionRequestDto,
+  AgentSkillSourceListDto,
+  AgentSkillSourceStatusDto,
+  AgentPermissionDecisionBody,
+  AgentCreatedDto,
+  AgentListDto,
+  AssistantModeAdmissionDto,
+  AssistantResponsibleUserDto,
+  ErrorDto,
+  IdParam,
+  WorkspaceFilesQueryDto,
+  WorkspaceRepoScopeQueryDto,
+  WorkspaceScopeQueryDto,
+  WorkspaceFilesDto,
+  WorkspaceFileQueryDto,
+  WorkspaceFileDto,
+  WorkspaceDownloadQueryDto,
+  WorkspaceTransferBody,
+  WorkspaceTransferDto,
+  WorkspaceTransferOperationParams,
+  WorkspaceTransferOperationQuery,
+  WorkspaceTransferPendingDto,
+  FileUploadBody,
+  FileUploadDto,
+  FileUploadPartsBody,
+  FileUploadPartsDto,
+  FileUploadPartsParams,
+  WorkspaceDownloadBody,
+  PutWorkspaceFileQueryDto,
+  PutWorkspaceFileBody,
+  WorkspaceFileWriteDto,
+  DeleteWorkspaceFileQueryDto,
+  WorkspaceFileDeleteDto,
+  CreateWorkspaceDirQueryDto,
+  WorkspaceDirCreateDto,
+  WorkspaceGitStatusDto,
+  WorkspaceGitDiffQueryDto,
+  WorkspaceGitDiffDto,
+  WorkspaceGitLogQueryDto,
+  WorkspaceGitLogDto,
+  WorkspaceGitPullDto,
+  WorkspaceGitStageBody,
+  WorkspaceGitCommitBody,
+  WorkspaceGitCommitResultDto,
+  WorkspaceGitPushResultDto,
+  WorkspaceGitMessageResultDto,
+  AgentTasksQueryDto,
+  AgentTasksDto,
+  AgentWakeDto,
+  AgentWakeQueryDto,
+  AgentMemoryDto,
+  MemoryFilesDto,
+  MemoryFilesQueryDto,
+  MemoryChannelsDto,
+  MemoryChannelClearDto,
+  PLACE_LAYER_KEY_DESCRIPTION,
+  MemoryFileQueryDto,
+  MyMemoryFileQueryDto,
+  DreamFileQueryDto,
+  PutMemoryFileQueryDto,
+  PutAgentMemoryBody,
+  AgentMemoryWriteDto,
+  MemoryHistoryQueryDto,
+  MemoryHistoryPageDto,
+  MemorySurfaceDto,
+  MemoryRecordPageDto,
+  MemoryRecordResultDto,
+  MemoryRecordGetResultDto,
+  MemoryRecordDeleteResultDto,
+  MemoryRecordHistoryPageDto,
+  MemoryRecordSearchBodyDto,
+  MemoryRecordPageQueryDto,
+  MemoryRecordParamDto,
+  CreateMemoryRecordBody,
+  UpdateMemoryRecordBody,
+  DeleteMemoryRecordBody,
+  DreamDto,
+  DreamListDto,
+  DreamFilesDto,
+  DreamRevisionsDto,
+  DreamFileDto,
+  DreamIdParam,
+  DreamSkillParam,
+  DreamSkillContentDto,
+  LocalSkillsDto,
+  RuntimeCommandsDto,
+  StartDreamBody,
+  AdoptDreamBody,
+  AcceptDreamSkillBody,
+  type AgentDtoT,
+  type WorkspaceFilesDtoT,
+  type WorkspaceFileDtoT,
+  type WorkspaceGitStatusDtoT,
+  type WorkspaceGitDiffDtoT,
+  type WorkspaceGitLogDtoT,
+  type WorkspaceGitPullDtoT,
+  type WorkspaceGitCommitResultDtoT,
+  type WorkspaceGitPushResultDtoT,
+  type WorkspaceGitMessageResultDtoT,
+  type AgentTasksDtoT,
+  type AgentMemoryDtoT,
+  type MemoryFilesDtoT,
+  type MemoryHistoryPageDtoT,
+  type MemorySurfaceDtoT,
+  type MemoryRecordPageDtoT,
+  type MemoryRecordResultDtoT,
+  type MemoryRecordGetResultDtoT,
+  type MemoryRecordDeleteResultDtoT,
+  type MemoryRecordHistoryPageDtoT,
+  type DreamDtoT,
+  type DreamListDtoT,
+  type DreamFilesDtoT,
+  type DreamRevisionsDtoT,
+  type DreamFileDtoT
+} from '../dto/index.js'
+import {
+  assembleWorkspaceFile,
+  attachmentDisposition,
+  downloadContentType,
+  DOWNLOAD_SLICE_BYTES,
+  sha256Matches,
+  WorkspaceDownloadRefusal
+} from '../workspace-download.js'
+import { provisionDaemonConnect } from '../onboarding.js'
+import { Tag } from '../plugins/openapi.js'
+import { buildAgentMoves } from '../agent-moves.js'
+import { GithubApiError } from '../../github/api.js'
+import { GitlabApiError, gitlabWorkspaceAccessLevel } from '../../gitlab/api.js'
+import { GiteaApiError } from '../../gitea/api.js'
+import { AzureDevOpsApiError } from '../../azure-devops/api.js'
+import { LogtoApiError } from '../../github/logto-identity.js'
+import { UserAuthzDeniedError } from '../../github/user-authz.js'
+import { syncAgentBotIcons } from '../agent-bot-icon-sync.js'
+
+/** Public bases for resolving an agent's `image` icon URL (cp/store). */
+function iconBasesOf(deps: HttpDeps): IconUrlBases {
+  return {
+    ...(deps.config.PUBLIC_CP_URL ? { cp: deps.config.PUBLIC_CP_URL } : {}),
+    ...(deps.config.S3_PUBLIC_BASE_URL ? { store: deps.config.S3_PUBLIC_BASE_URL } : {})
+  }
+}
+
+function badRequest(reply: FastifyReply, message: string) {
+  return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message })
+}
+
+/** Version-skew gate for memory dreaming. A daemon that predates the feature
+ *  omits it, and the CP must NOT forward `memory/dream/*` to it: that daemon
+ *  silently ignores unknown frames, so the request would hang until it times
+ *  out and surface as a misleading 503. Gating here fails fast with a clear
+ *  message, and the DTO projection lets the console hide the panel outright. */
+const DREAMING_FEATURE = 'memory-dreaming-v1'
+
+function dreamingSupportedOn(daemon: DaemonView | null): boolean {
+  return !!daemon?.capabilities.features.includes(DREAMING_FEATURE)
+}
+
+function organizationKnowledgeSupportedOn(daemon: DaemonView | null): boolean {
+  return !!daemon?.capabilities.features.includes(ORGANIZATION_KNOWLEDGE_FEATURE)
+}
+
+/** Does this daemon persist and enforce the monotonic `AgentSpec.configRevision`?
+ *  The precondition for placing an agent bound to an organization environment entry
+ *  (organization-secrets-and-variables.md §10). */
+function configRevisionSupportedOn(daemon: DaemonView | null): boolean {
+  return !!daemon?.capabilities.features.includes(AGENT_CONFIG_REVISION_FEATURE)
+}
+
+/** No assigned organization rows — the shape a minimal/legacy graph resolves to. */
+const NO_ORGANIZATION_ENVIRONMENT: AssignedOrganizationMetadata = { variables: [], secretKeys: [] }
+
+function workspaceToDto(workspace: AgentWorkspace, workspaceRepoId?: bigint): AgentDtoT['workspace'] {
+  if (workspace.mode === 'scratch') return { mode: 'scratch' }
+  // The DTO mirrors PERSISTED provenance (git-workspace-model.md §5) — never a live
+  // re-derivation. installationId stays server-side; the credential names the provider.
+  const credential = workspace.credential
+    ? codeHostProviders[workspace.credential.provider].workspace.toDto(workspace.credential, workspaceRepoId)
+    : null
+  return {
+    mode: 'git',
+    worktree: workspace.isolation === 'session',
+    gitRepo: workspace.gitRepo,
+    ...(workspace.gitBranch !== undefined ? { gitBranch: workspace.gitBranch } : {}),
+    ...(workspace.agentDir !== undefined ? { agentDir: workspace.agentDir } : {}),
+    // The vouching host owns its own read shape; an anonymous workspace has none.
+    ...(credential ? { credential } : {})
+  }
+}
+
+function toDto(
+  a: AgentRecord,
+  ctx: ViewCtx,
+  secretKeys: string[],
+  marks: IntegrationMarks,
+  iconBases: IconUrlBases,
+  placementView: PlacementView,
+  // Organization entries assigned to THIS agent. Metadata only: variable values
+  // plus secret KEY names, resolved without decrypting anything (design §6).
+  organizationEnvironment: AssignedOrganizationMetadata = NO_ORGANIZATION_ENVIRONMENT,
+  // The Computers whose agent access grants this agent (computer-use.md §4.1).
+  computers: readonly string[] = []
+): AgentDtoT {
+  return {
+    id: a.id,
+    orgId: a.orgId,
+    name: a.name,
+    displayName: a.displayName,
+    builtin: a.builtin,
+    icon: a.icon,
+    // Only `image` icons resolve to a URL (the object-store public URL); glyph/runtime
+    // render locally in the console, so null there. Cache-busted by lastModified.
+    iconUrl: a.icon?.kind === 'image' ? resolveAgentIconUrl(a.id, a.icon, iconBases, a.lastModifiedAt.getTime()) : null,
+    description: a.description,
+    runtime: a.runtime,
+    model: a.model,
+    modelProvider: a.modelProvider ?? null,
+    reasoningEffort: a.reasoningEffort,
+    outputMode: a.outputMode,
+    showFooter: a.showFooter,
+    showStatusBar: a.showStatusBar,
+    fastMode: a.fastMode,
+    permissionMode: a.permissionMode,
+    chatActions: a.chatActions,
+    pause: a.pause,
+    env: a.env,
+    // Only the secret NAMES leave the CP (AgentSecretStore.keys — values are
+    // write-only and never on the record). Sorted for a stable DTO.
+    secretKeys: [...secretKeys].sort(),
+    // Read-only inherited rows. A member who can view this agent sees its
+    // organization variable values and organization secret key names, and learns
+    // nothing about entries assigned only to another agent (§4).
+    organizationVariables: organizationEnvironment.variables,
+    organizationSecretKeys: organizationEnvironment.secretKeys,
+    mcpServers: a.mcpServers,
+    skills: a.skills,
+    decisionIds: a.decisionIds ?? [],
+    modelSelection: a.modelSelection ?? null,
+    coordinatorModel: a.coordinatorModel ?? null,
+    coordinatorDisabled: a.coordinatorDisabled === true,
+    coordinatorFilter: a.coordinatorFilter ?? null,
+    repositorySelector: a.repositorySelector ?? null,
+    managedSkills: a.managedSkills,
+    memory: a.memory,
+    assistantMode: a.assistantMode ?? null,
+    computerUse: agentComputerUseOf(a.computerUse, computers),
+    status: a.status,
+    placementKind: a.placementKind,
+    daemonId: a.daemonId,
+    daemonName: a.daemonId ? placementView.daemonName : null,
+    setId: a.setId,
+    placementReady: placementView.ready,
+    ahpWebchat: placementView.ahpWebchat,
+    ...(placementView.holderDaemonId !== undefined ? { holderDaemonId: placementView.holderDaemonId } : {}),
+    workspace: workspaceToDto(a.workspace, a.workspaceRepoId),
+    workspaceRepoId: a.workspaceRepoId?.toString() ?? null,
+    capabilities: a.capabilities,
+    createdAt: a.createdAt.toISOString(),
+    // The creator's userId — the stable identity the web resolves to a display name (or
+    // "You" for the viewer), unified with how session senders are labeled. A synthesized
+    // placeholder email (`<sub>@oidc.local`, when no real user is known) means a non-human
+    // creator, so surface null → the console shows "—" instead.
+    createdBy: a.createdBy && !isSyntheticEmail(a.createdBy.email) ? a.createdBy.userId : null,
+    lastModifiedAt: a.lastModifiedAt.toISOString(),
+    lastModifiedBy: a.lastModifiedBy && !isSyntheticEmail(a.lastModifiedBy.email) ? a.lastModifiedBy.userId : null,
+    visibility: a.visibility,
+    sharedWith: a.sharedWith,
+    canEdit: canEdit(a, ctx),
+    canManageSharing: canManageSharing(a, ctx),
+    callPolicy: a.callPolicy,
+    allowedCallerAgentIds: a.allowedCallerAgentIds,
+    outboundPolicy: a.outboundPolicy,
+    allowedTargetAgentIds: a.allowedTargetAgentIds,
+    introduceOnJoin: a.introduceOnJoin,
+    newConversationMode: a.newConversationMode,
+    githubAppId: a.githubAppId ?? null,
+    execution: a.execution,
+    strategies: placementView.strategies,
+    hookKinds: marks.hookKinds,
+    apiProtocols: marks.apiProtocols
+  }
+}
+
+/** What the list's integrations cell marks beside the agent's bot integrations. */
+interface IntegrationMarks {
+  hookKinds: AgentDtoT['hookKinds']
+  apiProtocols: AgentDtoT['apiProtocols']
+}
+
+/** One placement resolution supplies its display name, strategy table, and readiness. */
+interface PlacementView {
+  daemonName: string | null
+  /** What `execution` is checked against: the daemon's table, or every ready member's for a set. */
+  strategies: ExecutorStrategyTable
+  ready: boolean
+  /** Set only for an org's own group: the pool shares its store, and a machine placement names its daemon. */
+  holderDaemonId?: string | null
+  ahpWebchat: boolean
+}
+
+const NO_PLACEMENT: PlacementView = { daemonName: null, strategies: UNPLACED, ready: false, ahpWebchat: false }
+
+function placementViewOf(deps: HttpDeps, daemon: DaemonView | null): PlacementView {
+  const live = daemon ? deps.liveness.get(daemon.daemonId) : undefined
+  const ready = live?.reachable === true && live.state === 'READY'
+  return {
+    daemonName: daemon?.name ?? null,
+    strategies: placementStrategies(daemon ? [daemon.capabilities] : []),
+    ready,
+    ahpWebchat: ready && servesAhpWebchat(deps.config, daemon)
+  }
+}
+
+/**
+ * The API-sugar edge (daemon-groups.md §4): `{ placementKind: 'pool' }` names THE org-less set, so
+ * the console's existing "Cloud" entry needs no change and storage keeps one representation.
+ * `{ placementKind: 'set', setId }` names one explicitly; a set belonging to another org is not
+ * resolvable here, exactly as another org's daemon is not.
+ */
+async function resolveTargetSetId(
+  deps: HttpDeps,
+  orgId: OrgId,
+  body: { placementKind?: 'daemon' | 'pool' | 'set'; setId?: string }
+): Promise<string | null> {
+  if (body.placementKind === 'pool') return deps.repos.memberSet.crossOrgSetId()
+  if (body.placementKind !== 'set' || body.setId === undefined) return null
+  const set = await deps.repos.memberSet.get(body.setId)
+  return set && (set.orgId === null || set.orgId === orgId) ? set.id : null
+}
+
+/** Whether a placement keeps managed memory in the Control Plane (memory-evolution.md §3.2.1): any member set, or a legacy pin to a pool member. */
+async function placedOnMemberSet(
+  deps: HttpDeps,
+  target: { setId?: string | null; daemonId?: string | null }
+): Promise<boolean> {
+  if (target.setId) return true
+  if (!target.daemonId) return false
+  const pool = await deps.repos.memberSet.crossOrgSetId()
+  return pool !== null && (await deps.repos.memberSet.setIdOf(DaemonId(target.daemonId))) === pool
+}
+
+/** The write-time placement invariants (daemon-groups.md §2, §3) are asserted inside the
+ *  transaction that writes the placement, so they surface as a throw from any route that
+ *  writes one. Both are caller refusals, not faults — a route that lets one escape answers
+ *  a bare 500. Returns the client-facing message, or null when the error is something else. */
+function placementRefusalMessage(e: unknown): string | null {
+  if (e instanceof DaemonPlacementInSet) {
+    return 'that daemon is a managed pool member, and a pool member is a replaceable identity that an agent may not be pinned to — place the agent on the pool itself instead (placementKind: "pool")'
+  }
+  if (e instanceof AgentSetPlacementDenied) return 'the agent may not be placed on that member set'
+  return null
+}
+
+async function placementViewFor(deps: HttpDeps, a: AgentRecord, setMembers?: DaemonView[]): Promise<PlacementView> {
+  const eligibility = dutyEligibility(a)
+  if (eligibility.scope === 'none') return NO_PLACEMENT
+  if (eligibility.scope === 'daemon') {
+    // The org-fenced agent read supplies the availability scope for its daemon.
+    return placementViewOf(deps, await deps.registry.getAvailable(a.orgId, eligibility.daemonId))
+  }
+  const members = setMembers ?? (await readySetMembers(deps, OrgId(a.orgId), eligibility.setId))
+  const view = {
+    ...placementViewOf(deps, members[0] ?? null),
+    strategies: placementStrategies(members.map((member) => member.capabilities))
+  }
+  if (eligibility.setId === (await deps.repos.memberSet.crossOrgSetId())) return view
+  return { ...view, holderDaemonId: await deps.placementResolver.routableDaemon(a) }
+}
+
+/** The dto's hook-kind and API marks for ONE agent (single-agent reads/writes). */
+async function integrationMarksOf(deps: HttpDeps, agentId: string): Promise<IntegrationMarks> {
+  const [hooks, apis] = await Promise.all([
+    deps.repos.hook.listForAgent(AgentId(agentId)),
+    deps.repos.agentApiEntry.listForAgent(AgentId(agentId))
+  ])
+  return {
+    hookKinds: [...new Set(hooks.filter((h) => h.enabled).map((h) => h.kind))],
+    apiProtocols: apis.map((e) => e.protocol)
+  }
+}
+
+/** Wire REP → HTTP body: null-coalesce optional fields (the zod response schema
+ *  is enforced on serialization). Pure — exported for the unit test. */
+export function toWorkspaceFilesDto(page: WorkspaceListPage): WorkspaceFilesDtoT {
+  return {
+    path: page.path,
+    exists: page.exists,
+    entries: page.entries.map((e) => ({
+      name: e.name,
+      type: e.type,
+      size: e.size ?? null,
+      mtime: e.mtime ?? null
+    })),
+    nextCursor: page.nextCursor ?? null
+  }
+}
+
+/** Wire REP → HTTP body for one file slice (see {@link toWorkspaceFilesDto}). `type`
+ *  keeps a directory readable as DATA instead of an empty file — or an outage. */
+export function toWorkspaceFileDto(rep: WorkspaceReadContent): WorkspaceFileDtoT {
+  return {
+    path: rep.path,
+    exists: rep.exists,
+    type: rep.type ?? null,
+    size: rep.size ?? null,
+    mtime: rep.mtime ?? null,
+    // Only a download asks for bytes, so a text read never carries `base64`.
+    encoding: rep.encoding === 'base64' ? null : (rep.encoding ?? null),
+    content: rep.content ?? null,
+    offset: rep.offset ?? null,
+    nextOffset: rep.nextOffset ?? null,
+    truncated: rep.truncated ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a memory slice (see {@link toWorkspaceFileDto}). */
+export function toAgentMemoryDto(rep: MemoryReadContent): AgentMemoryDtoT {
+  return {
+    path: rep.path,
+    exists: rep.exists,
+    size: rep.size ?? null,
+    mtime: rep.mtime ?? null,
+    content: rep.content ?? null,
+    offset: rep.offset ?? null,
+    nextOffset: rep.nextOffset ?? null,
+    truncated: rep.truncated ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a memory-dir listing. */
+export function toMemoryFilesDto(rep: MemoryListPage): MemoryFilesDtoT {
+  return { exists: rep.exists, files: rep.entries }
+}
+
+/** Wire REP → bounded HTTP page for managed file provenance. */
+export function toMemoryHistoryPageDto(rep: MemoryHistoryPage): MemoryHistoryPageDtoT {
+  return { events: rep.events, nextCursor: rep.nextCursor ?? null }
+}
+
+/** Wire REP → HTTP body for one dream job's metadata (never staged bodies). */
+export function toDreamDto(dream: DreamInfo): DreamDtoT {
+  return {
+    dreamId: dream.dreamId,
+    agentId: dream.agentId,
+    status: dream.status,
+    trigger: dream.trigger,
+    sessionIds: dream.sessionIds,
+    snapshotDigest: dream.snapshotDigest,
+    executionSessionId: dream.executionSessionId ?? null,
+    runtime: dream.runtime ?? null,
+    model: dream.model ?? null,
+    stopReason: dream.stopReason ?? null,
+    instructions: dream.instructions ?? null,
+    skills: dream.skills ?? null,
+    usage: dream.usage ?? null,
+    error: dream.error ?? null,
+    createdAt: dream.createdAt,
+    endedAt: dream.endedAt ?? null
+  }
+}
+
+export function toDreamListDto(rep: DreamListPage): DreamListDtoT {
+  return { dreams: rep.dreams.map(toDreamDto) }
+}
+
+export function toDreamFilesDto(rep: DreamFilesPage): DreamFilesDtoT {
+  return {
+    exists: rep.exists,
+    files: rep.entries,
+    ...(rep.reviewToken !== undefined ? { reviewToken: rep.reviewToken } : {})
+  }
+}
+
+export function toDreamRevisionsDto(rep: DreamRevisionsPage): DreamRevisionsDtoT {
+  return { exists: rep.exists, revisions: rep.revisions }
+}
+
+export function toDreamFileDto(rep: DreamFileReadContent): DreamFileDtoT {
+  return {
+    path: rep.path,
+    exists: rep.exists,
+    size: rep.size ?? null,
+    mtime: rep.mtime ?? null,
+    content: rep.content ?? null,
+    offset: rep.offset ?? null,
+    nextOffset: rep.nextOffset ?? null,
+    truncated: rep.truncated ?? null
+  }
+}
+
+export function toMemorySurfaceDto(rep: MemorySurfaceInfo): MemorySurfaceDtoT {
+  return { shape: rep.shape, capabilities: rep.capabilities }
+}
+
+export function toMemoryRecordPageDto(rep: MemoryRecordListPage | MemoryRecordSearchPage): MemoryRecordPageDtoT {
+  return {
+    records: rep.records,
+    nextCursor: 'nextCursor' in rep ? (rep.nextCursor ?? null) : null
+  }
+}
+
+export function toMemoryRecordResultDto(
+  rep: MemoryRecordCreateResult | MemoryRecordUpdateResult
+): MemoryRecordResultDtoT {
+  return { record: rep.record }
+}
+
+export function toMemoryRecordGetResultDto(rep: MemoryRecordGetResult): MemoryRecordGetResultDtoT {
+  return { record: rep.record }
+}
+
+export function toMemoryRecordDeleteResultDto(rep: MemoryRecordDeleteResult): MemoryRecordDeleteResultDtoT {
+  return { id: rep.id, deleted: rep.deleted }
+}
+
+export function toMemoryRecordHistoryPageDto(rep: MemoryRecordHistoryPage): MemoryRecordHistoryPageDtoT {
+  return { events: rep.events, nextCursor: rep.nextCursor ?? null }
+}
+
+/** Wire REP → HTTP body for a workspace git status. `repo`/`agentDir` are folded
+ *  in from the agent config (the daemon reports only live checkout facts). */
+export function toWorkspaceGitStatusDto(
+  rep: WorkspaceGitStatus,
+  cfg: { repo?: string; agentDir?: string } = {}
+): WorkspaceGitStatusDtoT {
+  return {
+    isRepo: rep.isRepo,
+    clean: rep.clean,
+    repo: cfg.repo ?? null,
+    agentDir: cfg.agentDir ?? null,
+    branch: rep.branch ?? null,
+    tracking: rep.tracking ?? null,
+    ahead: rep.ahead ?? null,
+    behind: rep.behind ?? null,
+    files: (rep.files ?? []).map((f) => ({
+      path: f.path,
+      index: f.index,
+      workingDir: f.workingDir,
+      additions: f.additions ?? null,
+      deletions: f.deletions ?? null
+    })),
+    truncated: rep.truncated ?? false,
+    lastCommit: rep.lastCommit ?? null,
+    lastFetchAt: rep.lastFetchAt ?? null
+  }
+}
+
+/** The config half of a git-status body: the daemon reports only live checkout facts, so
+ *  the configured repo/subdir are folded in from the agent. Shared by every route that
+ *  answers with a `WorkspaceGitStatusDto` (the status read and both stage writes). */
+export function workspaceGitConfigOf(agent: AgentRecord): { repo?: string; agentDir?: string } {
+  const ws = agent.workspace
+  return ws.mode === 'git' ? { repo: ws.gitRepo, ...(ws.agentDir ? { agentDir: ws.agentDir } : {}) } : {}
+}
+
+/** The same, for a status read scoped to a secondary root: that root IS the repository named, and
+ *  the primary's working subdirectory means nothing inside it. */
+export function workspaceGitConfigFor(
+  agent: AgentRecord,
+  repo: string | undefined
+): { repo?: string; agentDir?: string } {
+  return repo ? { repo } : workspaceGitConfigOf(agent)
+}
+
+/** Wire REP → HTTP body for one path's unified diff. Every "no diff" reason stays
+ *  data: a non-repo workspace, an absent path, a binary change, no changes at all. */
+export function toWorkspaceGitDiffDto(rep: WorkspaceGitDiffResult): WorkspaceGitDiffDtoT {
+  return {
+    path: rep.path,
+    isRepo: rep.isRepo,
+    exists: rep.exists,
+    diff: rep.diff ?? null,
+    binary: rep.binary ?? false,
+    truncated: rep.truncated ?? false
+  }
+}
+
+/** Wire REP → HTTP body for the commit log. `tracking` null ⇒ the branch tracks
+ *  nothing, so every commit's `pushed` reads false and the console draws no markers;
+ *  `base` names the ref the listing excludes, null ⇒ the checkout's whole history. */
+export function toWorkspaceGitLogDto(rep: WorkspaceGitLog): WorkspaceGitLogDtoT {
+  return {
+    isRepo: rep.isRepo,
+    commits: rep.commits,
+    truncated: rep.truncated,
+    tracking: rep.tracking ?? null,
+    base: rep.base ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a workspace git pull (see {@link toWorkspaceFilesDto}). */
+export function toWorkspaceGitPullDto(rep: WorkspaceGitPullResult): WorkspaceGitPullDtoT {
+  return {
+    isRepo: rep.isRepo,
+    ok: rep.ok,
+    detail: rep.detail ?? null,
+    changed: rep.changed ?? null,
+    insertions: rep.insertions ?? null,
+    deletions: rep.deletions ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a console commit. Every refusal stays data, carrying the
+ *  daemon's closed `reason` so the console can offer the right next action (stage
+ *  something, commit from the agent, register an identity) instead of parsing prose. */
+export function toWorkspaceGitCommitDto(rep: WorkspaceGitCommitResult): WorkspaceGitCommitResultDtoT {
+  return {
+    isRepo: rep.isRepo,
+    ok: rep.ok,
+    sha: rep.sha ?? null,
+    detail: rep.detail ?? null,
+    reason: rep.reason ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a console push. `ahead` is what is STILL unpushed, so a
+ *  successful push reports 0 and a refusal reports the commits that did not land. */
+export function toWorkspaceGitPushDto(rep: WorkspaceGitPushResult): WorkspaceGitPushResultDtoT {
+  return {
+    isRepo: rep.isRepo,
+    ok: rep.ok,
+    detail: rep.detail ?? null,
+    ahead: rep.ahead ?? null,
+    reason: rep.reason ?? null
+  }
+}
+
+/** Wire REP → HTTP body for a drafted commit message. The CP proxies the text and
+ *  stores none of it (body-locality, §1/§12); a runtime that declines is `ok:false`. */
+export function toWorkspaceGitMessageDto(rep: WorkspaceGitMessageResult): WorkspaceGitMessageResultDtoT {
+  return { ok: rep.ok, message: rep.message ?? null, detail: rep.detail ?? null }
+}
+
+/** Wire REP → HTTP body for one ACP session's background tasks. The CP proxies the daemon's
+ *  order (live first, then its bounded settled history) and stores nothing; `tracked:false`
+ *  stays data so the console can say "this runtime reports no tasks" rather than "none are
+ *  running". Absent optionals become explicit nulls for the response schema. */
+export function toAgentTasksDto(rep: TaskList): AgentTasksDtoT {
+  return {
+    sessionId: rep.sessionId,
+    tracked: rep.tracked,
+    tasks: rep.tasks.map((task) => ({
+      id: task.id,
+      description: task.description ?? null,
+      state: task.state,
+      subagent: task.subagent,
+      startedAt: task.startedAt,
+      endedAt: task.endedAt ?? null,
+      detail: task.detail ?? null
+    })),
+    truncated: rep.truncated
+  }
+}
+
+/** Map a daemon-edge failure to a 503 message, or null to rethrow. Covers: no
+ *  live connection, the socket dropping mid-flight ('connection closed'), and a
+ *  daemon-side `error` frame (ProtocolError — e.g. path containment
+ *  BAD_PAYLOAD). Anything else is a CP bug → the 500 handler. */
+function daemonEdgeFailure(err: unknown): string | null {
+  if (err instanceof NoConnection || (err instanceof Error && err.message === 'connection closed')) {
+    return 'owning daemon is offline'
+  }
+  if (err instanceof ProtocolError) return `daemon rejected the request: ${err.message}`
+  return null
+}
+
+/** The daemon's workspace `reason` as the HTTP `code` the console branches on; null
+ *  when it named none (older daemon), so the caller keeps its generic answer. */
+export function workspaceErrorCode(err: ProtocolError): string | null {
+  const reason = WorkspaceErrorReason.safeParse(err.details?.reason)
+  return reason.success ? `WORKSPACE_${reason.data.toUpperCase().replaceAll('-', '_')}` : null
+}
+
+/** The one TRANSIENT workspace reason: 503 like an offline daemon, but with the code that tells "come back in a moment" apart from an outage. */
+const SANDBOX_UNAVAILABLE = SANDBOX_UNAVAILABLE_CODE
+
+/** A session whose own sandbox was removed: absent until its next message creates a new one, so a 404 with nothing to wake. */
+const SANDBOX_REMOVED_CODE = 'WORKSPACE_SANDBOX_REMOVED'
+
+/** Status a console can act on instead of the 503 that reads as an offline daemon:
+ *  a worktree the daemon lacks is 404 (as when the CP pre-empts the read), a bad path
+ *  400, a stale fence 409. Reasonless ⇒ {@link daemonEdgeFailure}; null ⇒ rethrow. */
+export function workspaceFailure(
+  err: unknown
+): { status: 400 | 404 | 409 | 503; error: string; message: string; code?: string } | null {
+  if (err instanceof ProtocolError && (err.code === 'BAD_PAYLOAD' || err.code === 'CONFLICT')) {
+    const code = workspaceErrorCode(err)
+    if (code !== null) {
+      if (err.code === 'CONFLICT') return { status: 409, error: 'Conflict', message: err.message, code }
+      if (code === 'WORKSPACE_UNKNOWN_AGENT') {
+        return { status: 404, error: 'Not Found', message: 'workspace not found', code }
+      }
+      if (code === SANDBOX_REMOVED_CODE || code === 'WORKSPACE_NOT_FOUND') {
+        return { status: 404, error: 'Not Found', message: err.message, code }
+      }
+      // The store cannot take a transfer now (no lifecycle rules): the request was fine, the deployment is not.
+      if (code === 'WORKSPACE_TRANSFER_UNAVAILABLE')
+        return { status: 409, error: 'Conflict', message: err.message, code }
+      if (code === 'WORKSPACE_TRANSFER_FAILED') {
+        return { status: 503, error: 'Service Unavailable', message: err.message, code }
+      }
+      // Version skew in the sandbox, like a daemon missing a feature: nothing about the request was wrong.
+      if (code === 'WORKSPACE_SANDBOX_OUTDATED') return { status: 409, error: 'Conflict', message: err.message, code }
+      // Ahead of the 400: the daemon reports it as a refused request (it carries a reason), but
+      // nothing about the request was wrong, and a 400 tells a console to stop retrying.
+      if (code === SANDBOX_UNAVAILABLE) {
+        return { status: 503, error: 'Service Unavailable', message: err.message, code }
+      }
+      return { status: 400, error: 'Bad Request', message: err.message, code }
+    }
+  }
+  const unavailable = daemonEdgeFailure(err)
+  return unavailable === null ? null : { status: 503, error: 'Service Unavailable', message: unavailable }
+}
+
+/** No transfer bucket on this deployment: the request was fine, the deployment is not. */
+function sendTransferUnavailable(reply: FastifyReply): FastifyReply {
+  return reply.code(409).send({
+    error: 'Conflict',
+    statusCode: 409,
+    message: 'this deployment has no object store for file transfers',
+    code: 'WORKSPACE_TRANSFER_UNAVAILABLE'
+  })
+}
+
+/** A presigned request as the console sends it: its URL and exact headers, without the signer's expiry. */
+function signedRequest({ url, headers }: { url: string; headers: Record<string, string> }) {
+  return { url, headers }
+}
+
+/** A transfer refusal the control plane decided itself; false ⇒ not one. */
+function sendTransferRefusal(reply: FastifyReply, err: unknown): boolean {
+  if (!(err instanceof FileTransferRefusal)) return false
+  const error = err.status === 404 ? 'Not Found' : err.status === 409 ? 'Conflict' : 'Bad Request'
+  void reply.code(err.status).send({ error, statusCode: err.status, message: err.message, code: err.code })
+  return true
+}
+
+/** A transfer's answer: 202 while its upload runs, else the GET once the bytes still match a shared file's digest prefix. */
+function sendTransferResult(reply: FastifyReply, result: WorkspaceTransferResult, sha256Prefix?: string) {
+  if (isTransferPending(result)) return reply.code(202).send(result)
+  const { sha256, ...grant }: WorkspaceDownload = result
+  // The object's digest stands in for the bytes the proxied download would hash.
+  const hex = Buffer.from(sha256, 'base64').toString('hex')
+  if (sha256Prefix && !hex.startsWith(sha256Prefix.toLowerCase())) {
+    return reply.code(409).send({
+      error: 'Conflict',
+      statusCode: 409,
+      message: 'the file changed since it was shared',
+      code: 'WORKSPACE_FILE_CHANGED'
+    })
+  }
+  return reply.code(200).send({ ...grant, expiresAt: new Date(grant.expiresAt).toISOString() })
+}
+
+/** A wake's failure: a removed session sandbox is the read's own 404 and code, so the console stops offering Start; any other daemon-edge failure is 503; null ⇒ rethrow. */
+export function agentWakeFailure(
+  err: unknown
+): { status: 404 | 503; error: string; message: string; code?: string } | null {
+  if (err instanceof ProtocolError && workspaceErrorCode(err) === SANDBOX_REMOVED_CODE) {
+    return { status: 404, error: 'Not Found', message: err.message, code: SANDBOX_REMOVED_CODE }
+  }
+  const unavailable = daemonEdgeFailure(err)
+  return unavailable === null ? null : { status: 503, error: 'Service Unavailable', message: unavailable }
+}
+
+/** Send {@link workspaceFailure}'s answer; false ⇒ not a daemon-edge failure, rethrow. */
+function sendWorkspaceFailure(reply: FastifyReply, err: unknown): boolean {
+  const failure = workspaceFailure(err)
+  if (!failure) return false
+  void reply.code(failure.status).send({
+    error: failure.error,
+    statusCode: failure.status,
+    message: failure.message,
+    ...(failure.code ? { code: failure.code } : {})
+  })
+  return true
+}
+
+/** A memory request refused because the agent's memory home is out of reach (a sleeping sandbox, a Control-Plane
+ *  tree behind a missing connection, feature, scope, or migration): a 503 with the reason as `code`, so the console
+ *  retries — and wakes the sandbox on the one code it knows (#1077). false ⇒ not that. */
+function sendMemoryHomeUnavailable(reply: FastifyReply, err: unknown): boolean {
+  const failure = memoryHomeUnavailable(err)
+  if (!failure) return false
+  void reply.code(503).send({ error: failure.error, statusCode: 503, message: failure.message, code: failure.code })
+  return true
+}
+
+/** A console memory read's failure: an unreachable home as above, a path the CP's table refuses as 400, a daemon-edge failure as 503; false ⇒ rethrow. */
+function sendMemoryReadFailure(reply: FastifyReply, err: unknown): boolean {
+  if (sendMemoryHomeUnavailable(reply, err)) return true
+  if (err instanceof MemoryStorePathError) {
+    void reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: err.message })
+    return true
+  }
+  const unavailable = daemonEdgeFailure(err)
+  if (unavailable === null) return false
+  void reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+  return true
+}
+
+/** A workspace MUTATION's failure mapping, which differs from a read's on purpose: the
+ *  status is the mutation's (409 for a conflict, 400 for a refused payload) whatever the
+ *  daemon names, and a reason only rides along as the machine `code` — a write that was
+ *  not performed must never read as a resource that is absent. false ⇒ rethrow. */
+function sendWorkspaceMutationFailure(reply: FastifyReply, err: unknown): boolean {
+  const code = err instanceof ProtocolError ? workspaceErrorCode(err) : null
+  if (err instanceof ProtocolError && err.code === 'CONFLICT') {
+    void reply.code(409).send({ error: 'Conflict', statusCode: 409, message: err.message, ...(code ? { code } : {}) })
+    return true
+  }
+  // Same exception as the read path, and it matters more here: a 400 on a write tells the console the
+  // edit itself was rejected, so the reader would go fix content that was never the problem.
+  if (err instanceof ProtocolError && code === SANDBOX_UNAVAILABLE) {
+    void reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: err.message, code })
+    return true
+  }
+  if (err instanceof ProtocolError && err.code === 'BAD_PAYLOAD') {
+    void reply
+      .code(400)
+      .send({ error: 'Bad Request', statusCode: 400, message: err.message, ...(code ? { code } : {}) })
+    return true
+  }
+  const unavailable = daemonEdgeFailure(err)
+  if (unavailable !== null) {
+    void reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+    return true
+  }
+  return false
+}
+
+/** The daemon's task `reason` as the HTTP `code` the console branches on; null when it named
+ *  none (older daemon), so the caller keeps its generic answer. Kept separate from
+ *  {@link workspaceErrorCode} because the two enums are independent — a reason added to one
+ *  must not silently start being emitted under the other's prefix. */
+export function taskErrorCode(err: ProtocolError): string | null {
+  const reason = TaskErrorReason.safeParse(err.details?.reason)
+  return reason.success ? `TASK_${reason.data.toUpperCase().replaceAll('-', '_')}` : null
+}
+
+/** Status a console can act on instead of the 503 that reads as an offline daemon: an agent the
+ *  daemon does not hold is 404 (stale placement), and there is no 409 arm because the read
+ *  mutates nothing. Reasonless ⇒ {@link daemonEdgeFailure}; null ⇒ rethrow. */
+export function taskFailure(err: unknown): { status: 404 | 503; error: string; message: string; code?: string } | null {
+  if (err instanceof ProtocolError && err.code === 'BAD_PAYLOAD') {
+    const code = taskErrorCode(err)
+    if (code === 'TASK_UNKNOWN_AGENT') {
+      return { status: 404, error: 'Not Found', message: 'agent not found on its daemon', code }
+    }
+  }
+  const unavailable = daemonEdgeFailure(err)
+  return unavailable === null ? null : { status: 503, error: 'Service Unavailable', message: unavailable }
+}
+
+/** Send {@link taskFailure}'s answer; false ⇒ not a daemon-edge failure, rethrow. */
+function sendTaskFailure(reply: FastifyReply, err: unknown): boolean {
+  const failure = taskFailure(err)
+  if (!failure) return false
+  void reply.code(failure.status).send({
+    error: failure.error,
+    statusCode: failure.status,
+    message: failure.message,
+    ...(failure.code ? { code: failure.code } : {})
+  })
+  return true
+}
+
+function memoryAdminFailure(err: unknown): {
+  status: 400 | 409 | 503
+  error: 'Bad Request' | 'Conflict' | 'Service Unavailable'
+  message: string
+  code?: string
+} | null {
+  // The memory home is out of reach (asleep sandbox, unreachable Control-Plane tree): transient 503 + reason, never a 400.
+  const unreachable = memoryHomeUnavailable(err)
+  if (unreachable) return unreachable
+  if (err instanceof ProtocolError && err.code === 'BAD_PAYLOAD') {
+    return { status: 400, error: 'Bad Request', message: `daemon rejected the request: ${err.message}` }
+  }
+  if (err instanceof ProtocolError && err.code === 'CONFLICT') {
+    return { status: 409, error: 'Conflict', message: err.message }
+  }
+  const unavailable = daemonEdgeFailure(err)
+  return unavailable === null ? null : { status: 503, error: 'Service Unavailable', message: unavailable }
+}
+
+export function agentRoutes(deps: HttpDeps) {
+  return async function agentRoutesPlugin(app: FastifyInstance): Promise<void> {
+    const r = app.withTypeProvider<ZodTypeProvider>()
+    const codeHosts = codeHostsOf(deps)
+
+    // Fetch an agent AND verify it belongs to the caller's active org AND is visible
+    // to them — a cross-org id OR a restricted agent they can't see both read as
+    // absent (404), never as someone else's resource.
+    const getOrgAgent = async (req: FastifyRequest, id: string): Promise<AgentRecord | null> => {
+      const agent = await deps.repos.agent.get(orgOf(req), AgentId(id))
+      if (!agent) return null
+      return canView(agent, ctxOf(req)) ? agent : null
+    }
+
+    /**
+     * The same read, with `daemonId` resolved to the member that SERVES the agent right now
+     * instead of the one its placement names. Every daemon-edge proxy below (workspace, git,
+     * memory, dreams, tasks, skills, permissions) loads through this, because for a `set`
+     * placement the row names no machine at all and the live answer is the ledger's.
+     *
+     * Deliberately NOT used by the placement-authoritative routes — create, PATCH, move, delete —
+     * which compare and write the placement itself and must see what the row says.
+     */
+    const getServingAgent = async (req: FastifyRequest, id: string): Promise<AgentRecord | null> => {
+      const agent = await getOrgAgent(req, id)
+      if (!agent) return null
+      const daemonId = await deps.placementResolver.servingDaemon(agent)
+      return { ...agent, daemonId }
+    }
+
+    // A place layer the caller may not see is absent to them on every route that names one (product-conventions.md "Memory layers").
+    const placeAccess = makeMemoryPlaceAccess(deps)
+    // A Control-Plane home's console memory comes from the CP's tables, so it needs no daemon online.
+    const memorySourceOf = makeMemorySources(deps)
+    const placeHidden = async (
+      req: FastifyRequest,
+      source: MemorySource,
+      agentId: string,
+      channelKey: string | undefined
+    ): Promise<boolean> => {
+      if (channelKey === undefined) return false
+      if (!MemoryChannelKey.safeParse(channelKey).success) return true
+      const page = await source.channels({ agentId, channelKey })
+      const entry = page.channels.find((candidate) => candidate.channelKey === channelKey)
+      if (!entry) return true
+      const [view] = await placeAccess.judge(req, agentId, [entry], false)
+      return view?.visible !== true
+    }
+    const PLACE_NOT_FOUND = { error: 'Not Found', statusCode: 404, message: 'memory layer not found' } as const
+
+    type MemoryEntryOperation = MemoryEntriesReadReq | MemoryEntriesWriteReq extends infer R
+      ? R extends MemoryEntriesReadReq | MemoryEntriesWriteReq
+        ? Omit<R, 'agentId'>
+        : never
+      : never
+    // `code` is an entry error code, or the unreachable-home code the console wakes a sandbox on.
+    const entryError = z.object({
+      error: z.string(),
+      statusCode: z.number(),
+      message: z.string(),
+      code: z.string().optional(),
+      currentRevision: z.string().max(512).optional()
+    })
+    const entryCall = async (req: FastifyRequest, reply: FastifyReply, id: string, operation: MemoryEntryOperation) => {
+      const agent = await getServingAgent(req, id)
+      if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+      const mutation =
+        operation.operation === 'create' || operation.operation === 'update' || operation.operation === 'delete'
+      const editable = canEdit(agent, ctxOf(req))
+      if (mutation && !editable)
+        return reply
+          .code(403)
+          .send({ error: 'Forbidden', statusCode: 403, message: 'memory edit access is required', code: 'FORBIDDEN' })
+      const source = memorySourceOf(agent)
+      if (!agent.daemonId || !source)
+        return reply.code(503).send({
+          error: 'Service Unavailable',
+          statusCode: 503,
+          message: 'agent has no live daemon',
+          code: 'UNAVAILABLE'
+        })
+      try {
+        if (await placeHidden(req, source, agent.id, operation.channelKey)) return reply.code(404).send(PLACE_NOT_FOUND)
+        const payload = { ...operation, agentId: agent.id }
+        const answer = mutation
+          ? await deps.control.memoryEntriesWrite(agent.daemonId, payload as MemoryEntriesWriteReq)
+          : await deps.control.memoryEntriesRead(agent.daemonId, payload as MemoryEntriesReadReq)
+        if (answer.operation === 'error') {
+          const statuses = {
+            UNSUPPORTED: 501,
+            FORBIDDEN: 403,
+            NOT_FOUND: 404,
+            INVALID_ARGUMENT: 400,
+            CONFLICT: 409,
+            STALE_BINDING: 409,
+            CURSOR_EXPIRED: 410,
+            TOO_LARGE: 413,
+            UNAVAILABLE: 503,
+            AMBIGUOUS_WRITE: 503
+          } as const
+          const status = statuses[answer.code]
+          return reply.code(status).send({
+            error: answer.code,
+            statusCode: status,
+            message: answer.message,
+            code: answer.code,
+            ...('currentRevision' in answer ? { currentRevision: answer.currentRevision } : {})
+          })
+        }
+        if (answer.operation !== (mutation ? 'completed' : operation.operation))
+          throw new Error('unexpected memory entry reply')
+        if (!editable) {
+          if (answer.operation === 'describe')
+            return reply.send({
+              ...answer.result,
+              operations: answer.result.operations.filter(
+                (op) => op !== 'create' && op !== 'update' && op !== 'delete'
+              ),
+              exactCreate: false,
+              exactEdit: false
+            })
+          if (answer.operation === 'list')
+            return reply.send({
+              ...answer.result,
+              entries: answer.result.entries.map((entry) => ({ ...entry, editable: false }))
+            })
+          if (answer.operation === 'get' && answer.result)
+            return reply.send({ ...answer.result, entry: { ...answer.result.entry, editable: false } })
+          if (answer.operation === 'search')
+            return reply.send({
+              ...answer.result,
+              hits: answer.result.hits.map((hit) => ({ ...hit, entry: { ...hit.entry, editable: false } }))
+            })
+        }
+        return reply.send(answer.result)
+      } catch (err) {
+        const failure = memoryAdminFailure(err)
+        if (failure)
+          return reply.code(failure.status).send({
+            error: failure.error,
+            statusCode: failure.status,
+            message: failure.message,
+            ...(failure.code ? { code: failure.code } : {})
+          })
+        throw err
+      }
+    }
+    const entryErrors = Object.fromEntries(
+      [400, 403, 404, 409, 410, 413, 501, 503].map((status) => [status, entryError])
+    )
+    const entryScopeQuery = z
+      .object({ channelKey: z.string().min(1).max(256).describe(PLACE_LAYER_KEY_DESCRIPTION).optional() })
+      .strict()
+    r.get(
+      '/agents/:id/memory/capabilities',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Describe unified memory entry capabilities',
+          description: 'Reads current authorized provider capabilities through a daemon supporting memory-entries-v1.',
+          operationId: 'getAgentMemoryEntryCapabilities',
+          params: IdParam,
+          querystring: entryScopeQuery,
+          response: { 200: MemoryEntryCapabilities, ...entryErrors }
+        }
+      },
+      (req, reply) => entryCall(req, reply, req.params.id, { operation: 'describe', ...req.query })
+    )
+    r.get(
+      '/agents/:id/memory/entries',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List unified memory entries',
+          description: 'Returns bounded summaries and an opaque continuation. Partial pages do not imply absence.',
+          operationId: 'listAgentMemoryEntries',
+          params: IdParam,
+          querystring: entryScopeQuery.extend({
+            ...MemoryEntryListRequest.shape,
+            limit: z.coerce.number().int().min(1).max(100).default(20)
+          }),
+          response: { 200: MemoryEntryListResult, ...entryErrors }
+        }
+      },
+      (req, reply) => {
+        const { channelKey, ...request } = req.query
+        return entryCall(req, reply, req.params.id, {
+          operation: 'list',
+          ...(channelKey ? { channelKey } : {}),
+          request
+        })
+      }
+    )
+    r.get(
+      '/agents/:id/memory/entries/:ref',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Read unified memory entry content',
+          description:
+            'Reads one bounded content slice by an opaque entry ref. Missing content returns null; changes between slices conflict.',
+          operationId: 'getAgentMemoryEntry',
+          params: IdParam.extend({ ref: MemoryEntryGetRequest.shape.ref }),
+          querystring: entryScopeQuery.extend({
+            ...MemoryEntryGetRequest.omit({ ref: true }).shape,
+            maxBytes: z.coerce.number().int().min(4).max(32768).default(32768)
+          }),
+          response: { 200: MemoryEntryContent.nullable(), ...entryErrors }
+        }
+      },
+      (req, reply) => {
+        const { channelKey, ...request } = req.query
+        return entryCall(req, reply, req.params.id, {
+          operation: 'get',
+          ...(channelKey ? { channelKey } : {}),
+          request: { ...request, ref: req.params.ref }
+        })
+      }
+    )
+
+    r.get(
+      '/agents/:id/memory/entries/:ref/history',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List unified memory entry history',
+          description:
+            'Returns one bounded page of change events for an entry, newest first where the home orders them, through a daemon supporting memory-entries-history-v1. A Control-Plane home pages its own change log back through the daemon.',
+          operationId: 'listAgentMemoryEntryHistory',
+          params: IdParam.extend({ ref: MemoryEntryHistoryRequest.shape.ref }),
+          querystring: entryScopeQuery.extend({
+            ...MemoryEntryHistoryRequest.omit({ ref: true }).shape,
+            limit: z.coerce.number().int().min(1).max(5).default(5)
+          }),
+          response: { 200: MemoryEntryHistoryResult, ...entryErrors }
+        }
+      },
+      (req, reply) => {
+        const { channelKey, ...request } = req.query
+        return entryCall(req, reply, req.params.id, {
+          operation: 'history',
+          ...(channelKey ? { channelKey } : {}),
+          request: { ...request, ref: req.params.ref }
+        })
+      }
+    )
+    r.post(
+      '/agents/:id/memory/entries/search',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Search unified memory entries',
+          description:
+            'Returns bounded hits with snippets for a query through a daemon supporting memory-entries-search-v1. The result names the search kind and coverage; it is never an enumeration.',
+          operationId: 'searchAgentMemoryEntries',
+          params: IdParam,
+          querystring: entryScopeQuery,
+          body: MemoryEntrySearchRequest,
+          response: { 200: MemoryEntrySearchResult, ...entryErrors }
+        }
+      },
+      (req, reply) =>
+        entryCall(req, reply, req.params.id, {
+          operation: 'search',
+          ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {}),
+          request: req.body
+        })
+    )
+    r.post(
+      '/agents/:id/memory/entries',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Create a unified memory entry',
+          description:
+            'Applies a scoped conditional mutation through the serving daemon. JSON requests are bounded by capabilities.limits.maxMutationRequestBytes; oversized requests return 413. An ambiguous outcome must be reconciled by reading before retrying.',
+          operationId: 'createAgentMemoryEntry',
+          params: IdParam,
+          querystring: entryScopeQuery,
+          body: MemoryEntryCreateRequest,
+          response: { 200: MemoryEntryMutationReceipt, ...entryErrors }
+        }
+      },
+      (req, reply) => entryCall(req, reply, req.params.id, { operation: 'create', ...req.query, request: req.body })
+    )
+
+    r.patch(
+      '/agents/:id/memory/entries',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Update a unified memory entry',
+          description:
+            'Applies a scoped conditional mutation through the serving daemon. JSON requests are bounded by capabilities.limits.maxMutationRequestBytes; oversized requests return 413. An ambiguous outcome must be reconciled by reading before retrying.',
+          operationId: 'updateAgentMemoryEntry',
+          params: IdParam,
+          querystring: entryScopeQuery,
+          body: MemoryEntryUpdateRequest,
+          response: { 200: MemoryEntryMutationReceipt, ...entryErrors }
+        }
+      },
+      (req, reply) => entryCall(req, reply, req.params.id, { operation: 'update', ...req.query, request: req.body })
+    )
+
+    r.delete(
+      '/agents/:id/memory/entries',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Delete a unified memory entry',
+          description:
+            'Applies a scoped conditional mutation through the serving daemon. JSON requests are bounded by capabilities.limits.maxMutationRequestBytes; oversized requests return 413. An ambiguous outcome must be reconciled by reading before retrying.',
+          operationId: 'deleteAgentMemoryEntry',
+          params: IdParam,
+          querystring: entryScopeQuery,
+          body: MemoryEntryDeleteRequest,
+          response: { 200: MemoryEntryMutationReceipt, ...entryErrors }
+        }
+      },
+      (req, reply) => entryCall(req, reply, req.params.id, { operation: 'delete', ...req.query, request: req.body })
+    )
+
+    // A session worktree is part of that session's protected body surface. The
+    // caller must pass both the owning-agent gate above and the session's own
+    // private/external visibility rule before its daemon-local files are read.
+    const sessionAccess = makeSessionAccessResolver(deps)
+    // The session half of that gate, shared with the tasks read: the row must be THIS agent's,
+    // still hold its content, and pass the session's own private/external visibility rule.
+    // Isolation is deliberately not part of it — that is a worktree question, and a session's
+    // background tasks exist whatever checkout it runs in. null ⇒ refuse as absent.
+    const visibleAgentSession = async (req: FastifyRequest, agentId: string, sessionId: string) => {
+      const session = await deps.repos.session.get(orgOf(req), SessionId(sessionId))
+      if (!session || session.agentId !== agentId || session.contentPurgedAt) return null
+      const access = await sessionAccess.forSessions(req, [session])
+      return canViewSession(session, ctxOf(req), access.identitySet, access.externalAccess) ? session : null
+    }
+    const canReadWorkspaceScope = async (
+      req: FastifyRequest,
+      agentId: string,
+      sessionId: string | undefined
+    ): Promise<boolean> => {
+      if (!sessionId) return true
+      const session = await visibleAgentSession(req, agentId, sessionId)
+      // A shared checkout has no per-session worktree, so the daemon would answer BAD_PAYLOAD.
+      return session?.workspaceIsolation === 'session'
+    }
+
+    // A `repo` scope names one of the agent's AUTHORIZED additional repositories, matched
+    // case-insensitively like every other repository full name. A name the agent does not
+    // authorize reads as an absent workspace, exactly as an unknown path does, so the query
+    // never becomes an oracle for which repositories exist or which an agent may reach.
+    const canReadWorkspaceRepoScope = async (agent: AgentRecord, repo: string | undefined): Promise<boolean> => {
+      if (!repo) return true
+      const rows = await deps.repos.agentRepoAuth.listForAgent(agent.id)
+      return rows.some((row) => row.repoFullName.toLowerCase() === repo.toLowerCase())
+    }
+
+    const requireSessionWorkspaceRead = async (
+      reply: FastifyReply,
+      orgId: OrgId,
+      daemonId: DaemonId,
+      sessionId: string | undefined
+    ): Promise<boolean> => {
+      if (!sessionId) return true
+      const daemon = await deps.registry.getAvailable(orgId, daemonId)
+      if (daemon?.capabilities.features.includes(WORKSPACE_SESSION_READ_FEATURE)) return true
+      reply.code(409).send({
+        error: 'Conflict',
+        statusCode: 409,
+        message: 'this agent version does not support session worktree browsing'
+      })
+      return false
+    }
+
+    // Version skew: an older daemon drops an unknown frame silently, so the REQ would
+    // burn its whole retransmit budget and then read as an offline daemon. Refuse first.
+    const requireDaemonFeature = async (
+      reply: FastifyReply,
+      orgId: OrgId,
+      daemonId: DaemonId,
+      feature: string,
+      message: string
+    ): Promise<boolean> => {
+      const daemon = await deps.registry.getAvailable(orgId, daemonId)
+      if (daemon?.capabilities.features.includes(feature)) return true
+      reply.code(409).send({ error: 'Conflict', statusCode: 409, message, code: 'DAEMON_FEATURE_MISSING' })
+      return false
+    }
+
+    // A console upload's preconditions: a visible agent, a transfer bucket, and a live daemon able to fetch uploads.
+    const uploadingAgent = async (
+      req: FastifyRequest,
+      reply: FastifyReply,
+      id: string
+    ): Promise<(AgentRecord & { daemonId: DaemonId }) | null> => {
+      const agent = await getServingAgent(req, id)
+      if (!agent) {
+        reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return null
+      }
+      if (!deps.fileTransfer) {
+        sendTransferUnavailable(reply)
+        return null
+      }
+      if (!agent.daemonId) {
+        reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        return null
+      }
+      const capable = await requireDaemonFeature(
+        reply,
+        agent.orgId,
+        agent.daemonId,
+        FILE_TRANSFER_FEATURE,
+        'this agent’s daemon predates control-plane-signed file transfers'
+      )
+      return capable ? { ...agent, daemonId: agent.daemonId } : null
+    }
+
+    // Version skew: an older daemon simply ignores `repo` and would answer for the PRIMARY
+    // workspace — the wrong repository's files under the right name. Refuse instead.
+    const requireRepoScope = async (
+      reply: FastifyReply,
+      orgId: OrgId,
+      daemonId: DaemonId,
+      repo: string | undefined
+    ): Promise<boolean> =>
+      !repo ||
+      (await requireDaemonFeature(
+        reply,
+        orgId,
+        daemonId,
+        WORKSPACE_REPO_SCOPE_FEATURE,
+        'this agent version does not support browsing an additional repository; upgrade its daemon'
+      ))
+
+    const requireGitReview = (reply: FastifyReply, orgId: OrgId, daemonId: DaemonId): Promise<boolean> =>
+      requireDaemonFeature(
+        reply,
+        orgId,
+        daemonId,
+        WORKSPACE_GIT_REVIEW_FEATURE,
+        'this agent version does not support git review reads; upgrade its daemon'
+      )
+
+    // The write gate is separate from the review gate, and the wand's from both: the
+    // console hides exactly the controls a given daemon cannot serve.
+    const requireGitWrite = (reply: FastifyReply, orgId: OrgId, daemonId: DaemonId): Promise<boolean> =>
+      requireDaemonFeature(
+        reply,
+        orgId,
+        daemonId,
+        WORKSPACE_GIT_WRITE_FEATURE,
+        'this agent version does not support git writes from the console; upgrade its daemon'
+      )
+
+    const requireGitMessage = (reply: FastifyReply, orgId: OrgId, daemonId: DaemonId): Promise<boolean> =>
+      requireDaemonFeature(
+        reply,
+        orgId,
+        daemonId,
+        WORKSPACE_GIT_MESSAGE_FEATURE,
+        'this agent version cannot draft commit messages; upgrade its daemon'
+      )
+
+    // Separate from every git gate: a daemon can serve the Tasks panel without serving git
+    // review, and the console hides exactly the tabs a given daemon cannot answer.
+    const requireTasks = (reply: FastifyReply, orgId: OrgId, daemonId: DaemonId): Promise<boolean> =>
+      requireDaemonFeature(
+        reply,
+        orgId,
+        daemonId,
+        TASK_LIST_FEATURE,
+        'this agent version does not report background tasks; upgrade its daemon'
+      )
+
+    const resolvePolicyAgentIds = async (
+      req: FastifyRequest,
+      subjectAgentId: string,
+      requestedIds: string[],
+      existingIds: string[]
+    ): Promise<string[]> => {
+      const peers = (await deps.repos.agent.list(orgOf(req))).filter((agent) => agent.id !== subjectAgentId)
+      const peerIds = new Set(peers.map((agent) => String(agent.id)))
+      const visiblePeerIds = new Set(
+        peers.filter((agent) => canView(agent, ctxOf(req))).map((agent) => String(agent.id))
+      )
+      // A collaborator editing the target may not see every restricted caller
+      // previously granted by an owner. Preserve those valid existing grants,
+      // while only accepting NEW choices from the editor's visible peer set.
+      const retainedHiddenIds = existingIds.filter((id) => peerIds.has(id) && !visiblePeerIds.has(id))
+      const requestedVisibleIds = requestedIds.filter((id) => visiblePeerIds.has(id))
+      return [...new Set([...retainedHiddenIds, ...requestedVisibleIds])]
+    }
+
+    // The agent's secret KEY NAMES for the DTO ([] when none) — never the values.
+    const secretKeysOf = async (orgId: OrgId, agentId: string): Promise<string[]> =>
+      (await deps.repos.agentSecret.keys(orgId, [AgentId(agentId)])).get(agentId) ?? []
+    // Names and descriptions only: a live secret's value never leaves the spec assembler.
+    const liveSecretsOf = async (
+      orgId: OrgId,
+      agentId: string
+    ): Promise<{ name: string; description: string | null }[]> =>
+      (await deps.repos.agentSecret.liveInfo(orgId, [AgentId(agentId)])).get(agentId) ?? []
+
+    /** Assigned organization rows for ONE agent's DTO. Metadata only — this path
+     *  never decrypts an organization secret (design §6). */
+    // The Computers an agent may use are derived from each Computer's agent access (computer-use.md §4.1).
+    const computersOf = async (agent: Pick<AgentRecord, 'id' | 'orgId'>): Promise<string[]> =>
+      derivedComputerIds(await deps.repos.computer.listAgentGrants(OrgId(agent.orgId)), agent.id)
+
+    const organizationEnvironmentOf = async (agent: AgentRecord): Promise<AssignedOrganizationMetadata> =>
+      (await deps.repos.organizationEnvironmentResolver?.metadataForAgents(agent.orgId, [agent.id]))?.get(agent.id) ??
+      NO_ORGANIZATION_ENVIRONMENT
+
+    /** How many organization entries are assigned to this agent — the placement
+     *  gate's input. Counts through the metadata resolver, so it never decrypts. */
+    const organizationEnvironmentBindingCount = async (agent: AgentRecord): Promise<number> => {
+      const assigned = await organizationEnvironmentOf(agent)
+      return assigned.variables.length + assigned.secretKeys.length
+    }
+
+    /** The list-endpoint form: ONE batched resolve instead of a query per agent. */
+    const organizationEnvironmentOfAll = async (
+      orgId: OrgId,
+      agents: readonly AgentRecord[]
+    ): Promise<Map<string, AssignedOrganizationMetadata>> =>
+      (await deps.repos.organizationEnvironmentResolver?.metadataForAgents(
+        orgId,
+        agents.map((agent) => agent.id)
+      )) ?? new Map()
+
+    // Replicate a spec change to every daemon that serves this agent — its
+    // placement AND any member currently holding its duty (deps.agentDelivery is
+    // the one resolver). The daemon's local config replica must stay current
+    // because a direct Slack→daemon launch reads the replica, not the CP.
+    // Best-effort: if the agent reaches no daemon or a daemon is offline, the
+    // `register/ok` reconcile roster is the backstop on its next connect.
+    const replicateUpsert = (agent: AgentRecord): Promise<void> =>
+      deps.agentDelivery.upsert(agent, (err, daemonId) => {
+        // Best-effort (see the register/ok reconcile backstop above): the agent update is
+        // ALREADY persisted, so a daemon-side hiccup must not fail the HTTP write — not just
+        // an offline daemon (NoConnection) but also a rejected/failed live reconcile or a
+        // slow/absent ack (agent/upsert became a blocking request-ack in #740; before that a
+        // reconcile hiccup was silent). The daemon re-syncs from the register/ok roster on its
+        // next (re)connect. Matches the icon route's replicate handler.
+        if (err instanceof NoConnection) {
+          app.log.debug({ agentId: agent.id, daemonId }, 'agent/upsert skipped: daemon offline')
+        } else {
+          app.log.warn(
+            { err, agentId: agent.id, daemonId },
+            'agent/upsert live reconcile failed (backstop: reconnect roster)'
+          )
+        }
+      })
+
+    const replicateRemove = (agent: ResolvableAgent, orgId: string): Promise<void> =>
+      deps.agentDelivery.remove(agent, orgId, (err, target) => {
+        if (!(err instanceof NoConnection)) throw err
+        app.log.debug({ agentId: agent.id, daemonId: target }, 'agent/remove skipped: daemon offline')
+      })
+
+    // Converge the destination before the source so shared provider accounts retain a live membership.
+    const convergeWorkspaceRepositories = (
+      orgId: OrgId,
+      agents: Iterable<Pick<AgentRecord, 'workspace' | 'workspaceRepoId'>>
+    ): void => {
+      void (async () => {
+        const seen = new Set<string>()
+        for (const agent of agents) {
+          if (agent.workspace.mode !== 'git' || !agent.workspace.credential || agent.workspaceRepoId === undefined)
+            continue
+          const provider = agent.workspace.credential.provider
+          const repoId = agent.workspaceRepoId
+          const key = `${provider}:${repoId}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          await codeHosts[provider].hooks.convergeManagedRepository(deps, orgId, repoId, (err) =>
+            app.log.warn({ err, provider, repoId: String(repoId) }, 'workspace webhook converge failed')
+          )
+        }
+      })()
+    }
+
+    // An enable-list change adds or drops the agent as a consumer of each credentialed GitLab skill project (§7.2).
+    const convergeGitlabSkillProjects = (orgId: OrgId, before: string[], after: string[]): void => {
+      const gitlab = deps.gitlab
+      if (!gitlab) return
+      const warn = (err: unknown): void => app.log.warn({ err }, 'skill source: gitlab converge failed')
+      void (async () => {
+        const [was, now] = await Promise.all([
+          resolveGitlabSkillSourceProjects({ orgId, skills: before }, deps.repos.skillSource),
+          resolveGitlabSkillSourceProjects({ orgId, skills: after }, deps.repos.skillSource)
+        ])
+        // Destinations first, so a shared account keeps a live membership and is never retired mid-move.
+        const changed = [...now.filter((id) => !was.includes(id)), ...was.filter((id) => !now.includes(id))]
+        for (const id of changed) await gitlab.provisioner.convergeProject(orgId, id).catch(warn)
+      })().catch(warn)
+    }
+
+    // The alive relay's HTTP origin for MCP proxy defs (ws→http/wss→https), or null
+    // when no relay is live. Mirrors the mcp-providers route's relayBaseUrl.
+    const relayProxyBase = async (): Promise<string | null> => {
+      const alive = await deps.repos.relay.listAlive(new Date(Date.now() - (deps.config.RELAY_STALE_MS ?? 0)))
+      const url = alive[0]?.daemonUrl
+      return url ? relayHttpOrigin(url) : null
+    }
+
+    // A registry provider's def (grant key + relay proxy URL) reaches a daemon ONLY by CP push:
+    // provider CRUD, an enable-list edit, a move, or the register/ok reconcile as the slow
+    // backstop. The two primitives below are that push and its inverse; every caller is
+    // best-effort, because an offline daemon converges on its next register.
+    /** The org registry rows among these names. A name with no row is a daemon-local def
+     *  (the operator's `config.json`) — never pushed, never removed, and absent here. */
+    const registryProvidersOf = async (orgId: OrgId, names: readonly string[]) => {
+      const wanted = new Set(names)
+      const rows = wanted.size === 0 ? [] : await deps.repos.mcpProvider.listForOrg(orgId)
+      return rows.filter((p) => wanted.has(p.name))
+    }
+    // One daemon's send, never surfaced: offline is the reconcile backstop, and the error is not
+    // logged because a codec/transport error can retain the grant-bearing payload.
+    const sendMcp = async (daemonId: string, fn: () => Promise<void>) => {
+      try {
+        await fn()
+      } catch (err) {
+        if (!(err instanceof NoConnection)) app.log.warn({ daemonId }, 'mcp def send failed (reconcile will converge)')
+      }
+    }
+    /** Push each provider's proxy def to these daemons. Nothing to push without a live relay. */
+    const pushMcpDefs = async (providers: readonly McpProviderRecord[], daemonIds: readonly string[]) => {
+      if (providers.length === 0 || daemonIds.length === 0) return
+      try {
+        const base = await relayProxyBase()
+        if (!base) return
+        for (const provider of providers) {
+          const grant = currentMcpGrant(await deps.repos.mcpGrant.activeForProvider(provider.orgId, provider.id))
+          if (!grant) continue
+          const spec = mcpProxyDef(provider, grant, base)
+          for (const daemonId of daemonIds) await sendMcp(daemonId, () => deps.control.mcpServerUpsert(daemonId, spec))
+        }
+      } catch (err) {
+        app.log.warn({ err }, 'mcp def push failed (reconcile will converge)')
+      }
+    }
+    /** Drop each provider's def from those of these daemons that serve NO agent still enabling
+     *  it. "Still used" is delivery-set membership, not placement: a duty holder counts. */
+    const dropMcpDefsIfUnused = async (
+      orgId: OrgId,
+      providers: readonly McpProviderRecord[],
+      daemonIds: readonly string[]
+    ) => {
+      if (providers.length === 0 || daemonIds.length === 0) return
+      try {
+        const peers = await deps.repos.agent.list(orgId)
+        for (const { name } of providers) {
+          const stillOn = new Set(
+            await deps.agentDelivery.daemonsForAgents(peers.filter((a) => a.mcpServers.includes(name)))
+          )
+          for (const daemonId of daemonIds) {
+            if (!stillOn.has(daemonId))
+              await sendMcp(daemonId, () => deps.control.mcpServerRemove(daemonId, orgId, name))
+          }
+        }
+      } catch (err) {
+        app.log.warn({ err }, 'mcp def removal deferred (reconcile will converge)')
+      }
+    }
+
+    // Reflect an enable-list edit onto every daemon serving the agent (a duty holder installed
+    // the same list and needs the same defs): provision the newly-enabled registry providers,
+    // retire the disabled ones that nobody there still uses. Never throws — its callers have
+    // already committed the row, and a failed sync converges on the daemon's next register.
+    const syncMcpDefsForAgent = async (
+      agent: AgentRecord,
+      before: readonly string[],
+      after: readonly string[]
+    ): Promise<void> => {
+      const added = after.filter((n) => !before.includes(n))
+      const removed = before.filter((n) => !after.includes(n))
+      if (added.length === 0 && removed.length === 0) return
+      try {
+        const targets = await deps.agentDelivery.daemonsFor(agent)
+        if (targets.length === 0) return
+        await pushMcpDefs(await registryProvidersOf(agent.orgId, added), targets)
+        await dropMcpDefsIfUnused(agent.orgId, await registryProvidersOf(agent.orgId, removed), targets)
+      } catch (err) {
+        app.log.warn({ agentId: agent.id, err }, 'mcp def sync failed (reconcile will converge)')
+      }
+    }
+
+    // A caller may DISABLE a registry MCP provider they can't see (one already on the
+    // agent), but may not ADD one back — the enable-list surface mirrors provider
+    // visibility. Returns a 403 message for any newly-added name that resolves to a
+    // provider outside the caller's view; daemon-local (non-registry) names carry no
+    // visibility and always pass. `before` is [] on create.
+    const enablingUnseenDenied = async (
+      orgId: OrgId,
+      ctx: ViewCtx,
+      before: readonly string[],
+      after: readonly string[]
+    ): Promise<string | null> => {
+      const added = after.filter((n) => !before.includes(n))
+      if (added.length === 0) return null
+      const visible = new Set((await deps.repos.mcpProvider.listForOrg(orgId, ctx)).map((p) => p.name))
+      const registry = new Set((await deps.repos.mcpProvider.listForOrg(orgId)).map((p) => p.name))
+      const blocked = added.filter((n) => registry.has(n) && !visible.has(n))
+      return blocked.length ? `cannot enable MCP provider you don't have access to: ${blocked.join(', ')}` : null
+    }
+
+    // Run an agent write inside the (orgId, name) provider chains of every name its
+    // SUBMITTED enable-list contains (serializeByProviderNames — sorted, deadlock-
+    // free), so the write cannot land between a provider DELETE's reference check and
+    // its row drop, nor interleave with a same-name provider create (see
+    // routes/mcp-providers.ts — the chains are keyed by NAME, the durable binding
+    // key, so no resolve-to-row-id staleness exists). Keyed off the whole submitted
+    // list, NOT an added-vs-before diff: ordinary agent edits may overlap, so a
+    // full-replace PATCH re-asserting a name it believes unchanged may be the write
+    // that RESTORES it after a concurrent removal, and it must serialize like any
+    // other reference-creating write. Removal-only submissions ([] / null /
+    // untouched) don't join any chain: a stale 409 on the delete side is benign, a
+    // missed reference is not.
+    //
+    // The visibility gate re-runs INSIDE the fence, with the keep-exemption derived
+    // from the agent's COMMITTED enable-list — never from request-time snapshots.
+    // Committed-hold is sound on its own: while an agent holds a name, its provider
+    // row can be neither deleted nor name-captured by a new row (both 409 while
+    // referenced), so a held name's current row is necessarily the one the hold was
+    // originally authorized against.
+    //
+    // The decision itself is handed to `run` as a checker and evaluated INSIDE the
+    // agent-row-locked update transaction (AgentUpdateOpts.authorizeMcpServers),
+    // against the same committed list that write is about to merge onto: a
+    // removal-only PATCH joins no provider-name chain, so any hold read taken here
+    // in the fence could be invalidated before the write lands — only the row lock
+    // makes hold-check and write inseparable. The registry/visibility sets ARE safe
+    // to capture here: provider create/delete/sharing all serialize on the very
+    // name chains this fence holds. A refusal surfaces as McpEnableDenied (the
+    // route maps it to 403).
+    const withSubmittedMcpProviderChains = async <T>(
+      orgId: OrgId,
+      ctx: ViewCtx,
+      submitted: readonly string[] | null | undefined,
+      run: (authorizeMcpServers: (currentlyHeld: readonly string[]) => void) => Promise<T>
+    ): Promise<T> => {
+      if (!submitted || submitted.length === 0) return run(() => {})
+      return serializeByProviderNames(orgId, submitted, async () => {
+        const registry = new Set((await deps.repos.mcpProvider.listForOrg(orgId)).map((p) => p.name))
+        const visible = new Set((await deps.repos.mcpProvider.listForOrg(orgId, ctx)).map((p) => p.name))
+        return run((currentlyHeld) => {
+          const held = new Set(currentlyHeld)
+          const blocked = submitted.filter((n) => registry.has(n) && !held.has(n) && !visible.has(n))
+          if (blocked.length) {
+            throw new McpEnableDenied(`cannot enable MCP provider you don't have access to: ${blocked.join(', ')}`)
+          }
+        })
+      })
+    }
+
+    // Skills enablement authorization (shared-skills.md §9). A skill-ref is
+    // "<source>/<skill>" / "<source>/*" / "<source>"; its self-contained definition
+    // is pushed to the daemon, so a caller may only ADD refs to sources they can see.
+    // Newly-added refs to an unknown OR unviewable source are blocked, so the
+    // enable-list surface mirrors source visibility (same rule as MCP providers);
+    // removing/keeping a ref to a source they can't see is allowed. `before` is [] on create.
+    const enablingUnseenSkillDenied = async (
+      orgId: OrgId,
+      ctx: ViewCtx,
+      before: readonly string[],
+      after: readonly string[]
+    ): Promise<string | null> => {
+      const sourceOf = (ref: string) => (ref.includes('/') ? ref.slice(0, ref.indexOf('/')) : ref)
+      const addedSources = [...new Set(after.filter((r) => !before.includes(r)).map(sourceOf))]
+      if (addedSources.length === 0) return null
+      const visible = new Set((await deps.repos.skillSource.listForOrg(orgId, ctx)).map((s) => s.name))
+      const blocked = addedSources.filter((n) => !visible.has(n))
+      return blocked.length
+        ? `cannot enable skills from a source you don't have access to: ${blocked.join(', ')}`
+        : null
+    }
+
+    // The skill-source twin of withSubmittedMcpProviderChains, carried as an
+    // in-transaction fence rather than a route-level chain (see
+    // routes/skill-sources.ts and AgentSkillSourceFence): the repo takes the
+    // (orgId, name) advisory scope of every SOURCE the submitted skill-refs
+    // name, keyed off the whole submitted list (a stale full-replace PATCH may
+    // be the write that RESTORES a ref after a concurrent removal).
+    // Removal-only submissions ([] / null / untouched) carry no fence.
+    //
+    // The visibility gate runs INSIDE the write's transaction, under those
+    // scopes, with the keep-exemption derived from the agent's COMMITTED refs
+    // (the row-locked bag read): a kept ref's source can be neither deleted nor
+    // name-captured while held (both 409 while referenced), so the committed
+    // hold is exactly the authorization it was granted under. One
+    // skills-specific difference from MCP: there is no daemon-local fallback
+    // for a skill-ref — a submitted NEW ref whose source is unknown (e.g. just
+    // deleted under the same scope) or unviewable is refused, so a dangling ref
+    // can never be committed through this surface. A refusal surfaces as
+    // SkillEnableDenied (the route maps it to 403).
+    const skillSourceFenceFor = (
+      orgId: OrgId,
+      ctx: ViewCtx,
+      submitted: readonly string[] | null | undefined
+    ): AgentSkillSourceFence | undefined => {
+      if (!submitted || submitted.length === 0) return undefined
+      return {
+        orgId,
+        names: submitted.map((ref) => parseSkillRef(ref).source),
+        viewer: ctx,
+        authorize: (committedHeld, visibleSourceNames) => {
+          const held = new Set(committedHeld)
+          const blocked = [
+            ...new Set(submitted.filter((ref) => !held.has(ref)).map((ref) => parseSkillRef(ref).source))
+          ].filter((n) => !visibleSourceNames.has(n))
+          if (blocked.length) {
+            throw new SkillEnableDenied(
+              `cannot enable skills from a source you don't have access to: ${blocked.join(', ')}`
+            )
+          }
+        }
+      }
+    }
+
+    const validateExternalMemoryBinding = async (
+      memory: AgentRecord['memory'] | undefined,
+      orgId: OrgId
+    ): Promise<string | null> => {
+      if (memory?.provider !== 'external') return null
+      const connection = await deps.repos.externalMemoryConnection.get(orgId, memory.connectionId)
+      if (!connection) return 'external memory connection not found in this organization'
+      // Probing is daemon-owned and a connection reaches a daemon through its
+      // first binding, so rejecting every non-ready connection here creates a
+      // bootstrap deadlock. Persist probing/degraded bindings; daemon admission
+      // remains fail-closed until this exact definition passes conformance.
+      // A proven-invalid revision, however, is actionable static failure and is
+      // rejected until the owner updates the connection (which bumps revision
+      // and returns it to probing).
+      if (connection.status === 'invalid' && connection.probedRevision === connection.revision) {
+        return 'external memory connection failed conformance validation'
+      }
+      return null
+    }
+
+    const validateManagedSkills = async (
+      ids: readonly string[] | null | undefined,
+      orgId: OrgId
+    ): Promise<string | null> => {
+      if (!ids || ids.length === 0) return null
+      const repo = deps.repos.organizationKnowledge
+      if (!repo) return 'managed skills are unavailable on this control plane'
+      const rows = await Promise.all([...new Set(ids)].map((id) => repo.getManagedSkill(orgId, id)))
+      const invalid = rows.some((row) => !row || row.archivedAt !== null)
+      return invalid ? 'managed skill not found, archived, or outside this organization' : null
+    }
+
+    /** Registry-before-agent ordering: a live daemon must see the referenced
+     * connection before it applies an external-memory AgentSpec. */
+    const pushExternalMemoryToDaemon = async (agent: AgentRecord, daemonId: string): Promise<boolean> => {
+      if (agent.memory?.provider !== 'external') return true
+      try {
+        const connection = await deps.repos.externalMemoryConnection.get(agent.orgId, agent.memory.connectionId)
+        if (!connection) return false
+        const installation = await deps.repos.memoryPluginInstallation.get(connection.installationId)
+        if (!installation) return false
+        if (installation.transport === 'stdio') {
+          const secrets = (await deps.repos.externalMemoryConnectionSecret.get(connection.orgId, connection.id)) ?? {}
+          await deps.control.memoryConnectionUpsert(
+            daemonId,
+            stdioMemoryConnectionSpec(connection, installation, secrets)
+          )
+          return true
+        }
+        const [grant, secretKeys, base] = await Promise.all([
+          deps.repos.externalMemoryGrant
+            .activeForConnection(connection.orgId, connection.id)
+            .then((rows) => rows.at(-1)),
+          deps.repos.externalMemoryConnectionSecret.keys(connection.orgId, connection.id),
+          relayProxyBase()
+        ])
+        if (!grant || !base) return false
+        await deps.control.memoryConnectionUpsert(
+          daemonId,
+          memoryConnectionSpec(connection, installation, secretKeys, grant.key, base)
+        )
+        return true
+      } catch {
+        // The projection is grant-bearing. A codec/transport error can retain
+        // the rejected payload, so log only stable identifiers here.
+        app.log.warn(
+          { agentId: agent.id, daemonId },
+          'external memory registry live sync failed (backstop: reconnect roster)'
+        )
+        return false
+      }
+    }
+
+    /** Every daemon serving this agent gets the connection before the spec that
+     *  names it — a duty holder included, or its memory admission stays closed. */
+    const pushExternalMemoryBeforeAgent = async (agent: AgentRecord): Promise<void> => {
+      for (const daemonId of await deps.agentDelivery.daemonsFor(agent)) {
+        await pushExternalMemoryToDaemon(agent, daemonId)
+      }
+    }
+
+    const removeExternalMemoryFromDaemonIfUnused = async (
+      orgId: OrgId,
+      daemonId: string,
+      connectionId: string
+    ): Promise<void> => {
+      try {
+        // "Still used on this daemon" is delivery-set membership, not placement:
+        // a duty holder serving another agent bound to the connection keeps it.
+        const users = (await deps.repos.agent.list(orgId)).filter(
+          (agent) => agent.memory?.provider === 'external' && agent.memory.connectionId === connectionId
+        )
+        const stillOn = new Set(await deps.agentDelivery.daemonsForAgents(users))
+        if (!stillOn.has(daemonId)) await deps.control.memoryConnectionRemove(daemonId, connectionId)
+      } catch (err) {
+        // Offline/version-skewed daemon converges the full registry on reconnect.
+        app.log.warn({ daemonId, connectionId, err }, 'external memory registry removal deferred')
+      }
+    }
+
+    const removeUnusedExternalMemoryAfterAgent = async (before: AgentRecord, after: AgentRecord): Promise<void> => {
+      if (before.memory?.provider !== 'external') return
+      const connectionId = before.memory.connectionId
+      if (
+        after.daemonId === before.daemonId &&
+        after.memory?.provider === 'external' &&
+        after.memory.connectionId === connectionId
+      ) {
+        return
+      }
+      for (const daemonId of await deps.agentDelivery.daemonsFor(before)) {
+        await removeExternalMemoryFromDaemonIfUnused(before.orgId, daemonId, connectionId)
+      }
+    }
+
+    const agentMoves = buildAgentMoves(deps, app.log)
+    const refreshMutationAgent = (observed: AgentRecord) => refreshAgentUnderMutation(deps.repos.agent, observed)
+
+    r.post(
+      '/agents',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Create an agent',
+          description:
+            'Mint a new agent definition scoped to the caller’s org; the CP assigns its UUID. With ?connect=true, also provisions a daemon connect token and start command for onboarding; a request authenticated by an API key cannot use it. A managed memory binding is stored with its resolved home: an agent placed on a group or the managed pool keeps its memory in the Control Plane (an explicit daemon home there is refused with 409); anywhere else the given home or daemon. `execution` names the strategy sessions run in and is checked against the strategies the placement reports: one it does not offer, or offers but cannot run now, is refused with 409 and the reason; absent, it is `host` where the placement runs it, else the first available sandbox. `repositorySelector` names the Decision provider and model the per-session repository selector asks; one that does not answer Choice questions is refused with 400.',
+          operationId: 'createAgent',
+          body: CreateAgentBody,
+          querystring: z.object({ connect: z.stringbool().default(false) }),
+          response: {
+            201: AgentCreatedDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        // `?connect=true` mints a daemon key, which only an interactive sign-in may do, as on `POST /daemons/token`.
+        if (req.query.connect && (req.apiKeyId !== undefined || req.delegatedInvocation !== undefined)) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'interactive sign-in required' })
+        }
+        const conflict = (message: string) => reply.code(409).send({ error: 'Conflict', statusCode: 409, message })
+        // Placement accepts visible org-owned daemons and this org's member sets, never another
+        // org's daemon — or a SET, which names no member and is validated against its live members
+        // instead, exactly like the move route's set target.
+        const wantsSet = req.body.placementKind === 'pool' || req.body.placementKind === 'set'
+        const targetSetId = wantsSet ? await resolveTargetSetId(deps, orgOf(req), req.body) : null
+        if (wantsSet && targetSetId === null) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'member set not found' })
+        }
+        if (req.body.modelProvider && targetSetId && (await deps.repos.memberSet.get(targetSetId))?.orgId === null) {
+          return conflict(
+            'provider API key selection is only available on self-hosted daemons; Cloud uses its existing credentials'
+          )
+        }
+        const setMembers = targetSetId ? await readySetMembers(deps, orgOf(req), targetSetId) : []
+        if (wantsSet && setMembers.length === 0) return conflict('no daemon in the target member set is ready')
+        const placedDaemon = wantsSet
+          ? (setMembers[0] ?? null)
+          : req.body.daemonId !== undefined
+            ? await deps.registry.getAvailable(orgOf(req), DaemonId(req.body.daemonId))
+            : null
+        if (!wantsSet && req.body.daemonId !== undefined) {
+          if (!placedDaemon || !canView(placedDaemon, ctxOf(req))) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+          }
+        }
+        if (req.body.managedSkills?.length && placedDaemon && !organizationKnowledgeSupportedOn(placedDaemon)) {
+          return conflict('managed skills require a daemon that supports organization knowledge')
+        }
+        if (
+          req.body.modelProvider &&
+          !wantsSet &&
+          placedDaemon &&
+          !advertises(
+            placedDaemon.capabilities.features,
+            requiredDaemonFeatures({ modelProvider: req.body.modelProvider })
+          )
+        ) {
+          return conflict('upgrade the selected daemon before using a provider API key')
+        }
+        const selectorRefusal =
+          repositorySelectorRefusal(req.body.repositorySelector) ?? coordinatorFilterRefusal(req.body.coordinatorFilter)
+        if (selectorRefusal) return badRequest(reply, selectorRefusal)
+        const executionChoice = resolveExecution(
+          placementStrategies((wantsSet ? setMembers : placedDaemon ? [placedDaemon] : []).map((d) => d.capabilities)),
+          req.body.execution
+        )
+        if ('refused' in executionChoice) return conflict(executionChoice.refused)
+        // The one credential derivation (git-workspace-model.md §6) decides who
+        // vouches for the address — the identity gate runs inside it. Ordered
+        // AFTER the daemonId visibility gate (404 semantics); refusals answer
+        // 409 — installations and their grant sets are org-level infrastructure
+        // (visibility taxonomy), so a 409 is not an oracle.
+        const ws = req.body.workspace
+        let workspace: AgentWorkspace | undefined =
+          ws === undefined ? undefined : { mode: 'scratch', isolation: 'shared' }
+        let workspaceRepoId: bigint | undefined
+        if (ws?.mode === 'git') {
+          let derived: DerivedWorkspace
+          try {
+            derived = await deriveWorkspaceCredential(deps, orgOf(req), req.principal?.userId, ws.gitRepo, ws.access, {
+              write: true
+            })
+          } catch (e) {
+            if (e instanceof WorkspaceCredentialRefused) return conflict(e.message)
+            if (e instanceof UserAuthzDeniedError) {
+              return reply
+                .code(403)
+                .send({ error: 'Forbidden', statusCode: 403, message: `github: ${e.message}`, code: e.code })
+            }
+            if (e instanceof LogtoApiError) {
+              // Identity assertion unavailable — the gate fails CLOSED, as
+              // upstream trouble (retryable), never as a silent allow.
+              return reply.code(502).send({ error: 'Bad Gateway', statusCode: 502, message: e.message })
+            }
+            if (e instanceof GithubApiError) {
+              const status = e.code === 'RATE_LIMITED' ? 429 : 502
+              return reply.code(status).send({
+                error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+                statusCode: status,
+                message: `github: ${e.message}`
+              })
+            }
+            if (e instanceof GitlabApiError) {
+              const status = e.code === 'RATE_LIMITED' ? 429 : 502
+              return reply.code(status).send({
+                error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+                statusCode: status,
+                message: `gitlab: ${e.message}`
+              })
+            }
+            if (e instanceof GiteaApiError || e instanceof AzureDevOpsApiError) {
+              const status = e.code === 'RATE_LIMITED' ? 429 : 502
+              const host = e instanceof GiteaApiError ? 'gitea' : 'azure devops'
+              return reply.code(status).send({
+                error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+                statusCode: status,
+                message: `${host}: ${e.message}`
+              })
+            }
+            throw e
+          }
+          // §17.3/§24.4: a DIRECT placement must advertise the features NOW — the
+          // delivery/reconcile gates would otherwise strand a 201'd agent
+          // assigned to a daemon that can never materialize it.
+          const vouching = derived.kind === 'anonymous' ? null : codeHosts[derived.kind]
+          const vouchingFeatures = vouching ? vouching.features.required(vouching.features.deploymentHost(deps)) : []
+          if (vouching && vouchingFeatures.length > 0 && req.body.daemonId !== undefined) {
+            const daemon = await deps.registry.getAvailable(orgOf(req), DaemonId(req.body.daemonId))
+            if (!advertises(daemon?.capabilities.features, vouchingFeatures)) {
+              return conflict(
+                `the selected daemon does not support ${vouching.displayName} workspaces yet — upgrade it first`
+              )
+            }
+          }
+          // The derivation's canonical address and default branch — never the
+          // caller's clone host/path — are the authority for a credentialed workspace.
+          const built = workspaceFromDerived(codeHosts, derived, {
+            isolation: ws.worktree === false ? 'shared' : 'session',
+            ...(ws.gitBranch !== undefined ? { gitBranch: ws.gitBranch } : {}),
+            ...(ws.agentDir !== undefined ? { agentDir: ws.agentDir } : {})
+          })
+          workspace = built.workspace
+          workspaceRepoId = built.workspaceRepoId
+        }
+        if (Array.isArray(req.body.mcpServers)) {
+          const denied = await enablingUnseenDenied(orgOf(req), ctxOf(req), [], req.body.mcpServers)
+          if (denied) return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: denied })
+        }
+        if (Array.isArray(req.body.skills)) {
+          const denied = await enablingUnseenSkillDenied(orgOf(req), ctxOf(req), [], req.body.skills)
+          if (denied) return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: denied })
+        }
+        const managedSkillError = await validateManagedSkills(req.body.managedSkills, orgOf(req))
+        if (managedSkillError) {
+          return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: managedSkillError })
+        }
+        // The memory home is resolved here, once, so a later placement change never flips it (§3.2.1).
+        const resolvedMemory = resolveMemoryBindingOnCreate(
+          req.body.memory,
+          await placedOnMemberSet(deps, { setId: targetSetId, daemonId: wantsSet ? undefined : req.body.daemonId })
+        )
+        if ('refused' in resolvedMemory) return conflict(resolvedMemory.message)
+        const memory = resolvedMemory.memory
+        // The friendly external-memory validation runs here; the authoritative
+        // fence (connection advisory try-lock + in-transaction existence
+        // re-check) lives inside the create transaction (PgAgentRepo) and
+        // surfaces as MemoryConnectionBusy/Missing in the catch below.
+        try {
+          const memoryError = await validateExternalMemoryBinding(memory, orgOf(req))
+          if (memoryError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: memoryError })
+          }
+          // Restricted-on-create: intersect the requested share set with current org
+          // members (same rule as PUT /sharing) so a create can't grant a non-member.
+          const initialSharedWith = req.body.sharedWith
+            ? await resolveShareSet(deps.repos.user, orgOf(req), req.body.sharedWith)
+            : undefined
+          // Selected-callers-on-create: intersect the requested caller allow-list
+          // with visible same-org peers (same rule as PUT /call-policy). The new
+          // agent isn't a peer yet, so `agentId` self-exclusion is a harmless no-op.
+          const agentId = AgentId(randomUUID())
+          const defaultAgentVisibility = (await deps.repos.org.defaultAgentVisibility(orgOf(req))) ?? 'all'
+          const callPolicy = req.body.callPolicy ?? defaultAgentVisibility
+          const outboundPolicy = req.body.outboundPolicy ?? defaultAgentVisibility
+          const initialAllowedCallers =
+            callPolicy === 'selected'
+              ? await resolvePolicyAgentIds(req, agentId, req.body.allowedCallerAgentIds ?? [], [])
+              : undefined
+          const initialAllowedTargets =
+            outboundPolicy === 'selected'
+              ? await resolvePolicyAgentIds(req, agentId, req.body.allowedTargetAgentIds ?? [], [])
+              : undefined
+          // One transaction for the agent row + its initial secret rows (sealing
+          // happens before it opens) — a failure can't leave a partial definition.
+          // Chained per submitted MCP provider name (route-level chain), and fenced
+          // per submitted skill-ref source name INSIDE the create transaction (the
+          // skillSources opts) so the row can't commit inside a concurrent
+          // registry-delete's check→drop window. The MCP chain wraps the whole
+          // transaction, so the two fence families still nest in a fixed order.
+          const skillsFence = skillSourceFenceFor(orgOf(req), ctxOf(req), req.body.skills)
+          let agent: AgentRecord
+          try {
+            agent = await withSubmittedMcpProviderChains(orgOf(req), ctxOf(req), req.body.mcpServers, (authorize) => {
+              // A not-yet-created agent holds nothing, and nothing can concurrently
+              // remove from it — the empty-hold decision is stable through create.
+              authorize([])
+              return deps.repos.agentConfig.create(
+                {
+                  id: agentId,
+                  orgId: orgOf(req),
+                  name: req.body.name,
+                  ...(req.body.displayName !== undefined ? { displayName: req.body.displayName } : {}),
+                  // Absent ⇒ the repo assigns a random glyph+color combo (product default).
+                  ...(req.body.icon !== undefined ? { icon: req.body.icon } : {}),
+                  ...(req.body.description !== undefined ? { description: req.body.description } : {}),
+                  runtime: req.body.runtime,
+                  ...(req.body.model !== undefined ? { model: req.body.model } : {}),
+                  ...(req.body.modelProvider !== undefined ? { modelProvider: req.body.modelProvider } : {}),
+                  ...(req.body.reasoningEffort !== undefined ? { reasoningEffort: req.body.reasoningEffort } : {}),
+                  ...(req.body.outputMode !== undefined ? { outputMode: req.body.outputMode } : {}),
+                  ...(req.body.showFooter !== undefined ? { showFooter: req.body.showFooter } : {}),
+                  ...(req.body.showStatusBar !== undefined ? { showStatusBar: req.body.showStatusBar } : {}),
+                  ...(req.body.fastMode !== undefined ? { fastMode: req.body.fastMode } : {}),
+                  ...(req.body.permissionMode !== undefined ? { permissionMode: req.body.permissionMode } : {}),
+                  ...(req.body.chatActions !== undefined ? { chatActions: req.body.chatActions } : {}),
+                  ...(req.body.pause !== undefined ? { pause: req.body.pause } : {}),
+                  ...(req.body.introduceOnJoin !== undefined ? { introduceOnJoin: req.body.introduceOnJoin } : {}),
+                  ...(req.body.newConversationMode !== undefined
+                    ? { newConversationMode: req.body.newConversationMode }
+                    : {}),
+                  ...(req.body.computerUse !== undefined ? { computerUse: req.body.computerUse } : {}),
+                  execution: executionChoice.execution,
+                  ...(req.body.env !== undefined ? { env: req.body.env } : {}),
+                  ...(req.body.mcpServers !== undefined ? { mcpServers: req.body.mcpServers } : {}),
+                  ...(req.body.skills !== undefined ? { skills: req.body.skills } : {}),
+                  ...(req.body.decisionIds !== undefined ? { decisionIds: req.body.decisionIds } : {}),
+                  ...(req.body.modelSelection !== undefined ? { modelSelection: req.body.modelSelection } : {}),
+                  ...(req.body.coordinatorModel !== undefined ? { coordinatorModel: req.body.coordinatorModel } : {}),
+                  ...(req.body.coordinatorDisabled !== undefined
+                    ? { coordinatorDisabled: req.body.coordinatorDisabled }
+                    : {}),
+                  ...(req.body.coordinatorFilter !== undefined
+                    ? { coordinatorFilter: req.body.coordinatorFilter }
+                    : {}),
+                  ...(req.body.repositorySelector !== undefined
+                    ? { repositorySelector: req.body.repositorySelector }
+                    : {}),
+                  ...(req.body.managedSkills !== undefined ? { managedSkills: req.body.managedSkills } : {}),
+                  ...(memory !== undefined ? { memory } : {}),
+                  ...(targetSetId !== null
+                    ? { placementKind: 'set' as const, setId: targetSetId }
+                    : req.body.daemonId !== undefined
+                      ? { daemonId: DaemonId(req.body.daemonId) }
+                      : {}),
+                  ...(workspace !== undefined ? { workspace } : {}),
+                  ...(workspaceRepoId !== undefined ? { workspaceRepoId } : {}),
+                  ...(req.principal ? { createdByUserId: req.principal.userId } : {}),
+                  ...(req.body.visibility ? { visibility: req.body.visibility } : {}),
+                  ...(initialSharedWith ? { sharedWith: initialSharedWith } : {}),
+                  callPolicy,
+                  allowedCallerAgentIds: initialAllowedCallers ?? [],
+                  outboundPolicy,
+                  allowedTargetAgentIds: initialAllowedTargets ?? [],
+                  capabilities: req.body.capabilities
+                },
+                // Initial write-only secrets — same transaction, so the first
+                // replicateUpsert below always sees the complete definition.
+                req.body.secrets,
+                skillsFence ? { skillSources: skillsFence } : undefined
+              )
+            })
+          } catch (e) {
+            if (e instanceof ModelSelectionInvalid) {
+              return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: e.message })
+            }
+            if (e instanceof McpEnableDenied || e instanceof SkillEnableDenied || e instanceof DecisionBindingDenied) {
+              return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: e.message })
+            }
+            // Everything else (including the organization-environment fence's
+            // admission refusal) is mapped by the outer catch below.
+            throw e
+          }
+          // `?connect=true` also provisions a daemon connect token + start command
+          // so the onboarding screen can show "run this to connect a daemon".
+          const connect = req.query.connect
+            ? await provisionDaemonConnect(deps.apiKeys, deps.config, req.orgCtx!.orgId, req.principal?.userId)
+            : undefined
+          // §7.2 BEFORE the spec push: the daemon prepares a gitlab workspace by
+          // minting credentials from this agent's OWN account. The row is
+          // created first on purpose — a crash here leaves an agent the next
+          // convergence adopts as a consumer, where the reverse order would
+          // leave an account no agent owns.
+          if (
+            agent.workspace.mode === 'git' &&
+            agent.workspace.credential?.provider === 'gitlab' &&
+            agent.workspaceRepoId !== undefined &&
+            deps.gitlab
+          ) {
+            const gitlab = deps.gitlab
+            // The agent row IS the authorization here and is already committed,
+            // so nothing has to run inside the lease alongside the ensure.
+            const ensured = await gitlab.provisioner.provisionAgentAccount(
+              agent.orgId,
+              agent.workspaceRepoId,
+              { agentId: agent.id, accessLevel: gitlabWorkspaceAccessLevel(agent.workspace.credential.access) },
+              async () => undefined
+            )
+            if (!ensured.ok) {
+              // Nothing was pushed yet, so the create can still be withdrawn
+              // whole rather than leaving an agent whose workspace cannot start.
+              // The account rows go with it: they carry no agent foreign key on
+              // purpose, so a dropped agent would otherwise orphan whatever the
+              // failed provisioning already created at GitLab (§19.4).
+              await deps.repos.agent
+                .delete(agent.orgId, agent.id)
+                .catch((err) => app.log.warn({ err, agentId: agent.id }, 'agent rollback after gitlab account failure'))
+              await gitlab.accounts
+                .retireAgentAccounts(agent.orgId, agent.id)
+                .catch((err) => app.log.warn({ err, agentId: agent.id }, 'gitlab account rollback failed'))
+              return conflict(gitlabAccountUnavailableMessage(ensured.reason))
+            }
+          }
+          // Issue the private definition first. Even if its probe ACK is lost,
+          // the WebSocket preserves frame order and daemon admission remains
+          // closed until the registry validates it.
+          await pushExternalMemoryBeforeAgent(agent)
+          await replicateUpsert(agent) // no-op until placed; reconcile carries it otherwise
+          // Mint the agent's duty group now, so a pool member can claim it on its
+          // next beat instead of waiting for the first trigger's rendezvous.
+          deps.recomputeDuties?.(agent.orgId)
+          // A create that arrives already PLACED (`daemonId` in the body) must also enter
+          // the peer directory now. `replicateUpsert` only ships the AgentSpec (same-daemon
+          // authorization); a peer WAKE is authorized against the collaboration snapshot,
+          // whose flat `agents[]` is the only structure an agent with no IM integration can
+          // appear in — and channel membership no longer gates the directory, so there is no
+          // later `integration/channels` push to rely on. Without this the agent would be
+          // DISCOVERABLE (channel/agents reads the DB live) yet un-wakeable until an
+          // unrelated change bumped the snapshot: the listed-but-uncallable state that
+          // discovery-as-authorization forbids. Gated on placement for the same reason
+          // `replicateUpsert` is — `buildCollabSnapshot` drops daemonId-less rows, so an
+          // unplaced create has nothing to publish and must not churn every routingEpoch.
+          // Best-effort for the same reason as `replicateUpsert` above: the agent row is
+          // ALREADY committed, so a snapshot-push hiccup must not turn a successful create
+          // into a 500. `register/ok` carries the same directory as the reconnect backstop.
+          if (agent.daemonId) {
+            try {
+              await deps.collabRoutes.broadcast(agent.orgId)
+            } catch (err) {
+              app.log.warn(
+                { err, agentId: agent.id, orgId: agent.orgId },
+                'collaboration routes push failed after agent create (backstop: reconnect snapshot)'
+              )
+            }
+          }
+          await syncMcpDefsForAgent(agent, [], agent.mcpServers)
+          convergeWorkspaceRepositories(agent.orgId, [agent])
+          convergeGitlabSkillProjects(agent.orgId, [], agent.skills)
+          return reply.code(201).send({
+            ...toDto(
+              agent,
+              ctxOf(req),
+              await secretKeysOf(agent.orgId, agent.id),
+              await integrationMarksOf(deps, agent.id),
+              iconBasesOf(deps),
+              await placementViewFor(deps, agent),
+              // Create already enrolled the agent into the org's `all` entries in
+              // its own transaction, so the response shows what will actually apply.
+              await organizationEnvironmentOf(agent),
+              await computersOf(agent)
+            ),
+            ...(connect ? { connect } : {})
+          })
+        } catch (e) {
+          if (e instanceof MemoryConnectionBusy) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: 'external memory connection is being updated; retry agent creation'
+            })
+          }
+          if (e instanceof MemoryConnectionMissing) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: e.message })
+          }
+          // See the PATCH handler: the organization-environment fence refused the
+          // complete resolved definition (cross-kind downgrade, or over the wire
+          // admission budget). Nothing was persisted.
+          if (e instanceof OrganizationEnvironmentAdmissionError) {
+            return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: e.message })
+          }
+          // A code-host binding fence: the repository was removed while this create was in flight.
+          if (e instanceof CodeHostBindingUnavailable) return conflict(e.message)
+          const refused = placementRefusalMessage(e)
+          if (refused) return conflict(refused)
+          throw e
+        }
+      }
+    )
+
+    r.get(
+      '/agents',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List agents',
+          description: 'Every agent definition in the caller’s active org.',
+          operationId: 'listAgents',
+          response: { 200: AgentListDto }
+        }
+      },
+      async (req) => {
+        const ctx = ctxOf(req)
+        const rows = await deps.repos.agent.list(orgOf(req), ctx)
+        const hookKinds = await deps.repos.hook.kindsByAgent(orgOf(req))
+        const apiProtocols = await deps.repos.agentApiEntry.protocolsByAgent(orgOf(req))
+        const secretKeys = await deps.repos.agentSecret.keys(
+          orgOf(req),
+          rows.map((a) => a.id)
+        )
+        // ONE batched resolve for the whole page (design §6) — never a query per agent.
+        const organizationEnvironment = await organizationEnvironmentOfAll(orgOf(req), rows)
+        const computerGrants = await deps.repos.computer.listAgentGrants(orgOf(req))
+        // Two batched resolves for the whole page: the named daemons, and each named set once.
+        const daemonIds = [...new Set(rows.flatMap((a) => (a.daemonId ? [a.daemonId] : [])))]
+        const views = new Map(
+          await Promise.all(
+            daemonIds.map(
+              async (daemonId) =>
+                [daemonId, placementViewOf(deps, await deps.registry.getAvailable(orgOf(req), daemonId))] as const
+            )
+          )
+        )
+        const setIds = [...new Set(rows.flatMap((a) => (a.setId ? [a.setId] : [])))]
+        const setViews = new Map(
+          await Promise.all(
+            setIds.map(
+              async (setId) =>
+                [setId, placementViewOf(deps, (await readySetMembers(deps, orgOf(req), setId))[0] ?? null)] as const
+            )
+          )
+        )
+        // And one ledger read for the holders of every agent on one of the org's own groups.
+        const poolSetId = await deps.repos.memberSet.crossOrgSetId()
+        const onGroup = (a: AgentRecord): boolean => {
+          const eligibility = dutyEligibility(a)
+          return eligibility.scope === 'set' && eligibility.setId !== poolSetId
+        }
+        const holders = await deps.placementResolver.routableHolders(rows.filter(onGroup).map((a) => a.id))
+        const viewFor = (a: AgentRecord): PlacementView => {
+          const eligibility = dutyEligibility(a)
+          if (eligibility.scope === 'none') return NO_PLACEMENT
+          if (eligibility.scope === 'daemon') return views.get(eligibility.daemonId) ?? NO_PLACEMENT
+          const view = setViews.get(eligibility.setId) ?? NO_PLACEMENT
+          return onGroup(a) ? { ...view, holderDaemonId: holders.get(a.id) ?? null } : view
+        }
+        return rows.map((a) =>
+          toDto(
+            a,
+            ctx,
+            secretKeys.get(a.id) ?? [],
+            { hookKinds: hookKinds.get(a.id) ?? [], apiProtocols: apiProtocols.get(a.id) ?? [] },
+            iconBasesOf(deps),
+            viewFor(a),
+            organizationEnvironment.get(a.id) ?? NO_ORGANIZATION_ENVIRONMENT,
+            derivedComputerIds(computerGrants, a.id)
+          )
+        )
+      }
+    )
+
+    r.get(
+      '/agents/:id',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get an agent',
+          description: 'Fetch one agent by id; a cross-org id reads as absent (404).',
+          operationId: 'getAgent',
+          params: IdParam,
+          response: { 200: AgentDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return {
+          ...toDto(
+            agent,
+            ctxOf(req),
+            await secretKeysOf(agent.orgId, agent.id),
+            await integrationMarksOf(deps, agent.id),
+            iconBasesOf(deps),
+            await placementViewFor(deps, agent),
+            await organizationEnvironmentOf(agent),
+            await computersOf(agent)
+          ),
+          liveSecrets: await liveSecretsOf(agent.orgId, agent.id)
+        }
+      }
+    )
+
+    r.get(
+      '/agents/:id/assistant-mode/admission',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Check assistant mode admission',
+          description:
+            'Reports whether the agent may switch assistant mode on as it stands, and every reason it may not: no runtime yet, a runtime outside the admission list, memory other than managed, a daemon group whose members do not share one store, or a conversation that is By decision or in a shared bot’s routing (`routing`, with those conversations in `conversations`). Switching it off is never refused.',
+          operationId: 'getAgentAssistantModeAdmission',
+          params: IdParam,
+          response: { 200: AssistantModeAdmissionDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return assistantModeAdmissionOf(deps.repos, agent)
+      }
+    )
+
+    r.get(
+      '/agents/:id/assistant-mode/responsible-user',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get the assistant mode responsible user',
+          description:
+            'Names the member asked to approve what an assistant-mode agent cannot route to a person behind the work: the agent’s creator while they may edit it, otherwise the editor who joined the organization first. Null when no member may edit the agent; such requests wait in Activity.',
+          operationId: 'getAgentAssistantResponsibleUser',
+          params: IdParam,
+          response: { 200: AssistantResponsibleUserDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const member = assistantResponsibleUser(agent, await deps.repos.user.listMembers(agent.orgId))
+        return { userId: member?.userId ?? null }
+      }
+    )
+
+    r.get(
+      '/agents/:id/decisions',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List an agent’s attached Decisions',
+          description:
+            'Returns metadata for an agent’s MCP Decision attachments, or its model-selection binding when purpose=model_selection. Adding a binding requires access to the Decision; existing bindings remain usable independently of later sharing changes.',
+          operationId: 'listAgentDecisions',
+          params: IdParam,
+          querystring: z.object({ purpose: z.literal('model_selection').optional() }),
+          response: {
+            200: z.array(
+              DecisionToolDefinition.omit({ question: true }).extend({
+                questionType: z.enum(['boolean', 'choice', 'score'])
+              })
+            ),
+            404: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const ids =
+          req.query.purpose === 'model_selection'
+            ? modelSelectionDecisionIds(agent.modelSelection)
+            : (agent.decisionIds ?? [])
+        const rows = await deps.repos.decision.listForAgent(agent.orgId, ids, { limit: 64 })
+        return rows.map(({ question, ...row }) => ({ ...row, questionType: question.type }))
+      }
+    )
+
+    r.get(
+      '/agents/:id/skill-sources',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List an agent’s enabled skill sources',
+          description:
+            'Resolve the agent’s skill enable-list ("<source>/<skill>" refs) into the registry rows it references. Gated on viewing the AGENT, not the source: a source restricted away from the caller still resolves, because its definition is part of what this agent installs. Refs to a source that no longer exists are omitted. `credential` names the code host whose credential acquires the source, or is null when it is acquired anonymously.',
+          operationId: 'listAgentSkillSources',
+          params: IdParam,
+          response: { 200: AgentSkillSourceListDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const names = [...new Set(agent.skills.map((ref) => parseSkillRef(ref).source))]
+        const rows = await Promise.all(names.map((name) => deps.repos.skillSource.getByName(agent.orgId, name)))
+        return rows.flatMap((s) =>
+          s
+            ? [
+                {
+                  id: s.id,
+                  name: s.name,
+                  // This response crosses the source's OWN visibility, so the string
+                  // is redacted even though `SkillSourceArg` now rejects credentials
+                  // on write — rows predating that guard must not leak one here.
+                  source: redactSourceCredentials(s.source),
+                  ref: s.ref,
+                  subDir: s.subDir,
+                  skills: s.skills,
+                  private: s.private,
+                  credential: s.credential ? { provider: s.credential.provider } : null
+                }
+              ]
+            : []
+        )
+      }
+    )
+
+    r.get(
+      '/agents/:id/skill-source-status',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get an agent’s skill source install status',
+          description:
+            'The latest install failure of each skill source the agent enables, as the daemon serving it reported after its last skill reconcile: the source name, an enumerated reason code (resolution_failed, access_denied, ref_moved, commit_unavailable, sha_fetch_refused, fetch_failed, limits_exceeded or cli_failed) and when the control plane received it. A source that installed, or has not been tried since it was enabled, is not listed. Raw Git or CLI output is never stored; detail stays in the daemon log. Gated on viewing the agent.',
+          operationId: 'getAgentSkillSourceStatus',
+          params: IdParam,
+          response: { 200: AgentSkillSourceStatusDto, 404: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const rows = (await deps.repos.agentSkillSourceStatus?.list(AgentId(agent.id))) ?? []
+        // A row for a Source the agent no longer enables is stale until its next report.
+        const enabled = new Set(agent.skills.map((ref) => parseSkillRef(ref).source))
+        return {
+          sources: rows
+            .filter((row) => enabled.has(row.sourceName))
+            .map((row) => ({ name: row.sourceName, code: row.code, reportedAt: row.reportedAt.toISOString() }))
+        }
+      }
+    )
+
+    r.get(
+      '/agents/:id/permission-requests',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List agent approval requests',
+          description:
+            'Proxy the owning daemon’s bounded, secret-masked approval queue. Only callers who can edit the agent may read it; the Control Plane does not persist these requests.',
+          operationId: 'listAgentPermissionRequests',
+          params: IdParam,
+          response: { 200: AgentPermissionRequestPageDto, 403: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          const page = await deps.control.agentPermissionRequests(agent.daemonId, {
+            agentId: agent.id,
+            limit: 100
+          })
+          return { requests: page.requests.map(toPermissionRequestDto) }
+        } catch (err) {
+          const unavailable = daemonEdgeFailure(err)
+          if (unavailable !== null) {
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+          }
+          throw err
+        }
+      }
+    )
+
+    r.post(
+      '/agents/:id/permission-requests/:requestId/decision',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Decide an agent approval request',
+          description:
+            'Allow or deny one pending runtime request on the owning daemon, optionally by one of the options it offers. Only callers who can edit the agent may decide it.',
+          operationId: 'decideAgentPermissionRequest',
+          params: z.object({ id: z.string().uuid(), requestId: z.string().uuid() }),
+          body: AgentPermissionDecisionBody,
+          response: {
+            200: z.object({ ok: z.literal(true) }),
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          // Stamp the decider server-side (slack-approval-dm.md §6.2) — never client-supplied.
+          const me = ctxOf(req)
+          const profile = await deps.repos.user.getProfile(me.userId).catch(() => null)
+          const decidedByName = profile?.displayName ?? profile?.email ?? undefined
+          const ack = await deps.control.agentPermissionDecision(agent.daemonId, {
+            agentId: agent.id,
+            requestId: req.params.requestId,
+            decision: req.body.decision,
+            ...(req.body.optionId ? { optionId: req.body.optionId } : {}),
+            decidedBy: `user:${me.userId}`,
+            ...(decidedByName ? { decidedByName } : {})
+          })
+          if (!ack.ok) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: ack.reason ?? 'permission request is no longer pending'
+            })
+          }
+          return { ok: true as const }
+        } catch (err) {
+          const unavailable = daemonEdgeFailure(err)
+          if (unavailable !== null) {
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Edit the spec (name / system-prompt / model / runtime / capabilities).
+    // Persisted as the source of truth; `agent/upsert` hot-syncs the owning
+    // daemon's replica, and the new spec also rides the next `register/ok` and
+    // `agent/launch`.
+    r.patch(
+      '/agents/:id',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Update an agent',
+          description:
+            'Edit the agent spec or widen an existing GitHub workspace from read to write access; the change hot-syncs the owning daemon’s replica and rides the next register/launch. A managed memory binding without a home keeps the current one. Switching the home from daemon to control-plane is accepted and flags a migration the owning daemon completes; the reverse is refused with 409 unless force is set, and then drops every memory file and change-log record the Control Plane holds for the agent. An agent placed on a group or the managed pool cannot name the daemon home, nor can an agent in assistant mode: turning assistant mode on switches a daemon home to control-plane in the same write and flags the migration, and while it is on the memory must stay managed and the forced return is refused with 409. A new `execution` is checked against the strategies the placement reports and refused with 409 when it cannot run there; it reaches only sessions created afterwards. `repositorySelector` names the Decision provider and model the per-session repository selector asks, must answer Choice questions (400 otherwise), and null clears it (409 while any repository authorization or installation grant is marked `decision`). `coordinatorDisabled: true` turns the `auto` coordinator off: the agent’s conversations can no longer be set to Auto, new rooms start Per thread, and its Auto conversations run Single session until it is turned back on, which their stored mode then resumes. `coordinatorFilter` names the Decision provider and model that screen each unaddressed message before the coordinator, must answer Boolean questions (400 otherwise), and null removes it. `liveSecrets` merges key by key like `secrets` (an object `{ value, description? }` sets one, null deletes it): a live secret is fetched by the agent’s own shell when a command needs it, never placed in its environment, and saving one restarts nothing; a name already used by an environment variable or secret of the agent or its organization answers 409.',
+          operationId: 'updateAgent',
+          params: IdParam,
+          body: UpdateAgentBody,
+          response: {
+            200: AgentDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        // getOrgAgent already enforces visibility; the edit action then keeps
+        // viewers read-only while collaborators and owners may edit.
+        if (!canEdit(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        // Built-in preset agents keep their fixed brand identity (preset-agents.md
+        // §3.1): display name and icon are not editable — everything else stays an
+        // ordinary edit. (The slug is create-time-immutable for every agent.)
+        if (existing.builtin && (req.body.displayName !== undefined || req.body.icon !== undefined)) {
+          return reply.code(403).send({
+            error: 'Forbidden',
+            statusCode: 403,
+            message: 'built-in agent identity (display name, icon) cannot be changed'
+          })
+        }
+        const release = deps.agentMutations.tryBeginMutation(existing.id)
+        if (!release) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'agent move is in progress; retry the edit' })
+        }
+        // External-memory fencing (advisory try-lock on the committed + target
+        // connections and the in-transaction existence re-check) happens inside
+        // the update transaction (PgAgentRepo); MemoryConnectionBusy/Missing
+        // surface in the catch below.
+        try {
+          if (!(await refreshMutationAgent(existing))) {
+            return reply
+              .code(409)
+              .send({ error: 'Conflict', statusCode: 409, message: 'agent changed; refresh and retry the edit' })
+          }
+          const placementView = await placementViewFor(deps, existing)
+          if (req.body.modelProvider) {
+            if (existing.setId && (await deps.repos.memberSet.get(existing.setId))?.orgId === null) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message:
+                  'provider API key selection is only available on self-hosted daemons; Cloud uses its existing credentials'
+              })
+            }
+            const serving = await deps.agentDelivery.daemonsFor(existing)
+            const daemons = await Promise.all(serving.map((id) => deps.registry.getAvailable(orgOf(req), DaemonId(id))))
+            const required = requiredDaemonFeatures({ modelProvider: req.body.modelProvider })
+            if (daemons.some((daemon) => !advertises(daemon?.capabilities.features, required))) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message: 'upgrade the serving daemons before using a provider API key'
+              })
+            }
+          }
+          const selectorRefusal =
+            repositorySelectorRefusal(req.body.repositorySelector) ??
+            coordinatorFilterRefusal(req.body.coordinatorFilter)
+          if (selectorRefusal) return badRequest(reply, selectorRefusal)
+          if (req.body.repositorySelector === null && (await usesDecisionMaterialize(deps, existing.id))) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message:
+                'the repository selector is in use; move every repository and installation marked by decision to another checkout first'
+            })
+          }
+          const executionChoice =
+            req.body.execution !== undefined
+              ? resolveExecution(placementView.strategies, req.body.execution)
+              : undefined
+          if (executionChoice && 'refused' in executionChoice) {
+            return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: executionChoice.refused })
+          }
+          if (req.body.agentDir !== undefined && existing.workspace.mode !== 'git') {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: 'working subdirectory is only available for Git workspaces'
+            })
+          }
+          if (req.body.gitAccess === 'write') {
+            const conflict = (message: string) => reply.code(409).send({ error: 'Conflict', statusCode: 409, message })
+            if (existing.workspace.mode !== 'git' || existing.workspace.credential?.provider !== 'github') {
+              return conflict('write access can only upgrade an existing GitHub App workspace')
+            }
+            if (!deps.github) return conflict('github-app workspaces are not enabled on this control plane')
+
+            const [owner, repo] = gitRepoLabel(existing.workspace.gitRepo).split('/')
+            if (!owner || !repo) return conflict('workspace gitRepo is not a github repository')
+            const installation = await deps.repos.githubInstallation.liveByOrgAndAccount(
+              existing.orgId,
+              owner,
+              existing.githubAppId ?? null
+            )
+            if (!installation || installation.suspendedAt) {
+              return conflict(`no live GitHub installation covers ${owner}`)
+            }
+            try {
+              const ref = await deps.github.repoRefFor(installation, owner, repo)
+              if (!ref || (existing.workspaceRepoId !== undefined && existing.workspaceRepoId !== ref.repoId)) {
+                return conflict('workspace repository is no longer covered by its GitHub installation')
+              }
+              if (deps.githubUserAuthz) {
+                const [canonicalOwner, canonicalRepo] = ref.fullName.split('/')
+                if (!canonicalOwner || !canonicalRepo) {
+                  return conflict('workspace gitRepo is not a github repository')
+                }
+                await deps.githubUserAuthz.assertAccess(
+                  req.principal!.userId,
+                  installation,
+                  canonicalOwner,
+                  canonicalRepo,
+                  'write'
+                )
+              }
+            } catch (e) {
+              if (e instanceof UserAuthzDeniedError) {
+                return reply
+                  .code(403)
+                  .send({ error: 'Forbidden', statusCode: 403, message: `github: ${e.message}`, code: e.code })
+              }
+              if (e instanceof LogtoApiError) {
+                return reply.code(502).send({ error: 'Bad Gateway', statusCode: 502, message: e.message })
+              }
+              if (e instanceof GithubApiError) {
+                const status = e.code === 'RATE_LIMITED' ? 429 : 502
+                return reply.code(status).send({
+                  error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+                  statusCode: status,
+                  message: `github: ${e.message}`
+                })
+              }
+              throw e
+            }
+          }
+          // null clears the list (removal-only) → nothing to gate; only an explicit
+          // array can add a provider.
+          if (Array.isArray(req.body.mcpServers)) {
+            const denied = await enablingUnseenDenied(orgOf(req), ctxOf(req), existing.mcpServers, req.body.mcpServers)
+            if (denied) return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: denied })
+          }
+          if (Array.isArray(req.body.skills)) {
+            const denied = await enablingUnseenSkillDenied(orgOf(req), ctxOf(req), existing.skills, req.body.skills)
+            if (denied) return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: denied })
+          }
+          const managedSkillError = await validateManagedSkills(req.body.managedSkills, orgOf(req))
+          if (managedSkillError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: managedSkillError })
+          }
+          const addsManagedSkill =
+            Array.isArray(req.body.managedSkills) &&
+            req.body.managedSkills.some((id) => !existing.managedSkills.includes(id))
+          if (addsManagedSkill && existing.daemonId) {
+            const daemon = await deps.registry.getAvailable(orgOf(req), existing.daemonId)
+            if (!organizationKnowledgeSupportedOn(daemon)) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message: 'managed skills require a daemon that supports organization knowledge'
+              })
+            }
+          }
+          // The memory home rules (§3.2.1; a member set and assistant mode refuse `daemon`): the friendly refusal here, the authoritative one in the row-locked write (`opts.memoryHome`).
+          const onSet = await placedOnMemberSet(deps, { setId: existing.setId, daemonId: existing.daemonId })
+          const force = req.body.force === true
+          const targetAssistantMode =
+            req.body.assistantMode !== undefined ? req.body.assistantMode : existing.assistantMode
+          // An assistant mode edit carries a `daemon` home to the CP, so it resolves the home even with no `memory`.
+          const memoryHome =
+            req.body.memory !== undefined || req.body.assistantMode !== undefined
+              ? { input: req.body.memory, onSet, force }
+              : undefined
+          const memoryChange = resolveMemoryBindingOnUpdate(
+            existing.memory,
+            req.body.memory,
+            onSet,
+            force,
+            targetAssistantMode?.enabled === true
+          )
+          if (memoryChange.kind === 'refused') {
+            return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: memoryChange.message })
+          }
+          const targetMemory = memoryChange.kind === 'write' ? memoryChange.memory : existing.memory
+          const memoryError = await validateExternalMemoryBinding(targetMemory ?? undefined, orgOf(req))
+          if (memoryError) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: memoryError })
+          }
+          // The friendly admission refusal, with the store and routing checks; the row-locked write re-checks the definition.
+          const targetRuntime = req.body.runtime ?? existing.runtime
+          const changesDefinition =
+            targetRuntime !== existing.runtime ||
+            (targetMemory?.provider ?? 'managed') !== (existing.memory?.provider ?? 'managed')
+          if (assistantModeEditNeedsAdmission(existing.assistantMode, targetAssistantMode, changesDefinition)) {
+            // Routing is checked on the switch-on alone: an agent already on keeps its existing rows (§5.18 ①).
+            const alreadyOn = existing.assistantMode?.enabled === true
+            const admission = await assistantModeAdmissionOf(
+              deps.repos,
+              { ...existing, runtime: targetRuntime, memory: targetMemory },
+              { routing: !alreadyOn }
+            )
+            if (!admission.admitted) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message: assistantModeRefusalMessage(admission.refusals, alreadyOn, admission.conversations),
+                code: ASSISTANT_MODE_NOT_ADMITTED
+              })
+            }
+          }
+          // The row patch and the secret merge commit as ONE transaction (sealing
+          // outside it), so the replicateUpsert below can only ever ship a
+          // definition that fully applied — never a half-updated one. Chained per
+          // submitted MCP provider name (route-level chain, wrapping the whole
+          // transaction) and fenced per submitted skill-ref source name INSIDE
+          // that transaction (the skillSources opts), so the row can't commit
+          // inside a concurrent registry-delete's check→drop window.
+          // `force` and the submitted binding are consumed above; the row gets the resolved binding.
+          const {
+            secrets: plainSecretsPatch,
+            liveSecrets: liveSecretsPatch,
+            force: _force,
+            memory: _memory,
+            execution: _execution,
+            ...bodyPatch
+          } = req.body
+          // One key-by-key merge: a live secret is a row of its own kind (capability-requests.md §4.9.2), never also a plain one.
+          const twice = Object.keys(liveSecretsPatch ?? {}).filter((key) => plainSecretsPatch?.[key] !== undefined)
+          if (twice.length > 0) {
+            return reply.code(400).send({
+              error: 'Bad Request',
+              statusCode: 400,
+              message: `${twice.join(', ')} is named in both secrets and liveSecrets`
+            })
+          }
+          // One name is one row: a live secret never silently becomes a spawn-time one, or the other way round, and a delete names its own kind.
+          if (plainSecretsPatch || liveSecretsPatch) {
+            const spawnKeys = new Set(await secretKeysOf(orgOf(req), req.params.id))
+            const liveKeys = new Set((await liveSecretsOf(orgOf(req), req.params.id)).map((secret) => secret.name))
+            const crossed = [
+              ...Object.keys(liveSecretsPatch ?? {}).filter((key) => spawnKeys.has(key)),
+              ...Object.keys(plainSecretsPatch ?? {}).filter((key) => liveKeys.has(key))
+            ]
+            if (crossed.length > 0) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message: `${crossed.join(', ')} is a secret of the other kind on this agent; change or delete it under ${liveKeys.has(crossed[0]!) ? 'liveSecrets' : 'secrets'}, then save it again`
+              })
+            }
+            // The spec carries at most LIVE_SECRETS_MAX, so a save past it would leave the agent unable to sync.
+            const kept = new Set(liveKeys)
+            for (const [key, live] of Object.entries(liveSecretsPatch ?? {})) {
+              if (live === null) kept.delete(key)
+              else kept.add(key)
+            }
+            if (kept.size > LIVE_SECRETS_MAX) {
+              return reply.code(409).send({
+                error: 'Conflict',
+                statusCode: 409,
+                message: `an agent holds at most ${LIVE_SECRETS_MAX} live secrets; delete one before adding another`
+              })
+            }
+          }
+          const secretsPatch: Record<string, SecretPatchValue> | undefined =
+            plainSecretsPatch || liveSecretsPatch
+              ? {
+                  ...plainSecretsPatch,
+                  ...Object.fromEntries(
+                    Object.entries(liveSecretsPatch ?? {}).map(([key, live]) => [
+                      key,
+                      live === null
+                        ? null
+                        : {
+                            value: live.value,
+                            delivery: 'live' as const,
+                            ...(live.description ? { description: live.description } : {})
+                          }
+                    ])
+                  )
+                }
+              : undefined
+          const skillsFence = skillSourceFenceFor(orgOf(req), ctxOf(req), req.body.skills)
+          // The first switch-on records research's hints (assistant-mode.md §5.15); a lookup that fails records none.
+          const assistantOnboardingHints =
+            existing.assistantMode?.enabled !== true &&
+            req.body.assistantMode?.enabled === true &&
+            !existing.assistantOnboarding
+              ? await onboardingHintsFor(deps, existing, req.principal?.userId).catch((err: unknown) => {
+                  req.log.warn({ err }, 'assistant onboarding hints unavailable')
+                  return undefined
+                })
+              : undefined
+          let agent: AgentRecord
+          try {
+            agent = await withSubmittedMcpProviderChains(
+              orgOf(req),
+              ctxOf(req),
+              req.body.mcpServers,
+              (authorizeMcpServers) =>
+                deps.repos.agentConfig.update(
+                  orgOf(req),
+                  AgentId(req.params.id),
+                  {
+                    ...bodyPatch,
+                    ...(executionChoice ?? {}),
+                    ...(memoryChange.kind === 'write' ? { memory: memoryChange.memory } : {}),
+                    ...(req.principal ? { lastModifiedByUserId: req.principal.userId } : {})
+                  },
+                  secretsPatch,
+                  // Evaluated inside the row-locked transaction, against the same
+                  // committed lists this write merges onto (see the fence helpers).
+                  {
+                    authorizeMcpServers,
+                    ...(skillsFence ? { skillSources: skillsFence } : {}),
+                    ...(memoryHome ? { memoryHome } : {}),
+                    ...(assistantOnboardingHints ? { assistantOnboardingHints } : {})
+                  }
+                )
+            )
+          } catch (e) {
+            if (e instanceof ModelSelectionInvalid) {
+              return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: e.message })
+            }
+            if (e instanceof McpEnableDenied || e instanceof SkillEnableDenied || e instanceof DecisionBindingDenied) {
+              return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: e.message })
+            }
+            // The binding changed under the edit (a forced return, a completion) and the locked resolution refused.
+            if (e instanceof MemoryHomeRefusedError) {
+              return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: e.message })
+            }
+            if (e instanceof AssistantModeAdmissionRefused) {
+              return reply
+                .code(409)
+                .send({ error: 'Conflict', statusCode: 409, message: e.message, code: ASSISTANT_MODE_NOT_ADMITTED })
+            }
+            throw e
+          }
+          await pushExternalMemoryBeforeAgent(agent)
+          await replicateUpsert(agent)
+          // Assistant mode and the coordinator switch fix session modes, projected into every integration's spec; they gate nothing.
+          if (
+            isAssistantModeAgent(existing) !== isAssistantModeAgent(agent) ||
+            !!existing.coordinatorDisabled !== !!agent.coordinatorDisabled
+          ) {
+            await convergeIntegrationGating(deps, agent, req.log)
+          }
+          if ((existing.pause === true) !== (agent.pause === true)) {
+            // Pause decides whether this agent's hooks belong in the relay pool, which nothing else recomputes.
+            await deps.hooks.rebroadcastForAgent(AgentId(agent.id))
+            // The peer directory names a paused agent so other agents' coordinators stop deferring to it; the row is committed, so a failed push only waits for the reconnect snapshot.
+            if (agent.daemonId || agent.setId) {
+              await deps.collabRoutes.broadcast(agent.orgId).catch((err: unknown) => {
+                app.log.warn(
+                  { err, agentId: agent.id, orgId: agent.orgId },
+                  'collaboration routes push failed after pause change (backstop: reconnect snapshot)'
+                )
+              })
+            }
+          }
+          if (req.body.icon !== undefined) {
+            void syncAgentBotIcons(deps, agent, app.log)
+            void deps.gitlab?.accounts.syncAgentAvatars(agent.orgId, agent.id)
+          }
+          await removeUnusedExternalMemoryAfterAgent(existing, agent)
+          // Provision/drop MCP proxy defs for an enable-list change with the placement
+          // unchanged (a daemon move goes through AgentMoveService + reconcile, not
+          // here). The fan-out itself is delivery-set-wide, so an unplaced agent whose
+          // duty holders serve it is still covered.
+          if (agent.daemonId === existing.daemonId) {
+            await syncMcpDefsForAgent(agent, existing.mcpServers, agent.mcpServers)
+          }
+          if (req.body.skills !== undefined) convergeGitlabSkillProjects(agent.orgId, existing.skills, agent.skills)
+          return {
+            ...toDto(
+              agent,
+              ctxOf(req),
+              await secretKeysOf(agent.orgId, agent.id),
+              await integrationMarksOf(deps, agent.id),
+              iconBasesOf(deps),
+              placementView,
+              // A PATCH may also have enrolled the agent into `all` entries added
+              // since its last edit, so re-resolve rather than echoing the request.
+              await organizationEnvironmentOf(agent),
+              await computersOf(agent)
+            ),
+            liveSecrets: await liveSecretsOf(agent.orgId, agent.id)
+          }
+        } catch (e) {
+          if (e instanceof MemoryConnectionBusy) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: 'external memory connection is being updated; retry the edit'
+            })
+          }
+          if (e instanceof MemoryConnectionMissing) {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: e.message })
+          }
+          // The organization-environment fence refused this write inside its
+          // transaction (organization-secrets-and-variables.md §5): either an
+          // agent-local secret would sit beneath an assigned organization variable —
+          // the declassification the design rejects from BOTH write directions — or
+          // the resolved configuration would not fit the wire admission budget. The
+          // message names keys, never values.
+          if (e instanceof OrganizationEnvironmentAdmissionError) {
+            return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: e.message })
+          }
+          throw e
+        } finally {
+          release()
+        }
+      }
+    )
+
+    // Workspace changes use the acknowledged lifecycle rather than generic
+    // PATCH: the daemon drains active work, reconciles the local checkout, and
+    // evicts cached repository credentials before success.
+    r.put(
+      '/agents/:id/workspace',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Edit an agent workspace',
+          description:
+            'Replace a workspace with scratch or a Git repository, or edit its repository, branch, working directory, and read/write access. Who vouches for the repository is derived from the address: a github.com repository covered by an App installation or a managed GitLab project earns managed credentials, a public repository on either host is cloned anonymously (read-only), and any other Git host is cloned anonymously with no preflight. A repository whose owner is covered but which the installation does not grant is refused, since an anonymous clone cannot serve it. An unstated access tier takes the highest the target can carry: write where credentials are minted for it, read for an anonymous checkout. Changing workspace type, repository, or branch discards daemon-local workspace files. The caller must hold the requested host permission. Active work is drained and repository credentials are invalidated before success. Enabled GitHub review or Check actions reject edits that remove their required write authority.',
+          operationId: 'setAgentWorkspace',
+          params: IdParam,
+          body: SetAgentWorkspaceBody,
+          response: {
+            200: AgentDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            429: ErrorDto,
+            502: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        const conflict = (message: string) => reply.code(409).send({ error: 'Conflict', statusCode: 409, message })
+        if (existing.daemonId) {
+          const daemon = await deps.registry.getAvailable(orgOf(req), existing.daemonId)
+          const live = deps.liveness.get(existing.daemonId)
+          if (!daemon || live?.reachable !== true || live.state !== 'READY') {
+            return conflict('the agent must be online and ready to edit its workspace')
+          }
+          if (!daemon.capabilities.features.includes('workspace-edit-v2')) {
+            return conflict('this agent version does not support workspace editing')
+          }
+        }
+
+        try {
+          let workspace: AgentWorkspace = { mode: 'scratch', isolation: 'shared' }
+          let workspaceRepoId: bigint | undefined
+          let derived: DerivedWorkspace | undefined
+          if (req.body.mode === 'git') {
+            // The same derivation the create route runs (git-workspace-model.md §6):
+            // provenance from the address, eligibility from the acting caller.
+            try {
+              derived = await deriveWorkspaceCredential(
+                deps,
+                existing.orgId,
+                req.principal?.userId,
+                req.body.gitRepo,
+                req.body.access,
+                { write: true, githubAppId: existing.githubAppId ?? null }
+              )
+            } catch (e) {
+              if (e instanceof WorkspaceCredentialRefused) return conflict(e.message)
+              throw e // provider/identity errors map in the shared catch below
+            }
+            // §17.3: the daemon that will re-activate a host-vouched workspace must
+            // decode its credential — direct placement or a pool/duty incumbent alike
+            // (the earlier check only proves workspace-edit-v2).
+            const vouching = derived.kind === 'anonymous' ? null : codeHosts[derived.kind]
+            const vouchingFeatures = vouching ? vouching.features.required(vouching.features.deploymentHost(deps)) : []
+            if (vouching && vouchingFeatures.length > 0) {
+              const servingId = (await deps.placementResolver.servingDaemon(existing)) ?? existing.daemonId
+              if (servingId) {
+                const serving = await deps.registry.getAvailable(existing.orgId, servingId)
+                if (!advertises(serving?.capabilities.features, vouchingFeatures)) {
+                  return conflict(
+                    `the serving daemon does not support ${vouching.displayName} workspaces yet — upgrade it first`
+                  )
+                }
+              }
+            }
+            const worktree =
+              req.body.worktree ??
+              (existing.workspace.mode !== 'scratch' ? existing.workspace.isolation === 'session' : true)
+            const built = workspaceFromDerived(codeHosts, derived, {
+              isolation: worktree ? 'session' : 'shared',
+              ...(req.body.gitBranch !== undefined ? { gitBranch: req.body.gitBranch } : {}),
+              ...(req.body.agentDir ? { agentDir: req.body.agentDir } : {})
+            })
+            workspace = built.workspace
+            workspaceRepoId = built.workspaceRepoId
+          }
+
+          const writableRepoId =
+            workspace.mode === 'git' &&
+            workspace.credential?.provider === 'github' &&
+            workspace.credential.access === 'write'
+              ? workspaceRepoId
+              : undefined
+          const affectedRepoIds = new Set(
+            [existing.workspaceRepoId, workspaceRepoId].filter((repoId): repoId is bigint => repoId !== undefined)
+          )
+          const currentRepoName =
+            existing.workspace.mode === 'git' ? gitRepoLabel(existing.workspace.gitRepo).toLowerCase() : undefined
+          const blocking = (await deps.repos.hook.listForAgent(existing.id)).some((hook) => {
+            if (
+              hook.kind !== 'github' ||
+              !hook.enabled ||
+              (hook.reviewPolicy === 'off' && hook.reportingMode === 'off') ||
+              hook.repoId === writableRepoId
+            ) {
+              return false
+            }
+            return (
+              (hook.repoId !== null && affectedRepoIds.has(hook.repoId)) ||
+              (existing.workspaceRepoId === undefined && hook.repoFullName?.toLowerCase() === currentRepoName)
+            )
+          })
+          if (blocking) {
+            return conflict(AGENT_WORKSPACE_INTEGRATION_CONFLICT_MESSAGE)
+          }
+
+          // §7.2 BEFORE activation: the daemon prepares the workspace by minting
+          // credentials from this agent's OWN GitLab account, so the account,
+          // its membership, and its PATs must already exist. A post-write kick
+          // cannot serve this — activation would be refused, the edit would roll
+          // back, and the agent would never become the consumer that convergence
+          // needs a reason to provision for.
+          // A gitlab clone URL is read from the catalog BEFORE the lease, and the
+          // lease's own project read converges every replicated path. Taking the
+          // live answer keeps this write from putting the stale one back.
+          const applyWorkspace = (live?: GitlabLiveProject): Promise<AgentRecord> =>
+            agentMoves.setWorkspace(
+              existing,
+              live?.cloneUrl && workspace.mode === 'git' && derived?.kind === 'gitlab'
+                ? { ...workspace, gitRepo: live.cloneUrl }
+                : workspace,
+              workspaceRepoId,
+              req.principal?.userId
+            )
+          let converted: AgentRecord
+          if (derived?.kind === 'gitlab' && workspaceRepoId !== undefined && deps.gitlab) {
+            let applied
+            try {
+              // The edit itself runs under the binding lease this takes, so the
+              // membership and the workspace row that authorizes it commit
+              // together as far as convergence can see.
+              applied = await deps.gitlab.provisioner.provisionAgentAccount(
+                existing.orgId,
+                workspaceRepoId,
+                { agentId: existing.id, accessLevel: gitlabWorkspaceAccessLevel(derived.access) },
+                applyWorkspace
+              )
+            } catch (err) {
+              // The edit rolled back, so the membership just bound belongs to an
+              // agent that does not consume the project: converge it away.
+              convergeWorkspaceRepositories(existing.orgId, [{ workspace, workspaceRepoId }])
+              throw err
+            }
+            if (!applied.ok) return conflict(gitlabAccountUnavailableMessage(applied.reason))
+            converted = applied.result
+          } else {
+            converted = await applyWorkspace()
+          }
+          convergeWorkspaceRepositories(converted.orgId, [converted, existing])
+          return toDto(
+            converted,
+            ctxOf(req),
+            await secretKeysOf(converted.orgId, converted.id),
+            await integrationMarksOf(deps, converted.id),
+            iconBasesOf(deps),
+            await placementViewFor(deps, converted),
+            await organizationEnvironmentOf(converted),
+            await computersOf(converted)
+          )
+        } catch (err) {
+          if (err instanceof AgentMoveConflict) return conflict(err.message)
+          if (err instanceof AgentMoveFailed) {
+            app.log.warn({ err, agentId: existing.id }, 'workspace edit failed')
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: err.message })
+          }
+          if (err instanceof UserAuthzDeniedError) {
+            return reply
+              .code(403)
+              .send({ error: 'Forbidden', statusCode: 403, message: `github: ${err.message}`, code: err.code })
+          }
+          if (err instanceof LogtoApiError) {
+            return reply.code(502).send({ error: 'Bad Gateway', statusCode: 502, message: err.message })
+          }
+          if (err instanceof GithubApiError) {
+            const status = err.code === 'RATE_LIMITED' ? 429 : 502
+            return reply.code(status).send({
+              error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+              statusCode: status,
+              message: `github: ${err.message}`
+            })
+          }
+          if (err instanceof GitlabApiError) {
+            const status = err.code === 'RATE_LIMITED' ? 429 : 502
+            return reply.code(status).send({
+              error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+              statusCode: status,
+              message: `gitlab: ${err.message}`
+            })
+          }
+          if (err instanceof GiteaApiError || err instanceof AzureDevOpsApiError) {
+            const status = err.code === 'RATE_LIMITED' ? 429 : 502
+            const host = err instanceof GiteaApiError ? 'gitea' : 'azure devops'
+            return reply.code(status).send({
+              error: status === 429 ? 'Too Many Requests' : 'Bad Gateway',
+              statusCode: status,
+              message: `${host}: ${err.message}`
+            })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Hard-cut an agent over to another daemon. The explicit action keeps
+    // destructive/local-state semantics out of generic spec PATCH. A safe move
+    // requires both source and target READY; an explicit force reassign may
+    // bypass only the unavailable source ACK. The target always receives the
+    // complete CP-owned definition and activates last.
+    r.put(
+      '/agents/:id/daemon',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Move an agent to another daemon',
+          description:
+            'Hard-cut an agent over to another READY daemon. Active source turns are cancelled without a final reply, and subsequent messages start fresh on the target; force is an explicit disaster-recovery option when the source is unavailable. Daemon-local workspace, memory, and transcript data are not migrated or replayed; managed memory follows the agent only when its home is the Control Plane, and an agent whose memory home is the daemon is refused a move onto a group or the managed pool (409) until the home is switched — except an unplaced agent, which has no tree to lose and is switched to the Control Plane home in the move itself.',
+          operationId: 'moveAgentDaemon',
+          params: IdParam,
+          body: SetAgentDaemonBody,
+          response: { 200: AgentDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+
+        const conflict = (message: string) => reply.code(409).send({ error: 'Conflict', statusCode: 409, message })
+        const force = req.body.force === true
+        const wantsSet = req.body.placementKind === 'pool' || req.body.placementKind === 'set'
+        const targetSetId = wantsSet ? await resolveTargetSetId(deps, orgOf(req), req.body) : null
+        if (wantsSet && targetSetId === null) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'member set not found' })
+        }
+        const moveReady = (daemonId: string) => {
+          const live = deps.liveness.get(daemonId)
+          return live?.reachable === true && live.state === 'READY'
+        }
+        const MOVE_FEATURE = 'agent-move-v1'
+
+        // The daemons the target admits. A `daemon` target is one machine and every check below
+        // is about that machine. A `set` target names a member set, and the CP does not get to
+        // choose which member serves the agent — so the checks are evaluated against the UNION of
+        // its live members: the target is admissible when SOME live member could serve this agent
+        // today. Pool members are one Deployment of one image, so union and intersection differ
+        // only mid-rollout, and there the ledger's install-on-grant refusal is the backstop that
+        // keeps a member from holding what it cannot install.
+        const candidates = targetSetId
+          ? await (async () => {
+              const memberIds = new Set(await deps.repos.memberSet.memberIdsOf(targetSetId))
+              return (await deps.registry.listAvailable(orgOf(req))).filter(
+                (d) => memberIds.has(d.daemonId) && moveReady(d.daemonId) && canView(d, ctxOf(req))
+              )
+            })()
+          : await (async () => {
+              const one = await deps.registry.getAvailable(orgOf(req), DaemonId(req.body.daemonId!))
+              return one && canView(one, ctxOf(req)) ? [one] : []
+            })()
+        if (candidates.length === 0) {
+          if (!wantsSet) {
+            return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'daemon not found' })
+          }
+          return conflict('no daemon in the target member set is ready')
+        }
+
+        // Deferred exec config (preset-agents.md §3.2): placement is where a
+        // runtime becomes mandatory — an unplaced preset carries none until the
+        // user (or M1 auto-placement) chooses one.
+        if (!existing.runtime) {
+          return conflict('agent has no runtime yet — set a runtime before placing it on a daemon')
+        }
+
+        const placement = placementTargetOf(existing)
+        const samePlacementTarget = targetSetId
+          ? placement.kind === 'set' && placement.setId === targetSetId
+          : placement.kind === 'daemon' && placement.daemonId === req.body.daemonId
+
+        // A daemon-home tree cannot follow onto a member set (§3.2.1); a same-target retry is no move, and an unplaced agent has no tree, so the move's write switches its home.
+        const ontoSet =
+          !samePlacementTarget &&
+          (await placedOnMemberSet(deps, { setId: targetSetId, daemonId: targetSetId ? undefined : req.body.daemonId }))
+        const homeOnMove = resolveMemoryHomeOnMove(existing.memory, ontoSet, placement.kind === 'unplaced')
+        if (homeOnMove === 'refuse') return conflict(SET_MOVE_NEEDS_CP_HOME)
+        const moveOpts: AgentMoveOpts | undefined =
+          homeOnMove === 'switch' ? { memoryHome: 'control-plane' } : undefined
+
+        // The org registry rows the agent enables — read once for every candidate's facts check
+        // below, then staged on the target.
+        const registryProviders = await registryProvidersOf(existing.orgId, existing.mcpServers)
+        const registryTransport = new Map(registryProviders.map((p) => [p.name, p.transport] as const))
+
+        /** Why this daemon cannot take the agent, or null when it can. */
+        const admits = async (daemon: DaemonView): Promise<string | null> => {
+          if (!moveReady(daemon.daemonId)) return 'target daemon is not ready'
+          if (!daemon.capabilities.features.includes(MOVE_FEATURE)) return 'target daemon does not support agent moves'
+          if (existing.managedSkills.length > 0 && !organizationKnowledgeSupportedOn(daemon)) {
+            return 'target daemon does not support organization knowledge managed skills'
+          }
+          // Rollout gate (organization-secrets-and-variables.md §10 step 3): an agent
+          // bound to an organization entry receives FULL resolved env/secret maps, and
+          // that is only safe on a daemon that persists `configRevision` and refuses an
+          // older snapshot. An unplaced bound agent may be saved; placing it requires
+          // the feature. Deliberately not "old daemons ignore the optional field" — a
+          // late-completing older snapshot there would reinstate a rotated value.
+          if ((await organizationEnvironmentBindingCount(existing)) > 0 && !configRevisionSupportedOn(daemon)) {
+            return 'target daemon does not yet support organization variables and secrets, which this agent is assigned; upgrade it first'
+          }
+          const targetRuntime = daemon.runtimeProfiles.find((p) => p.runtime === existing.runtime)
+          if (daemon.runtimeProfiles.length > 0 && !targetRuntime) {
+            return `target daemon does not support runtime ${existing.runtime}`
+          }
+          // A 'cached' model list (hydrated from the daemon's last-good cache, not
+          // confirmed by a live probe this process) is permissive exactly like an
+          // empty one — only a probed list enforces membership, so a daemon that
+          // restarted mid-upgrade never strands a move on a stale hydrated list
+          // (runtime-model-catalog.md §5).
+          if (
+            existing.model &&
+            targetRuntime &&
+            targetRuntime.modelsSource !== 'cached' &&
+            targetRuntime.models.length > 0 &&
+            !targetRuntime.models.includes(existing.model)
+          ) {
+            return `target daemon does not support model ${existing.model} for runtime ${existing.runtime}`
+          }
+          for (const name of existing.mcpServers) {
+            // The CP pushes a registry def only to daemons already serving an enabling agent, so
+            // "the target holds no such fact yet" is not "it cannot attach it" — reading that as a
+            // refusal pinned every connector-using agent to its daemon (#1192). The move stages the
+            // def; only a daemon-LOCAL name (the operator's `config.json`) is genuinely host-bound.
+            const transport =
+              daemon.mcpServers.find((candidate) => candidate.name === name)?.transport ?? registryTransport.get(name)
+            if (!transport) return `target daemon cannot attach MCP server ${name}`
+            const caps = targetRuntime?.mcpCapabilities
+            const transportSupported = transport === 'stdio' || !caps || (transport === 'http' ? caps.http : caps.sse)
+            if (!transportSupported) {
+              return `target runtime ${existing.runtime} does not support MCP ${transport} transport for ${name}`
+            }
+          }
+          // Capacity is a per-member fact even on a set: "some member has headroom" is exactly
+          // the condition the ledger's own headroom gate applies when it hands out the duty.
+          if (!samePlacementTarget && daemon.load && daemon.maxAgents > 0 && daemon.load.agents >= daemon.maxAgents) {
+            return 'target daemon is at agent capacity'
+          }
+          return null
+        }
+
+        // First admitting candidate wins; a set target refuses only when EVERY live member
+        // refuses, and then it reports the first member's reason rather than inventing one.
+        let target: DaemonView | undefined
+        let refusal: string | null = null
+        for (const candidate of candidates) {
+          const why = await admits(candidate)
+          if (why === null) {
+            target = candidate
+            break
+          }
+          refusal ??= why
+        }
+        if (!target) return conflict(refusal ?? 'no daemon can take this agent')
+
+        const moveTarget: PlacementTarget = targetSetId
+          ? onSet(targetSetId)
+          : { kind: 'daemon', daemonId: target.daemonId }
+
+        // A same-target retry is an idempotent repair after placement already
+        // committed, not a second handoff. Target admission above still applies,
+        // but there is no separate source to gate before ensureActive below.
+        if (!samePlacementTarget) {
+          // Every member serving the agent today has to quiesce — for a set source that is the
+          // duty holder, not a placement, and there may be none at all.
+          const sourceDaemonIds = await deps.placementResolver.servingDaemons(existing)
+          if (sourceDaemonIds.length > 0) {
+            for (const sourceDaemonId of sourceDaemonIds) {
+              const source = await deps.registry.getAvailable(orgOf(req), DaemonId(sourceDaemonId))
+              const sourceLive = source ? deps.liveness.get(source.daemonId) : undefined
+              const sourceReady = sourceLive?.reachable === true && sourceLive.state === 'READY'
+              if (force) {
+                if (sourceReady) return conflict('source daemon is ready; use a safe move')
+                if (sourceLive?.reachable === true) {
+                  return conflict('source daemon is reconnecting; wait until it is ready')
+                }
+              } else {
+                if (!source || !moveReady(source.daemonId)) return conflict('source daemon is not ready')
+                if (!source.capabilities.features.includes(MOVE_FEATURE)) {
+                  return conflict('source daemon does not support agent moves')
+                }
+              }
+            }
+          } else if (force) {
+            return conflict('force reassign requires an unavailable source daemon')
+          }
+        }
+
+        try {
+          // Retry/repair: the prior response may have been lost, or a failed move
+          // may have left DB placement on a partially bootstrapped target. Reapply
+          // the full bundle + activate; all operations are idempotent.
+          if (samePlacementTarget) {
+            try {
+              const repaired = await agentMoves.ensureActive(existing)
+              return toDto(
+                repaired,
+                ctxOf(req),
+                await secretKeysOf(repaired.orgId, repaired.id),
+                await integrationMarksOf(deps, repaired.id),
+                iconBasesOf(deps),
+                placementViewOf(deps, target),
+                await organizationEnvironmentOf(repaired),
+                await computersOf(repaired)
+              )
+            } catch (err) {
+              if (err instanceof AgentMoveConflict) return conflict(err.message)
+              if (err instanceof AgentMoveFailed) {
+                app.log.warn({ err, agentId: existing.id }, 'agent move repair failed')
+                return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: err.message })
+              }
+              const refusedRepair = placementRefusalMessage(err)
+              if (refusedRepair) return conflict(refusedRepair)
+              throw err
+            }
+          }
+
+          if (force) {
+            req.log.warn(
+              {
+                agentId: existing.id,
+                sourcePlacement: placementLabel(placement),
+                targetPlacement: placementLabel(moveTarget),
+                userId: req.principal?.userId
+              },
+              'agent force reassign requested while source daemon is unavailable'
+            )
+          }
+          const moved = force
+            ? await agentMoves.forceReassign(existing, moveTarget, req.principal?.userId)
+            : await agentMoves.move(existing, moveTarget, req.principal?.userId, moveOpts)
+          if (existing.daemonId && existing.memory?.provider === 'external') {
+            await removeExternalMemoryFromDaemonIfUnused(
+              existing.orgId,
+              existing.daemonId,
+              existing.memory.connectionId
+            )
+          }
+          if (existing.daemonId) await dropMcpDefsIfUnused(existing.orgId, registryProviders, [existing.daemonId])
+          return toDto(
+            moved,
+            ctxOf(req),
+            await secretKeysOf(moved.orgId, moved.id),
+            await integrationMarksOf(deps, moved.id),
+            iconBasesOf(deps),
+            placementViewOf(deps, target),
+            await organizationEnvironmentOf(moved),
+            await computersOf(moved)
+          )
+        } catch (err) {
+          if (err instanceof AgentMoveConflict) return conflict(err.message)
+          if (err instanceof AgentMoveFailed) {
+            app.log.warn({ err, agentId: existing.id }, 'agent move failed')
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: err.message })
+          }
+          const refusedMove = placementRefusalMessage(err)
+          if (refusedMove) return conflict(refusedMove)
+          throw err
+        } finally {
+          // Keep definitions still in use; a postcommit activation failure may have delivered them before rollback.
+          if (existing.memory?.provider === 'external') {
+            await removeExternalMemoryFromDaemonIfUnused(existing.orgId, target.daemonId, existing.memory.connectionId)
+          }
+          // Same usage re-read for the staged MCP defs: an authoritative target keeps them.
+          await dropMcpDefsIfUnused(existing.orgId, registryProviders, [target.daemonId])
+        }
+      }
+    )
+
+    // Delete the agent. Removes the C6 definition (including agent-owned hooks),
+    // then tells the owning daemon to drop it from its local replica
+    // (`agent/remove`, best-effort).
+    r.delete(
+      '/agents/:id',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Delete an agent',
+          description:
+            'Remove the agent definition and its hooks, then tell the owning daemon to drop it from its local replica (best-effort).',
+          operationId: 'deleteAgent',
+          params: IdParam,
+          response: { 204: z.null(), 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        // Built-in preset agents are permanent org fixtures (preset-agents.md §3):
+        // deletion is refused on every surface (console, REST, MCP all land here).
+        if (existing.builtin) {
+          return reply
+            .code(403)
+            .send({ error: 'Forbidden', statusCode: 403, message: 'built-in agent cannot be deleted' })
+        }
+        const release = deps.agentMutations.tryBeginMutation(existing.id)
+        if (!release) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'agent move is in progress; retry the delete' })
+        }
+        // External-memory fencing (advisory try-lock on the committed binding's
+        // connection) happens inside the delete transaction (PgAgentRepo);
+        // MemoryConnectionBusy surfaces in the catch below.
+        try {
+          const current = await refreshMutationAgent(existing)
+          if (!current) {
+            return reply
+              .code(409)
+              .send({ error: 'Conflict', statusCode: 409, message: 'agent changed; refresh and retry the delete' })
+          }
+          // AgentRepo holds the shared agent lifecycle lock while it captures
+          // every HookDef, tombstones their durable review projections, and
+          // cascades the Agent/HookDef rows in one transaction.
+          const removedHooks = await deps.repos.agent.delete(orgOf(req), AgentId(req.params.id))
+          // WITHDRAW it from the peer directory now, the mirror of the create path above.
+          // Discovery (`channel/agents`) reads the DB live while a peer WAKE is authorized
+          // against the pushed snapshot, so without this every daemon in the org keeps a flat
+          // `agents[]` entry whose `admits()` still says yes — a wake routed at a row that no
+          // longer exists. Gated on placement for the same reason as the create: an unplaced
+          // agent was never in a snapshot, so there is nothing to withdraw and no reason to
+          // churn every routingEpoch. Best-effort — the row is already gone, and `register/ok`
+          // carries the corrected directory as the reconnect backstop.
+          if (current.daemonId) {
+            try {
+              await deps.collabRoutes.broadcast(current.orgId)
+            } catch (err) {
+              app.log.warn(
+                { err, agentId: current.id, orgId: current.orgId },
+                'collaboration routes push failed after agent delete (backstop: reconnect snapshot)'
+              )
+            }
+          }
+          await replicateRemove(current, current.orgId)
+          // AFTER the fan-out: `remove` resolves holders from the membership rows
+          // the reap deletes, and the agent row this reads by is already gone.
+          deps.recomputeDuties?.(current.orgId)
+          if (current.daemonId && current.memory?.provider === 'external') {
+            await removeExternalMemoryFromDaemonIfUnused(current.orgId, current.daemonId, current.memory.connectionId)
+          }
+          convergeWorkspaceRepositories(current.orgId, [current])
+          for (const h of removedHooks) deps.hooks.remove(h.id)
+          // The cascade wrote no hook row, so the routed scopes these left are re-hosted and their hosts bumped here.
+          void deps.hookRouting
+            .reconcileHooks(removedHooks, { membersChanged: true })
+            .catch((err) =>
+              app.log.warn({ err, agentId: current.id }, 'hook routing reconcile after agent delete failed')
+            )
+          // A code-host hook that left with the agent no longer wants ingress: its host narrows the managed webhook to what remains.
+          for (const h of removedHooks) {
+            if (!isCodeHostHookKind(h.kind)) continue
+            codeHosts[h.kind].hooks.convergeManagedRepository(deps, current.orgId, h.repoId, (err) =>
+              app.log.warn({ err, hookId: h.id }, `${h.kind} webhook converge after agent delete failed`)
+            )
+          }
+          // §19.4: the agent's GitLab accounts retire — memberships removed,
+          // PATs revoked, accounts deleted. Best-effort here; an account whose
+          // external cleanup fails stays `cleanup_pending` for a repair.
+          if (deps.gitlab) {
+            void deps.gitlab.accounts
+              .retireAgentAccounts(current.orgId, current.id)
+              .catch((err) => app.log.warn({ err, agentId: current.id }, 'gitlab account retirement failed'))
+          }
+          return reply.code(204).send(null)
+        } catch (e) {
+          if (e instanceof MemoryConnectionBusy) {
+            return reply.code(409).send({
+              error: 'Conflict',
+              statusCode: 409,
+              message: 'external memory connection is being updated; retry the delete'
+            })
+          }
+          throw e
+        } finally {
+          release()
+        }
+      }
+    )
+
+    // Set who can see this agent (visibility + complete Selected audience).
+    // Gated exactly like a content edit (§13.3): viewers can't, and a
+    // collaborator who can't view a restricted agent 404s. Identities never
+    // ride the wire, but the DERIVED conversation-gating flag does (§14/§9): a
+    // visibility flip re-converges every integration of the agent — direct installs
+    // get a fresh spec push, HTTP bots a route recompile — best-effort, with the
+    // reconcile roster as the durable backstop.
+    r.put(
+      '/agents/:id/sharing',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Set agent sharing',
+          description:
+            'Set an agent’s visibility (Everyone vs Selected) and complete Selected audience. Requires edit rights; Selected must retain at least one current organization member, and sharedWith is intersected with current membership.',
+          operationId: 'setAgentSharing',
+          params: IdParam,
+          body: SetSharingBody,
+          response: { 200: AgentDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canManageSharing(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot change sharing' })
+        }
+        const release = deps.agentMutations.tryBeginMutation(existing.id)
+        if (!release) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'agent move is in progress; retry the edit' })
+        }
+        try {
+          if (!(await refreshMutationAgent(existing))) {
+            return reply
+              .code(409)
+              .send({ error: 'Conflict', statusCode: 409, message: 'agent changed; refresh and retry the edit' })
+          }
+          const sharedWith = await resolveShareSet(deps.repos.user, orgOf(req), req.body.sharedWith)
+          const agent = await deps.repos.agent.setSharing(
+            orgOf(req),
+            AgentId(req.params.id),
+            { visibility: req.body.visibility, sharedWith },
+            req.principal?.userId
+          )
+          if (agent.visibility !== existing.visibility) {
+            await convergeIntegrationGating(deps, agent, req.log)
+          }
+          // §14.8: an audience that GAINED members may authorize DMs those members
+          // already have open with this agent. The diff, never the whole audience — a
+          // later edit must not reassert the default over an editor's own Off.
+          // Best-effort: the sharing write has landed, and a failure leaves those rows
+          // Off, which is where they already were.
+          const gained = agent.sharedWith.filter((id) => !existing.sharedWith.includes(id))
+          await reconcileAgentLinkedDms(agent, gained, {
+            users: deps.repos.user,
+            orgs: deps.repos.org,
+            agents: deps.repos.agent,
+            integrations: deps.repos.integration,
+            bots: deps.repos.bot,
+            channels: deps.repos.integrationChannel,
+            ...(deps.logtoIdentity ? { identity: deps.logtoIdentity } : {}),
+            push: (target) => convergeIntegrationGating(deps, target, req.log),
+            log: req.log
+          }).catch((err: unknown) => req.log.warn({ err, agentId: agent.id }, 'gated DM: sharing catch-up failed'))
+          return toDto(
+            agent,
+            ctxOf(req),
+            await secretKeysOf(agent.orgId, agent.id),
+            await integrationMarksOf(deps, agent.id),
+            iconBasesOf(deps),
+            await placementViewFor(deps, agent),
+            await organizationEnvironmentOf(agent),
+            await computersOf(agent)
+          )
+        } finally {
+          release()
+        }
+      }
+    )
+
+    r.put(
+      '/agents/:id/call-policy',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Set directional agent visibility',
+          description:
+            'Set which peer agents may call this agent and which peers this agent may discover or call. Effective access requires both directions to allow it. Requires edit rights; allow-lists are intersected with visible same-org peer agents.',
+          operationId: 'setAgentCallPolicy',
+          params: IdParam,
+          body: SetAgentCallPolicyBody,
+          response: { 200: AgentDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const existing = await getOrgAgent(req, req.params.id)
+        if (!existing) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(existing, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        const release = deps.agentMutations.tryBeginMutation(existing.id)
+        if (!release) {
+          return reply
+            .code(409)
+            .send({ error: 'Conflict', statusCode: 409, message: 'agent move is in progress; retry the edit' })
+        }
+        try {
+          const current = await refreshMutationAgent(existing)
+          if (!current) {
+            return reply
+              .code(409)
+              .send({ error: 'Conflict', statusCode: 409, message: 'agent changed; refresh and retry the edit' })
+          }
+          const allowedCallerAgentIds =
+            req.body.callPolicy === 'selected'
+              ? await resolvePolicyAgentIds(
+                  req,
+                  req.params.id,
+                  req.body.allowedCallerAgentIds,
+                  current.allowedCallerAgentIds
+                )
+              : []
+          const outboundPolicy = req.body.outboundPolicy ?? current.outboundPolicy
+          const requestedTargetAgentIds =
+            req.body.allowedTargetAgentIds ??
+            (req.body.outboundPolicy === undefined ? current.allowedTargetAgentIds : [])
+          const allowedTargetAgentIds =
+            outboundPolicy === 'selected'
+              ? await resolvePolicyAgentIds(req, req.params.id, requestedTargetAgentIds, current.allowedTargetAgentIds)
+              : []
+          const agent = await deps.repos.agent.setCallPolicy(
+            orgOf(req),
+            AgentId(req.params.id),
+            {
+              callPolicy: req.body.callPolicy,
+              allowedCallerAgentIds,
+              outboundPolicy,
+              allowedTargetAgentIds
+            },
+            req.principal?.userId
+          )
+          // Push both policy replicas immediately: AgentSpec serves same-daemon
+          // authorization; the collaboration snapshot serves directory/relay/target
+          // authorization. Reconnect reconciliation remains the offline backstop.
+          await Promise.all([replicateUpsert(agent), deps.collabRoutes.broadcast(agent.orgId)])
+          return toDto(
+            agent,
+            ctxOf(req),
+            await secretKeysOf(agent.orgId, agent.id),
+            await integrationMarksOf(deps, agent.id),
+            iconBasesOf(deps),
+            await placementViewFor(deps, agent),
+            await organizationEnvironmentOf(agent),
+            await computersOf(agent)
+          )
+        } finally {
+          release()
+        }
+      }
+    )
+
+    // Workspace browser: proxy one directory page live from the owning daemon.
+    // The CP stores NO workspace data (body-locality §1/§12) — a missing dir is
+    // data (`exists:false`), not an error. 503 when unplaced/daemon offline.
+    r.get(
+      '/agents/:id/workspace/files',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'List workspace files',
+          description:
+            'Proxy one directory page live from the owning daemon. Pass sessionId to browse an authorized isolated session worktree; a missing directory is data (exists:false), not an error. 503 when unplaced or the daemon is offline. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'listAgentWorkspaceFiles',
+          params: IdParam,
+          querystring: WorkspaceFilesQueryDto,
+          response: { 200: WorkspaceFilesDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await canReadWorkspaceScope(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, req.query.sessionId))) return
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const page = await deps.control.workspaceList(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            path: req.query.path ?? '',
+            ...(req.query.cursor !== undefined ? { cursor: req.query.cursor } : {}),
+            limit: req.query.limit ?? 200
+          })
+          return toWorkspaceFilesDto(page)
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Local skill inventory: proxy the skills the agent's materialized workspace
+    // can load, tagged by origin (dream-accepted / managed / git-source / repo).
+    // This is the one place the console surfaces accepted Dream skills and
+    // repo-committed skills, which otherwise have no post-install UI.
+    r.get(
+      '/agents/:id/skills/local',
+      {
+        schema: {
+          tags: [Tag.Skills],
+          summary: 'List an agent’s local skills',
+          description:
+            'Proxy the skills the agent’s materialized workspace can load live from the owning daemon, each tagged by origin (dream-accepted, managed, git-source, or repo-committed). `materialized:false` means the workspace has not been prepared yet, so the empty list is "unknown", not "no skills". 503 when unplaced or the daemon is offline.',
+          operationId: 'listAgentLocalSkills',
+          params: IdParam,
+          response: { 200: LocalSkillsDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return await deps.control.listLocalSkills(agent.daemonId, { agentId: agent.id })
+        } catch (err) {
+          const unavailable = daemonEdgeFailure(err)
+          if (unavailable !== null) {
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Runtime slash commands: what the agent's ACP runtime advertised it can be
+    // asked to run. Unlike skills/local this is the runtime's own answer, so it
+    // covers user/plugin skills and built-ins a workspace scan never sees.
+    r.get(
+      '/agents/:id/commands',
+      {
+        schema: {
+          tags: [Tag.Skills],
+          summary: 'List an agent’s runtime slash commands',
+          description:
+            'Proxy the slash commands the agent’s ACP runtime last advertised (`available_commands_update`) live from the owning daemon — skills, plugin skills and the harness’s own built-ins in one list, each with the runtime’s description and optional argument hint. `reported:false` means no session has advertised a list yet, so the empty list is "unknown", not "no commands". 409 when the daemon predates this read, 503 when unplaced or offline.',
+          operationId: 'listAgentRuntimeCommands',
+          params: IdParam,
+          response: { 200: RuntimeCommandsDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        // Version skew: an older daemon drops the frame silently, so refuse before sending it.
+        const supported = await requireDaemonFeature(
+          reply,
+          agent.orgId,
+          agent.daemonId,
+          RUNTIME_COMMANDS_FEATURE,
+          'this agent version does not report its runtime commands; upgrade its daemon'
+        )
+        if (!supported) return reply
+        try {
+          return await deps.control.listRuntimeCommands(agent.daemonId, { agentId: agent.id })
+        } catch (err) {
+          const unavailable = daemonEdgeFailure(err)
+          if (unavailable !== null) {
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Workspace file view: proxy one byte slice live from the owning daemon
+    // (64 KiB default; the UI pages with `offset` while `truncated`). A missing
+    // file is data (`exists:false`); binary files come back `encoding:'none'`.
+    r.get(
+      '/agents/:id/workspace/file',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Read a workspace file',
+          description:
+            'Proxy one byte slice of a file live from the owning daemon (64 KiB default; page with offset while truncated). Pass sessionId to read an authorized isolated session worktree. A missing file is data (exists:false); binary files come back encoding:none. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'readAgentWorkspaceFile',
+          params: IdParam,
+          querystring: WorkspaceFileQueryDto,
+          response: { 200: WorkspaceFileDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await canReadWorkspaceScope(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, req.query.sessionId))) return
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const rep = await deps.control.workspaceRead(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            path: req.query.path,
+            offset: req.query.offset ?? 0,
+            limit: req.query.limit ?? 65536
+          })
+          return toWorkspaceFileDto(rep)
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // A workspace file's scope as a read resolves it: an isolated session's worktree, a repo root, or the checkout.
+    // null ⇒ the route already answered; a shared session addresses the checkout, as the daemon lands its files there.
+    const workspaceFileScope = async (
+      req: FastifyRequest,
+      reply: FastifyReply,
+      agent: AgentRecord,
+      query: { sessionId?: string | undefined; repo?: string | undefined }
+    ): Promise<{ daemonId: DaemonId; sessionId?: string; repo?: string } | null> => {
+      let sessionId: string | undefined
+      if (query.sessionId) {
+        const session = await visibleAgentSession(req, agent.id, query.sessionId)
+        if (!session) {
+          reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'session not found' })
+          return null
+        }
+        if (session.workspaceIsolation === 'session') sessionId = query.sessionId
+      }
+      if (!(await canReadWorkspaceRepoScope(agent, query.repo))) {
+        reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        return null
+      }
+      if (!agent.daemonId) {
+        reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        return null
+      }
+      const daemonId = agent.daemonId
+      if (!(await requireSessionWorkspaceRead(reply, agent.orgId, daemonId, sessionId))) return null
+      if (!(await requireRepoScope(reply, agent.orgId, daemonId, query.repo))) return null
+      return { daemonId, ...(sessionId ? { sessionId } : {}), ...(query.repo ? { repo: query.repo } : {}) }
+    }
+
+    // Workspace file download: any file in the workspace, assembled from daemon byte slices and never stored.
+    r.get(
+      '/agents/:id/workspace/file/download',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Download a workspace file',
+          description:
+            'Return the original bytes of one workspace file as an attachment. Pass sessionId to read a visible session’s working root — its isolated worktree, or the agent’s checkout when the session shares it — and repo (owner/repo) for one of the agent’s authorized additional repositories; omit both for the agent’s primary workspace. Containment, the .git rule and symlink refusal are the workspace read’s. Pass sha256, the digest prefix a shared file’s transcript marker records, to require the bytes still match it (409 WORKSPACE_FILE_CHANGED otherwise). The control plane assembles the file from bounded byte slices it proxies live from the owning daemon and stores none of it; a file over the download ceiling is refused with 413 WORKSPACE_FILE_TOO_LARGE — use the transfer route for those. 409 when the daemon or the agent’s sandbox is too old to serve bytes, 503 when the agent is unplaced or its daemon is offline.',
+          operationId: 'downloadAgentSessionFile',
+          params: IdParam,
+          querystring: WorkspaceDownloadQueryDto,
+          response: {
+            200: WorkspaceDownloadBody,
+            400: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            413: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const scope = await workspaceFileScope(req, reply, agent, req.query)
+        if (!scope) return reply
+        const { daemonId, ...target } = scope
+        const downloads = await requireDaemonFeature(
+          reply,
+          agent.orgId,
+          daemonId,
+          WORKSPACE_FILE_DOWNLOAD_FEATURE,
+          'this agent version does not support file downloads; upgrade its daemon'
+        )
+        if (!downloads) return reply
+
+        try {
+          const bytes = await assembleWorkspaceFile((offset) =>
+            deps.control.workspaceRead(daemonId, {
+              agentId: agent.id,
+              ...target,
+              path: req.query.path,
+              offset,
+              limit: DOWNLOAD_SLICE_BYTES,
+              encoding: 'base64'
+            })
+          )
+          if (req.query.sha256 && !sha256Matches(bytes, req.query.sha256)) {
+            throw new WorkspaceDownloadRefusal(409, 'WORKSPACE_FILE_CHANGED', 'the file changed since it was shared')
+          }
+          // The typed reply knows only the documented string body; Fastify sends a Buffer raw, past the serializer.
+          return (reply as FastifyReply)
+            .header('content-type', downloadContentType(req.query.path))
+            .header('content-disposition', attachmentDisposition(req.query.path))
+            .header('x-content-type-options', 'nosniff')
+            .header('content-security-policy', "default-src 'none'; sandbox")
+            .header('cache-control', 'private, no-store')
+            .send(bytes)
+        } catch (err) {
+          if (err instanceof WorkspaceDownloadRefusal) {
+            const error = err.status === 404 ? 'Not Found' : err.status === 409 ? 'Conflict' : 'Payload Too Large'
+            return reply.code(err.status).send({ error, statusCode: err.status, message: err.message, code: err.code })
+          }
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Large or binary workspace file: the daemon PUTs it on a URL signed here, and the browser fetches a presigned GET.
+    r.post(
+      '/agents/:id/workspace/file/transfer',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Get a download link for a workspace file',
+          description:
+            'Return a short-lived presigned URL that downloads one workspace file as an attachment directly from the deployment’s object store, for files too large or too binary for the proxied download. The scope rules are the download route’s (sessionId, repo, containment, .git). When the store does not already hold this revision of the file, the owning daemon uploads it first on a URL the control plane signs; the control plane sees only URLs. Pass poll: true to get 202 with an operationId while that upload runs, then poll GET /agents/{id}/workspace/file/transfer/{operationId}; without it the call waits for the upload, which may take minutes. A repeated request for a revision already uploading joins that upload. Pass sha256, the digest prefix a shared file’s transcript marker records, to require the bytes still match it (409 WORKSPACE_FILE_CHANGED otherwise). 409 WORKSPACE_TRANSFER_UNAVAILABLE when the deployment has no transfer bucket or it cannot take one right now, 409 DAEMON_FEATURE_MISSING when the agent’s daemon predates control-plane-signed transfers, 404 WORKSPACE_NOT_FOUND for a missing file, 400 WORKSPACE_TOO_LARGE over the transfer cap.',
+          operationId: 'transferAgentWorkspaceFile',
+          params: IdParam,
+          body: WorkspaceTransferBody,
+          response: {
+            200: WorkspaceTransferDto,
+            202: WorkspaceTransferPendingDto,
+            400: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const transfers = deps.fileTransfer
+        if (!transfers) return sendTransferUnavailable(reply)
+        const scope = await workspaceFileScope(req, reply, agent, req.body)
+        if (!scope) return reply
+        const { daemonId, ...target } = scope
+        const capable = await requireDaemonFeature(
+          reply,
+          agent.orgId,
+          daemonId,
+          FILE_TRANSFER_FEATURE,
+          'this agent’s daemon predates control-plane-signed file transfers'
+        )
+        if (!capable) return reply
+        const daemon = await deps.registry.getAvailable(agent.orgId, daemonId)
+        const begin = daemon?.capabilities.features.includes(WORKSPACE_UPLOAD_BEGIN_FEATURE) ?? false
+        try {
+          const result = await transfers.workspaceDownload({
+            orgId: agent.orgId,
+            daemonId,
+            agentId: agent.id,
+            ...target,
+            path: req.body.path,
+            begin,
+            poll: req.body.poll === true
+          })
+          return sendTransferResult(reply, result, req.body.sha256)
+        } catch (err) {
+          if (sendTransferRefusal(reply, err) || sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // One begun workspace transfer: any replica answers it from the shared ticket, so a CP failover loses nothing.
+    r.get(
+      '/agents/:id/workspace/file/transfer/:operationId',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Poll a workspace file transfer',
+          description:
+            'Return the state of a workspace transfer that answered 202: 202 with the same operation while the owning daemon is still uploading, then the presigned GET exactly as the transfer route returns it. Poll about once a second. The operation is bound to the agent it was started for and is readable for ten minutes after the upload settles; 404 WORKSPACE_TRANSFER_UNKNOWN for an unknown or expired operation, after which a new transfer request reuses the uploaded copy. Pass sha256 to require the bytes still match a shared file’s digest prefix (409 WORKSPACE_FILE_CHANGED otherwise). A failed upload answers the transfer route’s errors, such as 409 WORKSPACE_STALE when the file changed while it was copied and 503 WORKSPACE_TRANSFER_FAILED.',
+          operationId: 'getAgentWorkspaceFileTransfer',
+          params: WorkspaceTransferOperationParams,
+          querystring: WorkspaceTransferOperationQuery,
+          response: {
+            200: WorkspaceTransferDto,
+            202: WorkspaceTransferPendingDto,
+            400: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const transfers = deps.fileTransfer
+        if (!transfers) return sendTransferUnavailable(reply)
+        try {
+          const result = await transfers.transferStatus({ agentId: agent.id, operationId: req.params.operationId })
+          return sendTransferResult(reply, result, req.query.sha256)
+        } catch (err) {
+          if (sendTransferRefusal(reply, err) || sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // A file the console sends with a webchat turn: the control plane presigns a PUT, or a multipart upload, into the transfer bucket.
+    r.post(
+      '/agents/:id/uploads',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Reserve a file upload',
+          description:
+            'Reserve one file upload for a chat turn with this agent and return short-lived presigned requests into the deployment’s object store. A file of at most the runtime config’s `fileTransfer.partBytes` (or any file when it is absent) goes in one PUT: the browser hashes it (sha256, base64), sends exactly the returned headers and the declared number of bytes, then names uploadId in the turn’s files. A larger file goes in parts: the browser sends `parts` (its part size, at most `partBytes`, and each part’s sha256) with `sha256` set to the composite (the sha256 of the parts’ raw digests), PUTs each part on the returned URLs (asking `…/uploads/:uploadId/parts` for the rest), then POSTs the CompleteMultipartUpload XML to `complete` before naming uploadId. The agent receives a download link, never the bytes through the control plane. Uploaded objects expire with the store’s lifecycle rule. 409 WORKSPACE_TRANSFER_UNAVAILABLE when the deployment has no transfer bucket or it cannot take one right now, 409 DAEMON_FEATURE_MISSING when the agent’s daemon cannot fetch uploads yet, 400 WORKSPACE_TOO_LARGE over the transfer cap, 400 WORKSPACE_UPLOAD_INVALID when the parts do not describe the file.',
+          operationId: 'reserveAgentFileUpload',
+          params: IdParam,
+          body: FileUploadBody,
+          response: { 200: FileUploadDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await uploadingAgent(req, reply, req.params.id)
+        if (!agent) return reply
+        try {
+          const grant = await deps.fileTransfer!.reserveUpload({
+            orgId: agent.orgId,
+            agentId: agent.id,
+            size: req.body.size,
+            sha256: req.body.sha256,
+            ...(req.body.parts ? { parts: req.body.parts } : {})
+          })
+          const expiresAt = new Date(grant.expiresAt).toISOString()
+          if (!('multipartId' in grant)) return { ...grant, expiresAt }
+          const { uploadId, multipartId, parts, complete } = grant
+          return { uploadId, expiresAt, multipart: { multipartId, parts, complete: signedRequest(complete) } }
+        } catch (err) {
+          if (sendTransferRefusal(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    r.post(
+      '/agents/:id/uploads/:uploadId/parts',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Sign more parts of a file upload',
+          description:
+            'For a file upload reserved in parts, presign the PUTs of up to 100 more parts (or fresh ones for parts whose URLs expired) and a fresh complete. Send the same size and part size the upload was reserved with, the multipartId it returned, and each wanted part’s number and sha256; an empty list returns only a fresh complete. 409 WORKSPACE_TRANSFER_UNAVAILABLE when the deployment cannot take uploads in parts right now, 400 WORKSPACE_UPLOAD_INVALID for a part outside the upload.',
+          operationId: 'signAgentFileUploadParts',
+          params: FileUploadPartsParams,
+          body: FileUploadPartsBody,
+          response: { 200: FileUploadPartsDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await uploadingAgent(req, reply, req.params.id)
+        if (!agent) return reply
+        try {
+          const signed = await deps.fileTransfer!.signUploadParts({
+            orgId: agent.orgId,
+            agentId: agent.id,
+            uploadId: req.params.uploadId,
+            ...req.body
+          })
+          return {
+            parts: signed.parts,
+            complete: signedRequest(signed.complete),
+            expiresAt: new Date(signed.expiresAt).toISOString()
+          }
+        } catch (err) {
+          if (sendTransferRefusal(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Create or replace one scratch-workspace text file. The caller must be able
+    // to edit the agent; bytes transit to the daemon and are never persisted here.
+    r.put(
+      '/agents/:id/workspace/file',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Create or replace a scratch workspace file',
+          description:
+            'Atomically create or replace one UTF-8 file in a scratch workspace on the owning daemon. Requires edit access to the agent. Creation never overwrites an existing file; replacement requires the mtime returned by the last read. Conflicts return 409. GitHub workspaces remain read-only. The control plane stores no file content.',
+          operationId: 'putAgentWorkspaceFile',
+          params: IdParam,
+          querystring: PutWorkspaceFileQueryDto,
+          body: PutWorkspaceFileBody,
+          response: {
+            200: WorkspaceFileWriteDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.workspace.mode !== 'scratch') {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'workspace files are editable only in scratch workspaces'
+          })
+        }
+        if (Buffer.byteLength(req.body.content, 'utf8') > MAX_WORKSPACE_EDIT_BYTES) {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: `workspace file exceeds the ${MAX_WORKSPACE_EDIT_BYTES}-byte edit limit`
+          })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+
+        const daemon = await deps.registry.getAvailable(orgOf(req), agent.daemonId)
+        if (!daemon?.capabilities.features.includes('workspace-file-edit-v1')) {
+          return reply.code(409).send({
+            error: 'Conflict',
+            statusCode: 409,
+            message: 'this agent version does not support workspace file editing'
+          })
+        }
+
+        try {
+          const writeReq = {
+            agentId: agent.id,
+            path: req.query.path,
+            contentBase64: Buffer.from(req.body.content, 'utf8').toString('base64'),
+            ...(req.body.ifMatchMtime ? { ifMatchMtime: req.body.ifMatchMtime } : {})
+          }
+          const ok = await deps.control.workspaceWrite(agent.daemonId, writeReq)
+          return { path: ok.path, size: ok.size, mtime: ok.mtime }
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Delete one unchanged scratch-workspace file. Like writes, this is
+    // authorized by the CP but executed only on the owning daemon.
+    r.delete(
+      '/agents/:id/workspace/file',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Delete a scratch workspace file',
+          description:
+            'Delete one regular file from a scratch workspace on the owning daemon. Requires edit access and the mtime returned by the last read, so a newer agent revision is never removed silently. Conflicts return 409. GitHub workspaces remain read-only.',
+          operationId: 'deleteAgentWorkspaceFile',
+          params: IdParam,
+          querystring: DeleteWorkspaceFileQueryDto,
+          response: {
+            200: WorkspaceFileDeleteDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.workspace.mode !== 'scratch') {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'workspace files are editable only in scratch workspaces'
+          })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+
+        const daemon = await deps.registry.getAvailable(orgOf(req), agent.daemonId)
+        if (!daemon?.capabilities.features.includes('workspace-file-delete-v1')) {
+          return reply.code(409).send({
+            error: 'Conflict',
+            statusCode: 409,
+            message: 'this agent version does not support workspace file deletion'
+          })
+        }
+
+        try {
+          const ok = await deps.control.workspaceDelete(agent.daemonId, {
+            agentId: agent.id,
+            path: req.query.path,
+            ifMatchMtime: req.query.ifMatchMtime
+          })
+          return { path: ok.path }
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Create one empty scratch-workspace directory: authorized like a write, executed only on the owning daemon.
+    r.post(
+      '/agents/:id/workspace/dir',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Create a scratch workspace folder',
+          description:
+            'Create one empty directory, and any missing parent directories, in a scratch workspace on the owning daemon. Requires edit access. A path that already exists, as a file or a folder, returns 409. GitHub workspaces remain read-only, and a daemon too old to create folders returns 409.',
+          operationId: 'createAgentWorkspaceDir',
+          params: IdParam,
+          querystring: CreateWorkspaceDirQueryDto,
+          response: {
+            200: WorkspaceDirCreateDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.workspace.mode !== 'scratch') {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'workspace files are editable only in scratch workspaces'
+          })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+
+        const daemon = await deps.registry.getAvailable(orgOf(req), agent.daemonId)
+        if (!daemon?.capabilities.features.includes('workspace-dir-create-v1')) {
+          return reply.code(409).send({
+            error: 'Conflict',
+            statusCode: 409,
+            message: 'this agent version does not support creating workspace folders'
+          })
+        }
+
+        try {
+          const ok = await deps.control.workspaceMkdir(agent.daemonId, { agentId: agent.id, path: req.query.path })
+          return { path: ok.path }
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Wake: bring a cluster sandbox to Running WITHOUT a turn, so a read refused as `sandbox-unavailable` has an explicit press (#1070); a GET never wakes anything.
+    const wakes = new AgentWakeCoordinator(deps.clock)
+    r.post(
+      '/agents/:id/wake',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Wake the agent’s sandbox',
+          description:
+            'Ask the daemon serving this agent to bring its cluster sandbox to Running without starting a turn, so the workspace reads become available again. Pass sessionId to wake that isolated session’s own sandbox instead of the agent’s: it is only ever resumed onto the claim it already has, so a session whose sandbox was removed answers 404 with code WORKSPACE_SANDBOX_REMOVED (its next message creates a new one), and a daemon too old to wake one session wakes the agent’s sandbox as before. A sessionId the caller cannot browse reads 404. Answers with what the daemon observed: 202 with running (reachable now) or starting (resume in flight — poll the workspace read); 200 with unsupported when there is nothing to wake (a machine-placed agent, or a daemon that runs no sandboxes). Wakes are debounced per sandbox: one in flight is joined, and one settled within the last 30 s is answered from its result. For a pool agent nobody currently serves, the wake reaches a live member, which claims the agent the way a turn would. Requires edit access; 503 when no daemon can be reached.',
+          operationId: 'wakeAgent',
+          params: IdParam,
+          querystring: AgentWakeQueryDto,
+          response: { 200: AgentWakeDto, 202: AgentWakeDto, 403: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getOrgAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        // A session's own sandbox holds that session's worktree, so it is gated like the worktree's read.
+        const sessionId = req.query.sessionId
+        if (!(await canReadWorkspaceScope(req, agent.id, sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        // DISPATCH, not serving: a set agent whose lease lapsed is served by nobody for one horizon,
+        // and the wake is exactly the trigger that gives it a holder again.
+        const daemonId = await deps.placementResolver.dispatchDaemon(agent)
+        if (!daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        // A daemon that runs no sandboxes never advertises the wake, and is never sent one.
+        const daemon = await deps.registry.getAvailable(agent.orgId, daemonId)
+        if (!daemon?.capabilities.features.includes(AGENT_WAKE_FEATURE))
+          return reply.code(200).send({ state: 'unsupported' })
+        const wake = agentWakeRequest(agent.id, sessionId, daemon.capabilities.features)
+        try {
+          const outcome = await wakes.wake(wake.key, () => deps.control.agentWake(daemonId, wake.req, agent.orgId))
+          return reply.code(outcome.state === 'unsupported' ? 200 : 202).send({ state: outcome.state })
+        } catch (err) {
+          const failure = agentWakeFailure(err)
+          if (failure === null) throw err
+          return reply.code(failure.status).send({
+            error: failure.error,
+            statusCode: failure.status,
+            message: failure.message,
+            ...(failure.code ? { code: failure.code } : {})
+          })
+        }
+      }
+    )
+
+    // Agent memory, a MEMORY.md index plus topic files: from the CP's tables for a Control-Plane home, else live from the owning daemon.
+    r.get(
+      '/agents/:id/memory',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Read the agent memory index',
+          description:
+            "Read the agent's memory index (MEMORY.md); a not-yet-created file is data (exists:false). A memory home in the Control Plane is read here with no daemon involved; a home on the daemon is proxied live from the owning daemon, and is 503 when the agent is unplaced or the daemon is offline. 503 also when the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'readAgentMemory',
+          params: IdParam,
+          querystring: MemoryFileQueryDto,
+          response: { 200: AgentMemoryDto, 400: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider === 'none') {
+          return toAgentMemoryDto({ agentId: agent.id, path: req.query.path ?? 'MEMORY.md', exists: false })
+        }
+        if (agent.memory?.provider === 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'external memory does not expose files' })
+        }
+        const source = memorySourceOf(agent)
+        if (!source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          if (await placeHidden(req, source, agent.id, req.query.channelKey))
+            return reply.code(404).send(PLACE_NOT_FOUND)
+          const rep = await source.read({
+            agentId: agent.id,
+            ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {}),
+            path: req.query.path ?? 'MEMORY.md',
+            offset: req.query.offset ?? 0,
+            limit: req.query.limit ?? 65536
+          })
+          return toAgentMemoryDto(rep)
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // List the files in the memory dir (the index + topic files).
+    r.get(
+      '/agents/:id/memory/files',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List agent memory files',
+          description:
+            "List the files in the agent's memory dir (MEMORY.md index + topic files). A memory home in the Control Plane is listed here with no daemon involved; a home on the daemon is listed live from the owning daemon, and is 503 when the agent is unplaced or the daemon is offline. 503 also when the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'listAgentMemoryFiles',
+          params: IdParam,
+          querystring: MemoryFilesQueryDto,
+          response: { 200: MemoryFilesDto, 400: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider === 'none') {
+          return toMemoryFilesDto({ agentId: agent.id, exists: false, entries: [] })
+        }
+        if (agent.memory?.provider === 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'external memory does not expose files' })
+        }
+        const source = memorySourceOf(agent)
+        if (!source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          if (await placeHidden(req, source, agent.id, req.query.channelKey))
+            return reply.code(404).send(PLACE_NOT_FOUND)
+          const rep = await source.list({
+            agentId: agent.id,
+            ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {})
+          })
+          return toMemoryFilesDto(rep)
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // The signed-in caller's own memory layer, named by who is asking and never by the request.
+    const myMemory = async (req: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+      const agent = await getServingAgent(req, req.params.id)
+      if (!agent) {
+        await reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return null
+      }
+      const userId = req.principal?.userId
+      if (!userId) {
+        await reply.code(401).send({ error: 'Unauthorized', statusCode: 401, message: 'sign in to read your memory' })
+        return null
+      }
+      // Only managed memory keeps a layer for one person.
+      if (agent.memory?.provider !== undefined && agent.memory.provider !== 'managed')
+        return { agentId: agent.id, source: null, userId: null }
+      const source = memorySourceOf(agent)
+      if (!source) {
+        await reply
+          .code(503)
+          .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        return null
+      }
+      // Version skew: a daemon that predates person layers would read the shared one instead.
+      if (!(await source.supports(MEMORY_PERSON_LAYER_FEATURE))) {
+        await reply.code(503).send({
+          error: 'Service Unavailable',
+          statusCode: 503,
+          message: "the agent's daemon cannot read your memory yet; update it"
+        })
+        return null
+      }
+      return { agentId: agent.id, source, userId }
+    }
+
+    // List the files of the caller's own memory layer.
+    r.get(
+      '/agents/:id/memory/mine/files',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List your memory files',
+          description:
+            "List the files of the signed-in caller's own memory layer for this agent: what it keeps for that person from their DMs on linked platforms and their console conversations. A memory home in the Control Plane is read here with no daemon involved, any other live from the owning daemon. Only the caller's own layer can be read; nobody else's, editors included. Empty for an agent whose memory is not managed. 503 when a home on the daemon is unplaced or its daemon is offline or too old, or the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'listMyAgentMemoryFiles',
+          params: IdParam,
+          response: { 200: MemoryFilesDto, 401: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const mine = await myMemory(req, reply)
+        if (!mine) return
+        if (!mine.userId || !mine.source) return toMemoryFilesDto({ agentId: mine.agentId, exists: false, entries: [] })
+        try {
+          return toMemoryFilesDto(await mine.source.list({ agentId: mine.agentId, personUserId: mine.userId }))
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Read one file of the caller's own memory layer.
+    r.get(
+      '/agents/:id/memory/mine/file',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Read your memory file',
+          description:
+            "Read one byte slice of a file in the signed-in caller's own memory layer (?path defaults to MEMORY.md); a missing file is data (exists:false). A memory home in the Control Plane is read here with no daemon involved, any other live from the owning daemon. Only the caller's own layer can be read. 503 when a home on the daemon is unplaced or its daemon is offline or too old, or the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'readMyAgentMemoryFile',
+          params: IdParam,
+          querystring: MyMemoryFileQueryDto,
+          response: { 200: AgentMemoryDto, 401: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const mine = await myMemory(req, reply)
+        if (!mine) return
+        const path = req.query.path ?? 'MEMORY.md'
+        if (!mine.userId || !mine.source) return toAgentMemoryDto({ agentId: mine.agentId, path, exists: false })
+        try {
+          const rep = await mine.source.read({
+            agentId: mine.agentId,
+            personUserId: mine.userId,
+            path,
+            offset: req.query.offset ?? 0,
+            limit: req.query.limit ?? 65536
+          })
+          return toAgentMemoryDto(rep)
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // List the conversations whose memory has a place layer of its own.
+    r.get(
+      '/agents/:id/memory/channels',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List agent channel memory folders',
+          description:
+            "List the conversations whose memory has a place layer of its own (a private channel, a group DM, a conversation shared with another organization or one the platform cannot confirm internal), each named by its platform and display name. A memory home in the Control Plane is listed here with no daemon involved, any other live from the owning daemon. Only the layers whose conversation shows the caller a session in the console are listed; an organization owner also sees the others with `visible: false`, which they may clear but not read. A person's layer is never listed. Empty for an agent whose memory is not managed. 503 when a home on the daemon is unplaced or its daemon is offline. 503 also when the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'listAgentMemoryChannels',
+          params: IdParam,
+          response: { 200: MemoryChannelsDto, 400: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider !== undefined && agent.memory.provider !== 'managed') {
+          return { channels: [] }
+        }
+        const source = memorySourceOf(agent)
+        if (!source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          const rep = await source.channels({ agentId: agent.id })
+          const owner = can(ctxOf(req), { action: AuthorizationAction.OrganizationManage })
+          const clearable = owner && (await source.supports(MEMORY_PLACE_CLEAR_FEATURE))
+          const views = await placeAccess.judge(req, agent.id, rep.channels, owner)
+          return { channels: views.map((view) => ({ ...view, clearable })) }
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Clear one place layer: an organization owner's way to remove what an agent kept for a conversation they cannot read.
+    r.delete(
+      '/agents/:id/memory/channels/:channelKey',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Clear an agent memory place layer',
+          description:
+            "Delete every file of one conversation's place layer, its change history included: in the Control Plane for a memory home there, with no daemon involved, otherwise on the owning daemon. Organization owners only; the answer says whether there was a layer and never carries its content. Someone who cannot see a session of the conversation gets 404, as for an absent layer; anyone else who is not an owner gets 403. The change is recorded in the organization's audit log without content. 409 when the agent's daemon is too old to clear a layer; 503 when a home on the daemon is unplaced or its daemon is offline, or the memory home of the agent is not reachable right now; `code` says why.",
+          operationId: 'clearAgentMemoryChannel',
+          params: IdParam.extend({ channelKey: MemoryChannelKey.describe(PLACE_LAYER_KEY_DESCRIPTION) }),
+          response: {
+            200: MemoryChannelClearDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if ((agent.memory?.provider ?? 'managed') !== 'managed') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'only managed memory keeps place layers' })
+        }
+        const source = memorySourceOf(agent)
+        if (!source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        const { channelKey } = req.params
+        const failed = (err: unknown) => {
+          const failure = memoryAdminFailure(err)
+          if (!failure) throw err
+          return reply.code(failure.status).send({
+            error: failure.error,
+            statusCode: failure.status,
+            message: failure.message,
+            ...(failure.code ? { code: failure.code } : {})
+          })
+        }
+        try {
+          const owner = can(ctxOf(req), { action: AuthorizationAction.OrganizationManage })
+          const page = await source.channels({ agentId: agent.id, channelKey })
+          const entry = page.channels.find((candidate) => candidate.channelKey === channelKey)
+          if (!entry) return reply.code(404).send(PLACE_NOT_FOUND)
+          if (!owner) {
+            const [view] = await placeAccess.judge(req, agent.id, [entry], false)
+            if (!view?.visible) return reply.code(404).send(PLACE_NOT_FOUND)
+            return reply.code(403).send({
+              error: 'Forbidden',
+              statusCode: 403,
+              message: 'only an organization owner can clear a memory layer'
+            })
+          }
+        } catch (err) {
+          return failed(err)
+        }
+        if (!(await source.supports(MEMORY_PLACE_CLEAR_FEATURE))) {
+          return reply.code(409).send({
+            error: 'Conflict',
+            statusCode: 409,
+            message: "the agent's daemon cannot clear a memory layer yet; update it"
+          })
+        }
+        let cleared: boolean
+        try {
+          // A Control-Plane home drops the layer's change log with its files, since it holds the content the clear removed.
+          cleared = (await source.clearChannel({ agentId: agent.id, channelKey })).cleared
+        } catch (err) {
+          return failed(err)
+        }
+        // The layer's own change log is gone with it, so the organization's audit log records the clear, without content.
+        await deps.repos.audit
+          .append({
+            kind: 'memory_change',
+            orgId: orgOf(req),
+            agentId: AgentId(agent.id),
+            ...(req.principal ? { actorUserId: req.principal.userId } : {}),
+            frameType: 'memory/channel/clear',
+            message: 'memory place layer cleared',
+            details: { operation: 'clear', layer: 'place', channelKey, cleared }
+          })
+          .catch((err: unknown) => req.log.warn({ err }, 'memory: audit append failed'))
+        return { cleared }
+      }
+    )
+
+    // Read one memory file (`?path=` defaults to the MEMORY.md index).
+    r.get(
+      '/agents/:id/memory/file',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Read a memory file',
+          description:
+            'Read one byte slice of a memory file (?path defaults to MEMORY.md); a missing file is data (exists:false). A memory home in the Control Plane is read here with no daemon involved; a home on the daemon is proxied live from the owning daemon, and is 503 when the agent is unplaced or the daemon is offline. 503 also when the memory home of the agent is not reachable right now; `code` says why.',
+          operationId: 'readAgentMemoryFile',
+          params: IdParam,
+          querystring: MemoryFileQueryDto,
+          response: { 200: AgentMemoryDto, 400: ErrorDto, 404: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider === 'none') {
+          return toAgentMemoryDto({ agentId: agent.id, path: req.query.path ?? 'MEMORY.md', exists: false })
+        }
+        if (agent.memory?.provider === 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'external memory does not expose files' })
+        }
+        const source = memorySourceOf(agent)
+        if (!source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          if (await placeHidden(req, source, agent.id, req.query.channelKey))
+            return reply.code(404).send(PLACE_NOT_FOUND)
+          const rep = await source.read({
+            agentId: agent.id,
+            ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {}),
+            path: req.query.path ?? 'MEMORY.md',
+            offset: req.query.offset ?? 0,
+            limit: req.query.limit ?? 65536
+          })
+          return toAgentMemoryDto(rep)
+        } catch (err) {
+          if (sendMemoryReadFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Replace one memory file (console edit; `?path=` defaults to the index). Write
+    // is gated exactly like a content edit (`canEdit`); the daemon owns the file.
+    r.put(
+      '/agents/:id/memory/file',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Replace a memory file',
+          description:
+            'Replace one memory file (?path defaults to MEMORY.md) through the owning daemon, whatever the memory home, since the daemon stamps the header, regenerates the index and records the change; returns the written size/mtime. `ifMatchMtime` (optional) is optimistic concurrency — a 409 if the file changed under you. Requires edit permission. 503 when unplaced or the daemon is offline. 503 also when the memory home of the agent is not reachable right now; `code` says why.',
+          operationId: 'putAgentMemoryFile',
+          params: IdParam,
+          querystring: PutMemoryFileQueryDto,
+          body: PutAgentMemoryBody,
+          response: {
+            200: AgentMemoryWriteDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.memory?.provider === 'none') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'memory is disabled for this agent' })
+        }
+        if (agent.memory?.provider === 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'external memory does not expose files' })
+        }
+        // A write goes to the daemon whatever the home: header stamping, the generated index and the dream fence's write ledger live there.
+        const source = memorySourceOf(agent)
+        if (!agent.daemonId || !source) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          if (await placeHidden(req, source, agent.id, req.query.channelKey))
+            return reply.code(404).send(PLACE_NOT_FOUND)
+          const ok = await deps.control.memoryWrite(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {}),
+            path: req.query.path ?? 'MEMORY.md',
+            content: req.body.content,
+            ...(req.body.ifMatchMtime ? { ifMatchMtime: req.body.ifMatchMtime } : {})
+          })
+          return { path: ok.path, size: ok.size, mtime: ok.mtime }
+        } catch (err) {
+          if (sendMemoryHomeUnavailable(reply, err)) return
+          // The daemon rejects a stale write (CONFLICT) or an over-budget / bad-path
+          // write (BAD_PAYLOAD) — surface those as 409 / 400, not the generic 503.
+          if (err instanceof ProtocolError && err.code === 'CONFLICT') {
+            return reply.code(409).send({ error: 'Conflict', statusCode: 409, message: err.message })
+          }
+          if (err instanceof ProtocolError && err.code === 'BAD_PAYLOAD') {
+            return reply.code(400).send({ error: 'Bad Request', statusCode: 400, message: err.message })
+          }
+          const unavailable = daemonEdgeFailure(err)
+          if (unavailable !== null) {
+            return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503, message: unavailable })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Page the managed provider's hidden provenance sidecar for one selected
+    // file. The CP forwards bounded rows live and never persists their bodies.
+    r.get(
+      '/agents/:id/memory/history',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List memory file history',
+          description:
+            'Return one newest-first page of add/update/delete provenance for a managed memory file. For a memory home on the daemon the page is proxied live from the owning daemon and not persisted here; for a home in the Control Plane it is answered from the change log the Control Plane keeps, with no daemon involved. 503 when a home on the daemon is unplaced or its daemon is offline, or the memory home of the agent is not reachable right now; `code` says why.',
+          operationId: 'listAgentMemoryFileHistory',
+          params: IdParam,
+          querystring: MemoryHistoryQueryDto,
+          response: {
+            200: MemoryHistoryPageDto,
+            400: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if ((agent.memory?.provider ?? 'managed') !== 'managed') {
+          return reply.code(400).send({
+            error: 'Bad Request',
+            statusCode: 400,
+            message: 'file change history is available only for managed memory'
+          })
+        }
+        // Naming a place layer asks the memory's source whose conversation it is: the CP's own tables for a Control-Plane home.
+        if (req.query.channelKey !== undefined) {
+          const source = memorySourceOf(agent)
+          if (!source)
+            return reply
+              .code(503)
+              .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+          try {
+            if (await placeHidden(req, source, agent.id, req.query.channelKey))
+              return reply.code(404).send(PLACE_NOT_FOUND)
+          } catch (err) {
+            const failure = memoryAdminFailure(err)
+            if (!failure) throw err
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          }
+        }
+        // A Control-Plane home keeps its change log here, so the read needs no daemon at all (§3.2.1).
+        if (memoryHomedInControlPlane(agent.memory)) {
+          const page = await deps.repos.agentMemoryHistory.page(
+            AgentId(agent.id),
+            memoryHistoryRoot(req.query.channelKey),
+            req.query.path,
+            req.query.cursor,
+            req.query.limit ?? 5
+          )
+          return { events: page.records.map(toHistoryEvent), nextCursor: page.nextCursor ?? null }
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryHistoryPageDto(
+            await deps.control.memoryHistory(agent.daemonId, {
+              agentId: agent.id,
+              ...(req.query.channelKey ? { channelKey: req.query.channelKey } : {}),
+              path: req.query.path,
+              ...(req.query.cursor ? { cursor: req.query.cursor } : {}),
+              limit: req.query.limit ?? 5
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure) {
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          }
+          throw err
+        }
+      }
+    )
+
+    // Provider-neutral memory administration. Files remain on the legacy routes
+    // above; external providers expose canonical records below. The CP is a
+    // transient proxy only: record/query bodies are never persisted or logged.
+    r.get(
+      '/agents/:id/memory/surface',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get the agent memory administration surface',
+          operationId: 'getAgentMemorySurface',
+          params: IdParam,
+          response: { 200: MemorySurfaceDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        const provider = agent.memory?.provider ?? 'managed'
+        if (provider === 'none') return { shape: 'none' as const, capabilities: [] }
+        if (provider !== 'external') return { shape: 'files' as const, capabilities: [] }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemorySurfaceDto(await deps.control.memorySurface(agent.daemonId, { agentId: agent.id }))
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.post(
+      '/agents/:id/memory/records/search',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Search external-memory records',
+          operationId: 'searchAgentMemoryRecords',
+          params: IdParam,
+          body: MemoryRecordSearchBodyDto,
+          response: { 200: MemoryRecordPageDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordPageDto(
+            await deps.control.memoryRecordSearch(agent.daemonId, {
+              agentId: agent.id,
+              query: req.body.query,
+              topK: req.body.topK ?? 20,
+              maxBytes: req.body.maxBytes ?? 32768
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.get(
+      '/agents/:id/memory/records',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List external-memory records',
+          operationId: 'listAgentMemoryRecords',
+          params: IdParam,
+          querystring: MemoryRecordPageQueryDto,
+          response: { 200: MemoryRecordPageDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordPageDto(
+            await deps.control.memoryRecordList(agent.daemonId, {
+              agentId: agent.id,
+              ...(req.query.cursor ? { cursor: req.query.cursor } : {}),
+              limit: req.query.limit ?? 20
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.post(
+      '/agents/:id/memory/records',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Create an external-memory record',
+          operationId: 'createAgentMemoryRecord',
+          params: IdParam,
+          body: CreateMemoryRecordBody,
+          response: {
+            200: MemoryRecordResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordResultDto(
+            await deps.control.memoryRecordCreate(agent.daemonId, {
+              agentId: agent.id,
+              operationId: randomUUID(),
+              text: req.body.text,
+              ...(req.body.metadata ? { metadata: req.body.metadata } : {})
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.get(
+      '/agents/:id/memory/records/:recordId',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get an external-memory record',
+          operationId: 'getAgentMemoryRecord',
+          params: MemoryRecordParamDto,
+          response: { 200: MemoryRecordGetResultDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordGetResultDto(
+            await deps.control.memoryRecordGet(agent.daemonId, { agentId: agent.id, id: req.params.recordId })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.put(
+      '/agents/:id/memory/records/:recordId',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Update an external-memory record',
+          operationId: 'updateAgentMemoryRecord',
+          params: MemoryRecordParamDto,
+          body: UpdateMemoryRecordBody,
+          response: {
+            200: MemoryRecordResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordResultDto(
+            await deps.control.memoryRecordUpdate(agent.daemonId, {
+              agentId: agent.id,
+              operationId: randomUUID(),
+              id: req.params.recordId,
+              text: req.body.text,
+              ...(req.body.metadata ? { metadata: req.body.metadata } : {}),
+              ...(req.body.version ? { version: req.body.version } : {})
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.delete(
+      '/agents/:id/memory/records/:recordId',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Delete an external-memory record',
+          operationId: 'deleteAgentMemoryRecord',
+          params: MemoryRecordParamDto,
+          body: DeleteMemoryRecordBody,
+          response: {
+            200: MemoryRecordDeleteResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordDeleteResultDto(
+            await deps.control.memoryRecordDelete(agent.daemonId, {
+              agentId: agent.id,
+              operationId: randomUUID(),
+              id: req.params.recordId,
+              ...(req.body.version ? { version: req.body.version } : {})
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    r.get(
+      '/agents/:id/memory/records/:recordId/history',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List external-memory record history',
+          operationId: 'listAgentMemoryRecordHistory',
+          params: MemoryRecordParamDto,
+          querystring: MemoryRecordPageQueryDto,
+          response: {
+            200: MemoryRecordHistoryPageDto,
+            400: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (agent.memory?.provider !== 'external') {
+          return reply
+            .code(400)
+            .send({ error: 'Bad Request', statusCode: 400, message: 'record memory is not enabled' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        try {
+          return toMemoryRecordHistoryPageDto(
+            await deps.control.memoryRecordHistory(agent.daemonId, {
+              agentId: agent.id,
+              id: req.params.recordId,
+              ...(req.query.cursor ? { cursor: req.query.cursor } : {}),
+              limit: req.query.limit ?? 20
+            })
+          )
+        } catch (err) {
+          const failure = memoryAdminFailure(err)
+          if (failure)
+            return reply.code(failure.status).send({
+              error: failure.error,
+              statusCode: failure.status,
+              message: failure.message,
+              ...(failure.code ? { code: failure.code } : {})
+            })
+          throw err
+        }
+      }
+    )
+
+    // ── Memory dreaming (docs/designs/memory-dreaming.md §10) ──────────────────
+    // Offline consolidation jobs over the managed store. The CP is a pure relay
+    // here: lifecycle + staged-output review are forwarded to the owning daemon
+    // and nothing (metadata or bodies) is persisted CP-side — list/get require a
+    // live daemon (offline metadata caching is deferred, design §8/§10).
+    // Managed-provider only; a non-managed agent is a 400. Lifecycle mutations
+    // require edit rights (viewers get 403).
+
+    /** Guard: managed provider + a live daemon, or the right 4xx/503 reply.
+     *  `edit: true` additionally requires edit rights (403 for a viewer) — dream
+     *  lifecycle mutations run agent work or replace the live store, so they must
+     *  match the viewer-read-only invariant of the other memory mutations. */
+    const dreamAgentOrReply = async (
+      req: FastifyRequest,
+      reply: FastifyReply,
+      id: string,
+      edit = false
+    ): Promise<(AgentRecord & { daemonId: string }) | null> => {
+      const agent = await getServingAgent(req, id)
+      if (!agent) {
+        await reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return null
+      }
+      if (edit && !canEdit(agent, ctxOf(req))) {
+        await reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        return null
+      }
+      if (agent.memory?.provider !== undefined && agent.memory.provider !== 'managed') {
+        await reply
+          .code(400)
+          .send({ error: 'Bad Request', statusCode: 400, message: 'dreaming requires the managed memory provider' })
+        return null
+      }
+      if (!agent.daemonId) {
+        await reply
+          .code(503)
+          .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        return null
+      }
+      // Version skew: refuse before we send a frame the daemon would drop.
+      if (!dreamingSupportedOn(await deps.registry.getAvailable(agent.orgId, agent.daemonId))) {
+        await reply.code(409).send({
+          error: 'Conflict',
+          statusCode: 409,
+          message: 'this agent version does not support memory dreaming; upgrade its daemon',
+          // Machine-readable so the console can hide the panel instead of
+          // string-matching the prose.
+          code: 'DAEMON_FEATURE_MISSING'
+        })
+        return null
+      }
+      return agent as AgentRecord & { daemonId: string }
+    }
+
+    const sendDreamFailure = (reply: FastifyReply, err: unknown): boolean => {
+      const failure = memoryAdminFailure(err)
+      if (!failure) return false
+      void reply.code(failure.status).send({
+        error: failure.error,
+        statusCode: failure.status,
+        message: failure.message,
+        ...(failure.code ? { code: failure.code } : {})
+      })
+      return true
+    }
+
+    // Start a dream (manual trigger).
+    r.post(
+      '/agents/:id/memory/dreams',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Start a memory dream',
+          description:
+            'Kick off an offline consolidation job over the managed store on the owning daemon. Returns the pending job; poll it for status. 400 if dreaming is not enabled, 409 if one is already in flight, 503 when the daemon is offline.',
+          operationId: 'startAgentMemoryDream',
+          params: IdParam,
+          body: StartDreamBody,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamStart(agent.daemonId, {
+            agentId: agent.id,
+            trigger: 'manual',
+            ...(req.body.sessionWindow !== undefined ? { sessionWindow: req.body.sessionWindow } : {}),
+            ...(req.body.instructions !== undefined ? { instructions: req.body.instructions } : {})
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // List an agent's dream jobs (newest first).
+    r.get(
+      '/agents/:id/memory/dreams',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List memory dreams',
+          description:
+            "List the agent's memory dream jobs (newest first), proxied from the owning daemon. 409 when the owning daemon is too old to support dreaming (code DAEMON_FEATURE_MISSING).",
+          operationId: 'listAgentMemoryDreams',
+          params: IdParam,
+          querystring: z.object({
+            limit: z.coerce.number().int().positive().max(50).optional(),
+            // Pending skill proposals outlive the store lifecycle, so they need a
+            // path that does not age out behind newer history.
+            pendingSkills: z.coerce.boolean().optional()
+          }),
+          response: { 200: DreamListDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          return toDreamListDto(
+            await deps.control.dreamList(agent.daemonId, {
+              agentId: agent.id,
+              limit: req.query.limit ?? 20,
+              ...(req.query.pendingSkills ? { pendingSkills: true } : {})
+            })
+          )
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Fetch one dream job's metadata.
+    r.get(
+      '/agents/:id/memory/dreams/:dreamId',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Get a memory dream',
+          description:
+            "Fetch one dream job's metadata (never staged bodies), proxied from the owning daemon. 409 when the owning daemon is too old to support dreaming (code DAEMON_FEATURE_MISSING).",
+          operationId: 'getAgentMemoryDream',
+          params: DreamIdParam,
+          response: { 200: DreamDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamGet(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Cancel a pending|running dream.
+    r.post(
+      '/agents/:id/memory/dreams/:dreamId/cancel',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Cancel a memory dream',
+          description:
+            'Cancel a pending or running dream on the owning daemon (cancel-wins; a late extraction result is never staged). 409 if the dream is already terminal.',
+          operationId: 'cancelAgentMemoryDream',
+          params: DreamIdParam,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamCancel(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Adopt a completed dream's staged store (fenced; `force` overrides the fence).
+    r.post(
+      '/agents/:id/memory/dreams/:dreamId/adopt',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Adopt a memory dream',
+          description:
+            "Atomically replace the agent's live managed store with this dream's staged output (with a backup). Fenced against changes since the snapshot unless `force` is set. 409 on a fence conflict or a non-completed dream.",
+          operationId: 'adoptAgentMemoryDream',
+          params: DreamIdParam,
+          body: AdoptDreamBody,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamAdopt(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId,
+            force: req.body.force ?? false,
+            ...(req.body.reviewToken !== undefined ? { reviewToken: req.body.reviewToken } : {})
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Discard a terminal dream's staged output (keeps the job record).
+    r.post(
+      '/agents/:id/memory/dreams/:dreamId/discard',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Discard a memory dream',
+          description:
+            "Delete a terminal dream's staged output on the owning daemon, keeping the job record for history. 409 if the dream is not in a terminal state.",
+          operationId: 'discardAgentMemoryDream',
+          params: DreamIdParam,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamDiscard(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Read one candidate's FULL staged body. Acceptance installs executable
+    // instruction content, so the reviewer must be able to see it — a
+    // model-authored description cannot be evidence for itself (design §7).
+    r.get(
+      '/agents/:id/memory/dreams/:dreamId/skills/:name',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Read a mined skill candidate',
+          description:
+            'Proxy the staged SKILL.md and every staged script for one candidate live from the owning daemon, so the reviewer can read exactly what accepting would install. Nothing staged under that name is data (exists:false), not an error.',
+          operationId: 'readAgentMemoryDreamSkill',
+          params: DreamSkillParam,
+          response: { 200: DreamSkillContentDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          const content = await deps.control.dreamSkillRead(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId,
+            name: req.params.name
+          })
+          return {
+            name: content.name,
+            exists: content.exists,
+            skill: content.skill ?? null,
+            scripts: content.scripts ?? [],
+            ...(content.reviewToken !== undefined ? { reviewToken: content.reviewToken } : {})
+          }
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Accept one mined skill candidate — installs it for THIS agent (design §7).
+    r.post(
+      '/agents/:id/memory/dreams/:dreamId/skills/:name/accept',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Accept a mined skill',
+          description:
+            "Install one of this dream's mined skill candidates for the agent. Copies the reviewed skill into the agent's own tree, so discarding the dream later does not uninstall it. 409 if the candidate was already dismissed or the daemon predates dreaming.",
+          operationId: 'acceptAgentMemoryDreamSkill',
+          params: DreamSkillParam,
+          body: AcceptDreamSkillBody,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamSkillAccept(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId,
+            name: req.params.name,
+            ...(req.body?.reviewToken !== undefined ? { reviewToken: req.body.reviewToken } : {})
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Dismiss one mined skill candidate — drops its staging, records the decision
+    // so later dreams can be told not to propose it again.
+    r.post(
+      '/agents/:id/memory/dreams/:dreamId/skills/:name/dismiss',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'Dismiss a mined skill',
+          description:
+            "Reject one of this dream's mined skill candidates. Its staging is dropped and the decision recorded, so later dreams are told not to propose it again. 409 if it was already accepted.",
+          operationId: 'dismissAgentMemoryDreamSkill',
+          params: DreamSkillParam,
+          response: { 200: DreamDto, 400: ErrorDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id, true)
+        if (!agent) return
+        try {
+          const { dream } = await deps.control.dreamSkillDismiss(agent.daemonId, {
+            agentId: agent.id,
+            dreamId: req.params.dreamId,
+            name: req.params.name
+          })
+          return toDreamDto(dream)
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // List a dream's staged output files (the review surface).
+    r.get(
+      '/agents/:id/memory/dreams/:dreamId/files',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: "List a dream's staged files",
+          description:
+            "List the files in this dream's staged output store (index + topics). Nothing staged yet is data (exists:false), not an error.",
+          operationId: 'listAgentMemoryDreamFiles',
+          params: DreamIdParam,
+          response: { 200: DreamFilesDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          return toDreamFilesDto(
+            await deps.control.dreamFiles(agent.daemonId, { agentId: agent.id, dreamId: req.params.dreamId })
+          )
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // A dream's checked revisions log: proxied live from the daemon, never persisted (model-authored notes).
+    r.get(
+      '/agents/:id/memory/dreams/:dreamId/revisions',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: "List a dream's revisions",
+          description:
+            'Proxy the checked revisions a dream listed — each file it corrected, dropped or moved, with the reason and a one-line note — live from the owning daemon. Entries with `problem` were not applied. A dream that kept no log is data (exists:false).',
+          operationId: 'listAgentMemoryDreamRevisions',
+          params: DreamIdParam,
+          response: { 200: DreamRevisionsDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          return toDreamRevisionsDto(
+            await deps.control.dreamRevisions(agent.daemonId, { agentId: agent.id, dreamId: req.params.dreamId })
+          )
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Read one byte slice of a dream's staged file (memory/read semantics).
+    r.get(
+      '/agents/:id/memory/dreams/:dreamId/file',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: "Read a dream's staged file",
+          description:
+            'Proxy one byte slice of a staged output file (default the MEMORY.md index) live from the owning daemon. `nextOffset` is authoritative — clients must not recompute it.',
+          operationId: 'readAgentMemoryDreamFile',
+          params: DreamIdParam,
+          querystring: DreamFileQueryDto,
+          response: { 200: DreamFileDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        const agent = await dreamAgentOrReply(req, reply, req.params.id)
+        if (!agent) return
+        try {
+          return toDreamFileDto(
+            await deps.control.dreamFileRead(agent.daemonId, {
+              agentId: agent.id,
+              dreamId: req.params.dreamId,
+              path: req.query.path ?? 'MEMORY.md',
+              offset: req.query.offset ?? 0,
+              limit: req.query.limit ?? 65536
+            })
+          )
+        } catch (err) {
+          if (sendDreamFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Workspace git status: is the owning daemon's checkout clean? A dirty tree or
+    // a from-scratch (non-repo) workspace is data (`clean`/`isRepo`), not an error.
+    r.get(
+      '/agents/:id/workspace/gitstatus',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Get workspace git status',
+          description:
+            'Report whether the owning daemon’s checkout is clean. Pass sessionId for an authorized isolated session worktree; a dirty tree or a from-scratch (non-repo) workspace is data (clean/isRepo), not an error. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'getAgentWorkspaceGitStatus',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          response: { 200: WorkspaceGitStatusDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        // Route through getOrgAgent (org boundary + canView) — a bare repo.get here
+        // would leak a restricted / cross-org agent's checkout state.
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await canReadWorkspaceScope(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, req.query.sessionId))) return
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const rep = await deps.control.workspaceGitStatus(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {})
+          })
+          return toWorkspaceGitStatusDto(rep, workspaceGitConfigFor(agent, req.query.repo))
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Workspace git diff: proxy ONE path's unified-diff text live from the owning daemon.
+    // A binary change, an unchanged path and a non-repo workspace are all data.
+    r.get(
+      '/agents/:id/workspace/gitdiff',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Get a workspace file diff',
+          description:
+            'Proxy the unified diff of one workspace path live from the owning daemon. `scope=staged` compares the index against HEAD; the default `unstaged` compares the worktree against the index. Pass sessionId for an authorized isolated session worktree. A binary change (binary:true), a path with no changes (diff:null) and a from-scratch workspace (isRepo:false) are all data, not errors; the daemon bounds the text to the wire frame cap and reports truncated. 503 when unplaced or the daemon is offline. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'getAgentWorkspaceGitDiff',
+          params: IdParam,
+          querystring: WorkspaceGitDiffQueryDto,
+          response: { 200: WorkspaceGitDiffDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        // Route through getOrgAgent (org boundary + canView) — a bare repo.get here
+        // would leak a restricted / cross-org agent's uncommitted work.
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await canReadWorkspaceScope(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireGitReview(reply, agent.orgId, agent.daemonId))) return
+        if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, req.query.sessionId))) return
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const rep = await deps.control.workspaceGitDiff(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            path: req.query.path,
+            staged: req.query.scope === 'staged'
+          })
+          return toWorkspaceGitDiffDto(rep)
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Workspace git log: proxy the newest commits of the checked-out branch live from the
+    // owning daemon, each marked `pushed` against the tracking ref. Empty repo ⇒ data.
+    r.get(
+      '/agents/:id/workspace/gitlog',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'List workspace commits',
+          description:
+            'Proxy the newest commits of the owning daemon’s checked-out branch (20 by default, 50 max), newest first. Pass sessionId for an authorized isolated session worktree. Each commit is marked pushed when the branch’s upstream ref already contains it; tracking:null means the branch tracks nothing, so pushed reads false throughout. An empty repo (commits: []) and a from-scratch workspace (isRepo:false) are data, not errors. 503 when unplaced or the daemon is offline. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'listAgentWorkspaceGitLog',
+          params: IdParam,
+          querystring: WorkspaceGitLogQueryDto,
+          response: { 200: WorkspaceGitLogDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        // Route through getOrgAgent (org boundary + canView) — a bare repo.get here
+        // would leak a restricted / cross-org agent's commit history.
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await canReadWorkspaceScope(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireGitReview(reply, agent.orgId, agent.daemonId))) return
+        if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, req.query.sessionId))) return
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const rep = await deps.control.workspaceGitLog(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            limit: req.query.limit ?? 20
+          })
+          return toWorkspaceGitLogDto(rep)
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Workspace sync: a git write (editors only); a refused sync is data, a busy checkout 409, an offline daemon 503.
+    r.post(
+      '/agents/:id/workspace/gitpull',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Sync the workspace',
+          description:
+            'Sync the checkout to its configured remote branch on the owning daemon: fetch, point the local branch at the remote tip and check it out, carrying uncommitted edits and never merging. Requires edit access to the agent. A refused sync (a local commit the remote lacks, an edit it would rewrite) is data (ok:false + detail); 409 when the agent is working in the checkout, 503 only when the daemon is offline. Pass repo to sync one of the agent’s authorized additional repositories instead of its primary workspace.',
+          operationId: 'pullAgentWorkspace',
+          params: IdParam,
+          querystring: WorkspaceRepoScopeQueryDto,
+          response: { 200: WorkspaceGitPullDto, 403: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        if (denyViewerWrite(req, reply)) return
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!canEdit(agent, ctxOf(req))) {
+          return reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        }
+        if (!(await canReadWorkspaceRepoScope(agent, req.query.repo))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, req.query.repo))) return
+
+        try {
+          const rep = await deps.control.workspaceGitPull(agent.daemonId, {
+            agentId: agent.id,
+            ...(req.query.repo ? { repo: req.query.repo } : {})
+          })
+          return toWorkspaceGitPullDto(rep)
+        } catch (err) {
+          if (sendWorkspaceFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    /** The READ chain plus the `denyViewerWrite` + `canEdit` gates every console git write shares; null ⇒ replied, nothing reached the daemon. */
+    const gitWriteTarget = async (
+      req: FastifyRequest,
+      reply: FastifyReply,
+      agentId: string,
+      sessionId: string | undefined,
+      repo: string | undefined,
+      requireFeature: (reply: FastifyReply, orgId: OrgId, daemonId: DaemonId) => Promise<boolean>
+    ): Promise<{ agent: AgentRecord; daemonId: DaemonId } | null> => {
+      if (denyViewerWrite(req, reply)) return null
+      const agent = await getServingAgent(req, agentId)
+      if (!agent) {
+        void reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        return null
+      }
+      if (!canEdit(agent, ctxOf(req))) {
+        void reply.code(403).send({ error: 'Forbidden', statusCode: 403, message: 'cannot edit this agent' })
+        return null
+      }
+      // A session worktree is that session's protected body surface on the write side too:
+      // editing the agent does not authorize touching a worktree its owner keeps private.
+      if (!(await canReadWorkspaceScope(req, agent.id, sessionId))) {
+        void reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        return null
+      }
+      if (!(await canReadWorkspaceRepoScope(agent, repo))) {
+        void reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'workspace not found' })
+        return null
+      }
+      if (!agent.daemonId) {
+        void reply
+          .code(503)
+          .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        return null
+      }
+      if (!(await requireFeature(reply, agent.orgId, agent.daemonId))) return null
+      if (!(await requireSessionWorkspaceRead(reply, agent.orgId, agent.daemonId, sessionId))) return null
+      if (!(await requireRepoScope(reply, agent.orgId, agent.daemonId, repo))) return null
+      return { agent, daemonId: agent.daemonId }
+    }
+
+    // Stage the named paths in the owning daemon's checkout. The REP is the FRESH status,
+    // so the console renders the result of its own action without a second read.
+    r.post(
+      '/agents/:id/workspace/gitstage',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Stage workspace paths',
+          description:
+            'Stage the named paths in the owning daemon’s checkout, or in an authorized isolated session worktree when sessionId is given. Requires edit access to the agent. Answers with the FRESH git status, so the console never re-polls for the result of its own action. An empty list, a path the checkout does not currently report as changed and a from-scratch workspace (isRepo:false) are all data, not errors; 409 when the agent is busy in its workspace, 503 when unplaced or the daemon is offline. The control plane executes no git and stores no workspace state. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'stageAgentWorkspacePaths',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          body: WorkspaceGitStageBody,
+          response: {
+            200: WorkspaceGitStatusDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const target = await gitWriteTarget(
+          req,
+          reply,
+          req.params.id,
+          req.query.sessionId,
+          req.query.repo,
+          requireGitWrite
+        )
+        if (!target) return
+
+        try {
+          const rep = await deps.control.workspaceGitStage(target.daemonId, {
+            agentId: target.agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            paths: req.body.paths
+          })
+          return toWorkspaceGitStatusDto(rep, workspaceGitConfigFor(target.agent, req.query.repo))
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Unstage the named paths — the same chain, the same fresh-status answer.
+    r.post(
+      '/agents/:id/workspace/gitunstage',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Unstage workspace paths',
+          description:
+            'Remove the named paths from the index of the owning daemon’s checkout, or of an authorized isolated session worktree when sessionId is given. Requires edit access to the agent. Answers with the FRESH git status. The working tree is never touched, so nothing the agent wrote is lost; an empty list, a path that is not staged and a from-scratch workspace (isRepo:false) are all data. 409 when the agent is busy in its workspace, 503 when unplaced or the daemon is offline. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'unstageAgentWorkspacePaths',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          body: WorkspaceGitStageBody,
+          response: {
+            200: WorkspaceGitStatusDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const target = await gitWriteTarget(
+          req,
+          reply,
+          req.params.id,
+          req.query.sessionId,
+          req.query.repo,
+          requireGitWrite
+        )
+        if (!target) return
+
+        try {
+          const rep = await deps.control.workspaceGitUnstage(target.daemonId, {
+            agentId: target.agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            paths: req.body.paths
+          })
+          return toWorkspaceGitStatusDto(rep, workspaceGitConfigFor(target.agent, req.query.repo))
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Commit on the owning daemon as the agent's App bot, else the registered identity; a refusal is data with a closed `reason`.
+    r.post(
+      '/agents/:id/workspace/gitcommit',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Commit the staged workspace changes',
+          description:
+            'Commit whatever is staged in the owning daemon’s checkout, or in an authorized isolated session worktree when sessionId is given. Requires edit access to the agent. The commit is attributed to the bot of the agent’s own organization GitHub App when it has one, else to the identity the daemon registered at handshake, never to the console user. Nothing staged, a blank message, a daemon with no registered identity and a git refusal all come back as ok:false with a machine `reason`, not an HTTP error; 409 when the agent is busy in its workspace, 503 when unplaced or the daemon is offline. The control plane forwards the message and stores neither it nor the diff. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'commitAgentWorkspace',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          body: WorkspaceGitCommitBody,
+          response: {
+            200: WorkspaceGitCommitResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const target = await gitWriteTarget(
+          req,
+          reply,
+          req.params.id,
+          req.query.sessionId,
+          req.query.repo,
+          requireGitWrite
+        )
+        if (!target) return
+
+        try {
+          const rep = await deps.control.workspaceGitCommit(target.daemonId, {
+            agentId: target.agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {}),
+            message: req.body.message
+          })
+          return toWorkspaceGitCommitDto(rep)
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Push the checked-out branch to the daemon-authorized remote. The daemon derives
+    // the refspec and never forces, so every rejection comes back as data.
+    r.post(
+      '/agents/:id/workspace/gitpush',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Push the workspace branch',
+          description:
+            'Push the branch checked out in the owning daemon’s workspace, or in an authorized isolated session worktree when sessionId is given, to the remote that daemon authorizes. Requires edit access to the agent. The daemon derives the refspec and never forces: a diverged branch (reason diverged), a detached HEAD (detached-head), a branch tracking nothing (no-upstream) and a remote rejection (rejected) are all ok:false data, and a push with nothing to send is ok:true with ahead:0. 409 when the agent is busy in its workspace, 503 when unplaced or the daemon is offline. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'pushAgentWorkspace',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          response: {
+            200: WorkspaceGitPushResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const target = await gitWriteTarget(
+          req,
+          reply,
+          req.params.id,
+          req.query.sessionId,
+          req.query.repo,
+          requireGitWrite
+        )
+        if (!target) return
+
+        try {
+          const rep = await deps.control.workspaceGitPush(target.daemonId, {
+            agentId: target.agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {})
+          })
+          return toWorkspaceGitPushDto(rep)
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // Draft a commit message from the staged diff on the AGENT's own runtime. The CP is
+    // never on the inference path (webchat-side-panels.md §2) — it authorizes a press,
+    // forwards it, and proxies the answer without storing the diff or the message.
+    r.post(
+      '/agents/:id/workspace/gitmessage',
+      {
+        schema: {
+          tags: [Tag.Workspace],
+          summary: 'Draft a commit message from the staged diff',
+          description:
+            'Ask the owning daemon to draft a conventional-commit message from the staged diff of its checkout, or of an authorized isolated session worktree when sessionId is given. The model pass runs on the daemon against the agent’s own runtime — the control plane never calls a model provider, and stores neither the diff nor the message. Requires edit access to the agent, because it spends the agent’s model budget. Nothing staged, a runtime that declines or answers with prose, and a timeout are all ok:false with a detail to render; 503 when unplaced or the daemon is offline. This writes nothing: the reader edits the draft and commits it separately. Pass repo (owner/repo) to address one of the agent’s authorized additional repositories instead of its primary workspace; an unauthorized name reads 404, and a daemon too old to scope by repository yields 409.',
+          operationId: 'draftAgentWorkspaceCommitMessage',
+          params: IdParam,
+          querystring: WorkspaceScopeQueryDto,
+          response: {
+            200: WorkspaceGitMessageResultDto,
+            400: ErrorDto,
+            403: ErrorDto,
+            404: ErrorDto,
+            409: ErrorDto,
+            503: ErrorDto
+          }
+        }
+      },
+      async (req, reply) => {
+        const target = await gitWriteTarget(
+          req,
+          reply,
+          req.params.id,
+          req.query.sessionId,
+          req.query.repo,
+          requireGitMessage
+        )
+        if (!target) return
+
+        try {
+          const rep = await deps.control.workspaceGitMessage(target.daemonId, {
+            agentId: target.agent.id,
+            ...(req.query.sessionId ? { sessionId: req.query.sessionId } : {}),
+            ...(req.query.repo ? { repo: req.query.repo } : {})
+          })
+          return toWorkspaceGitMessageDto(rep)
+        } catch (err) {
+          if (sendWorkspaceMutationFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+
+    // One ACP session's background tasks, projected live from the owning daemon's in-memory
+    // lease. A READ: there is no cancel counterpart, because no ACP primitive can address one
+    // background task (webchat-side-panels.md §3.5). The CP stores nothing.
+    r.get(
+      '/agents/:id/tasks',
+      {
+        schema: {
+          tags: [Tag.Agents],
+          summary: 'List a session’s background tasks',
+          description:
+            'Proxy the background tasks of ONE of the agent’s ACP sessions live from the owning daemon, live ones first and then the daemon’s bounded settled history. sessionId is REQUIRED, unlike the workspace reads: the daemon tracks tasks per (agent, ACP session) and has no per-agent aggregate to answer with. Both the session’s own visibility rule and the agent’s apply, so a session the caller cannot see reads as absent (404) — but the session’s workspace isolation does not, because tasks are not a checkout. tracked:false means the daemon holds no tracking for that session (a runtime that reports no task lifecycle, or one that has not yet), which is data and different from an empty list; a settled task stays listed for a bounded while with its outcome. There is no cancel counterpart: no agent-protocol primitive can address a single background task, so the escape hatch is cancelling the turn. 409 when the daemon is too old to report tasks, 503 when the agent is unplaced or its daemon is offline. The control plane persists none of this.',
+          operationId: 'listAgentSessionTasks',
+          params: IdParam,
+          querystring: AgentTasksQueryDto,
+          response: { 200: AgentTasksDto, 400: ErrorDto, 404: ErrorDto, 409: ErrorDto, 503: ErrorDto }
+        }
+      },
+      async (req, reply) => {
+        // Route through getOrgAgent (org boundary + canView) — a bare repo.get here would leak
+        // a restricted / cross-org agent's work, and task descriptions are model-authored text.
+        const agent = await getServingAgent(req, req.params.id)
+        if (!agent) return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'agent not found' })
+        if (!(await visibleAgentSession(req, agent.id, req.query.sessionId))) {
+          return reply.code(404).send({ error: 'Not Found', statusCode: 404, message: 'session not found' })
+        }
+        if (!agent.daemonId) {
+          return reply
+            .code(503)
+            .send({ error: 'Service Unavailable', statusCode: 503, message: 'agent has no live daemon' })
+        }
+        if (!(await requireTasks(reply, agent.orgId, agent.daemonId))) return
+
+        try {
+          const rep = await deps.control.taskList(agent.daemonId, {
+            agentId: agent.id,
+            sessionId: req.query.sessionId
+          })
+          return toAgentTasksDto(rep)
+        } catch (err) {
+          if (sendTaskFailure(reply, err)) return
+          throw err
+        }
+      }
+    )
+  }
+}

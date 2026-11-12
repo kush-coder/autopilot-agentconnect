@@ -1,0 +1,1563 @@
+/** GitHub ingress (`POST /webhooks/github`, webhook-triggers-and-github-events.md P2): mandatory signature, installation events ring a doorbell, subscription events match rules by numeric repo id; the payload is never logged. */
+import { randomUUID } from 'node:crypto'
+import type { FastifyInstance } from 'fastify'
+import type { Clock } from '@agentconnect.md/connection'
+import {
+  codeHostSubjectBody,
+  GITHUB_RELEASE_RESTATED_EVENTS,
+  GITHUB_REQUEST_REVIEW_ACTION,
+  HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED,
+  isGithubPullRequestRevisionEvent,
+  type RcGithubCommentAuthz,
+  type RcGithubRerequest,
+  type RcGithubRerequestResult,
+  type RcPullRequestFeedback,
+  type FollowUpEventKind,
+  type GithubHookMetadata,
+  type HookContext,
+  type RcGithubInstallation,
+  type RcHookAssign,
+  type RcRunReport,
+  type RdHookNotice,
+  type RdMsgHook
+} from '@agentconnect.md/protocol'
+import type { RelayDaemonServer } from '../relay-daemon-server.js'
+import type { HookTable } from './hook-table.js'
+import type { GithubAppWebhookTable } from './github-app-table.js'
+import type { FollowUpWatchTable } from './follow-up-watch-table.js'
+import { githubRuleByHookId, githubRulesForEvent } from './github-installation.js'
+import type { HookRateLimiter } from './rate-limit.js'
+import { dispatchHookFire, noticeDelivery } from './ingress.js'
+import { GITHUB_ROUTED_THREAD_EVENTS, GITHUB_ROUTING, githubEventFamily, githubRuleFamilies } from './github-routing.js'
+import { createCodeHostRouter } from './code-host-routing.js'
+import { hookSnapshotForDelivery } from './hook-snapshot.js'
+import { verifySha256Header } from './signature.js'
+import { labelFilterAdmits } from './label-filter.js'
+import type { Logger } from '../log.js'
+
+/** Raw-body cap for the GitHub endpoint (design: 1 MiB — GitHub's own payload cap). */
+export const GITHUB_BODY_LIMIT = 1024 * 1024
+/** `HookContext.bodyExcerpt` cap (design: 4 KiB) — the agent pulls the full thread itself. */
+export const GITHUB_BODY_EXCERPT_MAX = 4 * 1024
+
+/** The event families that are matched against hook rules (everything else: 202 no-op). */
+const SUBSCRIPTION_EVENTS = new Set([
+  'issues',
+  'pull_request',
+  'issue_comment',
+  'pull_request_review_comment',
+  'push',
+  'deployment',
+  'deployment_status',
+  'release'
+])
+/** The events that ring the installation doorbell instead of matching. */
+const INSTALLATION_EVENTS = new Set(['installation', 'installation_repositories'])
+
+export interface GithubIngressDeps {
+  table: HookTable
+  /** Late-bound: the rd/* server exists only after `listen()` (routes register before). */
+  daemons: () => Pick<RelayDaemonServer, 'get'> | undefined
+  /** Emit one delivery-stage `rc/run-report` EVT to the CP (fire-and-forget). */
+  report: (report: RcRunReport) => void
+  /** Emit one `rc/github-installation` doorbell EVT to the CP (fire-and-forget). */
+  doorbell: (poke: RcGithubInstallation) => void
+  /** Persist body-free PR feedback before the signed webhook is acknowledged. */
+  reportPullRequestFeedback?: (signal: RcPullRequestFeedback) => Promise<boolean>
+  /** The objects follow-ups watch; a wake-only event on any other object goes nowhere. */
+  followUpWatches?: Pick<FollowUpWatchTable, 'watched'>
+  /** Send a wake-only event, fire-and-forget: the timed check covers a lost one. */
+  reportFollowUpEvent?: (signal: RcPullRequestFeedback) => Promise<boolean>
+  /** Resolve every issue/PR actor's live write authority: metadata only, delegated to the CP's GitHub App. */
+  authorizeComment: (request: RcGithubCommentAuthz) => Promise<boolean>
+  /** Resolve a signed review control through CP-owned durable metadata. */
+  authorizeRerequest: (request: RcGithubRerequest) => Promise<RcGithubRerequestResult>
+  /** Dedicated upstream-call budget, shared by every hook on one repository. */
+  authzLimiter: HookRateLimiter
+  limiter: HookRateLimiter
+  clock: Clock
+  log: Logger
+  /** The App webhook secret from this process's immutable startup snapshot. */
+  webhookSecret: () => string | undefined
+  /** Organization GitHub Apps' webhook secrets, pushed by the CP. */
+  appWebhooks?: Pick<GithubAppWebhookTable, 'secretFor'>
+}
+
+/** The payload slice the matcher reads: untrusted filter input; authorization is the compiled `installationIds` set. */
+interface GithubPayload {
+  action?: string
+  changes?: { base?: unknown }
+  /** The label a `labeled` action just applied. */
+  label?: { name?: string }
+  installation?: { id?: number }
+  repository?: GithubRepositoryRef
+  sender?: { login?: string; type?: string; avatar_url?: string }
+  requested_reviewer?: { login?: string; type?: string }
+  requested_action?: { identifier?: string }
+  issue?: GithubSubject
+  pull_request?: GithubSubject
+  comment?: {
+    id?: number
+    pull_request_review_id?: number
+    in_reply_to_id?: number | null
+    body?: string
+    html_url?: string
+    user?: { login?: string }
+    author_association?: string
+  }
+  review?: { body?: string | null; state?: string; user?: { login?: string }; author_association?: string }
+  // push ("commits") deliveries — no subject, no action.
+  ref?: string // 'refs/heads/main'
+  compare?: string // diff URL for the pushed range
+  head_commit?: { message?: string | null } | null
+  commits?: Array<{ message?: string | null }> // ≤20 in the payload (GitHub truncates)
+  check_run?: {
+    id?: number
+    head_sha?: string
+    app?: { id?: number }
+    pull_requests?: Array<{
+      number?: number
+      head?: { sha?: string; repo?: { id?: number } | null }
+      base?: { sha?: string; repo?: { id?: number } | null }
+    }>
+  }
+  check_suite?: {
+    id?: number
+    head_sha?: string
+    app?: { id?: number }
+    conclusion?: string | null
+    pull_requests?: Array<{ number?: number }>
+  }
+  workflow_run?: {
+    event?: string
+    head_sha?: string
+    html_url?: string
+    triggering_actor?: { login?: string }
+    pull_requests?: Array<{ number?: number; head?: { sha?: string } }>
+  }
+  // deployment deliveries — the environment is the subject; a status carries the state.
+  deployment?: {
+    id?: number
+    sha?: string
+    ref?: string
+    environment?: string
+    description?: string | null
+  }
+  deployment_status?: {
+    state?: string // 'pending' | 'queued' | 'in_progress' | 'waiting' | 'success' | 'failure' | 'error' | 'inactive'
+    description?: string | null
+    target_url?: string | null
+    log_url?: string | null
+    environment_url?: string | null
+  }
+  // release deliveries — no thread; every release of the repository continues one session.
+  release?: {
+    tag_name?: string
+    target_commitish?: string
+    name?: string | null
+    body?: string | null
+    html_url?: string
+    draft?: boolean
+    prerelease?: boolean
+  }
+}
+
+/** `deployment` and `deployment_status` — one subject family, no thread, machine-authored by design. */
+export function isGithubDeploymentEvent(event: string): boolean {
+  return event === 'deployment' || event === 'deployment_status'
+}
+
+/** The matched action: GitHub's own, except a status, whose state is the axis `deployment_status:<state>` selects. */
+export function githubEventAction(event: string, payload: GithubPayload): string | undefined {
+  if (event === 'deployment_status') return payload.deployment_status?.state ?? payload.action
+  return payload.action
+}
+
+/** The delivery's own repository. `owner.type` is GitHub's signed owner kind. */
+interface GithubRepositoryRef {
+  id?: number
+  full_name?: string
+  owner?: { login?: string; type?: string }
+}
+
+interface GithubSubject {
+  number?: number
+  title?: string
+  body?: string | null
+  html_url?: string
+  user?: { login?: string; type?: string }
+  author_association?: string
+  labels?: Array<{ name?: string }>
+  head?: { sha?: string; repo?: { full_name?: string } | null }
+  base?: { sha?: string; repo?: { full_name?: string } | null }
+  merge_commit_sha?: string | null
+  merged?: boolean
+  draft?: boolean
+  state?: string
+  /** Present on the `issue` object when an `issue_comment` belongs to a PR. */
+  pull_request?: unknown
+}
+
+/** The per-delivery facts the match predicate consumes (extracted once). */
+export interface GithubMatchCtx {
+  event: string // 'issues'
+  // 'issues:opened'; action-less push is bare 'push' (matches `family:*` only); a status carries its state.
+  eventAction: string
+  installationId: string | undefined // String(payload.installation.id); absent ⇒ never matches
+  labels: string[] // the subject's CURRENT labels (not payload.label)
+  appliedLabel?: string // the label a `labeled` action just applied
+  senderType: string | undefined // 'User' | 'Bot' | …
+  senderLogin?: string
+  // P3 gating inputs: thread authors and the authored text; handles match locally, actor permission is always live.
+  subjectAuthorLogin?: string
+  subjectAuthorType?: string
+  headRepoFullName?: string
+  baseRepoFullName?: string
+  commentAuthorLogin?: string
+  /** The organization login that scopes `@<owner>/<agent>` team mentions; absent for a personal repository. */
+  teamOwnerLogin?: string
+  mentionText: string | undefined
+  /** The native reviewer request target; only this App's `[bot]` login makes `review_requested` a review request. */
+  requestedReviewerLogin?: string
+  /** Signed `pull_request:edited` proof that the target branch changed. */
+  baseChanged?: boolean
+  /** The PR's draft flag on a `pull_request` delivery; absent elsewhere. */
+  isDraft?: boolean
+  /** The comment's thread family: `issue_comment` reads the issue's `pull_request` marker; review comments are PR. */
+  commentSubjectFamily: 'issues' | 'pull_request' | undefined
+  /** The issue/PR number; absent for a push or deployment, which have no numbered thread. */
+  subjectNumber?: number
+  /** The signed payload's repository id, so a rule re-read after an await is fenced to this event's repository. */
+  repoId?: string
+}
+
+function isGithubPullRequestRevision(ctx: Pick<GithubMatchCtx, 'eventAction' | 'baseChanged'>): boolean {
+  return isGithubPullRequestRevisionEvent(ctx.eventAction, ctx)
+}
+
+function githubPullRequestBaseChanged(event: string, payload: GithubPayload): boolean {
+  return event === 'pull_request' && payload.action === 'edited' && payload.changes?.base !== undefined
+}
+
+/** Deliveries that close a thread's workspace; a PR `closed` counts only when merged, since an unmerged PR may reopen. */
+function githubThreadWorktreeCleanupEvent(event: string, payload: GithubPayload): string | undefined {
+  if (event === 'issues' && (payload.action === 'closed' || payload.action === 'deleted')) {
+    return `issues:${payload.action}`
+  }
+  if (event === 'pull_request' && payload.action === 'closed' && payload.pull_request?.merged === true) {
+    return 'pull_request:merged'
+  }
+  return undefined
+}
+
+/** no-match failed a static gate; trusted dispatches now; needs-authz awaits live maintainer authorization. */
+export type GithubRuleVerdict = 'no-match' | 'trusted' | 'needs-authz'
+
+/** `@<handle>` as a whole case-insensitive token, bounded on both sides; a trailing `/<slug>` is the team form. */
+export function mentionsGithubHandle(body: string | undefined, handle: string | undefined): boolean {
+  if (!body || !handle) return false
+  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?<![\\w-])@${escaped}(?![\\w-]|/[\\w-])`, 'i').test(body)
+}
+
+/** `@<owner>/<agent-slug>`, the team form that makes the handle autocomplete; matching stays pure text. */
+export function mentionsGithubTeam(
+  body: string | undefined,
+  owner: string | undefined,
+  slug: string | undefined
+): boolean {
+  return !!owner && !!slug && mentionsGithubHandle(body, `${owner}/${slug}`)
+}
+
+/** The organization whose teams a mention can name; a non-`Organization` owner (or an old payload) yields none. */
+export function githubTeamOwner(repository: GithubRepositoryRef | undefined): string | undefined {
+  if (repository?.owner?.type !== 'Organization') return undefined
+  return repository.owner.login || repository.full_name?.split('/')[0] || undefined
+}
+
+function requestsGithubAppReviewer(login: string | undefined, appSlug: string | undefined): boolean {
+  return !!login && !!appSlug && login.toLowerCase() === `${appSlug}[bot]`.toLowerCase()
+}
+
+/** A bot applying a label the rule filters on is a deliberate handoff; any other bot label churn stays vetoed. */
+function isFilteredBotLabel(rule: RcHookAssign, ctx: GithubMatchCtx): boolean {
+  return (
+    (ctx.eventAction === 'issues:labeled' || ctx.eventAction === 'pull_request:labeled') &&
+    !!ctx.appliedLabel &&
+    !!rule.github?.labelFilter?.length &&
+    labelFilterAdmits(rule.github.labelFilter, [ctx.appliedLabel])
+  )
+}
+
+/** Release automation is a bot by design; this App's own release is not admitted, or an agent editing its notes would re-trigger itself. */
+function isForeignBotRelease(rule: RcHookAssign, ctx: GithubMatchCtx): boolean {
+  return (
+    ctx.event === 'release' &&
+    !!rule.github?.appSlug &&
+    !requestsGithubAppReviewer(ctx.senderLogin, rule.github.appSlug)
+  )
+}
+
+function githubRuleSupportsPullRequests(rule: RcHookAssign): boolean {
+  if (!rule.github) return false
+  const commentFamilies = rule.github.commentFamilies
+  return rule.github.events.some(
+    (event) =>
+      event.startsWith('pull_request:') ||
+      event.startsWith('pull_request_review_comment:') ||
+      (event.startsWith('issue_comment:') &&
+        (!commentFamilies || commentFamilies.length === 0 || commentFamilies.includes('pull_request')))
+  )
+}
+
+function isConfiguredAppPullRequest(rule: RcHookAssign, ctx: GithubMatchCtx): boolean {
+  if (
+    ctx.event !== 'pull_request' ||
+    !isGithubPullRequestRevision(ctx) ||
+    !rule.github?.appSlug ||
+    ctx.subjectAuthorType !== 'Bot' ||
+    !ctx.subjectAuthorLogin
+  )
+    return false
+  const author = ctx.subjectAuthorLogin.toLowerCase()
+  return [rule.github.appSlug, ...(rule.github.internalAppSlugs ?? [])].some(
+    (slug) => author === `${slug}[bot]`.toLowerCase()
+  )
+}
+
+/** A same-repository App-authored revision is the internal CI lane, reviewable without trusting the bot as a maintainer. */
+function isInternalAppPullRequest(rule: RcHookAssign, ctx: GithubMatchCtx): boolean {
+  return Boolean(
+    isConfiguredAppPullRequest(rule, ctx) &&
+    ctx.headRepoFullName &&
+    ctx.baseRepoFullName &&
+    ctx.headRepoFullName.toLowerCase() === ctx.baseRepoFullName.toLowerCase()
+  )
+}
+
+function isGithubThreadComment(ctx: GithubMatchCtx): boolean {
+  return ctx.event === 'issue_comment' || ctx.event === 'pull_request_review_comment'
+}
+
+/** The targeted agent handle as the bare slug or the `@<owner>/<slug>` team form. */
+function githubMentionsAgent(body: string | undefined, rule: RcHookAssign, owner: string | undefined): boolean {
+  return mentionsGithubHandle(body, rule.github?.agentName) || mentionsGithubTeam(body, owner, rule.github?.agentName)
+}
+
+function githubRuleIsSummoned(rule: RcHookAssign, ctx: GithubMatchCtx): boolean {
+  return (
+    mentionsGithubHandle(ctx.mentionText, rule.github?.appSlug) ||
+    githubMentionsAgent(ctx.mentionText, rule, ctx.teamOwnerLogin)
+  )
+}
+
+/** Explicit agent handles narrow a repo fan-out; the App handle is the broadcast form, other mentions change nothing. */
+export function githubMentionCandidates(
+  rules: RcHookAssign[],
+  body: string | undefined,
+  owner?: string
+): RcHookAssign[] {
+  if (rules.some((rule) => mentionsGithubHandle(body, rule.github?.appSlug))) return rules
+  const targetedAgentIds = new Set(
+    rules.filter((rule) => githubMentionsAgent(body, rule, owner)).map((rule) => rule.agentId)
+  )
+  return targetedAgentIds.size === 0 ? rules : rules.filter((rule) => targetedAgentIds.has(rule.agentId))
+}
+
+/** Which static gate a `no-match` failed, so a dropped delivery can say why. */
+export type GithubNoMatchReason =
+  | 'not_github'
+  | 'deleted'
+  | 'lifecycle'
+  | 'bot_sender'
+  | 'release_restated'
+  | 'installation'
+  | 'review_request_target'
+  | 'event'
+  | 'comment_family'
+  | 'mention_only'
+  | 'label_filter'
+  | 'draft'
+
+export type GithubRuleMatch =
+  { verdict: 'trusted' | 'needs-authz' } | { verdict: 'no-match'; reason: GithubNoMatchReason }
+
+const noMatch = (reason: GithubNoMatchReason): GithubRuleMatch => ({ verdict: 'no-match', reason })
+
+/** One rule's pure verdict: noise/draft veto → bot veto → attribution → cadence/summon → comment scope → mention-only → labels → authz. */
+export function githubRuleVerdict(rule: RcHookAssign, ctx: GithubMatchCtx): GithubRuleVerdict {
+  return githubRuleMatch(rule, ctx).verdict
+}
+
+/** `githubRuleVerdict` with the failed gate of a `no-match`. */
+export function githubRuleMatch(rule: RcHookAssign, ctx: GithubMatchCtx): GithubRuleMatch {
+  if (rule.kind !== 'github' || !rule.github) return noMatch('not_github')
+  // Deletions are never new work (issue deletion is cleanup), even under a legacy wildcard.
+  if (ctx.eventAction === `${ctx.event}:deleted`) return noMatch('deleted')
+  // Lifecycle changes and content edits are silent; a signed target-branch edit still changes the revision.
+  if (
+    (ctx.event === 'issues' &&
+      (ctx.eventAction === 'issues:closed' ||
+        ctx.eventAction === 'issues:reopened' ||
+        ctx.eventAction === 'issues:edited')) ||
+    (ctx.event === 'pull_request' &&
+      (ctx.eventAction === 'pull_request:closed' ||
+        ctx.eventAction === 'pull_request:reopened' ||
+        (ctx.eventAction === 'pull_request:edited' && !isGithubPullRequestRevision(ctx)) ||
+        (ctx.eventAction === 'pull_request:ready_for_review' && !rule.github.skipDrafts) ||
+        ctx.eventAction === 'pull_request:converted_to_draft' ||
+        ctx.eventAction === 'pull_request:auto_merge_enabled' ||
+        ctx.eventAction === 'pull_request:auto_merge_disabled'))
+  )
+    return noMatch('lifecycle')
+  // A draft-skipping rule leaves draft revisions to `ready_for_review`, which reviews the head they reached.
+  if (rule.github.skipDrafts && ctx.isDraft === true && isGithubPullRequestRevision(ctx)) return noMatch('draft')
+  // Decision 10: bots are vetoed except PR revisions (another bot's earns only the manual-request Check), deployments, which cannot loop, other bots' releases, and filtered labels.
+  if (
+    ctx.senderType === 'Bot' &&
+    !(ctx.event === 'pull_request' && isGithubPullRequestRevision(ctx)) &&
+    !isGithubDeploymentEvent(ctx.event) &&
+    !isForeignBotRelease(rule, ctx) &&
+    !isFilteredBotLabel(rule, ctx)
+  )
+    return noMatch('bot_sender')
+  // A restated release action fires only on its explicit pattern, so one publish is one turn under `release:*`.
+  if (GITHUB_RELEASE_RESTATED_EVENTS.has(ctx.eventAction) && !rule.github.events.includes(ctx.eventAction))
+    return noMatch('release_restated')
+  // Decision 6(a): an event that cannot prove its installation does not fire.
+  if (!ctx.installationId || !rule.github.installationIds.includes(ctx.installationId)) return noMatch('installation')
+  // The native reviewer control bypasses cadence, label and mention filters, only for this App bot and behind live authz.
+  if (ctx.eventAction === 'pull_request:review_requested') {
+    return requestsGithubAppReviewer(ctx.requestedReviewerLogin, rule.github.appSlug) &&
+      githubRuleSupportsPullRequests(rule)
+      ? { verdict: 'needs-authz' }
+      : noMatch('review_request_target')
+  }
+  // An `issue_comment` subscription also covers diff-line review comments, so mention mode sees them.
+  const action = ctx.eventAction.includes(':') ? ctx.eventAction.slice(ctx.eventAction.indexOf(':')) : ''
+  const matchesPattern = (event: string): boolean =>
+    (action !== '' && rule.github!.events.includes(`${event}${action}`)) || rule.github!.events.includes(`${event}:*`)
+  const nativeEventMatched = matchesPattern(ctx.event)
+  // The shared issue_comment alias; an explicit review-comment subscription stays authoritative.
+  const sharedCommentAliasMatched = ctx.event === 'pull_request_review_comment' && matchesPattern('issue_comment')
+  const summoned = githubRuleIsSummoned(rule, ctx)
+  // "created" is additive: a later explicit summon in a selected family fires too, within mention-only's event universe.
+  const createdCadenceSummonFamily =
+    ctx.event === 'issues' || ctx.event === 'pull_request'
+      ? ctx.event
+      : (ctx.event === 'issue_comment' || ctx.event === 'pull_request_review_comment') && action === ':created'
+        ? ctx.commentSubjectFamily
+        : undefined
+  const createdCadenceSummonMatched =
+    summoned &&
+    createdCadenceSummonFamily !== undefined &&
+    rule.github.events.includes(`${createdCadenceSummonFamily}:opened`)
+  // Leaving draft stands in for the revisions a draft-skipping rule held back, so the Opened cadence takes it too.
+  const readyRevisionMatched =
+    ctx.eventAction === 'pull_request:ready_for_review' &&
+    (rule.github.events.includes('pull_request:opened') || rule.github.events.includes('pull_request:synchronize'))
+  const eventMatched =
+    nativeEventMatched || sharedCommentAliasMatched || createdCadenceSummonMatched || readyRevisionMatched
+  if (!eventMatched) return noMatch('event')
+  // `issue_comment` spans issues and PRs: selected comment families scope it, absent keeps the legacy repo-wide union.
+  const matchedViaSharedComment =
+    ctx.event === 'issue_comment' || (!nativeEventMatched && (sharedCommentAliasMatched || createdCadenceSummonMatched))
+  const commentFamilies = rule.github.commentFamilies
+  if (
+    matchedViaSharedComment &&
+    ctx.commentSubjectFamily &&
+    commentFamilies &&
+    commentFamilies.length > 0 &&
+    !commentFamilies.includes(ctx.commentSubjectFamily)
+  )
+    return noMatch('comment_family')
+  // P3 mention-only: fire only when the authored text summons the App or agent; a summoned issue's later updates keep flowing.
+  if (rule.github.mentionOnly && !summoned) return noMatch('mention_only')
+  if (!labelFilterAdmits(rule.github.labelFilter, ctx.labels)) return noMatch('label_filter')
+
+  // Association labels prove nothing: thread events resolve the live role; push, deployments, releases and bot labels rely on the installation gate.
+  return ctx.event === 'push' ||
+    isGithubDeploymentEvent(ctx.event) ||
+    ctx.event === 'release' ||
+    isInternalAppPullRequest(rule, ctx) ||
+    (ctx.senderType === 'Bot' && isFilteredBotLabel(rule, ctx))
+    ? { verdict: 'trusted' }
+    : { verdict: 'needs-authz' }
+}
+
+/** Truncate on a UTF-8 byte budget at a code-point boundary; the excerpt cap is bytes, not UTF-16 units. */
+export function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return { text, truncated: false }
+  const buf = Buffer.from(text, 'utf8')
+  let end = maxBytes
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end-- // never split a code point
+  return { text: buf.subarray(0, end).toString('utf8'), truncated: true }
+}
+
+/** Flatten and cap the title, which the daemon renders on its trusted header line (security boundary 1). */
+function sanitizeTitle(title: string): string {
+  const flat = title.replace(/\s+/g, ' ').trim()
+  return flat.length > 200 ? `${flat.slice(0, 199)}…` : flat
+}
+
+/** A commit id as GitHub writes it; anything else is dropped rather than rendered on the trusted header. */
+const COMMIT_SHA = /^[0-9a-f]{7,64}$/i
+
+/** The first link a payload actually carries — GitHub defaults an omitted status URL to `""`, not null. */
+function firstUrl(...candidates: Array<string | null | undefined>): string | undefined {
+  return candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate !== '')
+}
+
+/** The trimmed envelope every fanned-out hook shares; comment, head commit, deployment status or release notes win as the excerpt. */
+export function buildGithubContext(event: string, payload: GithubPayload): HookContext {
+  const subject = payload.issue ?? payload.pull_request
+  const deployment = isGithubDeploymentEvent(event) ? payload.deployment : undefined
+  const status = event === 'deployment_status' ? payload.deployment_status : undefined
+  const release = event === 'release' ? payload.release : undefined
+  // A review's own text is what the event says; it never falls back to the PR body.
+  const review = event === 'pull_request_review' ? payload.review : undefined
+  const bodySource =
+    (review ? (review.body ?? '') : undefined) ??
+    payload.comment?.body ??
+    subject?.body ??
+    status?.description ??
+    deployment?.description ??
+    release?.body ??
+    payload.head_commit?.message ??
+    ''
+  const excerpt = truncateUtf8(bodySource, GITHUB_BODY_EXCERPT_MAX)
+  const subjectBody = subject?.body == null ? undefined : codeHostSubjectBody(subject.body)
+  const action = githubEventAction(event, payload)
+  const htmlUrl = firstUrl(
+    payload.comment?.html_url,
+    subject?.html_url,
+    payload.compare,
+    status?.log_url,
+    status?.target_url,
+    status?.environment_url,
+    deployment ? payload.workflow_run?.html_url : undefined,
+    release?.html_url
+  )
+  const title = subject?.title || release?.name || release?.tag_name
+  return {
+    source: 'github',
+    event,
+    ...(action ? { action } : {}),
+    ...(payload.repository?.full_name ? { repo: payload.repository.full_name } : {}),
+    ...(subject?.number !== undefined ? { number: subject.number } : {}),
+    ...(title ? { title: sanitizeTitle(title) } : {}),
+    ...(payload.sender?.login ? { senderLogin: payload.sender.login } : {}),
+    ...(payload.sender?.avatar_url ? { senderAvatarUrl: payload.sender.avatar_url } : {}),
+    ...((payload.comment?.author_association ?? review?.author_association ?? subject?.author_association)
+      ? {
+          authorAssociation:
+            payload.comment?.author_association ?? review?.author_association ?? subject?.author_association
+        }
+      : {}),
+    ...(subject?.labels ? { labels: subject.labels.map((l) => l.name ?? '').filter(Boolean) } : {}),
+    ...(htmlUrl ? { htmlUrl } : {}),
+    ...(excerpt.text ? { bodyExcerpt: excerpt.text } : {}),
+    // The issue/PR itself, so a Decision can judge a comment against it; the body stays untrusted like the excerpt.
+    ...(subject
+      ? {
+          subject: {
+            ...(subject.user?.login ? { authorLogin: subject.user.login } : {}),
+            ...(subject.user?.type ? { authorType: subject.user.type } : {}),
+            ...(subject.author_association ? { authorAssociation: subject.author_association } : {}),
+            ...(subject.state ? { state: subject.state } : {}),
+            ...(typeof subject.draft === 'boolean' ? { draft: subject.draft } : {}),
+            ...subjectBody
+          }
+        }
+      : {}),
+    // The environment and ref ride the daemon's trusted header line, so they get the title's defanging.
+    ...(deployment?.environment ? { environment: sanitizeTitle(deployment.environment) } : {}),
+    ...(deployment?.ref ? { ref: sanitizeTitle(deployment.ref) } : {}),
+    ...(deployment?.sha && COMMIT_SHA.test(deployment.sha) ? { sha: deployment.sha } : {}),
+    // The tag and target ride the trusted header too; the flags let the agent tell a prerelease or draft apart.
+    ...(release?.tag_name
+      ? {
+          release: {
+            tag: sanitizeTitle(release.tag_name),
+            ...(release.target_commitish ? { target: sanitizeTitle(release.target_commitish) } : {}),
+            ...(typeof release.prerelease === 'boolean' ? { prerelease: release.prerelease } : {}),
+            ...(typeof release.draft === 'boolean' ? { draft: release.draft } : {})
+          }
+        }
+      : {}),
+    truncated: excerpt.truncated
+  }
+}
+
+/** The body-free trusted subject/revision envelope for one rule; undefined for push, deployment and release, which have no subject. */
+export function buildTrustedGithubMetadata(
+  event: string,
+  payload: GithubPayload,
+  rule: RcHookAssign
+): GithubHookMetadata | undefined {
+  if (!rule.github || event === 'push' || isGithubDeploymentEvent(event) || event === 'release') return undefined
+  const installationId = payload.installation?.id
+  const repoId = payload.repository?.id
+  if (installationId === undefined || repoId === undefined || String(repoId) !== rule.github.repoId) return undefined
+
+  const subject = payload.issue ?? payload.pull_request
+  if (subject?.number === undefined) return undefined
+  const isPullRequest =
+    payload.pull_request !== undefined ||
+    event === 'pull_request' ||
+    event === 'pull_request_review_comment' ||
+    (event === 'issue_comment' && payload.issue?.pull_request !== undefined)
+  const explicitReviewRequest =
+    rule.reviewPolicy !== undefined &&
+    rule.reviewPolicy !== 'off' &&
+    isPullRequest &&
+    event === 'issue_comment' &&
+    payload.action === 'created' &&
+    (mentionsGithubHandle(payload.comment?.body, rule.github.appSlug) ||
+      githubMentionsAgent(payload.comment?.body, rule, githubTeamOwner(payload.repository)))
+  const pr = payload.pull_request
+  const headSha = pr?.head?.sha
+  const baseChanged = githubPullRequestBaseChanged(event, payload)
+  const rawReviewCommentId = event === 'pull_request_review_comment' ? payload.comment?.id : undefined
+  const rawPullRequestReviewId =
+    event === 'pull_request_review_comment' ? payload.comment?.pull_request_review_id : undefined
+  const pullRequestReviewId =
+    rawPullRequestReviewId !== undefined && Number.isSafeInteger(rawPullRequestReviewId) && rawPullRequestReviewId > 0
+      ? rawPullRequestReviewId
+      : undefined
+  const reviewCommentId =
+    rawReviewCommentId !== undefined && Number.isSafeInteger(rawReviewCommentId) && rawReviewCommentId > 0
+      ? rawReviewCommentId
+      : undefined
+  // The signed `issue_comment` id that fired this delivery; its inline twin is `reviewCommentId`.
+  const rawIssueCommentId = event === 'issue_comment' ? payload.comment?.id : undefined
+  const issueCommentId = positiveSafeInteger(rawIssueCommentId) ? rawIssueCommentId : undefined
+  const rawReplyToId = event === 'pull_request_review_comment' ? payload.comment?.in_reply_to_id : undefined
+  // A null in_reply_to_id marks a thread root; an invalid parent fails closed rather than redirecting the reply.
+  const rawReviewThreadRootCommentId = rawReplyToId == null ? reviewCommentId : rawReplyToId
+  const reviewThreadRootCommentId =
+    rawReviewThreadRootCommentId !== undefined &&
+    Number.isSafeInteger(rawReviewThreadRootCommentId) &&
+    rawReviewThreadRootCommentId > 0
+      ? rawReviewThreadRootCommentId
+      : undefined
+
+  return {
+    repoId: String(repoId),
+    repoFullName: payload.repository?.full_name ?? rule.github.repoFullName,
+    sourceInstallationId: String(installationId),
+    subjectKind: isPullRequest ? 'pull_request' : 'issue',
+    ...(isPullRequest ? { pullNumber: subject.number } : {}),
+    ...(headSha ? { headSha, reportSha: headSha } : {}),
+    ...(pr?.base?.sha ? { baseSha: pr.base.sha } : {}),
+    ...(pr?.head?.repo?.full_name ? { headRepoFullName: pr.head.repo.full_name } : {}),
+    ...(pr?.merge_commit_sha ? { mergeCommitSha: pr.merge_commit_sha } : {}),
+    ...(pr?.draft !== undefined ? { isDraft: pr.draft } : {}),
+    ...(event === 'pull_request' && payload.action === 'edited' ? { baseChanged } : {}),
+    ...(explicitReviewRequest ? { explicitReviewRequest: true } : {}),
+    ...(pullRequestReviewId !== undefined ? { pullRequestReviewId: String(pullRequestReviewId) } : {}),
+    ...(reviewCommentId !== undefined ? { reviewCommentId: String(reviewCommentId) } : {}),
+    ...(reviewThreadRootCommentId !== undefined
+      ? { reviewThreadRootCommentId: String(reviewThreadRootCommentId) }
+      : {}),
+    ...(issueCommentId !== undefined ? { issueCommentId: String(issueCommentId) } : {})
+  }
+}
+
+function headerString(v: string | string[] | undefined): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+}
+
+const FAILED_CHECK_CONCLUSIONS = new Set([
+  'failure',
+  'cancelled',
+  'timed_out',
+  'action_required',
+  'stale',
+  'startup_failure'
+])
+
+/** Every watchable object event of a delivery; the lane's feedback ones resume the opening session, the rest are `wakeOnly` (assistant-mode.md §5.14). */
+export function githubObjectSignals(
+  event: string,
+  payload: GithubPayload,
+  deliveryKey: string
+): RcPullRequestFeedback[] {
+  const installationId = payload.installation?.id
+  const repoId = payload.repository?.id
+  const repoFullName = payload.repository?.full_name?.trim()
+  if (!positiveSafeInteger(installationId) || !positiveSafeInteger(repoId) || !repoFullName) return []
+  const build = (
+    number: unknown,
+    kind: FollowUpEventKind,
+    feedback: boolean,
+    subject: 'pull' | 'issue' = 'pull'
+  ): RcPullRequestFeedback[] =>
+    positiveSafeInteger(number)
+      ? [
+          {
+            deliveryKey: `${deliveryKey.slice(0, 150)}:${event}:${number}`,
+            installationId: String(installationId),
+            repoId: String(repoId),
+            repoFullName,
+            pullNumber: number,
+            subject,
+            event: kind,
+            ...(feedback ? {} : { wakeOnly: true as const })
+          }
+        ]
+      : []
+
+  if (event === 'pull_request_review' && payload.action === 'submitted') {
+    const state = payload.review?.state?.toLowerCase()
+    const hasBody = Boolean(payload.review?.body?.trim())
+    const kind = state === 'approved' ? 'approved' : state === 'changes_requested' ? 'changes_requested' : 'review'
+    return build(payload.pull_request?.number, kind, state === 'changes_requested' || hasBody)
+  }
+  if (event === 'pull_request_review_comment' && (payload.action === 'created' || payload.action === 'edited')) {
+    return build(payload.pull_request?.number, 'comment', true)
+  }
+  if (event === 'issue_comment' && (payload.action === 'created' || payload.action === 'edited')) {
+    const pull = payload.issue?.pull_request !== undefined
+    return build(payload.issue?.number, 'comment', pull, pull ? 'pull' : 'issue')
+  }
+  if (event === 'pull_request') {
+    const number = payload.pull_request?.number
+    if (payload.action === 'closed') return build(number, payload.pull_request?.merged ? 'merged' : 'closed', false)
+    if (payload.action === 'reopened') return build(number, 'reopened', false)
+    if (payload.action === 'synchronize') return build(number, 'commits', false)
+    return []
+  }
+  if (event === 'issues' && (payload.action === 'closed' || payload.action === 'reopened')) {
+    // A pull request's own issue event is its pull_request event's twin.
+    if (payload.issue?.pull_request !== undefined) return []
+    return build(payload.issue?.number, payload.action, false, 'issue')
+  }
+  if (event === 'check_suite' && payload.action === 'completed') {
+    const conclusion = payload.check_suite?.conclusion?.toLowerCase()
+    if (!conclusion) return []
+    const failed = FAILED_CHECK_CONCLUSIONS.has(conclusion)
+    const pulls = new Set(
+      (payload.check_suite?.pull_requests ?? [])
+        .map((pull) => pull.number)
+        .filter((pull): pull is number => positiveSafeInteger(pull))
+    )
+    return [...pulls].flatMap((pullNumber) => build(pullNumber, 'checks', failed))
+  }
+  return []
+}
+
+type GithubRerequestTarget = {
+  hookId: string
+  pullNumber: number
+  baseSha: string
+  configRevision: string
+  dispatchRevision: string
+}
+
+type GithubRerequestRule = RcHookAssign & { github: NonNullable<RcHookAssign['github']> }
+
+function currentGithubRerequestRule(
+  table: HookTable,
+  target: GithubRerequestTarget,
+  repoId: number,
+  repoFullName: string | undefined,
+  installationId: number,
+  source: 'check' | 'workflow',
+  expected?: Pick<RcHookAssign, 'agentId' | 'daemonId' | 'dispatchDaemonId'>
+): GithubRerequestRule | undefined {
+  const rule = githubRuleByHookId(table, target.hookId, { repoId: String(repoId), repoFullName: repoFullName ?? '' })
+  if (
+    !rule ||
+    rule.kind !== 'github' ||
+    !rule.github ||
+    rule.github.repoId !== String(repoId) ||
+    !rule.github.installationIds.includes(String(installationId)) ||
+    rule.configRevision !== target.configRevision ||
+    rule.dispatchRevision !== target.dispatchRevision ||
+    (source === 'check'
+      ? rule.reportingMode !== 'check' || rule.gateMode !== 'informational'
+      : rule.reviewPolicy === undefined || rule.reviewPolicy === 'off') ||
+    (expected !== undefined &&
+      (rule.agentId !== expected.agentId ||
+        rule.daemonId !== expected.daemonId ||
+        rule.dispatchDaemonId !== expected.dispatchDaemonId))
+  ) {
+    return undefined
+  }
+  return rule as GithubRerequestRule
+}
+
+async function dispatchGithubRerequest(
+  deps: GithubIngressDeps,
+  payload: GithubPayload,
+  deliveryKey: string,
+  event: 'check_run' | 'check_suite' | 'workflow_run',
+  action: 'rerequested' | 'requested_action' | 'in_progress',
+  // The organization App that delivered a check_run event; the CP then checks the run is that App's.
+  orgAppId?: string
+): Promise<void> {
+  const checkRunId = payload.check_run?.id
+  const checkSuiteId = payload.check_suite?.id
+  const appId = payload.check_suite?.app?.id
+  const repoId = payload.repository?.id
+  const repoFullName = payload.repository?.full_name
+  const deliveredInstallationId = payload.installation?.id
+  const headSha =
+    event === 'check_run'
+      ? payload.check_run?.head_sha
+      : event === 'check_suite'
+        ? payload.check_suite?.head_sha
+        : payload.workflow_run?.head_sha
+  if (
+    !positiveSafeInteger(repoId) ||
+    !positiveSafeInteger(deliveredInstallationId) ||
+    !repoFullName ||
+    !headSha ||
+    (event === 'check_run' && !positiveSafeInteger(checkRunId)) ||
+    (event === 'check_suite' && (!positiveSafeInteger(checkSuiteId) || !positiveSafeInteger(appId))) ||
+    (event === 'workflow_run' && payload.workflow_run?.event !== 'pull_request')
+  ) {
+    deps.log.info(`github ingress: ignored malformed ${event} rerequest ${deliveryKey}`)
+    return
+  }
+  // Reverse lookups share the authz budget, so unknown Check identities cannot buy unbounded CP work.
+  if (!deps.authzLimiter.allow(`${deliveredInstallationId}:${repoId}`)) {
+    deps.log.info(`github ingress: rerequest authz rate-limited ${deliveryKey}`)
+    return
+  }
+
+  const workflowPulls =
+    event === 'workflow_run'
+      ? (payload.workflow_run?.pull_requests ?? []).filter(
+          (pull) => positiveSafeInteger(pull.number) && pull.head?.sha === headSha
+        )
+      : []
+  const workflowPullNumber = workflowPulls.length === 1 ? workflowPulls[0]?.number : undefined
+
+  let result: RcGithubRerequestResult
+  try {
+    const request: RcGithubRerequest =
+      event === 'check_run'
+        ? {
+            checkRunId: String(checkRunId),
+            repoId: String(repoId),
+            headSha,
+            deliveryKey,
+            ...(action === 'requested_action' ? { includeBaseSha: true as const } : {}),
+            ...(orgAppId !== undefined ? { appId: orgAppId } : {})
+          }
+        : event === 'check_suite'
+          ? {
+              scope: 'suite',
+              appId: String(appId),
+              installationId: String(deliveredInstallationId),
+              repoId: String(repoId),
+              headSha,
+              deliveryKey
+            }
+          : {
+              scope: 'workflow',
+              installationId: String(deliveredInstallationId),
+              repoId: String(repoId),
+              headSha,
+              ...(workflowPullNumber !== undefined ? { pullNumber: workflowPullNumber } : {}),
+              deliveryKey
+            }
+    result = await deps.authorizeRerequest(request)
+  } catch {
+    // This explicit control needs the CP; ordinary events still match from the local rule table.
+    deps.log.warn(`github ingress: rerequest authorization unavailable ${deliveryKey}`)
+    return
+  }
+  if (!result.allowed) {
+    deps.log.info(`github ingress: ignored unowned ${event} rerequest ${deliveryKey}`)
+    return
+  }
+  const installationId = deliveredInstallationId
+
+  let targets: GithubRerequestTarget[]
+  if (event === 'check_suite' || event === 'workflow_run') {
+    if (!('targets' in result)) {
+      deps.log.info(`github ingress: ignored mismatched ${event} rerequest result ${deliveryKey}`)
+      return
+    }
+    targets = result.targets
+  } else {
+    if ('targets' in result) {
+      deps.log.info(`github ingress: ignored mismatched check_run rerequest result ${deliveryKey}`)
+      return
+    }
+    const pull = payload.check_run?.pull_requests?.find(
+      (candidate) => candidate.number === result.pullNumber && candidate.head?.sha === headSha
+    )
+    const payloadBaseSha =
+      pull?.head?.repo?.id === repoId && pull.base?.repo?.id === repoId ? pull.base?.sha : undefined
+    const baseSha = result.baseSha ?? payloadBaseSha
+    if (!baseSha) {
+      deps.log.info(`github ingress: ignored check_run request without an authoritative base ${deliveryKey}`)
+      return
+    }
+    targets = [{ ...result, baseSha }]
+  }
+  if (new Set(targets.map((target) => target.hookId)).size !== targets.length) {
+    deps.log.info(`github ingress: ignored duplicate ${event} rerequest targets ${deliveryKey}`)
+    return
+  }
+
+  // Re-read after the CP boundary: any rule change fails the whole suite fan-out closed.
+  const candidates = targets.map((target) => {
+    const rule = currentGithubRerequestRule(
+      deps.table,
+      target,
+      repoId,
+      repoFullName,
+      installationId,
+      event === 'workflow_run' ? 'workflow' : 'check'
+    )
+    return { rule, target }
+  })
+  if (candidates.some(({ rule }) => rule === undefined)) {
+    deps.log.info(`github ingress: ignored stale ${event} rerequest ${deliveryKey}`)
+    return
+  }
+  const resolved = candidates as Array<{ rule: GithubRerequestRule; target: GithubRerequestTarget }>
+  const representative = resolved[0]
+  if (!representative) return
+
+  const senderLogin = event === 'workflow_run' ? payload.workflow_run?.triggering_actor?.login : payload.sender?.login
+  if (!senderLogin) {
+    deps.log.info(`github ingress: rerequest authz metadata incomplete ${deliveryKey}`)
+    return
+  }
+  const authzRequest: RcGithubCommentAuthz = {
+    hookId: representative.rule.hookId,
+    installationId: String(installationId),
+    repoId: String(repoId),
+    repoFullName,
+    senderLogin,
+    configRevision: representative.target.configRevision,
+    dispatchRevision: representative.target.dispatchRevision,
+    ...(resolved.length > 1
+      ? {
+          siblingFences: resolved.slice(1).map(({ target }) => ({
+            hookId: target.hookId,
+            configRevision: target.configRevision,
+            dispatchRevision: target.dispatchRevision
+          }))
+        }
+      : {})
+  }
+  try {
+    const allowed = await deps.authorizeComment(authzRequest)
+    if (!allowed) return
+  } catch {
+    deps.log.warn(`github ingress: rerequest actor authorization unavailable ${deliveryKey}`)
+    return
+  }
+
+  const current = resolved.map(({ rule, target }) => {
+    const refreshed = currentGithubRerequestRule(
+      deps.table,
+      target,
+      repoId,
+      repoFullName,
+      installationId,
+      event === 'workflow_run' ? 'workflow' : 'check',
+      rule
+    )
+    return { rule: refreshed, target }
+  })
+  if (current.some(({ rule }) => rule === undefined)) {
+    deps.log.info(`github ingress: ${event} rerequest rule changed ${deliveryKey}`)
+    return
+  }
+  const refreshed = current as Array<{ rule: GithubRerequestRule; target: GithubRerequestTarget }>
+
+  const firedAt = new Date(deps.clock.now()).toISOString()
+  const dispatches: Promise<void>[] = []
+  for (const { rule, target } of refreshed) {
+    const targetDeliveryKey =
+      event === 'workflow_run' ? `workflow-approval:${repoId}:${target.pullNumber}:${headSha}` : deliveryKey
+    if (!deps.limiter.allow(rule.hookId)) {
+      deps.log.info(`github ingress: rate-limited ${rule.hookId}:${targetDeliveryKey} (${event}:${action})`)
+      continue
+    }
+    const github: GithubHookMetadata = {
+      repoId: String(repoId),
+      repoFullName,
+      sourceInstallationId: String(installationId),
+      subjectKind: 'pull_request',
+      pullNumber: target.pullNumber,
+      headSha,
+      baseSha: target.baseSha,
+      reportSha: headSha,
+      ...(event === 'workflow_run' ? { explicitReviewRequest: true } : {})
+    }
+    const msg: RdMsgHook = {
+      source: 'hook',
+      agentId: rule.agentId,
+      sessionKey: `${rule.github.sessionKeyPrefix ?? repoFullName}#${target.pullNumber}`,
+      msgId: `${rule.hookId}:${targetDeliveryKey}`,
+      hookId: rule.hookId,
+      deliveryKey: targetDeliveryKey,
+      firedAt,
+      ...hookSnapshotForDelivery(rule),
+      event: `${event}:${action}`,
+      github,
+      context: {
+        source: 'github',
+        event,
+        action,
+        repo: repoFullName,
+        number: target.pullNumber,
+        senderLogin,
+        truncated: false
+      },
+      // An explicit maintainer control with no authored text: it bypasses Decision routing, like cleanup and notices.
+      ...(rule.target ? { target: rule.target } : {})
+    }
+
+    dispatches.push(
+      dispatchHookFire(
+        { table: deps.table, daemons: deps.daemons, report: deps.report, clock: deps.clock, log: deps.log },
+        rule,
+        msg
+      )
+    )
+    deps.log.info(`github ingress: queued ${rule.hookId}:${targetDeliveryKey} (${event}:${action})`)
+  }
+  await Promise.all(dispatches)
+}
+
+function pullRequestNeedsMaintainer(ctx: GithubMatchCtx, prAuthorAuthorized: boolean): boolean {
+  return ctx.event === 'pull_request' && ctx.eventAction !== 'pull_request:review_requested' && !prAuthorAuthorized
+}
+
+function reportReviewRequestRequired(deps: GithubIngressDeps, rule: RcHookAssign, msg: RdMsgHook): void {
+  deps.report({
+    hookId: rule.hookId,
+    deliveryKey: msg.deliveryKey,
+    firedAt: msg.firedAt,
+    agentId: rule.agentId,
+    daemonId: rule.daemonId,
+    ...hookSnapshotForDelivery(rule),
+    ...(msg.event ? { event: msg.event } : {}),
+    ...(msg.github ? { github: msg.github } : {}),
+    status: 'failed',
+    reason: HOOK_DELIVERY_REASON_REVIEW_REQUEST_REQUIRED
+  })
+}
+
+export function registerGithubIngress(app: FastifyInstance, deps: GithubIngressDeps): void {
+  // Own plugin scope, so the raw-body parser the signature needs does not leak onto other JSON routes.
+  void app.register(async (scope) => {
+    scope.addContentTypeParser(
+      'application/json',
+      { parseAs: 'buffer', bodyLimit: GITHUB_BODY_LIMIT },
+      (_req, body, done) => done(null, body)
+    )
+
+    scope.post('/webhooks/github', { bodyLimit: GITHUB_BODY_LIMIT }, async (req, reply) => {
+      const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0)
+      // Every App posts here and names itself in this header; the claim holds only if that App's own secret signed the body.
+      const targetAppId = headerString(req.headers['x-github-hook-installation-target-id'])
+      const orgAppSecret = targetAppId ? deps.appWebhooks?.secretFor(targetAppId) : undefined
+      const orgAppId = orgAppSecret !== undefined ? targetAppId : undefined
+      const webhookSecret = orgAppSecret ?? deps.webhookSecret()
+      if (!webhookSecret) return reply.code(404).send({ error: 'Not Found', statusCode: 404 })
+      // MANDATORY signature — only GitHub (or a secret holder) may spend work here.
+      if (!verifySha256Header(webhookSecret, raw, headerString(req.headers['x-hub-signature-256']))) {
+        return reply.code(401).send({ error: 'Unauthorized', statusCode: 401 })
+      }
+
+      const event = headerString(req.headers['x-github-event']) ?? ''
+      if (event === 'ping') return reply.code(204).send()
+
+      const deliveryKey = headerString(req.headers['x-github-delivery'])?.slice(0, 200) ?? randomUUID()
+
+      let payload: GithubPayload
+      try {
+        payload = JSON.parse(raw.toString('utf8')) as GithubPayload
+      } catch {
+        // Cannot happen from GitHub (it signed valid JSON) — defensive only.
+        return reply.code(400).send({ error: 'Bad Request', statusCode: 400 })
+      }
+      // Proves GitHub delivered a thread event, so a later silent drop is never mistaken for a missing delivery.
+      if (GITHUB_ROUTED_THREAD_EVENTS.has(event)) {
+        const number = (payload.issue ?? payload.pull_request)?.number
+        deps.log.info(
+          `github ingress: received ${event}:${payload.action ?? 'none'} ${deliveryKey} (github:${payload.repository?.id ?? 'none'}#${number ?? 'none'})`
+        )
+      }
+
+      const objectSignals = githubObjectSignals(event, payload, deliveryKey)
+      const feedbackSignals = objectSignals.filter((signal) => !signal.wakeOnly)
+      // A wake only saves a follow-up time, so it never holds this delivery back with a 503.
+      for (const signal of objectSignals) {
+        if (!signal.wakeOnly || !deps.reportFollowUpEvent || !deps.followUpWatches) continue
+        const watched = deps.followUpWatches.watched({
+          provider: 'github',
+          installationId: signal.installationId,
+          repoId: signal.repoId,
+          subject: signal.subject ?? 'pull',
+          number: signal.pullNumber
+        })
+        if (watched) {
+          void deps.reportFollowUpEvent(signal).catch(() => {
+            deps.log.warn(`github ingress: follow-up wake unavailable ${deliveryKey}`)
+          })
+        }
+      }
+      try {
+        if (deps.reportPullRequestFeedback) {
+          await Promise.all(feedbackSignals.map((signal) => deps.reportPullRequestFeedback!(signal)))
+        }
+      } catch {
+        deps.log.warn(`github ingress: PR feedback persistence unavailable ${deliveryKey}`)
+        return reply.code(503).send({ error: 'Service Unavailable', statusCode: 503 })
+      }
+
+      if (event === 'check_run' && payload.action === 'rerequested') {
+        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_run', 'rerequested', orgAppId)
+        return reply.code(202).send({ deliveryKey })
+      }
+      if (event === 'check_suite' && payload.action === 'rerequested') {
+        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_suite', 'rerequested')
+        return reply.code(202).send({ deliveryKey })
+      }
+      if (
+        event === 'check_run' &&
+        payload.action === 'requested_action' &&
+        payload.requested_action?.identifier === GITHUB_REQUEST_REVIEW_ACTION
+      ) {
+        void dispatchGithubRerequest(deps, payload, deliveryKey, 'check_run', 'requested_action', orgAppId)
+        return reply.code(202).send({ deliveryKey })
+      }
+      if (
+        event === 'workflow_run' &&
+        payload.action === 'in_progress' &&
+        payload.workflow_run?.event === 'pull_request'
+      ) {
+        void dispatchGithubRerequest(deps, payload, deliveryKey, 'workflow_run', 'in_progress')
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      // Decision 11: installation events are a doorbell, never a run.
+      if (INSTALLATION_EVENTS.has(event)) {
+        const id = payload.installation?.id
+        if (id !== undefined) {
+          // An organization App's id rides along: the CP pulls a new installation with that App's key.
+          deps.doorbell({
+            installationId: String(id),
+            action: payload.action ?? 'unknown',
+            ...(orgAppId !== undefined ? { appId: orgAppId } : {})
+          })
+          deps.log.info(`github ingress: doorbell ${deliveryKey} installation ${id} (${payload.action ?? 'unknown'})`)
+        }
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      if (!SUBSCRIPTION_EVENTS.has(event) && !GITHUB_ROUTED_THREAD_EVENTS.has(event))
+        return reply.code(202).send({ deliveryKey })
+
+      const repoId = payload.repository?.id
+      const subject = payload.issue ?? payload.pull_request
+      const rules =
+        repoId === undefined
+          ? []
+          : githubRulesForEvent(
+              deps.table,
+              { repoId: String(repoId), repoFullName: payload.repository?.full_name ?? '' },
+              payload.installation?.id !== undefined ? String(payload.installation.id) : undefined
+            )
+      // Threads need a number, pushes a ref, deployments an environment; every release of the repository shares one session.
+      const environment = isGithubDeploymentEvent(event) ? payload.deployment?.environment : undefined
+      const thread =
+        subject?.number !== undefined
+          ? String(subject.number)
+          : event === 'push'
+            ? payload.ref
+            : environment
+              ? `deployments/${environment}`
+              : event === 'release' && payload.release?.tag_name
+                ? 'releases'
+                : undefined
+      if (rules.length === 0 || thread === undefined) {
+        if (GITHUB_ROUTED_THREAD_EVENTS.has(event)) {
+          deps.log.info(
+            `github ingress: no rule for ${event}:${payload.action ?? 'none'} ${deliveryKey} (github:${repoId ?? 'none'}#${thread ?? 'none'}, ${rules.length} rules)`
+          )
+        }
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      const cleanupEvent = githubThreadWorktreeCleanupEvent(event, payload)
+      const action = githubEventAction(event, payload)
+      const ctx: GithubMatchCtx = {
+        event,
+        // Action-less events (push) stay bare — they only ever match `family:*`.
+        eventAction: cleanupEvent ?? (action ? `${event}:${action}` : event),
+        installationId: payload.installation?.id !== undefined ? String(payload.installation.id) : undefined,
+        labels: (subject?.labels ?? []).map((l) => l.name ?? '').filter(Boolean),
+        ...(payload.label?.name ? { appliedLabel: payload.label.name } : {}),
+        senderType: payload.sender?.type,
+        senderLogin: payload.sender?.login,
+        subjectAuthorLogin: subject?.user?.login,
+        subjectAuthorType: subject?.user?.type,
+        headRepoFullName: subject?.head?.repo?.full_name,
+        baseRepoFullName: subject?.base?.repo?.full_name,
+        commentAuthorLogin: payload.comment?.user?.login,
+        teamOwnerLogin: githubTeamOwner(payload.repository),
+        requestedReviewerLogin: payload.requested_reviewer?.login,
+        baseChanged: githubPullRequestBaseChanged(event, payload),
+        ...(event === 'pull_request' && typeof payload.pull_request?.draft === 'boolean'
+          ? { isDraft: payload.pull_request.draft }
+          : {}),
+        commentSubjectFamily:
+          event === 'pull_request_review_comment'
+            ? 'pull_request'
+            : event === 'issue_comment'
+              ? payload.issue?.pull_request !== undefined
+                ? 'pull_request'
+                : 'issues'
+              : undefined,
+        ...(subject?.number !== undefined ? { subjectNumber: subject.number } : {}),
+        ...(repoId !== undefined ? { repoId: String(repoId) } : {}),
+        // A push summon may sit in any shipped commit message; a deployment's only text is its (status) description.
+        mentionText:
+          payload.comment?.body ??
+          subject?.body ??
+          (event === 'push'
+            ? [payload.head_commit?.message, ...(payload.commits ?? []).map((c) => c.message)]
+                .filter(Boolean)
+                .join('\n') || undefined
+            : isGithubDeploymentEvent(event)
+              ? (payload.deployment_status?.description ?? payload.deployment?.description ?? undefined)
+              : event === 'release'
+                ? (payload.release?.body ?? undefined)
+                : undefined)
+      }
+      const context = buildGithubContext(event, payload)
+      // Session affinity `prefix#<thread|ref|deployments/env|releases>`, split on the last '#'; the compiled prefix survives renames.
+      const fallbackSessionKeyPrefix = payload.repository?.full_name ?? String(repoId)
+      const firedAt = new Date(deps.clock.now()).toISOString()
+
+      const ruleMessage = (rule: RcHookAssign): RdMsgHook => {
+        const github = buildTrustedGithubMetadata(event, payload, rule)
+        return {
+          source: 'hook',
+          agentId: rule.agentId,
+          sessionKey: `${rule.github?.sessionKeyPrefix ?? fallbackSessionKeyPrefix}#${thread}`,
+          msgId: `${rule.hookId}:${deliveryKey}`,
+          hookId: rule.hookId,
+          deliveryKey,
+          firedAt,
+          ...hookSnapshotForDelivery(rule),
+          event: ctx.eventAction,
+          ...(github ? { github } : {}),
+          context,
+          ...(rule.target ? { target: rule.target } : {})
+        }
+      }
+      const dispatchDeps = {
+        table: deps.table,
+        daemons: deps.daemons,
+        report: deps.report,
+        clock: deps.clock,
+        log: deps.log
+      }
+
+      const fireRule = (rule: RcHookAssign, msg: RdMsgHook, label = ''): void => {
+        void dispatchHookFire(dispatchDeps, rule, msg)
+        deps.log.info(
+          `github ingress: queued ${label}${label ? ' ' : ''}${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`
+        )
+      }
+
+      // Routing (code-host-decisions.md §4): a routed rule that would fire becomes a candidate of its scope instead.
+      const router = createCodeHostRouter(deps, GITHUB_ROUTING, {
+        event: ctx,
+        repoId: repoId === undefined ? undefined : String(repoId),
+        deliveryKey,
+        eventAction: ctx.eventAction,
+        messageFor: ruleMessage,
+        fire: fireRule
+      })
+      const threadFamily = router.family
+      // A routed rule is never narrowed by a mention: its scope's Decision chooses, a mentioned agent included.
+      const routed = router.routed
+      const unrouted = rules.filter((rule) => !routed(rule))
+      const narrowed = new Set(
+        ctx.eventAction === 'pull_request:review_requested'
+          ? unrouted
+          : githubMentionCandidates(unrouted, ctx.mentionText, ctx.teamOwnerLogin)
+      )
+      const mentionCandidates = rules.filter((rule) => routed(rule) || narrowed.has(rule))
+
+      const dispatchRule = (rule: RcHookAssign, prAuthorAuthorized = false, notice?: RdHookNotice): void => {
+        // Cleanup is maintenance and a notice a fixed post: neither is routed.
+        const routing = !cleanupEvent && notice === undefined && threadFamily !== undefined ? rule.routing : undefined
+        // Post-match per-hook budget: a drop is a logged skip, never a 429 (a dead delivery to GitHub) nor a run row; a routed rule spends it only when selected.
+        if (!routing && !cleanupEvent && !deps.limiter.allow(rule.hookId)) {
+          deps.log.info(`github ingress: rate-limited ${rule.hookId}:${deliveryKey} (${ctx.eventAction})`)
+          return
+        }
+        const msg = ruleMessage(rule)
+        if (!cleanupEvent && notice === undefined && pullRequestNeedsMaintainer(ctx, prAuthorAuthorized)) {
+          // No third-party-authored PR lifecycle payload reaches the daemon as a fire; revisions still get an actionable Check.
+          if (isGithubPullRequestRevision(ctx)) {
+            reportReviewRequestRequired(deps, rule, msg)
+            deps.log.info(
+              `github ingress: waiting for maintainer request ${rule.hookId}:${deliveryKey} (${ctx.eventAction} ${msg.sessionKey})`
+            )
+          }
+          return
+        }
+        if (routing) {
+          router.collect(rule)
+          return
+        }
+        // 202 below does not wait for the daemon; the verdict travels out-of-band, stamped with event:action.
+        fireRule(rule, notice ? noticeDelivery(msg, notice) : msg, notice)
+      }
+
+      const routeScopes = router.routeScopes
+
+      if (cleanupEvent) {
+        // Cleanup is maintenance for the thread family's hooks the installation may address; the daemon no-ops without a session.
+        const family = githubEventFamily(ctx)
+        for (const rule of rules) {
+          if (
+            rule.kind === 'github' &&
+            rule.github &&
+            ctx.installationId &&
+            rule.github.installationIds.includes(ctx.installationId) &&
+            family !== undefined &&
+            githubRuleFamilies(rule.github).has(family)
+          ) {
+            dispatchRule(rule)
+          }
+        }
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      const currentAuthorizedRule = (
+        rule: RcHookAssign,
+        authzRequest: RcGithubCommentAuthz
+      ): RcHookAssign | undefined => {
+        const current = githubRuleByHookId(deps.table, authzRequest.hookId, {
+          repoId: authzRequest.repoId,
+          repoFullName: authzRequest.repoFullName
+        })
+        if (
+          !current ||
+          current.hookId !== authzRequest.hookId ||
+          current.kind !== 'github' ||
+          !current.github ||
+          current.github.repoId !== authzRequest.repoId ||
+          !current.github.installationIds.includes(authzRequest.installationId) ||
+          current.configRevision !== authzRequest.configRevision ||
+          current.dispatchRevision !== authzRequest.dispatchRevision ||
+          current.agentId !== rule.agentId ||
+          current.daemonId !== rule.daemonId ||
+          current.dispatchDaemonId !== rule.dispatchDaemonId ||
+          githubRuleVerdict(current, ctx) !== 'needs-authz'
+        ) {
+          deps.log.info(`github ingress: authz rule changed ${rule.hookId}:${deliveryKey}`)
+          return undefined
+        }
+        return current
+      }
+
+      const authorizeAndDispatch = async (
+        fanout: RcHookAssign[],
+        actors: {
+          senderLogin: string | undefined
+          subjectAuthorLogin?: string
+          requireSubjectAuthor?: boolean
+        },
+        onDenied: 'skip' | 'request-review'
+      ): Promise<void> => {
+        const installationId = ctx.installationId
+        const payloadRepoId = payload.repository?.id
+        const repoFullName = payload.repository?.full_name
+        const representative = fanout[0]
+        if (!representative) return
+
+        if (
+          !representative.github ||
+          !installationId ||
+          payloadRepoId === undefined ||
+          !repoFullName ||
+          !actors.senderLogin ||
+          (actors.requireSubjectAuthor === true && !actors.subjectAuthorLogin) ||
+          fanout.some(
+            (rule) => !rule.github || rule.configRevision === undefined || rule.dispatchRevision === undefined
+          )
+        ) {
+          deps.log.info(`github ingress: authz metadata incomplete ${representative.hookId}:${deliveryKey}`)
+          if (onDenied === 'request-review') for (const rule of fanout) dispatchRule(rule)
+          return
+        }
+
+        // Permission lookups have their own budget; repository-wide actor facts resolve once before dispatch.
+        if (!deps.authzLimiter.allow(`${installationId}:${payloadRepoId}`)) {
+          deps.log.info(`github ingress: authz rate-limited ${representative.hookId}:${deliveryKey}`)
+          if (onDenied === 'request-review') for (const rule of fanout) dispatchRule(rule)
+          return
+        }
+
+        const authzRequest: RcGithubCommentAuthz = {
+          hookId: representative.hookId,
+          installationId,
+          repoId: String(payloadRepoId),
+          repoFullName,
+          senderLogin: actors.senderLogin,
+          ...(actors.subjectAuthorLogin && actors.subjectAuthorLogin !== actors.senderLogin
+            ? { subjectAuthorLogin: actors.subjectAuthorLogin }
+            : {}),
+          configRevision: representative.configRevision!,
+          dispatchRevision: representative.dispatchRevision!,
+          ...(fanout.length > 1
+            ? {
+                siblingFences: fanout.slice(1).map((rule) => ({
+                  hookId: rule.hookId,
+                  configRevision: rule.configRevision!,
+                  dispatchRevision: rule.dispatchRevision!
+                }))
+              }
+            : {})
+        }
+        let allowed = false
+        // Only the CP's own `false` refuses the actor; a timeout, failure or older peer never tells anyone they were refused.
+        let refused = false
+        try {
+          allowed = await deps.authorizeComment(authzRequest)
+          refused = !allowed
+        } catch (err) {
+          // An older CP (UNKNOWN_FRAME), a timeout or a transient failure all fail closed.
+          deps.log.warn(`github ingress: authz failed ${representative.hookId}:${deliveryKey}: ${String(err)}`)
+        }
+        // A refused explicit @-mention gets one fixed-text notice on its thread; anything less deliberate stays silent.
+        if (refused && fanout.some((rule) => githubRuleIsSummoned(rule, ctx))) {
+          dispatchRule(representative, false, 'actor_not_trusted')
+        }
+        // A silent skip is indistinguishable from "GitHub never delivered it" without this line.
+        if (!allowed && onDenied === 'skip') {
+          deps.log.info(
+            `github ingress: authz denied ${representative.hookId}:${deliveryKey} (${ctx.eventAction} actor ${actors.senderLogin})`
+          )
+          return
+        }
+
+        // Authz crossed remote calls: re-read and fence revisions and assignment, then dispatch the current rule.
+        for (const rule of fanout) {
+          const current = currentAuthorizedRule(rule, {
+            ...authzRequest,
+            hookId: rule.hookId,
+            configRevision: rule.configRevision!,
+            dispatchRevision: rule.dispatchRevision!
+          })
+          if (current) dispatchRule(current, onDenied === 'request-review' && allowed)
+        }
+      }
+
+      // A record-only event (a PR review) matches nothing: it only joins its thread's history on a routing host.
+      const evaluated = SUBSCRIPTION_EVENTS.has(event)
+        ? mentionCandidates.map((rule) => ({ rule, match: githubRuleMatch(rule, ctx) }))
+        : []
+      const matched = evaluated.flatMap(({ rule, match }) =>
+        match.verdict === 'no-match' ? [] : [{ rule, verdict: match.verdict }]
+      )
+      // A native reviewer request is an explicit maintainer action; a drop always deserves a line.
+      if (ctx.eventAction === 'pull_request:review_requested' && matched.length === 0) {
+        deps.log.info(
+          `github ingress: reviewer request matched no rule ${deliveryKey} (reviewer ${ctx.requestedReviewerLogin ?? 'none'} github:${repoId}#${thread})`
+        )
+      } else if (SUBSCRIPTION_EVENTS.has(event) && matched.length === 0) {
+        // Each rule's failed gate; a rule a mention narrowed away never reached the verdict.
+        const reasons = evaluated.map(
+          ({ rule, match }) => `${rule.hookId}=${match.verdict === 'no-match' ? match.reason : match.verdict}`
+        )
+        deps.log.info(
+          `github ingress: matched no rule ${deliveryKey} (${ctx.eventAction} github:${repoId}#${thread}; ${reasons.join(', ') || 'none'}; ${rules.length - mentionCandidates.length} narrowed by mention)`
+        )
+      }
+      if (
+        ctx.event === 'issues' ||
+        (ctx.event === 'pull_request' && ctx.eventAction !== 'pull_request:review_requested')
+      ) {
+        for (const rule of matched.filter((candidate) => candidate.verdict === 'trusted').map(({ rule }) => rule)) {
+          dispatchRule(rule, true)
+        }
+        const pending = matched.filter((candidate) => candidate.verdict === 'needs-authz').map(({ rule }) => rule)
+        // Another bot's revision never fires and its author is never authorized: it publishes the manual-request Check.
+        const botRevision = (rule: RcHookAssign): boolean =>
+          ctx.senderType === 'Bot' && !isConfiguredAppPullRequest(rule, ctx)
+        for (const rule of pending.filter(botRevision)) dispatchRule(rule)
+        const needsAuthz = pending.filter((rule) => !botRevision(rule))
+        if (needsAuthz.length > 0) {
+          router.track(
+            authorizeAndDispatch(
+              needsAuthz,
+              { senderLogin: ctx.subjectAuthorLogin },
+              ctx.event === 'pull_request' ? 'request-review' : 'skip'
+            ).catch((err) => {
+              deps.log.warn(`github ingress: thread-author authz task failed ${deliveryKey}: ${String(err)}`)
+            })
+          )
+        }
+        routeScopes()
+        return reply.code(202).send({ deliveryKey })
+      }
+
+      for (const { rule, verdict } of matched) if (verdict === 'trusted') dispatchRule(rule)
+
+      const needsAuthz = matched.filter((candidate) => candidate.verdict === 'needs-authz').map(({ rule }) => rule)
+      const queueAuthorizedFanout = (
+        fanout: RcHookAssign[],
+        actorLogin: string | undefined,
+        requireSubjectAuthor = false
+      ): void => {
+        if (fanout.length === 0) return
+        // Never hold GitHub's request open on the lookup; one repository-scoped decision fences the whole fan-out.
+        router.track(
+          authorizeAndDispatch(
+            fanout,
+            {
+              senderLogin: actorLogin,
+              ...(requireSubjectAuthor
+                ? { subjectAuthorLogin: ctx.subjectAuthorLogin, requireSubjectAuthor: true }
+                : {})
+            },
+            'skip'
+          ).catch((err) => {
+            deps.log.warn(`github ingress: authz task failed ${fanout[0]!.hookId}:${deliveryKey}: ${String(err)}`)
+          })
+        )
+      }
+
+      if (isGithubThreadComment(ctx)) {
+        queueAuthorizedFanout(
+          needsAuthz.filter((rule) => githubRuleIsSummoned(rule, ctx)),
+          ctx.commentAuthorLogin
+        )
+        queueAuthorizedFanout(
+          needsAuthz.filter((rule) => !githubRuleIsSummoned(rule, ctx)),
+          ctx.commentAuthorLogin,
+          true
+        )
+      } else {
+        // Reviewer requests authorize the actor; lifecycle events already went through the subject-author batch.
+        queueAuthorizedFanout(needsAuthz, payload.sender?.login)
+      }
+      routeScopes()
+      return reply.code(202).send({ deliveryKey })
+    })
+  })
+}

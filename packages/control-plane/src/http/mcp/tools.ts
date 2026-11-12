@@ -1,0 +1,1449 @@
+/**
+ * `http/mcp/tools.ts` — the AgentConnect MCP tool registry (docs/designs/
+ * agent-assistant.md §6.2: P0 read-only tools + P1 write tools).
+ *
+ * Each tool is a thin, curated adapter over the existing REST surface: it
+ * validates its arguments (zod), builds a versioned REST path, and the route
+ * layer executes it via `app.inject` with the caller's own credential — so
+ * RBAC, per-resource visibility, org scoping, and DTO shapes are inherited
+ * from the routes verbatim. Tools NEVER re-implement authorization.
+ *
+ * Write tools (`write: true`) are the §6.2 ✎ set — deliberately curated:
+ * credential, member, org, access-control, and bot-credential operations stay OUT of the
+ * catalog (§6.3; the REST guards remain the hard boundary). Destructive tools
+ * (`destructive: true`, §6.4 🔥) additionally carry a required `confirm`
+ * argument that must byte-equal the live resource's name — compared HERE, at
+ * the execution layer: a mechanism, not a prompt convention.
+ */
+import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
+import { CP_PLATFORM_IDS } from '../../platforms/ids.js'
+import {
+  AGENT_SETUP_SECTIONS,
+  AGENT_SETUP_URI,
+  AGENT_TOOLS_URI,
+  AgentSetupDraft,
+  AgentToolsIntent,
+  CODE_HOST_SETUP_URI,
+  CodeHostSetupIntent,
+  INTEGRATION_SETUP_URI,
+  IntegrationSetupIntent,
+  MCP_SETUP_URI,
+  McpSetupIntent,
+  SKILL_SETUP_URI,
+  SkillSetupIntent
+} from '@agentconnect.md/protocol/mcp-app'
+import { HOOK_KINDS, isCodeHostProvider } from '@agentconnect.md/protocol/code-host'
+import {
+  AgentDecisionIds,
+  AgentModelSelection,
+  AgentRepositorySelector,
+  CodeHostRoutingFamily,
+  CodeHostRoutingProvider,
+  DecisionDraft,
+  DecisionPreviewSample,
+  SharedBotDecisionRouting,
+  isCodeHostRoutingScope
+} from '@agentconnect.md/protocol'
+import { UpdateIntegrationChannelBody } from '../dto/index.js'
+import { BotDecisionRoutingSaveBody } from '../routes/decision-routing.js'
+import { BotDecisionRoutingPreviewBody } from '../routes/decision-routing-preview.js'
+
+/** The day presets `getUsage` accepts, which it converts to an explicit window. */
+type UsageToolRange = 'd1' | 'd7' | 'd30' | 'd90'
+
+/** What a tool needs to execute: the caller's org and credentialed requests
+ *  against the versioned REST surface (`/api/v1`-relative paths). */
+export interface McpToolCtx {
+  orgId: string
+  /** Present only for a webchat assertion; its host agent may change itself but not delete itself. */
+  delegatedAgentId?: string
+  /** The webchat conversation a delegated assertion speaks for. Server-supplied:
+   *  the operation reads below are scoped to it, so no caller can name another. */
+  delegatedConversationId?: string
+  get(path: string, query?: Record<string, string | number | undefined>): Promise<RestResult>
+  /** Mutating request with an optional JSON body — only `write: true` tools may use it. */
+  send(method: 'POST' | 'PATCH' | 'PUT' | 'DELETE', path: string, body?: Record<string, unknown>): Promise<RestResult>
+}
+
+export interface RestResult {
+  statusCode: number
+  body: string
+}
+
+export interface McpToolDef {
+  name: string
+  uiResourceUri?: string
+  /** The result body carries the tool's own answer with the intent under `nativeUi`,
+   *  instead of BEING the intent — how a write tool earns a card without losing what it returned. */
+  uiEnvelope?: true
+  description: string
+  /** Argument contract — published to clients as JSON Schema via {@link toolDescriptor}. */
+  schema: z.ZodType<Record<string, unknown>>
+  /** §6.2 ✎ — mutating: requires `mcp:write` on scope-confined credentials and
+   *  draws from the write rate budget (§6.5). Absent ⇒ read-only. */
+  write?: true
+  /** A delegated (webchat) call of this write tool opens a PREFILLED Console form instead of asking
+   *  the owner to approve an argument list: nothing is queued, and the human submits the write
+   *  under their own Console JWT. The direct path is unaffected and still executes. */
+  delegatedForm?(ctx: McpToolCtx, args: Record<string, unknown>): RestResult
+  /** §6.4 🔥 — irreversible: the schema carries a required `confirm` argument,
+   *  compared against the live resource name before the call goes out. */
+  destructive?: true
+  /** Server-owned effect classification for `write` tools
+   *  (webchat-preset-agentconnect-mcp.md §8): `'cp_db'` — the tool's ENTIRE
+   *  side effect is a mutation inside the CP database, so a delegated approval
+   *  commits it atomically with the operation's terminal transition (no
+   *  ambiguous window). Anything that also pushes to a daemon, requires a live
+   *  WS round-trip, or touches external state MUST stay `'external'` (the
+   *  default) and keep the fail-closed at-most-once/ambiguous contract. */
+  effect?: 'cp_db' | 'external'
+  /** Argument keys that carry message content: redacted from audit, and the tool is refused where approval would persist them. */
+  contentArgs?: readonly string[]
+  call(ctx: McpToolCtx, args: Record<string, unknown>): Promise<RestResult>
+}
+
+/** Path-segment-safe interpolation — a crafted id must not traverse into a
+ *  sibling route (`"x/../../me/keys"` stays one opaque segment). */
+const seg = (v: unknown): string => encodeURIComponent(String(v))
+
+const org = (ctx: McpToolCtx, sub: string): string => `/orgs/${seg(ctx.orgId)}${sub}`
+
+/** A UI tool's whole answer: the versioned presentation intent, with the organization
+ *  supplied by authentication rather than by the caller. */
+const uiIntent = (ctx: McpToolCtx, resourceUri: string, intent: unknown): RestResult => ({
+  statusCode: 200,
+  body: JSON.stringify({ resourceUri, resourceVersion: 1, orgId: ctx.orgId, intent })
+})
+
+/** A REST answer read as an object, or nothing — an empty or non-object body is not a failure here. */
+function jsonObject(body: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(body)
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const NoArgs = z.object({}).strict()
+
+/** Validated args minus the routing-only keys — write bodies must carry ONLY the
+ *  fields the caller actually provided (`UpdateAgentBody` is strict about absent
+ *  vs present, and PATCH semantics hinge on the difference). */
+function bodyOf(args: Record<string, unknown>, ...routingKeys: string[]): Record<string, unknown> {
+  const body: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(args)) {
+    if (v !== undefined && !routingKeys.includes(k)) body[k] = v
+  }
+  return body
+}
+
+/** §6.4 — the confirm gate's refusal. Deliberately does NOT echo the expected
+ *  value: the caller is told to look the name up and put it to the user. */
+function confirmMismatch(expected: string): RestResult {
+  return {
+    statusCode: 412,
+    body: JSON.stringify({
+      error: 'Precondition Failed',
+      statusCode: 412,
+      message:
+        `confirmation mismatch — \`confirm\` must exactly equal ${expected}. ` +
+        'Look it up, restate it to the user, and only retry after they explicitly approve.'
+    })
+  }
+}
+
+/** These two reads are about a delegated conversation's own operations, and an
+ *  external credential has none — a curated answer beats a confusing 404. */
+const notDelegated = (): Promise<RestResult> =>
+  Promise.resolve({
+    statusCode: 400,
+    body: JSON.stringify({
+      error: 'Bad Request',
+      statusCode: 400,
+      message:
+        'operations exist only for a webchat conversation whose writes need the owner’s approval; this connection has none'
+    })
+  })
+
+const notFound = (what: string): RestResult => ({
+  statusCode: 404,
+  body: JSON.stringify({ error: 'Not Found', statusCode: 404, message: `${what} not found` })
+})
+
+const delegatedSelfDeleteDenied = (): RestResult => ({
+  statusCode: 403,
+  body: JSON.stringify({
+    error: 'Forbidden',
+    statusCode: 403,
+    message: 'a delegated webchat invocation cannot delete its host agent'
+  })
+})
+
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+const CanonicalUuid = z.string().regex(UUID_TEXT, 'must be a canonical UUID')
+
+function canonicalUuid(value: unknown): string | null {
+  const parsed = CanonicalUuid.safeParse(value)
+  return parsed.success ? parsed.data.toLowerCase() : null
+}
+
+/** PostgreSQL's uuid type is case-insensitive; mirror that semantic identity
+ * before dispatch so a differently-cased path cannot bypass the host guard. */
+function sameUuid(left: string | undefined, right: unknown): boolean {
+  const canonicalLeft = canonicalUuid(left)
+  const canonicalRight = canonicalUuid(right)
+  return canonicalLeft !== null && canonicalLeft === canonicalRight
+}
+
+const invalidAgentId = (): RestResult => ({
+  statusCode: 400,
+  body: JSON.stringify({
+    error: 'Bad Request',
+    statusCode: 400,
+    message: 'agentId must be a canonical UUID'
+  })
+})
+
+/** Mirrors the REST `AgentSlug` shape (dto) — re-validated authoritatively by the route. */
+const AgentSlug = z
+  .string()
+  .min(1)
+  .max(63)
+  .regex(/^[a-z0-9]+(-[a-z0-9]+)*$/, 'lowercase letters, digits and single hyphens')
+
+const OutputMode = z.enum(['none', 'minimal', 'low', 'medium', 'high'])
+
+/** Mirrors the REST env var name rule (dto) — the route re-validates names, values and the size budget. */
+const EnvVarName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/, 'invalid env var name')
+
+/** The agent's own variables after a per-key patch: a string sets one, `null` removes it, the rest are kept. */
+function mergedEnv(current: unknown, patch: Record<string, string | null>): Record<string, string> {
+  const env: Record<string, string> = {}
+  if (current !== null && typeof current === 'object' && !Array.isArray(current))
+    for (const [key, value] of Object.entries(current)) if (typeof value === 'string') env[key] = value
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) delete env[key]
+    else env[key] = value
+  }
+  return env
+}
+
+/** What `configureAgent` accepts — the editor intent's caller-supplied half. */
+const ConfigureAgentIntent = z
+  .object({ agentId: z.string().uuid(), section: z.enum(AGENT_SETUP_SECTIONS).optional() })
+  .strict()
+
+/** Mirrors the REST `AgentWorkspaceInputBody` (git-workspace-model.md §5): the
+ *  ADDRESS is the only repository input — provenance and the rename-proof numeric
+ *  id are derived server-side, never supplied here. Kept FLAT rather than a
+ *  discriminated union so every published inputSchema stays one `type: "object"`,
+ *  and shared by `createAgent` and `setAgentWorkspace`, which take one shape. */
+const workspaceShape = {
+  mode: z.enum(['scratch', 'git']).describe('"git" checks a repository out; "scratch" is an empty working directory'),
+  gitRepo: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('Required for "git": a cloneable HTTPS or SSH address; bare `owner/repo` is github.com shorthand'),
+  gitBranch: z.string().min(1).optional().describe('Branch to check out; omit for the repository default'),
+  agentDir: z.string().min(1).optional().describe('Subdirectory of the repository to work in'),
+  worktree: z.boolean().optional().describe('true gives every session its own isolated worktree'),
+  access: z
+    .enum(['read', 'write'])
+    .optional()
+    .describe(
+      'read clones; write also lets the agent push and publish GitHub reviews and checks. Omit to take the highest tier the target can carry. The CALLER must hold the requested permission on the repository.'
+    )
+} as const
+
+const GIT_ONLY_KEYS = ['gitRepo', 'gitBranch', 'agentDir', 'worktree', 'access'] as const
+
+/** The mode gate the flat shape cannot express: an address is mandatory for a git
+ *  workspace and meaningless for a scratch one. */
+function checkWorkspaceMode(value: Record<string, unknown>, ctx: z.RefinementCtx): void {
+  if (value.mode === 'git') {
+    if (value.gitRepo === undefined) {
+      ctx.addIssue({ code: 'custom', message: 'gitRepo is required when mode is "git"', path: ['gitRepo'] })
+    }
+    return
+  }
+  for (const key of GIT_ONLY_KEYS) {
+    if (value[key] !== undefined) {
+      ctx.addIssue({ code: 'custom', message: `${key} applies to mode "git" only`, path: [key] })
+    }
+  }
+}
+
+/** The `family:action` patterns a github trigger subscribes to — validated
+ *  authoritatively by the route against the row's own family. */
+const GithubHookEvents = z.array(z.string().min(1)).min(1).max(20)
+
+// A Decision's executable half; its audience is access control and stays in the console (§6.3).
+const decisionFields = {
+  name: DecisionDraft.shape.name.describe('Display name, unique enough for a person to pick it from a list'),
+  providerId: DecisionDraft.shape.providerId.describe('An evaluator provider id from listDecisionProviders'),
+  model: DecisionDraft.shape.model.describe('One of that provider’s model ids that answers this question type'),
+  question: DecisionDraft.shape.question.describe(
+    'boolean: `criteria` {true, false}; choice: 2–32 `criteria` keys, each describing when it applies; score: an ordered `criteria` list of 2–10 levels. `instructions` says what to judge.'
+  )
+} as const
+
+const DecisionId = CanonicalUuid.describe('The Decision id (from listDecisions)')
+
+// A repository routing is keyed by the code host's numeric repository id and one subject family.
+const codeHostRoutingScope = {
+  provider: CodeHostRoutingProvider,
+  repoId: z
+    .string()
+    .regex(/^[1-9]\d{0,18}$/)
+    .describe('The repository’s numeric id on its code host, as listAgentHooks reports it (`repoId`)'),
+  family: CodeHostRoutingFamily.describe(
+    'github routes issues and pull_request; gitlab and gitea route issues and merge_request'
+  )
+} as const
+
+function checkRoutingScope(value: { provider?: unknown; family?: unknown }, ctx: z.RefinementCtx): void {
+  if (typeof value.provider === 'string' && !isCodeHostRoutingScope(value.provider, value.family as string))
+    ctx.addIssue({ code: 'custom', message: 'The family is not routable for this provider.', path: ['family'] })
+}
+
+const routingPath = (a: Record<string, unknown>): string =>
+  `/decision-routing/${seg(a.provider)}/${seg(a.repoId)}/${seg(a.family)}`
+
+// Each evaluation source is one consumer lane; the fields it needs are required by the refinement below.
+const EVALUATION_SOURCE_FIELDS = {
+  conversation: ['integrationId', 'channelId'],
+  bot: ['botId'],
+  repository: ['provider', 'repoId', 'family'],
+  model_selection: ['agentId']
+} as const
+
+export const MCP_TOOLS: McpToolDef[] = [
+  {
+    name: 'configureIntegration',
+    description:
+      'Open the Console integration dialog to add or edit an integration. For create, optionally preselect provider (github, gitlab, gitea, webhook, or a chat platform) and agentId. For edit, pass agentId and a target from listIntegrations (kind integration) or listAgentHooks (kind codehost-subscription). Never ask for credentials in chat. Opening does not save changes; the user submits the form.',
+    uiResourceUri: INTEGRATION_SETUP_URI,
+    schema: IntegrationSetupIntent,
+    call: async (ctx, args) => {
+      const result = await ctx.get(org(ctx, ''))
+      if (result.statusCode !== 200) return result
+      const intent = IntegrationSetupIntent.parse(args)
+      if (
+        intent.mode === 'create' &&
+        intent.provider &&
+        ![...CP_PLATFORM_IDS, ...HOOK_KINDS].some((id) => id === intent.provider)
+      ) {
+        return { statusCode: 400, body: JSON.stringify({ message: 'Unknown integration provider' }) }
+      }
+      if (intent.agentId) {
+        const agent = await ctx.get(org(ctx, `/agents/${seg(intent.agentId)}`))
+        if (agent.statusCode !== 200) return agent
+      }
+      if (intent.mode === 'edit') {
+        const list = await ctx.get(
+          org(ctx, intent.target.kind === 'integration' ? '/integrations' : `/agents/${seg(intent.agentId)}/hooks`)
+        )
+        if (list.statusCode !== 200) return list
+        const rows = JSON.parse(list.body) as Array<{ id: string; agentId?: string; kind?: string }>
+        const found = rows.find((row) => row.id === intent.target.id && row.agentId === intent.agentId)
+        if (!found || (intent.target.kind === 'codehost-subscription' && !isCodeHostProvider(found.kind)))
+          return notFound('integration')
+      }
+      return uiIntent(ctx, INTEGRATION_SETUP_URI, intent)
+    }
+  },
+  {
+    // Every action on this surface either redirects to the provider (GitHub App install, GitLab
+    // OAuth) or takes a bot token, so none of it can be a write tool: the human performs it in
+    // the browser under their own Console JWT, and the model only opens the page (§6.3).
+    name: 'manageCodeHosts',
+    description:
+      'Open the Console code-host connections surface: GitHub App installations (install, sync, uninstall), the organization’s GitLab account connections and bot accounts, and the Gitea bot connection and its repositories. Optionally open it on one provider. Never ask for a token, an install link or a code in chat — this hands the work to the browser. Opening changes nothing; the user acts in the dialog. To read the current state instead, use listGithubInstallations, listGitlabConnections or listGiteaConnections.',
+    uiResourceUri: CODE_HOST_SETUP_URI,
+    schema: CodeHostSetupIntent,
+    call: async (ctx, args) => {
+      const result = await ctx.get(org(ctx, ''))
+      if (result.statusCode !== 200) return result
+      const intent = CodeHostSetupIntent.parse(args)
+      // A provider whose routes are absent is not configured on this deployment — say so here
+      // rather than opening a dialog onto a card that can only report the same thing.
+      if (intent.provider) {
+        const probe = await ctx.get(
+          org(ctx, intent.provider === 'github' ? '/github/installations' : `/${intent.provider}/connections`)
+        )
+        if (probe.statusCode === 404)
+          return {
+            statusCode: 400,
+            body: JSON.stringify({
+              error: 'Bad Request',
+              statusCode: 400,
+              message: `${intent.provider} is not configured on this deployment`
+            })
+          }
+        if (probe.statusCode !== 200) return probe
+      }
+      return uiIntent(ctx, CODE_HOST_SETUP_URI, intent)
+    }
+  },
+  {
+    // The editor covers what no write tool takes — secret values above all, which are typed only into the dialog.
+    name: 'configureAgent',
+    description:
+      'Open the Console agent editor on one agent, so the user can change its configuration — display name, runtime and model, behavior, placement, environment variables, secrets and sharing. Optionally open it on a section (basics, runtime, access, secrets). Never ask for a secret value in chat; it is typed into the dialog. Opening saves nothing; the user submits the form. For a single field the tool can set on its own, updateAgent is the direct path.',
+    uiResourceUri: AGENT_SETUP_URI,
+    // `created` and `draft` are the server's own annotations on a createAgent card, never a caller's arguments.
+    schema: ConfigureAgentIntent,
+    call: async (ctx, args) => {
+      const intent = ConfigureAgentIntent.parse(args)
+      const agent = await ctx.get(org(ctx, `/agents/${seg(intent.agentId)}`))
+      if (agent.statusCode !== 200) return agent
+      return uiIntent(ctx, AGENT_SETUP_URI, intent)
+    }
+  },
+  {
+    // Removal is a per-row decision over live state, so the roster is the tool: naming what to take
+    // away in an argument would mean the model guessing at rows it has not seen.
+    name: 'manageAgentTools',
+    description:
+      'Open one agent’s Tools & Skills roster: the MCP servers it has attached and the skills it enables, each row with its own add and remove control. This is how a skill is disabled or removed and how an MCP server is detached — installSkill and installMcpServer only add. Optionally narrow to one roster with focus (mcp or skills). Opening changes nothing; the user acts on the rows.',
+    uiResourceUri: AGENT_TOOLS_URI,
+    schema: AgentToolsIntent,
+    call: async (ctx, args) => {
+      const intent = AgentToolsIntent.parse(args)
+      const agent = await ctx.get(org(ctx, `/agents/${seg(intent.agentId)}`))
+      if (agent.statusCode !== 200) return agent
+      return uiIntent(ctx, AGENT_TOOLS_URI, intent)
+    }
+  },
+  {
+    // Registering a source is a Console write under the human's own JWT: the dialog resolves the
+    // repository, names the library entry and settles sharing, none of which a tool argument can stand in for.
+    name: 'installSkill',
+    description:
+      'Open the Console skill installer: search the public skills.sh registry by name (source "registry", optionally preseeded with query) or import a Git repository (source "git"). Pass agentId to also enable the installed skill on that agent. Opening installs nothing; the user picks and confirms in the dialog. To see, disable or remove an agent’s existing skills, use manageAgentTools instead — this dialog only adds.',
+    uiResourceUri: SKILL_SETUP_URI,
+    schema: SkillSetupIntent,
+    call: async (ctx, args) => {
+      const intent = SkillSetupIntent.parse(args)
+      const probe = await ctx.get(org(ctx, intent.agentId ? `/agents/${seg(intent.agentId)}` : ''))
+      if (probe.statusCode !== 200) return probe
+      return uiIntent(ctx, SKILL_SETUP_URI, intent)
+    }
+  },
+  {
+    // The server's url and its credential — a header value or an OAuth client secret — belong in
+    // the browser, not in a tool argument that an audit log and a transcript would both keep.
+    name: 'installMcpServer',
+    description:
+      'Open the Console dialog that adds an MCP server to the organization: its name, url, header or OAuth credential, sharing, and whether it may render MCP Apps. Pass agentId to also attach the new server to that agent. Never ask for a token, a client secret or an authorization code in chat — this hands the work to the browser. Opening adds nothing; the user submits the form. To detach a server an agent already has, use manageAgentTools instead — this dialog only adds.',
+    uiResourceUri: MCP_SETUP_URI,
+    schema: McpSetupIntent,
+    call: async (ctx, args) => {
+      const intent = McpSetupIntent.parse(args)
+      const probe = await ctx.get(org(ctx, intent.agentId ? `/agents/${seg(intent.agentId)}` : ''))
+      if (probe.statusCode !== 200) return probe
+      return uiIntent(ctx, MCP_SETUP_URI, intent)
+    }
+  },
+  {
+    name: 'whoami',
+    description:
+      'Who you are acting as: the authenticated user, the organization this connection is bound to, and your role in it. Call this first to ground every other tool.',
+    schema: NoArgs,
+    call: async (ctx) => {
+      const [me, orgRes] = await Promise.all([ctx.get('/me'), ctx.get(org(ctx, ''))])
+      if (me.statusCode !== 200) return me
+      if (orgRes.statusCode !== 200) return orgRes
+      return {
+        statusCode: 200,
+        body: JSON.stringify({ user: JSON.parse(me.body), organization: JSON.parse(orgRes.body) })
+      }
+    }
+  },
+  {
+    name: 'listAgents',
+    description: 'List the agents in the organization that are visible to you (id, name, status, runtime, placement).',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/agents'))
+  },
+  {
+    name: 'getAgent',
+    description: 'Get one agent by id — full configuration and status.',
+    schema: z.object({ agentId: z.string().min(1).describe('The agent id (from listAgents)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/agents/${seg(a.agentId)}`))
+  },
+  // `getAgent` answers WHERE an agent works; these two answer what is in there.
+  // Both proxy live from the owning daemon and the CP persists nothing.
+  {
+    name: 'listWorkspaceFiles',
+    description:
+      'List one directory of an agent’s workspace, proxied live from the owning daemon. A missing directory is data (exists:false), not an error; the answer pages through nextCursor. 503 while the agent is unplaced or its daemon is offline.',
+    schema: z
+      .object({
+        agentId: z.string().min(1).describe('The agent id (from listAgents)'),
+        path: z.string().optional().describe('Workspace-relative POSIX path; omit for the workspace root'),
+        sessionId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Browse an authorized isolated session worktree instead of the primary checkout'),
+        repo: z
+          .string()
+          .min(1)
+          .max(256)
+          .optional()
+          .describe('owner/repo of one of the agent’s authorized additional repositories'),
+        cursor: z.string().min(1).optional().describe('Continue a listing from a previous nextCursor'),
+        limit: z.number().int().positive().max(500).optional().describe('Page size (default 200)')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.get(org(ctx, `/agents/${seg(a.agentId)}/workspace/files`), {
+        path: a.path as string | undefined,
+        sessionId: a.sessionId as string | undefined,
+        repo: a.repo as string | undefined,
+        cursor: a.cursor as string | undefined,
+        limit: a.limit as number | undefined
+      })
+  },
+  {
+    name: 'readWorkspaceFile',
+    description:
+      'Read one byte slice of a file in an agent’s workspace, proxied live from the owning daemon (64 KiB per call). Page by passing the answer’s nextOffset back as offset while truncated is true — never recompute it from the content. A missing file is data (exists:false); a binary file answers encoding:none with no content.',
+    schema: z
+      .object({
+        agentId: z.string().min(1).describe('The agent id (from listAgents)'),
+        path: z.string().min(1).describe('Workspace-relative POSIX path to a file (from listWorkspaceFiles)'),
+        sessionId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe('Read an authorized isolated session worktree instead of the primary checkout'),
+        repo: z
+          .string()
+          .min(1)
+          .max(256)
+          .optional()
+          .describe('owner/repo of one of the agent’s authorized additional repositories'),
+        offset: z.number().int().nonnegative().optional().describe('Byte offset to start at (default 0)'),
+        limit: z.number().int().positive().max(65536).optional().describe('Bytes per slice (default 65536)')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.get(org(ctx, `/agents/${seg(a.agentId)}/workspace/file`), {
+        path: a.path as string,
+        sessionId: a.sessionId as string | undefined,
+        repo: a.repo as string | undefined,
+        offset: a.offset as number | undefined,
+        limit: a.limit as number | undefined
+      })
+  },
+  {
+    name: 'listDaemons',
+    description:
+      'List the daemons (edge execution units) in the organization that are visible to you, with status and load. `pinnable: false` marks a member of the install-wide managed pool: it is a replaceable Pod, so never pass its id as createAgent’s daemonId — place the agent on the pool instead. This is the liveness view — what each daemon can RUN is listDaemonCapabilities, and one runtime’s model catalog is getDaemon.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/daemons'))
+  },
+  {
+    name: 'listDaemonCapabilities',
+    description:
+      'What each daemon in the fleet can run: the platforms and features it supports, the runtimes installed on it with their available model ids, and its configured MCP servers. Use this to choose a placement — which daemon offers the runtime an agent needs. Per-model detail (efforts, permission modes) is not here; read one daemon with getDaemon for that.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/daemons/capabilities'))
+  },
+  {
+    name: 'getDaemon',
+    description:
+      'One daemon in full: liveness, capabilities, and each installed runtime’s complete model catalog — the model ids it offers and, per model, the reasoning efforts and permission modes it accepts. This is the only read carrying that catalog, so consult it before setting an agent’s model, reasoningEffort or permissionMode, whose valid values are whatever the serving daemon reports.',
+    schema: z.object({ daemonId: z.string().min(1).describe('The daemon id (from listDaemons)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/daemons/${seg(a.daemonId)}`))
+  },
+  {
+    name: 'listCrons',
+    description: 'List the cron (scheduled task) definitions visible to you.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/crons'))
+  },
+  {
+    name: 'getCron',
+    description: 'Get one cron definition by id.',
+    schema: z.object({ cronId: z.string().min(1).describe('The cron id (from listCrons)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/crons/${seg(a.cronId)}`))
+  },
+  {
+    name: 'listCronRuns',
+    description: 'Run history for a cron, newest first (status, duration, session link).',
+    schema: z.object({ cronId: z.string().min(1).describe('The cron id (from listCrons)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/crons/${seg(a.cronId)}/runs`))
+  },
+  {
+    name: 'listSessions',
+    description:
+      'List recent agent sessions (metadata only: title, status, channel, last activity, token usage). Filterable by agent and platform.',
+    schema: z
+      .object({
+        agentId: z.string().min(1).optional().describe('Only sessions of this agent'),
+        // Mirrors the `/sessions` route filter, which accepts the canonical
+        // `Platform` set — keep the two in step (tools.test.ts guards it).
+        platform: z
+          .enum([
+            'slack',
+            'telegram',
+            'webchat',
+            'discord',
+            'feishu',
+            'hook',
+            'dream',
+            'qq',
+            'googlechat',
+            'dingtalk',
+            'msteams',
+            'wechat',
+            'wecom'
+          ])
+          .optional(),
+        channel: z.string().min(1).optional(),
+        limit: z.number().int().positive().max(200).optional().describe('Page size (default 50)')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.get(org(ctx, '/sessions'), {
+        agentId: a.agentId as string | undefined,
+        platform: a.platform as string | undefined,
+        channel: a.channel as string | undefined,
+        limit: a.limit as number | undefined
+      })
+  },
+  {
+    name: 'getSession',
+    description: 'Get one session’s metadata by id (phase, link, summary — not the transcript).',
+    schema: z.object({ sessionId: z.string().min(1).describe('The session id (from listSessions)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/sessions/${seg(a.sessionId)}`))
+  },
+  {
+    // The tool keeps asking in days because that is what an agent means by "this week",
+    // and turns it into the route's explicit window. The HTTP surface takes `[from, to)`
+    // so a billing period can be a caller's choice; a preset is this caller's.
+    name: 'getUsage',
+    description:
+      'Token/cost usage aggregates over a time window, totals plus agent, model, and metering-source breakdowns.',
+    schema: z
+      .object({
+        range: z.enum(['d1', 'd7', 'd30', 'd90']).optional().describe('Window: 1/7/30/90 days (default d7)'),
+        source: z
+          .enum(['daemon', 'gateway'])
+          .optional()
+          .describe('Only sessions metered by this ingress (default: both)')
+      })
+      .strict(),
+    call: (ctx, a) => {
+      const days = { d1: 1, d7: 7, d30: 30, d90: 90 }[(a.range as UsageToolRange | undefined) ?? 'd7']
+      const to = new Date()
+      const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000)
+      return ctx.get(org(ctx, '/usage'), {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        ...(a.source ? { source: a.source as string } : {})
+      })
+    }
+  },
+  {
+    name: 'listIntegrations',
+    description: 'List platform integrations (bot ↔ agent bindings) with their conversation triggers.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/integrations'))
+  },
+  {
+    // A delegated write does not execute in its own request (webchat-preset-
+    // agentconnect-mcp.md §8): it returns an operationId, the conversation owner
+    // approves in the browser, and THIS is how the outcome is read back. Without
+    // it a caller could only re-send the identical JSON-RPC request, and a fresh
+    // call would enqueue a SECOND operation rather than answer about the first.
+    name: 'getOperation',
+    description:
+      'The state of one of your own side-effecting operations: `awaiting_confirmation` (the conversation owner has not decided yet), `executing`, or a terminal `completed` / `failed` / `denied` / `expired` / `ambiguous`, with the tool’s bounded result once it has one. Call this after a write tool answered with an operationId — never re-issue the write to find out, which would enqueue a second operation.',
+    schema: z.object({ operationId: CanonicalUuid.describe('From the write tool’s answer') }).strict(),
+    call: (ctx, a) =>
+      ctx.delegatedConversationId === undefined || ctx.delegatedAgentId === undefined
+        ? notDelegated()
+        : ctx.get(
+            org(
+              ctx,
+              `/agents/${seg(ctx.delegatedAgentId)}/webchat/${seg(ctx.delegatedConversationId)}/mcp-operations/${seg(a.operationId)}`
+            )
+          )
+  },
+  {
+    name: 'listOperations',
+    description:
+      'Your side-effecting operations in this conversation that are still waiting for the owner’s decision. Use it to see what you are blocked on — a decided one is read with getOperation.',
+    schema: NoArgs,
+    call: (ctx) =>
+      ctx.delegatedConversationId === undefined || ctx.delegatedAgentId === undefined
+        ? notDelegated()
+        : ctx.get(
+            org(ctx, `/agents/${seg(ctx.delegatedAgentId)}/webchat/${seg(ctx.delegatedConversationId)}/mcp-operations`)
+          )
+  },
+  {
+    name: 'listGithubInstallations',
+    description:
+      'The organization’s live installations of the deployment GitHub App — the account (owner) each covers, whether it grants all repositories or a selected set, and the pull-request/checks permissions its repositories carry. A repository is reachable ONLY through an installation listed here, so check this before pointing a workspace or a trigger at one. An empty list means the App is not installed yet; 404 means this deployment has no GitHub App at all.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/github/installations'))
+  },
+  {
+    name: 'listGithubRepositories',
+    description:
+      'The repositories one installation grants, each with the default branch a workspace should take unless the user names another. Paged (≤100 per page); private rows are filtered to those you can read on GitHub and `privateReposHidden` says some were withheld. GitHub offers no server-side search here — page and filter locally.',
+    schema: z
+      .object({
+        installationId: z
+          .string()
+          .min(1)
+          .describe('The installation’s `id` from listGithubInstallations (that row id, not GitHub’s numeric one)'),
+        page: z.number().int().positive().optional().describe('1-based page (default 1)'),
+        perPage: z.number().int().positive().max(100).optional().describe('Page size (default 100)')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.get(org(ctx, `/github/installations/${seg(a.installationId)}/repositories`), {
+        page: a.page as number | undefined,
+        perPage: a.perPage as number | undefined
+      })
+  },
+  {
+    // The workspace write goes out under the CALLER's GitHub authority, so this is
+    // the preflight for it: without it the only way to learn that the caller lacks
+    // write is a 403 from createAgent, after the user has answered every question.
+    name: 'getGithubRepositoryAccess',
+    description:
+      'YOUR own effective GitHub permission on one repository (admin / write / read / none), and whether it is enough to read or to push. Check it before asking for a workspace at `write` access: that write is granted under your GitHub identity, not the App’s, so a caller with read gets a 403 at creation time. 404 means this deployment does not gate repository access per user, and nothing needs checking.',
+    schema: z
+      .object({
+        installationId: z
+          .string()
+          .min(1)
+          .describe('The installation’s `id` from listGithubInstallations (that row id, not GitHub’s numeric one)'),
+        owner: z.string().min(1).describe('Repository owner (the part before the slash)'),
+        repo: z.string().min(1).describe('Repository name (the part after the slash)')
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.get(
+        org(ctx, `/github/installations/${seg(a.installationId)}/repositories/${seg(a.owner)}/${seg(a.repo)}/access`)
+      )
+  },
+  {
+    name: 'listGitlabConnections',
+    description:
+      'The GitLab accounts members have connected for this organization — who connected each one, whether it is still connected, and how many managed projects it administers. A project is bound, repaired or taken over through a connection, so a stuck project usually means the connection that administers it is gone. 404 means this deployment has no GitLab application configured.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/gitlab/connections'))
+  },
+  {
+    name: 'listGitlabBots',
+    description:
+      'The GitLab service accounts the organization’s agents act as — one per agent per top-level group, with its health and the managed projects it is a member of. `converging: true` means account provisioning still owes work, so an incomplete answer is not yet a failure.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/gitlab/accounts'))
+  },
+  {
+    name: 'listGitlabProjects',
+    description:
+      'The GitLab projects this organization manages — lifecycle state, the reason behind a degraded one, the managed webhook’s state, and which connection administers it. `not_needed` webhook state is a resting state (no enabled trigger wants ingress), not a fault.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/gitlab/projects'))
+  },
+  {
+    name: 'listGiteaConnections',
+    description:
+      'The organization’s Gitea bot connection — the bot’s identity, the instance it talks to, whether that instance clears the supported-version floor, and how many repositories the connection administers. The bot token is write-only and is never returned. 404 means this deployment has no Gitea instance configured.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/gitea/connections'))
+  },
+  {
+    name: 'listGiteaRepositories',
+    description:
+      'The Gitea repositories this organization manages — lifecycle state, the repair category behind a degraded one, the managed webhook’s state, and when a delivery was last verified.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/gitea/repositories'))
+  },
+  {
+    name: 'listBots',
+    description: 'List the durable bot identities of the organization (metadata only — never token material).',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/bots'))
+  },
+  {
+    name: 'listMembers',
+    description: 'List the organization’s members and their roles.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/members'))
+  },
+  {
+    name: 'listAgentHooks',
+    description:
+      'List the triggers defined for an agent — inbound webhooks and code-host (GitHub / GitLab) subscriptions alike, with the repository and subject family each covers.',
+    schema: z.object({ agentId: z.string().min(1).describe('The agent id (from listAgents)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/agents/${seg(a.agentId)}/hooks`))
+  },
+  {
+    name: 'listHookRuns',
+    description: 'Delivery/run history for one trigger, newest first (metadata only).',
+    schema: z.object({ hookId: z.string().min(1).describe('The hook id (from listAgentHooks)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/hooks/${seg(a.hookId)}/runs`))
+  },
+  {
+    name: 'listDecisions',
+    description:
+      'List the reusable Decisions visible to you — typed questions (boolean, choice or score) an evaluator model answers about a message or subject — each with how many visible consumers use it: conversation gates, shared-bot routers, repository routings and agents.',
+    schema: NoArgs,
+    call: (ctx) => ctx.get(org(ctx, '/decisions'))
+  },
+  {
+    name: 'getDecision',
+    description:
+      'One Decision in full — provider, model and question — with every visible consumer that uses it. Read it before binding the Decision anywhere: a consumer’s condition must fit the question’s type and keys.',
+    schema: z.object({ decisionId: DecisionId }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/decisions/${seg(a.decisionId)}`))
+  },
+  {
+    name: 'listDecisionProviders',
+    description:
+      'The evaluator providers and models each daemon can run a Decision on, the question types each model answers, and whether the organization’s provider credentials are ready. Choose a Decision’s providerId and model from here.',
+    schema: z
+      .object({ daemonId: z.string().uuid().optional().describe('Only this daemon (from listDaemons)') })
+      .strict(),
+    call: (ctx, a) => ctx.get(org(ctx, '/decisions/providers'), { daemonId: a.daemonId as string | undefined })
+  },
+  {
+    name: 'getBotDecisionRouting',
+    description:
+      'A shared bot’s By decision routing: the root Decision, its rules (condition → an agent, skip, or a further Decision step), the Otherwise action, the channels it covers, and readiness. Read it before saveBotDecisionRouting, which replaces the whole configuration.',
+    schema: z.object({ botId: z.string().uuid().describe('The bot id (from listBots)') }).strict(),
+    call: (ctx, a) => ctx.get(org(ctx, `/bots/${seg(a.botId)}/decision-routing`))
+  },
+  {
+    name: 'getCodeHostDecisionRouting',
+    description:
+      'A repository’s Decision routing for one subject family: which of the agents triggered on it (`members`) takes each issue or pull/merge request, by rules over a Decision’s answer. `config` is null when the repository is not routed. Read it before saveCodeHostDecisionRouting, which replaces the whole configuration.',
+    schema: z.object(codeHostRoutingScope).strict().superRefine(checkRoutingScope),
+    call: (ctx, a) => ctx.get(org(ctx, routingPath(a)))
+  },
+  {
+    // Summaries only: an evaluation's detail carries the judged messages, and bodies stay out of the catalog (§15 Q1).
+    name: 'listDecisionEvaluations',
+    description:
+      'Recent evaluations of a Decision consumer, newest first, read live from the serving daemon: the answer and confidence, matched rule keys, outcome (triggered / skipped / unavailable / canceled / pending), model and latency. Use it to explain why a message was admitted, routed or skipped, or why a session got its model. `source` picks the consumer — conversation (integrationId + channelId), bot (botId, optionally one channelId), repository (provider + repoId + family), model_selection (agentId). Page with `cursor` from the previous `nextCursor`. A 503 means the daemon is offline or too old.',
+    schema: z
+      .object({
+        source: z.enum(['conversation', 'bot', 'repository', 'model_selection']),
+        integrationId: z.string().uuid().optional().describe('conversation: the integration (from listIntegrations)'),
+        channelId: z
+          .string()
+          .min(1)
+          .max(512)
+          .optional()
+          .describe('conversation: required; bot: narrows to one channel'),
+        botId: z.string().uuid().optional().describe('bot: the shared bot (from listBots)'),
+        provider: codeHostRoutingScope.provider.optional().describe('repository: the code host'),
+        repoId: codeHostRoutingScope.repoId.optional(),
+        family: codeHostRoutingScope.family.optional(),
+        agentId: z.string().uuid().optional().describe('model_selection: the agent (from listAgents)'),
+        decisionId: z.string().uuid().optional().describe('Only evaluations whose root Decision is this one'),
+        cursor: z.number().int().positive().optional(),
+        limit: z.number().int().min(1).max(50).optional()
+      })
+      .strict()
+      .superRefine((value, ctx) => {
+        for (const key of EVALUATION_SOURCE_FIELDS[value.source])
+          if (value[key] === undefined)
+            ctx.addIssue({ code: 'custom', message: `required for ${value.source}`, path: [key] })
+        if (value.source === 'repository') checkRoutingScope(value, ctx)
+      }),
+    call: (ctx, a) => {
+      const query = {
+        decisionId: a.decisionId as string | undefined,
+        cursor: a.cursor as number | undefined,
+        limit: a.limit as number | undefined
+      }
+      switch (a.source) {
+        case 'conversation':
+          return ctx.get(
+            org(ctx, `/integrations/${seg(a.integrationId)}/channels/${seg(a.channelId)}/decision-evaluations`),
+            query
+          )
+        case 'bot':
+          return ctx.get(org(ctx, `/bots/${seg(a.botId)}/decision-routing/evaluations`), {
+            ...query,
+            channelId: a.channelId as string | undefined
+          })
+        case 'repository':
+          return ctx.get(org(ctx, `${routingPath(a)}/evaluations`), query)
+        default:
+          return ctx.get(org(ctx, `/agents/${seg(a.agentId)}/model-evaluations`), query)
+      }
+    }
+  },
+
+  // ——— Write tools (§6.2 ✎) — curated; credentials/members/org/access-control stay out (§6.3) ———
+  {
+    name: 'createAgent',
+    description:
+      'Create a new agent, optionally with its Git workspace in the same call. Env vars, secrets, memory and sharing are configured in the console; triggers are their own tools (createGithubTrigger, upsertCron). Collect what the user wants first — from webchat this call opens the console create dialog PREFILLED with these arguments and the user submits it there, so the answer is a form to fill in, not an agent that exists yet.',
+    write: true,
+    schema: z
+      .object({
+        name: AgentSlug.describe('Immutable slug identifier (lowercase letters, digits, hyphens)'),
+        displayName: z.string().min(1).optional().describe('Human-friendly label shown in chat and the console'),
+        description: z.string().optional(),
+        runtime: z.string().min(1).describe('Runtime id — pick from the runtimes reported by listDaemonCapabilities'),
+        model: z.string().min(1).optional(),
+        reasoningEffort: z.string().min(1).optional(),
+        outputMode: OutputMode.optional(),
+        fastMode: z.boolean().optional(),
+        permissionMode: z.string().min(1).optional(),
+        placementKind: z
+          .enum(['daemon', 'pool', 'set'])
+          .optional()
+          .describe(
+            'Where the agent runs: "pool" for the install-wide managed pool (needs no daemonId — use this on a Cloud install), "set" with setId, or "daemon" (the default) with daemonId. Omit all three to leave the agent unplaced.'
+          ),
+        setId: z.string().uuid().optional().describe('The member set to place on, for placementKind "set"'),
+        daemonId: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            'Pin to ONE daemon from listDaemons, for placementKind "daemon". Only a daemon whose `pinnable` is true may be named: a managed pool member is replaceable and is refused. Omit to leave unplaced.'
+          ),
+        pause: z.boolean().optional(),
+        workspace: z
+          .object(workspaceShape)
+          .strict()
+          .superRefine(checkWorkspaceMode)
+          .optional()
+          .describe(
+            'Where the agent works. Omit for a scratch directory; pass mode "git" to check out a repository at creation instead of wiring it afterwards. An agent that reviews or edits one repository wants it here.'
+          )
+      })
+      .strict(),
+    uiResourceUri: AGENT_SETUP_URI,
+    uiEnvelope: true,
+    // In webchat the owner is already at a Console session, so a collected proposal opens the create
+    // dialog prefilled rather than asking them to approve an argument list they cannot edit. `pause`
+    // has no control in that dialog and is dropped with the rest of the approval hop.
+    delegatedForm: (ctx, a) => uiIntent(ctx, AGENT_SETUP_URI, { draft: AgentSetupDraft.parse(bodyOf(a, 'pause')) }),
+    call: async (ctx, a) => {
+      const created = await ctx.send('POST', org(ctx, '/agents'), bodyOf(a))
+      if (created.statusCode < 200 || created.statusCode >= 300) return created
+      // A creation that answered without a usable id — a pending approval, an empty 204 — still
+      // succeeded: hand back its own answer rather than failing the call over the card it could not earn.
+      const agent = jsonObject(created.body)
+      if (!agent || !canonicalUuid(agent.id)) return created
+      return {
+        statusCode: created.statusCode,
+        body: JSON.stringify({
+          ...agent,
+          nativeUi: {
+            resourceUri: AGENT_SETUP_URI,
+            resourceVersion: 1,
+            orgId: ctx.orgId,
+            intent: { agentId: agent.id, created: true }
+          }
+        })
+      }
+    }
+  },
+  {
+    name: 'updateAgent',
+    description:
+      'Update an agent’s configuration (partial update — only the fields you pass change; pass null to clear a nullable field). The name slug is immutable. `env` sets or removes individual plain environment variables and keeps the rest. Secret values are never accepted by any tool: never ask for one in chat — open configureAgent on its secrets section so the user types it into the dialog.',
+    write: true,
+    schema: z
+      .object({
+        agentId: CanonicalUuid.describe('The agent id (from listAgents)'),
+        displayName: z.string().min(1).nullable().optional(),
+        description: z.string().nullable().optional(),
+        runtime: z.string().min(1).optional(),
+        model: z.string().min(1).nullable().optional().describe('null resets to the runtime default'),
+        reasoningEffort: z.string().min(1).nullable().optional(),
+        outputMode: OutputMode.nullable().optional(),
+        fastMode: z.boolean().nullable().optional(),
+        permissionMode: z.string().min(1).nullable().optional(),
+        pause: z.boolean().optional().describe('true pauses the agent; false resumes it'),
+        env: z
+          .record(EnvVarName, z.string().nullable())
+          .optional()
+          .describe(
+            'Plain (non-secret) environment variables for the agent’s runtime, merged key by key: a string sets one, null removes it, omitted keys are kept. Never put a token, password or key here'
+          ),
+        decisionIds: AgentDecisionIds.nullable()
+          .optional()
+          .describe(
+            'Decisions the agent may evaluate itself during a turn (from listDecisions); replaces the list, null clears'
+          ),
+        modelSelection: AgentModelSelection.nullable()
+          .optional()
+          .describe(
+            'Pick each new session’s runtime and model by a Decision: `rules` map a condition on its answer to a target {runtime, model, effort?, permissionMode?, fastMode?} (valid values from getDaemon) or `nextStepId` of a chained step in `steps`. Replaces the whole selection; null reverts to the fixed runtime and model.'
+          ),
+        repositorySelector: AgentRepositorySelector.strict()
+          .nullable()
+          .optional()
+          .describe(
+            'The evaluator {providerId, model} that picks which `decision`-materialized repositories a session clones; must answer choice questions. null clears'
+          )
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      const agentId = canonicalUuid(a.agentId)
+      if (!agentId) return invalidAgentId()
+      const body = bodyOf(a, 'agentId')
+      if (a.env !== undefined) {
+        // REST replaces `env` wholesale, so a one-key patch is merged over the live variables first.
+        const current = await ctx.get(org(ctx, `/agents/${seg(agentId)}`))
+        if (current.statusCode !== 200) return current
+        body.env = mergedEnv(jsonObject(current.body)?.env, a.env as Record<string, string | null>)
+      }
+      return ctx.send('PATCH', org(ctx, `/agents/${seg(agentId)}`), body)
+    }
+  },
+  {
+    // §6.4 🔥 not because a row disappears but because the daemon-local checkout
+    // does: replacing the repository, the branch, or the mode discards whatever
+    // was only ever on that disk. A caller with a personal key executes straight
+    // through, so the confirmation has to live HERE, not in a delegated approval.
+    name: 'setAgentWorkspace',
+    description:
+      'Replace an agent’s workspace: point it at a Git repository (mode "git") or back to a scratch directory. Who vouches for the repository is derived from the address — a github.com repository inside one of the organization’s App installations or a managed GitLab project earns managed credentials, a public repository elsewhere is cloned anonymously and stays read-only. Changing the repository, branch or mode PERMANENTLY DISCARDS the daemon-local checkout, including uncommitted work, and active work is drained first; `confirm` must exactly equal the agent’s `name` (slug), so restate what is being replaced and get the user’s explicit approval before calling. Use this for an existing agent; a new one takes its workspace in createAgent, where there is nothing to lose yet.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        agentId: CanonicalUuid.describe('The agent id (from listAgents)'),
+        confirm: z.string().min(1).describe('The agent’s exact `name` (slug) — a deliberate re-type, not a copy'),
+        ...workspaceShape
+      })
+      .strict()
+      .superRefine(checkWorkspaceMode),
+    call: async (ctx, a) => {
+      const agentId = canonicalUuid(a.agentId)
+      if (!agentId) return invalidAgentId()
+      const target = await ctx.get(org(ctx, `/agents/${seg(agentId)}`))
+      if (target.statusCode !== 200) return target
+      const name = (JSON.parse(target.body) as { name?: unknown }).name
+      if (typeof name !== 'string' || name !== a.confirm) return confirmMismatch('the agent’s `name` (slug)')
+      return ctx.send('PUT', org(ctx, `/agents/${seg(agentId)}/workspace`), bodyOf(a, 'agentId', 'confirm'))
+    }
+  },
+  {
+    name: 'deleteAgent',
+    description:
+      'Permanently delete an agent and its triggers — IRREVERSIBLE. `confirm` must exactly equal the agent’s `name` (slug); restate it to the user and get their explicit approval before calling.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        agentId: CanonicalUuid.describe('The agent id (from listAgents)'),
+        confirm: z.string().min(1).describe('The agent’s exact `name` (slug) — a deliberate re-type, not a copy')
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      const agentId = canonicalUuid(a.agentId)
+      if (!agentId) return invalidAgentId()
+      if (sameUuid(ctx.delegatedAgentId, agentId)) return delegatedSelfDeleteDenied()
+      const target = await ctx.get(org(ctx, `/agents/${seg(agentId)}`))
+      if (target.statusCode !== 200) return target
+      const name = (JSON.parse(target.body) as { name?: unknown }).name
+      if (typeof name !== 'string' || name !== a.confirm) return confirmMismatch('the agent’s `name` (slug)')
+      return ctx.send('DELETE', org(ctx, `/agents/${seg(agentId)}`))
+    }
+  },
+  {
+    name: 'renameDaemon',
+    description: 'Rename a daemon (its console display name — placement and identity are unaffected).',
+    write: true,
+    // PATCH /daemons/:id only rewrites the daemon row's display name — no
+    // daemon push, no external state — so it qualifies for §8 atomic commit.
+    effect: 'cp_db',
+    schema: z
+      .object({
+        daemonId: z.string().min(1).describe('The daemon id (from listDaemons)'),
+        name: z.string().trim().min(1).max(64)
+      })
+      .strict(),
+    call: (ctx, a) => ctx.send('PATCH', org(ctx, `/daemons/${seg(a.daemonId)}`), { name: a.name })
+  },
+  {
+    name: 'upsertCron',
+    description:
+      'Create a scheduled task (omit cronId) or edit an existing one (pass its id from listCrons). The trigger text is the prompt the agent receives on each firing.',
+    write: true,
+    schema: z
+      .object({
+        cronId: z.string().uuid().optional().describe('Existing cron id to edit; omit to create a new one'),
+        agentId: z.string().uuid().describe('The agent this schedule drives (from listAgents)'),
+        name: z.string().trim().min(1).max(120).optional().describe('Display name shown in the console'),
+        schedule: z.string().min(1).describe('Cron expression, croner syntax (e.g. "0 9 * * MON-FRI")'),
+        // Required, and deliberately so: the schedule fires by this, and a caller that omitted it used
+        // to inherit whatever zone the control plane process happened to run in — UTC in a container.
+        // "Every morning at 9" then meant 9am somewhere the user has never been.
+        timezone: z
+          .string()
+          .min(1)
+          .describe(
+            'IANA timezone the schedule is interpreted in, e.g. "Asia/Shanghai". Use the timezone the person asking lives in — ask them if you do not know it. There is no default. When editing an existing schedule, pass back its current timezone (from getCron) unless the user is changing it: this is a full replace, so a guess here MOVES the schedule.'
+          ),
+        trigger: z.string().min(1).describe('The prompt sent to the agent on each firing'),
+        // Same cron target vocabulary the REST body accepts (`dto/index.ts`
+        // `Platform`), from the one registry declaration rather than a fourth copy.
+        targetPlatform: z.enum(CP_PLATFORM_IDS).optional(),
+        targetChannel: z.string().min(1).optional().describe('Channel to deliver into; omit for a headless run'),
+        targetIntegrationId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Integration to deliver through (from listIntegrations)'),
+        enabled: z.boolean().optional()
+      })
+      .strict(),
+    call: (ctx, a) => ctx.send('PUT', org(ctx, `/crons/${seg(a.cronId ?? randomUUID())}`), bodyOf(a, 'cronId'))
+  },
+  {
+    name: 'runCron',
+    description: 'Fire a scheduled task once, now (in addition to its schedule). The run is asynchronous.',
+    write: true,
+    schema: z.object({ cronId: z.string().min(1).describe('The cron id (from listCrons)') }).strict(),
+    call: (ctx, a) => ctx.send('POST', org(ctx, `/crons/${seg(a.cronId)}/run`))
+  },
+  {
+    name: 'deleteCron',
+    description:
+      'Permanently delete a scheduled task — IRREVERSIBLE. `confirm` must exactly equal the cron’s `name` (or its id when it has no name); get the user’s explicit approval before calling.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        cronId: z.string().min(1).describe('The cron id (from listCrons)'),
+        confirm: z.string().min(1).describe('The cron’s exact `name` (its id when unnamed) — a deliberate re-type')
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      const target = await ctx.get(org(ctx, `/crons/${seg(a.cronId)}`))
+      if (target.statusCode !== 200) return target
+      const cron = JSON.parse(target.body) as { name?: unknown }
+      const expected = typeof cron.name === 'string' && cron.name.length > 0 ? cron.name : String(a.cronId)
+      if (a.confirm !== expected) return confirmMismatch('the cron’s `name` (or its id when it has no name)')
+      return ctx.send('DELETE', org(ctx, `/crons/${seg(a.cronId)}`))
+    }
+  },
+  {
+    // Code-host triggers only: a `webhook` hook mints an ingress URL and an HMAC
+    // secret, and that capability-minting kind stays out of the catalog (§6.3).
+    name: 'createGithubTrigger',
+    description:
+      'Subscribe one GitHub repository to an agent — the trigger that starts a session when a pull request opens, an issue is filed, a deployment reports, or a release is published. The repository must sit inside one of the organization’s App installations (listGithubInstallations). One trigger covers ONE subject `family`, so watching both pull requests and issues is two calls and a second trigger on the same family is a 409. Canonical event shapes: a pull_request or issues family watched only from its opening is `["<family>:opened"]`; watched on every update it is `["<family>:*", "issue_comment:created"]` with `commentFamilies: ["<family>"]` (GitHub emits one issue_comment stream for both issue and PR threads, so a row that subscribes to it MUST scope it). A release is `["release:published"]` (prereleases included) or `["release:*"]` for every publish, edit and unpublish; a deployment is `["deployment:created"]` or `["deployment:*", "deployment_status:*"]`; neither takes `commentFamilies`. Reviews and run reporting (`reviewPolicy`, `reportingMode`) exist on pull requests only and need the agent’s workspace repository at write access.',
+    write: true,
+    schema: z
+      .object({
+        agentId: z.string().uuid().describe('The agent this trigger fires (from listAgents)'),
+        name: z.string().trim().min(1).max(120).describe('Display name shown in the console'),
+        repoFullName: z
+          .string()
+          .trim()
+          .regex(/^[^/\s]+\/[^/\s]+$/, 'expected "owner/repo"')
+          .describe('The repository, as owner/repo (from listGithubRepositories)'),
+        family: z
+          .enum(['pull_request', 'issues', 'push', 'deployment', 'release'])
+          .describe('The subject this trigger covers — immutable after creation'),
+        events: GithubHookEvents.describe('`family:action` patterns, or `family:*`; every one must belong to `family`'),
+        commentFamilies: z
+          .array(z.enum(['issues', 'pull_request']))
+          .max(2)
+          .optional()
+          .describe('Which thread family an `issue_comment` subscription belongs to — this row’s own family'),
+        labelFilter: z
+          .array(z.string().trim().min(1).max(100))
+          .max(20)
+          .optional()
+          .describe('Only run when the subject currently carries one of these labels'),
+        mentionOnly: z.boolean().optional().describe('Run only when the event’s text @-mentions this agent or the App'),
+        reviewPolicy: z
+          .enum(['off', 'comment', 'request_changes', 'full'])
+          .optional()
+          .describe(
+            'How the turn publishes on a pull request: off = an ordinary comment, comment/request_changes/full = a formal review with inline comments (pull_request family only)'
+          ),
+        reportingMode: z
+          .enum(['off', 'check', 'status'])
+          .optional()
+          .describe('Publish the run as a GitHub Check (`check`) or a commit status (`status`)'),
+        gateMode: z
+          .enum(['informational', 'required'])
+          .optional()
+          .describe('Whether a published Check merely reports (default) or gates the merge'),
+        enabled: z.boolean().optional(),
+        targetPlatform: z.enum(CP_PLATFORM_IDS).optional().describe('Mirror the turn into a chat conversation'),
+        targetChannel: z.string().min(1).optional(),
+        targetIntegrationId: z
+          .string()
+          .uuid()
+          .optional()
+          .describe('Integration to mirror through (from listIntegrations)')
+      })
+      .strict(),
+    call: (ctx, a) => ctx.send('POST', org(ctx, '/hooks'), { kind: 'github', ...bodyOf(a) })
+  },
+  {
+    name: 'setChannelTrigger',
+    description:
+      'Change how an integration behaves in one conversation: its trigger, session mode, and/or owning agent. Triggers are off (disables the conversation), mention, any, or decision — a group conversation admits a message only when a Decision gate says so. `decision` requires `decisionBinding` {type: "gate", decisionId, when, steps?}: `when` must fit the Decision’s question (boolean `values`, choice `thresholds` per key, score `min`/`max`), and `nextStepId` / `elseStepId` chain up to seven further `steps`. Any other trigger clears an existing gate. Check it afterwards with the `conversation` source of listDecisionEvaluations.',
+    write: true,
+    schema: z
+      .object({
+        integrationId: z.string().min(1).describe('The integration id (from listIntegrations)'),
+        channelId: z.string().min(1).describe('The platform channel id (from listIntegrations channels)'),
+        trigger: UpdateIntegrationChannelBody.shape.trigger,
+        decisionBinding: UpdateIntegrationChannelBody.shape.decisionBinding.describe(
+          'Required with, and only with, trigger "decision"'
+        ),
+        sessionMode: UpdateIntegrationChannelBody.shape.sessionMode.describe(
+          'createNew opens a session per thread; append joins the conversation’s one long-lived session; auto, where the daemon supports it, lets a coordinator session route each message'
+        ),
+        agentId: z.string().min(1).optional().describe('Owning agent for this channel (from listAgents)')
+      })
+      .strict()
+      .superRefine((value, ctx) => {
+        if ((value.trigger === 'decision') !== (value.decisionBinding !== undefined))
+          ctx.addIssue({
+            code: 'custom',
+            message: 'decisionBinding is required with, and only with, trigger "decision"',
+            path: ['decisionBinding']
+          })
+      }),
+    call: (ctx, a) =>
+      ctx.send(
+        'PATCH',
+        org(ctx, `/integrations/${seg(a.integrationId)}/channels/${seg(a.channelId)}`),
+        bodyOf(a, 'integrationId', 'channelId')
+      )
+  },
+  {
+    name: 'removeIntegration',
+    description:
+      'Remove a platform integration (bot ↔ agent binding) — IRREVERSIBLE (the bot identity survives and can be re-linked, but channel wiring is lost). `confirm` must exactly equal the integration’s `name`; get the user’s explicit approval before calling.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        integrationId: z.string().min(1).describe('The integration id (from listIntegrations)'),
+        confirm: z.string().min(1).describe('The integration’s exact `name` — a deliberate re-type')
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      // No GET-by-id route exists for integrations — resolve the name via the list.
+      const list = await ctx.get(org(ctx, '/integrations'))
+      if (list.statusCode !== 200) return list
+      const parsed = JSON.parse(list.body) as unknown
+      const found = Array.isArray(parsed)
+        ? (parsed as Array<{ id?: unknown; name?: unknown }>).find((i) => i.id === a.integrationId)
+        : undefined
+      if (!found) return notFound('integration')
+      if (typeof found.name !== 'string' || found.name !== a.confirm) return confirmMismatch('the integration’s `name`')
+      return ctx.send('DELETE', org(ctx, `/integrations/${seg(a.integrationId)}`))
+    }
+  },
+  {
+    name: 'createDecision',
+    description:
+      'Save a reusable Decision: a typed question an evaluator model answers about a message or subject. Saving enables nothing — bind it with setChannelTrigger (a conversation gate), saveBotDecisionRouting, saveCodeHostDecisionRouting, or updateAgent (modelSelection or decisionIds). It is visible to the whole organization; restricting its audience is done in the console. Try it first with previewDecision.',
+    write: true,
+    schema: z.object(decisionFields).strict(),
+    call: (ctx, a) => ctx.send('POST', org(ctx, '/decisions'), bodyOf(a))
+  },
+  {
+    name: 'updateDecision',
+    description:
+      'Replace a Decision’s name, provider, model and question in one step (pass all four; its audience is kept). Every consumer is revalidated: a gate or routing whose condition no longer fits the question is disabled as Needs review until it is saved again, so check getDecision’s usages before changing the question’s type or keys.',
+    write: true,
+    schema: z.object({ decisionId: DecisionId, ...decisionFields }).strict(),
+    call: (ctx, a) => ctx.send('PATCH', org(ctx, `/decisions/${seg(a.decisionId)}`), bodyOf(a, 'decisionId'))
+  },
+  {
+    name: 'deleteDecision',
+    description:
+      'Permanently delete a Decision — IRREVERSIBLE. Refused with 409 while any conversation gate, routing or agent still uses it (the answer lists them). `confirm` must exactly equal the Decision’s `name`; get the user’s explicit approval before calling.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        decisionId: DecisionId,
+        confirm: z.string().min(1).describe('The Decision’s exact `name` — a deliberate re-type')
+      })
+      .strict(),
+    call: async (ctx, a) => {
+      const target = await ctx.get(org(ctx, `/decisions/${seg(a.decisionId)}`))
+      if (target.statusCode !== 200) return target
+      const name = (JSON.parse(target.body) as { decision?: { name?: unknown } }).decision?.name
+      if (typeof name !== 'string' || name !== a.confirm) return confirmMismatch('the Decision’s `name`')
+      return ctx.send('DELETE', org(ctx, `/decisions/${seg(a.decisionId)}`))
+    }
+  },
+  {
+    name: 'saveBotDecisionRouting',
+    description:
+      'Replace a shared bot’s By decision routing: the root Decision, its rules (each an `id`, a `when` condition, and an action — an agent, skip, or `nextStepId` of a chained step), the Otherwise action, `enabled`, and the channel scope. `channelIds` is the COMPLETE scope: an added channel must be an enabled group channel and turns By decision, replacing any gate; every channel dropped from the scope must appear in `removals` with its replacement trigger. Read getBotDecisionRouting first and send the whole configuration back.',
+    write: true,
+    schema: z
+      .object({ botId: z.string().uuid().describe('The bot id (from listBots)'), ...BotDecisionRoutingSaveBody.shape })
+      .strict(),
+    call: (ctx, a) => ctx.send('PUT', org(ctx, `/bots/${seg(a.botId)}/decision-routing`), bodyOf(a, 'botId'))
+  },
+  {
+    name: 'saveCodeHostDecisionRouting',
+    description:
+      'Replace a repository’s Decision routing for one subject family: which of the agents triggered on it takes each issue or pull/merge request. `config` holds the root Decision, rules (each an `id`, a `when` condition, and an action — an agent, skip, or `nextStepId`), the Otherwise action and `enabled`; every rule’s agent must be one of getCodeHostDecisionRouting’s `members`, and you need edit access to all of them. `enabled: false` pauses routing, so every member fires again.',
+    write: true,
+    schema: z
+      .object({ ...codeHostRoutingScope, config: SharedBotDecisionRouting })
+      .strict()
+      .superRefine(checkRoutingScope),
+    call: (ctx, a) => ctx.send('PUT', org(ctx, routingPath(a)), { config: a.config })
+  },
+  {
+    name: 'deleteCodeHostDecisionRouting',
+    description:
+      'Remove a repository’s Decision routing for one subject family, so every agent triggered on it fires unrouted again — the rules are lost. `confirm` must exactly equal the repository’s `owner/repo` (`repoFullName` from getCodeHostDecisionRouting); get the user’s explicit approval before calling.',
+    write: true,
+    destructive: true,
+    schema: z
+      .object({
+        ...codeHostRoutingScope,
+        confirm: z.string().min(1).describe('The repository’s exact `owner/repo` — a deliberate re-type')
+      })
+      .strict()
+      .superRefine(checkRoutingScope),
+    call: async (ctx, a) => {
+      const target = await ctx.get(org(ctx, routingPath(a)))
+      if (target.statusCode !== 200) return target
+      const name = (JSON.parse(target.body) as { repoFullName?: unknown }).repoFullName
+      if (typeof name !== 'string' || name !== a.confirm) return confirmMismatch('the repository’s `owner/repo`')
+      return ctx.send('DELETE', org(ctx, routingPath(a)))
+    }
+  },
+
+  // Previews store nothing but each is a billed evaluator call, so they take the write path (mcp:write, budget).
+  {
+    name: 'previewDecision',
+    description:
+      'Try a Decision on a sample conversation — `history` lines with sender ids and the `currentMessage` to judge — and get the evaluator’s typed answer. Pass `decisionId` for a saved Decision, or `decision` for an unsaved draft. The run goes to one `target`: a daemon, the managed pool, or a member set. Stores nothing and binds nothing, but each run is a billed model call. Not available from webchat, where approval would store the sample.',
+    write: true,
+    contentArgs: ['state'],
+    schema: z
+      .object({
+        decisionId: DecisionId.optional(),
+        decision: z.object(decisionFields).strict().optional().describe('An unsaved draft instead of decisionId'),
+        target: z
+          .discriminatedUnion('kind', [
+            z.object({ kind: z.literal('daemon'), daemonId: z.string().uuid() }).strict(),
+            z.object({ kind: z.literal('pool') }).strict(),
+            z.object({ kind: z.literal('set'), setId: z.string().uuid() }).strict()
+          ])
+          .describe('Where it runs — a daemon from listDecisionProviders whose provider is ready'),
+        state: DecisionPreviewSample
+      })
+      .strict()
+      .superRefine((value, ctx) => {
+        if ((value.decisionId === undefined) === (value.decision === undefined))
+          ctx.addIssue({ code: 'custom', message: 'pass exactly one of decisionId and decision', path: ['decisionId'] })
+      }),
+    call: async (ctx, a) => {
+      let decision = a.decision as Record<string, unknown> | undefined
+      if (!decision) {
+        const saved = await ctx.get(org(ctx, `/decisions/${seg(a.decisionId)}`))
+        if (saved.statusCode !== 200) return saved
+        const { name, providerId, model, question } = (JSON.parse(saved.body) as { decision: Record<string, unknown> })
+          .decision
+        decision = { name, providerId, model, question }
+      }
+      return ctx.send('POST', org(ctx, '/decisions/preview'), {
+        decision,
+        target: a.target,
+        state: a.state,
+        consumer: { type: 'none' }
+      })
+    }
+  },
+  {
+    name: 'previewIntegrationChannelDecision',
+    description:
+      'Try a draft By decision gate on one conversation against a sample, on the daemon that serves it, and see whether the message would be admitted. Takes the same `decisionBinding` as setChannelTrigger and a `state` of `history` lines and the `currentMessage`. Writes nothing, but each run is a billed model call. Not available from webchat, where approval would store the sample.',
+    write: true,
+    contentArgs: ['state'],
+    schema: z
+      .object({
+        integrationId: z.string().uuid().describe('The integration id (from listIntegrations)'),
+        channelId: z.string().min(1).max(512).describe('The platform channel id (from listIntegrations channels)'),
+        decisionBinding: UpdateIntegrationChannelBody.shape.decisionBinding.unwrap(),
+        state: DecisionPreviewSample
+      })
+      .strict(),
+    call: (ctx, a) =>
+      ctx.send(
+        'POST',
+        org(ctx, `/integrations/${seg(a.integrationId)}/channels/${seg(a.channelId)}/decision-preview`),
+        bodyOf(a, 'integrationId', 'channelId')
+      )
+  },
+  {
+    name: 'previewBotDecisionRouting',
+    description:
+      'Try a draft shared-bot routing on one channel and situation against a sample, and see which agents it would route to. `config` and `channelIds` are the draft (as for saveBotDecisionRouting); `targets` is the situation — {type: "new"} for a new conversation, or {type: "mention" | "thread", agentIds, participantAgentIds} for an explicit mention or an established thread. Writes nothing, but each run is a billed model call. Not available from webchat, where approval would store the sample.',
+    write: true,
+    contentArgs: ['state'],
+    schema: z
+      .object({
+        botId: z.string().uuid().describe('The bot id (from listBots)'),
+        ...BotDecisionRoutingPreviewBody.shape
+      })
+      .strict(),
+    call: (ctx, a) => ctx.send('POST', org(ctx, `/bots/${seg(a.botId)}/decision-routing/preview`), bodyOf(a, 'botId'))
+  }
+]
+
+/** The `tools/list` entry: name/description plus the zod schema rendered as JSON
+ *  Schema (zod v4 native — the MCP SDK's own zod conversion is never used). Every tool
+ *  schema is a ZodObject, so the rendered schema always has `type: 'object'`. The
+ *  behavior annotations (MCP ToolAnnotations) derive from the §6.2 flags so clients
+ *  can gate write/destructive tools behind their own approval UX. */
+export function toolDescriptor(t: McpToolDef): {
+  name: string
+  _meta?: { ui: { resourceUri: string } }
+  description: string
+  inputSchema: { type: 'object' } & Record<string, unknown>
+  annotations: { readOnlyHint: boolean; destructiveHint?: boolean }
+} {
+  const json = z.toJSONSchema(t.schema) as { type: 'object' } & Record<string, unknown>
+  json.type = 'object'
+  delete json.$schema
+  return {
+    name: t.name,
+    ...(t.uiResourceUri ? { _meta: { ui: { resourceUri: t.uiResourceUri } } } : {}),
+    description: t.description,
+    inputSchema: json,
+    annotations: t.write ? { readOnlyHint: false, destructiveHint: t.destructive === true } : { readOnlyHint: true }
+  }
+}
+
+export function findTool(name: string): McpToolDef | undefined {
+  return MCP_TOOLS.find((t) => t.name === name)
+}

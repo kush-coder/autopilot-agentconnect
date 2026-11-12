@@ -1,0 +1,70 @@
+// Teams' first-run welcome (teams-integration.md §4.7): core's welcome as one Adaptive Card, mentioning who added the bot outside a 1:1 chat.
+import { WireMsTeamsBotAdded, type RdMsgPlatformAction } from '@agentconnect.md/protocol'
+import type { BotAdded, RelayBotAdds, Welcome } from '../contract.js'
+import { adaptiveCard, plainText, type AdaptiveElement } from './card.js'
+import { msTeamsTeamTarget } from './connection.js'
+import type { MsTeamsRelayIngressHost } from './relay-ingress.js'
+
+/** The welcome card; a group or channel welcome mentions the person who added the bot, as the Teams Store asks. */
+export function msTeamsWelcomeCard(welcome: Welcome, addedBy?: { id: string; name?: string }): Record<string, unknown> {
+  const name = addedBy?.name?.replace(/[<>]/g, '').trim()
+  const mention = addedBy && name ? `<at>${name}</at>` : undefined
+  const body: AdaptiveElement[] = [
+    { type: 'TextBlock', text: welcome.title, weight: 'Bolder', size: 'Medium', wrap: true },
+    ...(mention ? [{ type: 'TextBlock', text: `Thanks for adding me, ${mention}.`, wrap: true }] : []),
+    ...welcome.lines.flatMap((line) => plainText(line)),
+    { type: 'ActionSet', actions: welcome.links.map(({ title, url }) => ({ type: 'Action.OpenUrl', title, url })) }
+  ]
+  const card = adaptiveCard(body)
+  if (!mention || !addedBy) return card
+  return {
+    ...card,
+    msteams: {
+      ...(card.msteams as Record<string, unknown>),
+      entities: [{ type: 'mention', text: mention, mentioned: { id: addedBy.id, name } }]
+    }
+  }
+}
+
+/** The bot's own installs, welcomed through the integration's live connection; none while it is unbound. */
+export function msTeamsBotAdds(host: MsTeamsRelayIngressHost): RelayBotAdds {
+  return {
+    decode: (msg: RdMsgPlatformAction): BotAdded | null => {
+      const parsed = WireMsTeamsBotAdded.safeParse(msg.payload)
+      if (!parsed.success) return null
+      const added = parsed.data
+      const { teamId } = added
+      return {
+        channel: added.conversationId,
+        isDm: added.scope === 'personal',
+        // A team-wide install puts the bot in the team's standard channels, which the console lists at once.
+        ...(teamId && added.teamWide
+          ? {
+              places: async () =>
+                (await host
+                  .connection(msg.integrationId)
+                  ?.teamInstallPlaces(msTeamsTeamTarget(added.serviceUrl, teamId, added.teamTicket))) ?? []
+            }
+          : {}),
+        post: async (welcome) => {
+          const conn = host.connection(msg.integrationId)
+          if (!conn) throw new Error('msteams: the integration has no live connection')
+          const target = {
+            serviceUrl: added.serviceUrl,
+            conversationId: added.conversationId,
+            ...(added.ticket ? { ticket: added.ticket } : {})
+          }
+          let addedBy = added.scope === 'personal' ? undefined : added.addedBy
+          // A team install names its installer by ID only, so the mention's name comes from the roster; a failed lookup only drops the mention.
+          if (addedBy && !addedBy.name) {
+            const name = await conn.memberName(target, addedBy.id).catch(() => undefined)
+            addedBy = name ? { ...addedBy, name } : addedBy
+          }
+          const id = await conn.postCard(target, msTeamsWelcomeCard(welcome, addedBy), welcome.title)
+          // A channel post roots a thread keyed by its activity ID (§4.1); a chat has no thread to continue.
+          return added.scope === 'channel' ? id : undefined
+        }
+      }
+    }
+  }
+}

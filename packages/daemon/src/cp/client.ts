@@ -1,0 +1,2445 @@
+import { randomUUID } from 'node:crypto'
+import type { DecisionControlDeps } from './control/decision.js'
+import {
+  AhpSessionResult,
+  AhpSessionListResult,
+  type AhpSessionReserve,
+  type AhpSessionFinalize,
+  type AhpSessionResolve,
+  type AhpSessionList,
+  MEMORY_TRANSACTION_V1_FEATURE,
+  PROVIDER_CREDENTIALS_V1_FEATURE,
+  DECISION_TOOLS_V1_FEATURE,
+  DECISION_MODEL_SELECTION_V1_FEATURE,
+  DecisionListReply,
+  DecisionGetReply,
+  type DecisionListRequest,
+  type DecisionGetRequest,
+  MEMORY_CAPTURE_FENCE_V1_FEATURE,
+  type MemoryTransactionReq,
+  type MemoryTransactionResult,
+  FOLLOW_UP_WATCH_BUDGET_MS,
+  type CapabilityDecideReq,
+  type CapabilityDecideResult,
+  type CapabilityRequestReq,
+  type AgentCronReq,
+  type AgentCronResult,
+  type CapabilityRequestResult,
+  type CapabilityWithdrawReq,
+  type CapabilityWithdrawResult,
+  type AssistantFollowUpWatchReq,
+  type AssistantFollowUpWatchResult,
+  DAEMON_LIFECYCLE_BEGIN_FEATURE,
+  type DaemonLifecycleBegin,
+  type DaemonLifecycleBeginOk
+} from '@agentconnect.md/protocol'
+/**
+ * `CpClient` — the daemon-side CP WebSocket client FSM (protocol §2.1). Dials
+ * out, runs the auth → register handshake, then (Tasks 5–7) emits heartbeats,
+ * dispatches C→D control frames, and reconnects with backoff. Local-first:
+ * `start()` is non-blocking and a CP failure never affects the daemon.
+ */
+import type {
+  AnyFrame,
+  RegisterReq,
+  Heartbeat,
+  HeartbeatDuties,
+  DutyClaimOk,
+  DutyFetchOk,
+  FactsRuntimeProfile,
+  FactsMcpServer,
+  UsageReport,
+  EventSession,
+  SessionActivity,
+  AgentActivity,
+  AgentSkillStatus,
+  SessionPurged,
+  IntegrationChannels,
+  IntegrationRevoked,
+  IntegrationTenant,
+  IntegrationRevokedOk,
+  CronReport,
+  HookReport,
+  HookPreparing,
+  HookPreparingOk,
+  HookStart,
+  HookStartOk,
+  GithubReviewAuthorize,
+  GithubReviewAuthorized,
+  SharedImageGetOk,
+  SharedImageGetReq,
+  SharedImagePutOk,
+  SharedImagePutReq,
+  TransferGetOk,
+  TransferGetReq,
+  TransferSignOk,
+  TransferSignReq,
+  TransferSettleOk,
+  TransferSettleReq,
+  AgentApprovalRoute,
+  AgentApprovalRouted,
+  AgentReadAccess,
+  AgentReadAccessOk,
+  GithubReviewResultReport,
+  GithubReviewResultOk,
+  CodeHostNoteResult,
+  CodeHostNoteResultOk,
+  CodeHostReviewAuthorize,
+  CodeHostReviewAuthorized,
+  CodeHostReviewLeaseRenew,
+  CodeHostReviewLeaseRenewed,
+  CodeHostReviewOpAccepted,
+  CodeHostReviewOpRequest,
+  CodeHostReviewResultOk,
+  CodeHostReviewResultReport,
+  GitCredRequest,
+  GitCredGrant,
+  LinearCredRequest,
+  LinearCredGrant,
+  ProviderCredentialsRequest,
+  ProviderCredentialsReply,
+  ChannelAgentsReq,
+  ChannelAgentsOk,
+  ChildSessionStatus,
+  ChildSessionStatusReq,
+  MemoryConnectionFact,
+  WebchatMcpGrantIssue,
+  WebchatMcpGrantIssued,
+  WebchatMcpGrantAccept,
+  WebchatMcpGrantActivate,
+  WebchatMcpGrantRenew,
+  WebchatMcpGrantRenewed,
+  WebchatMcpGrantRevoke,
+  WebchatMcpGrantRevoked,
+  KnowledgeSearchReq,
+  KnowledgeSearchOk,
+  KnowledgeListReq,
+  KnowledgeListOk,
+  KnowledgeRecordConflict,
+  KnowledgeRecordOk,
+  KnowledgeRecordReadReq,
+  KnowledgeRecordWriteReq,
+  MemoryStoreReq,
+  MemoryFsReply,
+  MemoryHistoryAppendReq,
+  MemoryHistoryAppendOk,
+  MemoryHistoryReadReq,
+  MemoryHistoryReadOk,
+  MemoryHomeMigratedReq,
+  MemoryHomeMigratedOk,
+  OrgSkillsReq,
+  OrgSkillsOk,
+  OrganizationSuggestionsSyncReq,
+  OrganizationSuggestionsSyncOk,
+  ManagedSkillReadReq,
+  ManagedSkillChunk,
+  BootstrapLifecycle,
+  DaemonLifecycleProgress,
+  FrameOrgPeer,
+  OrganizationMode,
+  AgentExistsOk
+} from '@agentconnect.md/protocol'
+import {
+  AGENT_EXISTS_FEATURE,
+  AGENT_EXISTS_MAX,
+  COMPUTER_CHANNEL_FEATURE,
+  COMPUTER_LEASE_FEATURE,
+  COMPUTER_LEASE_QUEUE_FEATURE,
+  COMPUTER_POOL_FEATURE,
+  ComputerChannelGrantResult,
+  type ComputerChannelGrantRequest,
+  ComputerLeaseAcquireResult,
+  type ComputerPoolAcquire,
+  ComputerPoolAcquireResult,
+  type ComputerLeaseAcquire,
+  type ComputerLeaseRelease,
+  ExecutorCandidatesResult,
+  ExecutorPrepareResult,
+  ExecutorReleaseResult,
+  REPO_CANDIDATES_V1_FEATURE,
+  RepoCandidatesReply,
+  type RepoCandidatesRequest,
+  SESSION_EXECUTORS_V1_FEATURE,
+  type ExecutorCandidatesReq,
+  type ExecutorPrepareReq,
+  type ExecutorReleaseReq,
+  buildEnvelope,
+  decodeCpEnvelope,
+  encode,
+  FRAME_FRAGMENTS_FEATURE,
+  FrameAssembler,
+  type FrameFragment,
+  MAX_ASSEMBLED_FRAME_BYTES,
+  MAX_FRAME_BYTES,
+  AGENT_SKILL_STATUS_V1_FEATURE,
+  SESSION_LIVE_TAIL_FEATURE,
+  SESSION_METADATA_ACK_FEATURE,
+  CRON_REPORT_ACK_FEATURE,
+  SESSION_PURGE_FEATURE,
+  WEBCHAT_MCP_GRANT_RENEW_FEATURE,
+  INTEGRATION_REVOKED_FEATURE,
+  INTEGRATION_TENANT_FEATURE,
+  ORGANIZATION_KNOWLEDGE_FEATURE,
+  KNOWLEDGE_RECORD_FEATURE,
+  AGENT_MEMORY_HISTORY_READ_V1_FEATURE,
+  AGENT_MEMORY_STORE_V1_FEATURE,
+  AGENT_MEMORY_STORE_OPERATION_ID_V1_FEATURE,
+  DAEMON_BOOTSTRAP_PROTOCOL_VERSION,
+  checkInboundFrameOrg,
+  checkReplyFrameOrg,
+  isInstallWideFrameType
+} from '@agentconnect.md/protocol'
+import { ReqRep, WireError, type Clock, type TimerHandle, type Transport } from '@agentconnect.md/connection'
+import type { AgentControlDeps } from './control/agent.js'
+import type { ControlWire } from './control/context.js'
+import type { CodeHostControlDeps } from './control/codehost.js'
+import type { DreamControlDeps } from './control/dream.js'
+import type { ExecutorControlDeps } from './control/executor.js'
+import type { MemoryControlDeps } from './control/memory.js'
+import { CONTROL_HANDLERS, type ControlDeps } from './control/registry.js'
+import type { SessionControlDeps } from './control/session.js'
+import type { SkillsControlDeps } from './control/skills.js'
+import type { TaskControlDeps } from './control/task.js'
+import type { AssistantControlDeps } from './control/assistant.js'
+import type { CapabilityControlDeps } from './control/capability.js'
+import type { AutoMergeControlDeps } from './control/automerge.js'
+import type { SandboxKeepAliveDeps } from './control/sandbox-keepalive.js'
+import type { RuntimeProbeDeps } from './control/runtime-probe.js'
+import type { ComputerPoolControlDeps } from './control/computer-pool.js'
+import { GitMessagePasses, UploadBegins, type WorkspaceReadDeps } from './control/workspace.js'
+import type { ConfigApply } from './config-apply.js'
+import type { Logger } from '../log.js'
+
+/** The daemon↔CP wire's subprotocol + mount path — re-exported from the shared
+ *  protocol package (single source of truth) so the daemon's existing import
+ *  sites (`./cp/client.js`) keep working unchanged. */
+export { CP_SUBPROTOCOL, CP_WS_PATH } from '@agentconnect.md/protocol'
+
+const ACK_TIMEOUT_MS = 5000
+/** The correlator's default five-try budget: what a wrapped turn-path request had in total before it waited out a handoff. */
+const TURN_PATH_BUDGET_MS = 5 * ACK_TIMEOUT_MS
+/** One deadline for a `memory/store` op, the shim carrier's per-op timeout; a safe re-send fits inside it. */
+const MEMORY_STORE_TIMEOUT_MS = 30_000
+/** A capability request reads the agent's rows and may join an open one; one attempt, a generous window. */
+const CAPABILITY_CALL_BUDGET_MS = 15_000
+/** The `memory/store` ops that change nothing, so a re-send needs no operation id. */
+const MEMORY_FS_READS: ReadonlySet<string> = new Set(['memory-read', 'memory-stat', 'memory-readdir'])
+/** How long a turn-path request waits for a reconnecting control link; a planned CP handoff takes seconds. */
+export const CP_HANDOFF_WAIT_MS = 10_000
+/** Requests wait only this long after a READY link dropped: a handoff, never a startup without a CP or a long outage. */
+const CP_HANDOFF_WINDOW_MS = 30_000
+/** A credential answer must beat the git helper's 15s IPC timeout, waiting for the link included. */
+const CREDENTIAL_TOTAL_BUDGET_MS = 13_000
+/** The shortest ack window a turn-path send gets after waiting, so a late link still gets one real try. */
+const MIN_TURN_SEND_MS = 2_000
+/** After a planned CP restart (1012), redials wait only this plus jitter and never escalate within the handoff window. */
+const HANDOFF_REDIAL_BASE_MS = 250
+/** Per-attempt handshake cap for those redials, so one landing on a dying pod cannot eat the handoff budget. */
+const HANDOFF_REDIAL_HANDSHAKE_MS = 1_000
+const BACKOFF_BASE_MS = 1000
+const BACKOFF_CAP_MS = 30000
+// No-split invariant `T_reassign > T_fence`. The CP frees a lease at `renewedAt + leaseMs` and tells the member
+// that horizon on each renewal it performed (`duty/renewed`), so the member fences this fraction of it measured
+// from RECEIPT — receipt is strictly after the CP's renew, and both ends of the subtraction are the daemon's own
+// clock, so no skew enters. The remaining quarter is pure slop: the confirmation's one-way delivery, the daemon's
+// scheduling delay, and the teardown itself. Breaking the invariant would take a confirmation delivered more than
+// a quarter of the horizon late (30s at the shipped 120s) — a link that dead delivers nothing at all.
+const DUTY_FENCE_HORIZON_FRACTION = 0.75
+// Horizon assumed when `auth/ok` carries none (a CP older than the field); mirrors the CP's shipped default.
+// Deliberately a copy: it is a guess about a peer that cannot answer, and guessing beats silently never fencing.
+const DUTY_LEASE_FALLBACK_MS = 120_000
+const REGISTERING_CONTROL_QUEUE_LIMIT = 1024
+const utf8Bytes = (value: string) => new TextEncoder().encode(value).length
+
+export type CpState = 'CONNECTING' | 'AUTHENTICATING' | 'REGISTERING' | 'READY' | 'DRAINING' | 'CLOSED' | 'DEGRADED'
+
+export type BootstrapUpgradeOutcome =
+  { status: 'current' } | { status: 'failed'; reason: string } | { status: 'installed'; restart: () => void }
+
+interface RegisterControlBarrier {
+  transport: Transport
+  registerRequestId: string
+  /** Becomes true only after a valid register/ok correlated to this request. */
+  snapshotApplying: boolean
+  controls: Array<{ frame: AnyFrame; epoch?: number }>
+}
+
+export interface CpClientDeps
+  extends
+    AgentControlDeps,
+    DecisionControlDeps,
+    DreamControlDeps,
+    ExecutorControlDeps,
+    MemoryControlDeps,
+    SessionControlDeps,
+    SkillsControlDeps,
+    TaskControlDeps,
+    AssistantControlDeps,
+    CapabilityControlDeps,
+    AutoMergeControlDeps,
+    SandboxKeepAliveDeps,
+    RuntimeProbeDeps,
+    ComputerPoolControlDeps,
+    CodeHostControlDeps,
+    WorkspaceReadDeps {
+  // Credential leases must not lengthen when the wall clock moves backward.
+  monotonicNow?: () => number
+  url: string
+  /** The CP API key. Absent on an in-cluster daemon, which presents
+   *  {@link CpClientDeps.clusterIdentityToken} instead. */
+  token?: string
+  /** This pod's projected ServiceAccount token, re-read per connect because the kubelet
+   *  rotates it roughly hourly. Present ⇒ it is the credential and the API key is not sent. */
+  clusterIdentityToken?: () => string | undefined
+  /** Optional: when unset, the token's `sub` is the authoritative daemonId and
+   *  the CP assigns it. The adopted id is surfaced via `onDaemonId`. */
+  daemonId?: string
+  agentVersion: string
+  host: string
+  /** Rollout generation (pod-template hash) — a pool member's; absent for a local daemon. */
+  generation?: string
+  /** This process's boot identity, the same on every reconnect of one process. */
+  bootId?: string
+  heartbeatDefaultMs: number
+  maxAgents: number
+  capabilities: () => RegisterReq['capabilities']
+  /** Observed runtime profiles, emitted as one `facts/daemon-runtimes` snapshot after each register. */
+  runtimeProfiles: () => FactsRuntimeProfile[]
+  /** Daemon-configured MCP servers (name + transport), riding the same
+   *  `facts/daemon-runtimes` frame (daemon-level, REPLACE semantics). Derived
+   *  from config — not probed. Defaults to []. */
+  mcpServerFacts?: () => FactsMcpServer[]
+  localState: () => RegisterReq['localState']
+  loadSnapshot: () => Heartbeat['load']
+  activeSessions: () => number
+  /** Session environments live on this machine (session-executors.md §6); undefined while the executor facet is dark, and then the heartbeat says nothing. */
+  hostedSessions?: () => number | undefined
+  /** false ⇒ this daemon never reports session usage to the CP, because something
+   *  upstream of it is the single writer for these sessions. Local recording is
+   *  unaffected. Absent ⇒ reporting is on. */
+  usageReporting?: boolean
+  /** Tenant lookup for agent-scoped frames on an install-wide connection. */
+  orgForAgent?: (agentId: string) => string | undefined
+  /** Tenant lookup for integration reports whose payload has no agent id. */
+  orgForIntegration?: (integrationId: string) => string | undefined
+  /** Tenant lookup for cron control frames, which name only the cron. */
+  orgForCron?: (cronId: string) => string | undefined
+  /** Unservable CP-rule agentIds, surfaced in heartbeat.degradedScopes. Defaults to []. */
+  degradedScopes?: () => string[]
+  /** Duty-lease digest + headroom for the heartbeat (frames/duty.ts). Only read on
+   *  an install-wide (frame-mode) connection; absent ⇒ this daemon does not
+   *  participate in the ledger and the CP-side exchange stays dormant. */
+  duties?: () => HeartbeatDuties | undefined
+  /** Groups whose admission is in flight — intended to be held, not yet in the digest. Their deadlines must
+   *  survive a renewal's prune: dropping one is exactly what would leave an admitted group with no fence. */
+  dutyPending?: () => string[]
+  /** Duty self-fence: these groups' leases are about to go vacant at the CP, so stop serving them first. Called
+   *  with the groups whose OWN deadline elapsed — never the whole held set — so a member sheds exactly what it
+   *  can no longer prove it holds and keeps serving the rest. */
+  onDutyFence?: (groupIds: string[]) => void
+  // webchat content no longer rides this control WS (milestone A4) — the daemon serves
+  // webchat over the relay's rd/* wire (RelayClient / Daemon.handleRelayMsg) instead.
+  clock: Clock
+  /** Dial factory — production passes `ClientTransport.dial(url, ...)`; a handoff redial caps its handshake. */
+  connect: (opts?: { handshakeTimeoutMs?: number }) => Promise<Transport>
+  log: Logger
+  /** Backoff jitter in [0,1); defaults to Math.random. Injected as `() => 0` in tests. */
+  jitter?: () => number
+  /** Called with the authoritative daemonId from `auth/ok` (so the daemon can
+   *  persist a CP-assigned id when none was configured). */
+  onDaemonId?: (daemonId: string) => void
+  /** Called with the Web App console origin from `auth/ok` (the CP's own console URL, or
+   *  undefined when it has none). Used as the fallback base for session deep links. */
+  onWebAppUrl?: (webAppUrl: string | undefined) => void
+  /** Called with the daemon's org slug from `auth/ok` (or undefined when the CP couldn't
+   *  resolve it). The console is org-scoped, so this becomes the `<orgSlug>` segment of a
+   *  session deep link (`<webAppUrl>/<orgSlug>/sessions/<id>`). */
+  onOrgSlug?: (orgSlug: string | undefined) => void
+  /** Called when the CP rejects this daemon's credential for good (4401) AND that credential is the
+   *  projected identity token — the one case a restart can fix, since the token is re-read from the
+   *  pod's volume on every boot. The daemon exits here so its supervisor redials with backoff. */
+  onAuthFatal?: () => void
+  /** Auth-time recovery directive handled before full registration. */
+  onBootstrapUpgrade?: (lifecycle: BootstrapLifecycle) => Promise<BootstrapUpgradeOutcome>
+  /** Called once the daemon reaches READY on each (re)connect, after the initial
+   *  runtime profiles are emitted. The daemon uses this to kick off background
+   *  runtime probing and push the refreshed snapshot via `emitDaemonRuntimes`. */
+  onReady?: () => void | Promise<void>
+  /** The CP authenticated this daemon but refused `register` with a non-retryable error (auto-upgrade trial rollback). */
+  onRegisterRejected?: (err: WireError) => void
+}
+
+export class CpClient {
+  state: CpState = 'CLOSED'
+  sessionEpoch = 0
+  routingEpoch = 0
+
+  private transport?: Transport
+  private readonly correlator: ReqRep<AnyFrame>
+  private stopped = false
+  private fatal = false // 4401 — this connection never redials (the process may still exit and retry)
+  private readonly readyWaiters = new Set<{ resolve: (ready: boolean) => void; timer?: TimerHandle }>()
+  /** Bumped at every READY edge, so a retry can tell a replaced link from the one that failed. */
+  private linkGeneration = 0
+  /** When the last READY link dropped; waiting applies only inside the handoff window that follows. */
+  private droppedAt?: number
+  /** Until when redials run on the fast, non-escalating handoff cadence after a planned 1012 close. */
+  private handoffRedialUntil?: number
+  private serverFeatures = new Set<string>()
+  private readonly providerCredentials = new Map<string, { expiresAt: number; reply: ProviderCredentialsReply }>()
+  private providerCredentialEpoch = 0
+  private readonly providerCredentialNow: () => number
+  private organizationMode: OrganizationMode = 'connection'
+  /** The member set the CP announced at `auth/ok` (daemon-groups.md §3); null ⇒ in none. Never
+   *  asserted from here — membership is the CP's to record and this connection's to be told. */
+  private memberSetRef: { setId: string; name: string } | null = null
+  private attempt = 0
+  private reconnectTimer?: TimerHandle
+  private lastAuthedEpoch = 0 // for resume on reconnect (per-agent seq tail is out of scope)
+  private heartbeatTimer?: TimerHandle
+  /** Debounce for {@link CpClient.reportDutiesNow} — one extra beat per admission, not per group. */
+  private dutyReportTimer?: TimerHandle
+  private heartbeatMs = 0
+  /** Lease horizon: the CP's `auth/ok` value, replaced by each renewal's own. */
+  private dutyLeaseMs?: number
+  /** True when this CP confirms renewals (`auth/ok` carried a horizon ⇒ it also sends `duty/renewed`), so the
+   *  anchor is evidence the CP renewed rather than evidence we queued a frame. */
+  private dutyRenewalsConfirmed = false
+  /** One fence deadline PER HELD GROUP, keyed by groupId, each anchored on the receipt that restarted it:
+   *  `duty/renewed` (all of them), a `duty/grant`, or a won `duty/claim/ok` (just that one). The CP expires each
+   *  lease independently, so a single global deadline would let a fresh grant or claim postpone an older group
+   *  past its own unchanged expiry — and would leave a group granted without a following confirmation with no
+   *  deadline at all. Empty ⇒ no lease this member could lose. */
+  private readonly dutyDeadlines = new Map<string, { anchoredAt: number; deadline: number }>()
+  private dutyFenceTimer?: TimerHandle
+  private connectRun?: Promise<void>
+  /** `stop()` must join snapshot convergence after a transport has connected,
+   *  but it cannot wait forever for a connector whose dial is not cancellable.
+   *  Keep the transport-bound handshake separate from the outer dial attempt. */
+  private handshakeRun?: Promise<void>
+  /** The CP may send controls immediately after register/ok, while the daemon is
+   *  still converging that snapshot. Hold only those post-register controls and
+   *  drain them FIFO before exposing READY; pre-register controls stay illegal. */
+  private registerControlBarrier?: RegisterControlBarrier
+  /** A reconnect timer can fire while the failed connection attempt is still
+   *  unwinding. Preserve that admission instead of dropping it on the
+   *  `connectRun` single-flight guard. */
+  private connectPending = false
+  // Per-connection monotonic ordinal for `facts/daemon-runtimes` snapshots
+  // (reset at each register; the CP nulls its stored value then too).
+  private runtimesSeq = 0
+  // What this connection's CP currently believes our capabilities are (the
+  // register value, refreshed by `capabilities/update`). Serialized for the
+  // change check in updateCapabilities(); reset on each register.
+  private lastSentCapabilities?: string
+  /** Reassembles the current connection's `frame/fragment` streams; replaced with each transport. */
+  private fragments = new FrameAssembler()
+  /** The socket-facing half handed to every control handler — this client owns the transport. */
+  private readonly wire: ControlWire
+  /** The deps slice the control registry dispatches against (`src/cp/control/*`). */
+  private readonly controlDeps: ControlDeps
+
+  constructor(private readonly deps: CpClientDeps) {
+    this.providerCredentialNow = deps.monotonicNow ?? (() => performance.now())
+    this.correlator = new ReqRep<AnyFrame>(deps.clock, ACK_TIMEOUT_MS)
+    this.wire = {
+      reply: (req, type, payload) => this.reply(req, type, payload),
+      sendError: (corr, code, message, retryable, details) => this.sendError(corr, code, message, retryable, details),
+      emit: (type, payload) => this.emit(type, payload),
+      log: deps.log
+    }
+    this.controlDeps = {
+      configApply: deps.configApply,
+      sessionRead: deps.sessionRead,
+      childSessionStatusProbe: deps.childSessionStatusProbe && ((probe) => deps.childSessionStatusProbe!(probe)),
+      pullRequestFeedback: deps.pullRequestFeedback && ((req) => deps.pullRequestFeedback!(req)),
+      sharedImageResolve: deps.sharedImageResolve && ((req, orgId) => deps.sharedImageResolve!(req, orgId)),
+      workspaceRead: deps.workspaceRead,
+      workspaceGit: deps.workspaceGit,
+      // Every transfer URL is signed by the control plane, over this socket.
+      signTransfer: deps.signTransfer ?? ((req, orgId) => this.signTransfer(req, orgId)),
+      settleTransfer: (req, orgId) => this.settleTransfer(req, orgId),
+      ...(deps.transferNetwork ? { transferNetwork: deps.transferNetwork } : {}),
+      taskReader: deps.taskReader,
+      assistantActivity: deps.assistantActivity,
+      followUpWake: deps.followUpWake,
+      capabilitySettled: deps.capabilitySettled,
+      capabilityReopened: deps.capabilityReopened,
+      capabilityForward: deps.capabilityForward,
+      mcpRebound: deps.mcpRebound,
+      autoMerge: deps.autoMerge,
+      sandboxKeepAlive: deps.sandboxKeepAlive,
+      runtimeProbe: deps.runtimeProbe,
+      computerPoolOp: deps.computerPoolOp,
+      executorPrepare: deps.executorPrepare,
+      executorRelease: deps.executorRelease,
+      agentWake: deps.agentWake,
+      memoryReader: deps.memoryReader,
+      memoryEntriesRead: deps.memoryEntriesRead,
+      memoryEntriesWrite: deps.memoryEntriesWrite,
+      dreamReader: deps.dreamReader,
+      decisionEvaluator: deps.decisionEvaluator,
+      decisionEvaluations: deps.decisionEvaluations,
+      decisionModelEvaluations: deps.decisionModelEvaluations,
+      decisionApiGateEvaluations: deps.decisionApiGateEvaluations,
+      coordinatorFilterEvaluations: deps.coordinatorFilterEvaluations,
+      localSkillsReader: deps.localSkillsReader,
+      runtimeCommandsReader: deps.runtimeCommandsReader,
+      gitMessagePasses: new GitMessagePasses(),
+      uploadBegins: new UploadBegins(),
+      codeHostNoteProjection: deps.codeHostNoteProjection,
+      noteLeasesGranted: (groupIds) => this.noteLeasesGranted(groupIds),
+      forgetLeaseDeadlines: (groupIds) => this.forgetLeaseDeadlines(groupIds),
+      onDutyRenewed: (leaseMs) => this.onDutyRenewed(leaseMs),
+      // §2.1: DRAINING still admits control frames, and a bare drain is a rebalance — back to READY when it settles.
+      beginDrain: () => {
+        this.state = 'DRAINING'
+      },
+      endDrain: () => {
+        if (this.state === 'DRAINING') this.state = 'READY'
+      }
+    }
+  }
+
+  /** Non-blocking: kicks off the connect loop and returns. */
+  start(): void {
+    this.stopped = false
+    this.fatal = false
+    this.beginConnect()
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.clearProviderCredentials()
+    this.connectPending = false
+    if (this.reconnectTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    this.stopHeartbeat()
+    // A local shutdown tears down every agent anyway — a fence timer outliving it would
+    // only fire into a daemon that has already stopped serving.
+    this.clearDutyFence()
+    this.correlator.rejectAll(new Error('stopping'))
+    this.releaseReadyWaiters(false)
+    this.registerControlBarrier = undefined
+    this.transport?.close(1000, 'shutdown')
+    while (this.handshakeRun) {
+      const run = this.handshakeRun
+      await run.catch(() => undefined)
+      if (this.handshakeRun === run) this.handshakeRun = undefined
+    }
+    this.state = 'CLOSED'
+  }
+
+  /** True once this client will never dial again — stop() ran, a fatal auth close latched, or a
+   *  bootstrap upgrade retired the connection — so a retry loop waiting on it should give up now. */
+  terminallyClosed(): boolean {
+    return this.stopped || this.fatal
+  }
+
+  private beginConnect(): void {
+    if (this.stopped || this.fatal) return
+    if (this.connectRun) {
+      this.connectPending = true
+      return
+    }
+    this.connectPending = false
+    const run = this.attemptConnect()
+    this.connectRun = run
+    const clear = () => {
+      if (this.connectRun !== run) return
+      this.connectRun = undefined
+      if (this.connectPending) {
+        this.connectPending = false
+        this.beginConnect()
+      }
+    }
+    void run.then(clear, clear)
+  }
+
+  private async attemptConnect(): Promise<void> {
+    if (this.stopped || this.fatal) return
+    this.state = 'CONNECTING'
+    let t: Transport | undefined
+    try {
+      const handoffLeft = this.handoffRedialLeft()
+      const connected = await this.deps.connect(
+        handoffLeft > 0
+          ? { handshakeTimeoutMs: Math.max(HANDOFF_REDIAL_BASE_MS, Math.min(HANDOFF_REDIAL_HANDSHAKE_MS, handoffLeft)) }
+          : undefined
+      )
+      t = connected
+      if (this.stopped || this.fatal) {
+        // stop() (or a fatal close) raced the dial — drop the fresh socket unused.
+        connected.close(1000, 'shutdown')
+        return
+      }
+      this.transport = connected
+      this.fragments = new FrameAssembler()
+      connected.onMessage((txt) => void this.onText(txt, connected))
+      connected.onClose((c, r) => this.onClose(connected, c, r))
+      const handshake = this.handshake(connected)
+      this.handshakeRun = handshake
+      try {
+        await handshake
+      } finally {
+        if (this.handshakeRun === handshake) this.handshakeRun = undefined
+      }
+      this.attempt = 0 // connected — reset backoff
+    } catch (err) {
+      if (this.stopped) return
+      this.deps.log.warn(`cp: connect/handshake failed: ${(err as Error).message}`)
+      if (t && this.transport === t) {
+        if (this.registerControlBarrier?.transport === t) this.registerControlBarrier = undefined
+        t.close(1011, 'handshake failed')
+        this.transport = undefined
+      }
+      this.scheduleReconnect()
+    }
+  }
+
+  private handoffRedialLeft(): number {
+    return this.handoffRedialUntil === undefined ? 0 : Math.max(0, this.handoffRedialUntil - this.deps.clock.now())
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.fatal) return
+    if (this.reconnectTimer !== undefined) return // one in flight
+    const jitter = this.deps.jitter ?? Math.random
+    if (this.handoffRedialLeft() > 0) {
+      // A planned handoff: redial fast and do not escalate; ordinary backoff resumes after the window.
+      const delay = HANDOFF_REDIAL_BASE_MS + Math.floor(jitter() * HANDOFF_REDIAL_BASE_MS)
+      this.reconnectTimer = this.deps.clock.setTimeout(() => {
+        this.reconnectTimer = undefined
+        this.beginConnect()
+      }, delay)
+      return
+    }
+    const base = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** this.attempt)
+    // Exponential backoff with additive jitter in [0, base), clamped so no delay
+    // ever exceeds the cap (jitter()=0 → exactly base).
+    const delay = Math.min(BACKOFF_CAP_MS, base + Math.floor(jitter() * base))
+    this.attempt += 1
+    this.reconnectTimer = this.deps.clock.setTimeout(() => {
+      this.reconnectTimer = undefined
+      this.beginConnect()
+    }, delay)
+  }
+
+  private async handshake(expectedTransport: Transport): Promise<void> {
+    // ── auth ── (resume on reconnect carries only the last epoch the daemon held)
+    this.state = 'AUTHENTICATING'
+    // Read per connect, never cached: the kubelet rewrites the projected token roughly hourly.
+    const identityToken = this.deps.clusterIdentityToken?.()
+    const authPayload: Record<string, unknown> = {
+      ...(identityToken ? { serviceAccountToken: identityToken } : { apiKey: this.deps.token }),
+      agentVersion: this.deps.agentVersion,
+      ...(this.deps.onBootstrapUpgrade ? { bootstrapProtocolVersion: DAEMON_BOOTSTRAP_PROTOCOL_VERSION } : {})
+    }
+    // Send daemonId only if configured; otherwise the CP derives it from the
+    // token's `sub` and returns it in auth/ok (token-only onboarding). Never echoed on the
+    // identity-token path: the CP re-derives the daemon from the token each connect, so an
+    // id adopted from an earlier auth/ok could only contradict it — and a mismatch is fatal.
+    if (this.deps.daemonId && !identityToken) {
+      authPayload.daemonId = this.deps.daemonId
+    }
+    if (this.lastAuthedEpoch > 0) {
+      authPayload.resume = { lastEpoch: this.lastAuthedEpoch }
+    }
+    const auth = buildEnvelope('auth', authPayload)
+    const authOk = await this.correlator.request(auth, (encoded) => expectedTransport.send(encoded))
+    const ok = authOk.payload as {
+      daemonId: string
+      sessionEpoch: number
+      heartbeatSec: number
+      dutyLeaseMs?: number
+      webAppUrl?: string
+      orgSlug?: string
+      organizationMode?: OrganizationMode
+      memberSet?: { setId: string; name: string }
+      lifecycle?: BootstrapLifecycle
+    }
+    this.sessionEpoch = ok.sessionEpoch
+    this.organizationMode = ok.organizationMode ?? 'connection'
+    this.memberSetRef = ok.memberSet ?? null
+    this.dutyLeaseMs = ok.dutyLeaseMs
+    // A CP that announces its horizon is a CP that confirms renewals — both landed together.
+    this.dutyRenewalsConfirmed = ok.dutyLeaseMs !== undefined
+    // Once per connection, and only where a lease can exist: a member fencing on a guess should say so.
+    if (!this.dutyRenewalsConfirmed && this.memberSetRef && this.deps.duties) {
+      this.deps.log.warn(
+        `cp: no duty lease horizon in auth/ok — self-fencing on the built-in ${DUTY_LEASE_FALLBACK_MS}ms default, ` +
+          'anchored on the heartbeats sent rather than on renewals confirmed'
+      )
+    }
+    this.lastAuthedEpoch = ok.sessionEpoch
+    // Adopt the authoritative daemonId the CP assigned (no-op if we already had one).
+    if (ok.daemonId && ok.daemonId !== this.deps.daemonId) {
+      this.deps.daemonId = ok.daemonId
+      this.deps.onDaemonId?.(ok.daemonId)
+    }
+    // Adopt the CP's Web App console origin (for session deep links). Local config wins,
+    // so the daemon applies this only as a fallback (see sessionLink).
+    this.deps.onWebAppUrl?.(ok.webAppUrl)
+    // Adopt the org slug the daemon belongs to — the `<orgSlug>` path segment of a deep link.
+    this.deps.onOrgSlug?.(ok.orgSlug)
+    this.state = 'REGISTERING'
+    if (ok.lifecycle && this.deps.onBootstrapUpgrade) {
+      let outcome: BootstrapUpgradeOutcome
+      try {
+        outcome = await this.deps.onBootstrapUpgrade(ok.lifecycle)
+      } catch (err) {
+        outcome = { status: 'failed', reason: err instanceof Error ? err.message : String(err) }
+      }
+      if (outcome.status === 'failed') {
+        await this.reportBootstrapResult(expectedTransport, ok.lifecycle, 'failed', outcome.reason).catch((err) => {
+          this.deps.log.error(`cp: could not confirm bootstrap failure: ${(err as Error).message}`)
+        })
+      } else if (outcome.status === 'installed') {
+        await this.reportBootstrapResult(expectedTransport, ok.lifecycle, 'installed').catch((err) => {
+          this.deps.log.error(`cp: could not confirm bootstrap installation: ${(err as Error).message}`)
+        })
+        this.stopped = true
+        outcome.restart()
+        expectedTransport.close(1000, 'bootstrap upgrade installed')
+        throw new Error(`bootstrap upgrade to ${ok.lifecycle.targetVersion} installed`)
+      }
+    }
+
+    // ── register ──
+    this.clearProviderCredentials()
+    const registerCapabilities = this.wireCapabilities()
+    this.lastSentCapabilities = JSON.stringify(registerCapabilities)
+    const register = buildEnvelope('register', {
+      host: this.deps.host,
+      ...(this.deps.generation ? { generation: this.deps.generation } : {}),
+      ...(this.deps.bootId ? { bootId: this.deps.bootId } : {}),
+      capabilities: registerCapabilities,
+      maxAgents: this.deps.maxAgents,
+      localState: this.deps.localState()
+    })
+    const barrier: RegisterControlBarrier = {
+      transport: expectedTransport,
+      registerRequestId: register.id,
+      snapshotApplying: false,
+      controls: []
+    }
+    this.registerControlBarrier = barrier
+    try {
+      const regOk = await this.correlator
+        .request(register, (encoded) => expectedTransport.send(encoded))
+        .catch((err) => {
+          if (err instanceof WireError && !err.retryable) this.deps.onRegisterRejected?.(err)
+          throw err
+        })
+      if (regOk.type !== 'register/ok') throw new Error(`expected register/ok, got ${regOk.type}`)
+      const snap = regOk.payload as Parameters<ConfigApply['applyReconcileSnapshot']>[0]
+      this.serverFeatures = new Set((regOk.payload as { serverFeatures?: string[] }).serverFeatures ?? [])
+      this.routingEpoch = snap.routingEpoch
+      await this.deps.configApply.applyReconcileSnapshot(snap)
+      if (this.stopped || this.transport !== expectedTransport || this.registerControlBarrier !== barrier) {
+        throw new Error('control-plane handshake was superseded during snapshot convergence')
+      }
+
+      this.drainRegisterControls(barrier)
+      if (this.stopped || this.transport !== expectedTransport || this.registerControlBarrier !== barrier) {
+        throw new Error('control-plane handshake was superseded while draining post-register controls')
+      }
+      this.registerControlBarrier = undefined
+    } finally {
+      if (this.registerControlBarrier === barrier) this.registerControlBarrier = undefined
+    }
+
+    // A queued daemon/drain can move the client directly into DRAINING. All
+    // other post-register controls leave it REGISTERING until this atomic edge.
+    if (this.state === 'REGISTERING') this.state = 'READY'
+    if (this.state !== 'READY' && this.state !== 'DRAINING') {
+      throw new Error(`control-plane handshake left client in ${this.state}`)
+    }
+    this.droppedAt = undefined
+    this.handoffRedialUntil = undefined
+    this.linkGeneration++
+    this.releaseReadyWaiters(true)
+    // Reconcile runs (awaited) while REGISTERING and may change the daemon's
+    // computed capability set (for example by installing the builtin preset
+    // agent or admitting skills). updateCapabilities() deliberately cannot send
+    // before READY, so recheck once after the state transition to avoid
+    // dropping that mutation.
+    this.updateCapabilities()
+    this.heartbeatMs = ok.heartbeatSec > 0 ? ok.heartbeatSec * 1000 : this.deps.heartbeatDefaultMs
+    this.armHeartbeat()
+    // A member with a running fence beats immediately instead of a cadence from now: only a CONFIRMED
+    // renewal lifts the fence, and a reconnect that waits for the next scheduled beat can be fenced with
+    // the link already healthy. The confirmation this elicits is what actually cancels it.
+    if (this.state === 'READY' && this.dutyDeadlines.size > 0) this.sendHeartbeat()
+    this.deps.log.info(`cp: READY (epoch=${this.sessionEpoch}, routingEpoch=${this.routingEpoch})`)
+
+    // Report the observed runtime snapshot (D→C `facts/daemon-runtimes`,
+    // fire-and-forget) so the console can offer per-daemon runtime + model
+    // choices right away (models may still be the cached/empty pre-probe set).
+    // Replace semantics on the CP, so re-emitting on every (re)connect is fine
+    // — and it prunes runtimes uninstalled while the daemon was offline.
+    // The CP resets its stored snapshot seq on register, so the per-connection
+    // counter restarts here.
+    this.runtimesSeq = 0
+    this.emitDaemonRuntimes(this.deps.runtimeProfiles(), this.deps.mcpServerFacts?.() ?? [])
+
+    // Let the daemon kick off background runtime probing; the probed models
+    // arrive later as another `facts/daemon-runtimes` snapshot that replaces
+    // the one just sent.
+    // The replay is async now; a failed channel/cron store read must be logged here rather
+    // than becoming a floating rejection that abandons the rest of this reconnect's replay.
+    void Promise.resolve(this.deps.onReady?.()).catch((err) =>
+      this.deps.log.error(`cp: ready replay failed: ${(err as Error).message}`)
+    )
+  }
+
+  private async reportBootstrapResult(
+    transport: Transport,
+    lifecycle: BootstrapLifecycle,
+    status: 'installed' | 'failed',
+    reason?: string
+  ): Promise<void> {
+    const result = buildEnvelope('daemon/bootstrap/result', {
+      operationId: lifecycle.operationId,
+      status,
+      ...(reason ? { reason: reason.slice(0, 500) } : {})
+    })
+    const reply = await this.correlator.request(result, (encoded) => transport.send(encoded))
+    if (reply.type !== 'ack' || !(reply.payload as { ok?: boolean }).ok) {
+      throw new Error('control plane rejected the bootstrap result')
+    }
+  }
+
+  async reportLifecycleProgress(progress: DaemonLifecycleProgress): Promise<void> {
+    const transport = this.transport
+    if (!transport) return
+    const reply = await this.correlator.request(
+      buildEnvelope('daemon/lifecycle/progress', progress),
+      (encoded) => transport.send(encoded),
+      { maxTries: 1, ackTimeoutMs: 5_000 }
+    )
+    if (reply.type !== 'ack' || !(reply.payload as { ok?: boolean }).ok) {
+      throw new Error('control plane rejected lifecycle progress')
+    }
+  }
+
+  /** READY and the CP accepts `daemon/lifecycle/begin` (daemon-auto-upgrade.md §6). */
+  canBeginLifecycle(): boolean {
+    return (
+      this.state === 'READY' && this.transport !== undefined && this.serverFeatures.has(DAEMON_LIFECYCLE_BEGIN_FEATURE)
+    )
+  }
+
+  /** True between dialing and READY, when `serverFeatures` is not settled yet. */
+  handshaking(): boolean {
+    return this.state === 'CONNECTING' || this.state === 'AUTHENTICATING' || this.state === 'REGISTERING'
+  }
+
+  /** Open the CP record of an automatic upgrade; rejects with a `CONFLICT` WireError while another operation is pending. */
+  async beginLifecycle(req: DaemonLifecycleBegin): Promise<DaemonLifecycleBeginOk> {
+    const transport = this.transport
+    if (!transport || !this.canBeginLifecycle()) {
+      throw new WireError(
+        'INTERNAL',
+        `control plane unreachable for daemon/lifecycle/begin (client ${this.state})`,
+        true
+      )
+    }
+    const reply = await this.correlator.request(
+      buildEnvelope('daemon/lifecycle/begin', req),
+      (encoded) => transport.send(encoded),
+      { maxTries: 1, ackTimeoutMs: 10_000 }
+    )
+    if (reply.type !== 'daemon/lifecycle/begin/ok') {
+      throw new WireError('INTERNAL', `expected daemon/lifecycle/begin/ok, got ${reply.type}`, false)
+    }
+    return reply.payload as DaemonLifecycleBeginOk
+  }
+
+  /** The daemon's capabilities plus what this client itself reads off the wire. */
+  private wireCapabilities(): RegisterReq['capabilities'] {
+    const capabilities = this.deps.capabilities()
+    return { ...capabilities, features: [...capabilities.features, FRAME_FRAGMENTS_FEATURE] }
+  }
+
+  /**
+   * Re-announce `RegisterReq.capabilities` when the daemon's computed set has
+   * changed since this connection's register (D→C `capabilities/update` EVT,
+   * fire-and-forget, full-replace on the CP). Register runs before the agent
+   * roster is applied and before the runtime probe sweep, so features derived
+   * from either appear only via this refresh on a fresh connection. Cheap when
+   * nothing changed (serialized compare ⇒
+   * no-op), so callers fire it after every agent reconcile / probe sweep. An
+   * older CP answers `error{UNKNOWN_FRAME}`, which lands in dispatchControl's
+   * unknown-frame no-op — the feature then simply waits for the next register.
+   * No-op unless READY/DRAINING.
+   */
+  updateCapabilities(): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    const capabilities = this.wireCapabilities()
+    const serialized = JSON.stringify(capabilities)
+    if (serialized === this.lastSentCapabilities) return
+    this.lastSentCapabilities = serialized
+    this.transport?.send(encode(buildEnvelope('capabilities/update', { capabilities })))
+  }
+
+  /**
+   * Push the full runtime snapshot (D→C `facts/daemon-runtimes` EVT,
+   * fire-and-forget) — sent on each register and again when a probe sweep
+   * completes. REPLACE semantics on the CP: it reconciles the daemon's stored
+   * runtime list to exactly this snapshot, pruning runtimes that are no longer
+   * installed. No-op unless READY/DRAINING.
+   */
+  emitDaemonRuntimes(runtimes: FactsRuntimeProfile[], mcpServers: FactsMcpServer[] = []): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    // Monotonic per-connection ordinal: the CP dispatches inbound frames without
+    // awaiting, so two snapshots' transactions can interleave — it drops any
+    // snapshot whose seq is <= the last one it committed for this connection.
+    this.transport?.send(
+      encode(buildEnvelope('facts/daemon-runtimes', { runtimes, mcpServers, seq: ++this.runtimesSeq }))
+    )
+  }
+
+  /** Push the full metadata-only external-memory probe snapshot. Large snapshots
+   * are split across ordered frames so every frame stays within the wire cap.
+   * Grant, config, endpoint, secret keys, and memory bodies never enter it. */
+  emitMemoryConnectionFacts(connections: MemoryConnectionFact[]): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+
+    const send = (chunk: MemoryConnectionFact[]) => {
+      this.transport?.send(encode(buildEnvelope('facts/memory-connections', { connections: chunk })))
+    }
+    if (connections.length === 0) {
+      send([])
+      return
+    }
+
+    // UUID and RFC3339 envelope fields have fixed encoded widths. Measuring an
+    // empty frame once gives the exact per-frame overhead; each fact then adds
+    // its JSON bytes plus one comma when it is not the first item.
+    const emptyFrameBytes = utf8Bytes(encode(buildEnvelope('facts/memory-connections', { connections: [] })))
+    let chunk: MemoryConnectionFact[] = []
+    let chunkBytes = emptyFrameBytes
+    for (const fact of connections) {
+      const factBytes = utf8Bytes(JSON.stringify(fact))
+      const nextBytes = chunkBytes + (chunk.length > 0 ? 1 : 0) + factBytes
+      if (nextBytes > MAX_FRAME_BYTES && chunk.length > 0) {
+        send(chunk)
+        chunk = []
+        chunkBytes = emptyFrameBytes
+      }
+      if (emptyFrameBytes + factBytes > MAX_FRAME_BYTES) {
+        // The protocol schema bounds make this unreachable for a valid fact,
+        // but do not let a malformed runtime value close the CP socket.
+        this.deps.log.warn(`cp: memory connection fact too large (${fact.connectionId})`)
+        continue
+      }
+      chunkBytes += (chunk.length > 0 ? 1 : 0) + factBytes
+      chunk.push(fact)
+    }
+    if (chunk.length > 0) send(chunk)
+  }
+
+  /**
+   * Report a session's cumulative token usage (D→C `usage/report` EVT,
+   * fire-and-forget). No-op when this daemon is not the usage writer, and no-op
+   * unless READY/DRAINING — usage is dashboard telemetry,
+   * so a dropped report just means that turn's delta is absent from the CP's
+   * historical aggregates until the next report (which re-sends the cumulative
+   * snapshot, latest-wins). Never blocks the turn.
+   */
+  emitUsageReport(report: UsageReport): void {
+    // The gate lives HERE, at the one place a report leaves the daemon, so a future
+    // caller cannot reintroduce a second writer by forgetting to check.
+    if (this.deps.usageReporting === false) return
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(encode(this.scopedFrame('usage/report', report)))
+  }
+
+  /**
+   * Report a session's converged milestone + sessionKey echo (D→C `event/session`
+   * EVT, fire-and-forget, latest-wins per `sessionId`). This is what lets the CP
+   * store session metadata so a deep-link detail page (…/sessions/:id) resolves
+   * even when the daemon is offline. Metadata only — never the message stream
+   * (that stays daemon-local, §1/§12). No-op unless READY/DRAINING; a dropped
+   * `start` is re-covered by the next milestone (the CP upsert is latest-wins).
+   */
+  emitEventSession(event: EventSession): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(encode(this.scopedFrame('event/session', event)))
+  }
+
+  /**
+   * Persist one durable latest-wins session metadata snapshot (D→C
+   * `event/session-sync` REQ → `ack`). The daemon releases its local outbox row
+   * only after this resolves, so a disconnect or CP transaction failure is
+   * retried without blocking the turn that produced the snapshot.
+   */
+  async syncEventSession(event: EventSession): Promise<'acknowledged' | 'unsupported'> {
+    this.requireReady('event/session-sync')
+    if (!this.supportsServerFeature(SESSION_METADATA_ACK_FEATURE)) return 'unsupported'
+    const rep = await this.request('event/session-sync', event)
+    if (rep.type !== 'ack' || rep.payload.ok !== true) {
+      throw new WireError('INTERNAL', `expected event/session-sync ack, got ${rep.type}`, false)
+    }
+    return 'acknowledged'
+  }
+
+  /**
+   * Report retention-GC deletions (D→C `event/session-purged` REQ → `ack`, #485)
+   * so the CP marks the surviving metadata rows content-purged.
+   *
+   * Correlated rather than fire-and-forget, unlike every other session report: the
+   * local rows are already deleted, so a dropped frame could never be re-derived
+   * — the daemon holds a durable receipt and releases it only on this ACK.
+   * Returns `'unsupported'` when the CP does not advertise
+   * {@link SESSION_PURGE_FEATURE}: an older CP rejects the unknown frame type
+   * outright, so the receipts are kept for a post-upgrade reconnect instead.
+   */
+  async emitSessionPurged(purged: SessionPurged): Promise<'acknowledged' | 'unsupported'> {
+    this.requireReady('event/session-purged')
+    if (!this.supportsServerFeature(SESSION_PURGE_FEATURE)) return 'unsupported'
+    const rep = await this.request('event/session-purged', purged)
+    if (rep.type !== 'ack' || rep.payload.ok !== true) {
+      throw new WireError('INTERNAL', `expected event/session-purged ack, got ${rep.type}`, false)
+    }
+    return 'acknowledged'
+  }
+
+  /** D→C `agent/activity` EVT, fire-and-forget — the approval bell's signal (slack-approval-dm.md §7); every CP knows the frame. */
+  emitAgentActivity(activity: AgentActivity): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(encode(this.scopedFrame('agent/activity', activity)))
+  }
+
+  /** D→C `agent/skill-status` EVT, fire-and-forget and only to a CP that stores it (source-cache.md §11). */
+  emitAgentSkillStatus(status: AgentSkillStatus): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    if (!this.supportsServerFeature(AGENT_SKILL_STATUS_V1_FEATURE)) return
+    this.transport?.send(encode(this.scopedFrame('agent/skill-status', status)))
+  }
+
+  /** Signal a durable transcript mutation without putting message content on the control WS. */
+  emitSessionActivity(activity: SessionActivity): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    if (!this.supportsServerFeature(SESSION_LIVE_TAIL_FEATURE)) return
+    this.transport?.send(encode(this.scopedFrame('event/session-activity', activity)))
+  }
+
+  /**
+   * Report an integration's channels (D→C `integration/channels` EVT,
+   * fire-and-forget, latest-wins). Slack sends an authoritative membership
+   * snapshot; non-enumerable platforms send observed rows with
+   * `authoritative:false`. No-op unless READY/DRAINING — the daemon re-emits its
+   * cached reports on each (re)connect (see onReady in daemon.ts).
+   */
+  emitIntegrationChannels(snapshot: IntegrationChannels): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(
+      encode(this.scopedFrame('integration/channels', snapshot, this.deps.orgForIntegration?.(snapshot.integrationId)))
+    )
+  }
+
+  /** D→C `integration/tenant` EVT; false when it was not sent (not ready, or a CP not advertising {@link INTEGRATION_TENANT_FEATURE}). */
+  emitIntegrationTenant(payload: IntegrationTenant): boolean {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return false
+    if (!this.supportsServerFeature(INTEGRATION_TENANT_FEATURE) || !this.transport) return false
+    // One connection is one bot, so its integrations share the org of the first.
+    this.transport.send(
+      encode(this.scopedFrame('integration/tenant', payload, this.deps.orgForIntegration?.(payload.integrationIds[0]!)))
+    )
+    return true
+  }
+
+  /** D→C `integration/revoked` REQ; `'unsupported'` before a CP advertising {@link INTEGRATION_REVOKED_FEATURE}, which would refuse the frame. */
+  async reportIntegrationRevoked(payload: IntegrationRevoked): Promise<IntegrationRevokedOk | 'unsupported'> {
+    this.requireReady('integration/revoked')
+    if (!this.supportsServerFeature(INTEGRATION_REVOKED_FEATURE)) return 'unsupported'
+    // One connection is one bot, so its integrations share the org of the first.
+    const orgId = this.deps.orgForIntegration?.(payload.integrationIds[0]!)
+    const rep = await this.request('integration/revoked', payload, orgId)
+    if (rep.type !== 'integration/revoked/ok') {
+      throw new WireError('INTERNAL', `expected integration/revoked/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as IntegrationRevokedOk
+  }
+
+  /**
+   * Report a CP-owned cron fire (D→C `cron/report` EVT, fire-and-forget) so the
+   * console's `lastRunAt` converges. The local D11 stamp stays authoritative and
+   * the CP upsert is latest-wins, so re-asserting stored stamps on each
+   * (re)connect (see onReady in daemon.ts) makes a dropped report only a delay,
+   * never a loss. No-op unless READY/DRAINING.
+   */
+  emitCronReport(report: CronReport): void {
+    if (this.state !== 'READY' && this.state !== 'DRAINING') return
+    this.transport?.send(encode(this.scopedFrame('cron/report', report)))
+  }
+
+  /** Persist one terminal CP-cron outcome (D→C `cron/report-sync` REQ → `ack`); the outbox row is released only after it resolves. */
+  async syncCronReport(report: CronReport): Promise<'acknowledged' | 'unsupported'> {
+    this.requireReady('cron/report-sync')
+    if (!this.supportsServerFeature(CRON_REPORT_ACK_FEATURE)) return 'unsupported'
+    const rep = await this.request('cron/report-sync', report)
+    if (rep.type !== 'ack' || rep.payload.ok !== true) {
+      throw new WireError('INTERNAL', `expected cron/report-sync ack, got ${rep.type}`, false)
+    }
+    return 'acknowledged'
+  }
+
+  /**
+   * Durably converge a hook turn outcome (D→C `hook/report` REQ). The daemon
+   * retains its metadata-only outbox row until the CP replies after persistence
+   * and projection convergence, so a long CP outage delays GC instead of losing
+   * a terminal result.
+   */
+  async emitHookReport(report: HookReport): Promise<void> {
+    this.requireReady('hook/report')
+    const rep = await this.request('hook/report', report)
+    if (rep.type !== 'ack' || rep.payload.ok !== true) {
+      throw new WireError('INTERNAL', `expected hook/report ack, got ${rep.type}`, false)
+    }
+  }
+
+  async prepareHook(payload: HookPreparing): Promise<HookPreparingOk> {
+    this.requireReady('hook/preparing')
+    const rep = await this.request('hook/preparing', payload)
+    if (rep.type !== 'hook/preparing/ok') {
+      throw new WireError('INTERNAL', `expected hook/preparing/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as HookPreparingOk
+  }
+
+  /** Durable start barrier for an accepted hook turn; the gitlab arm is organization-scoped (§17.2). */
+  async startHook(payload: HookStart, orgId?: string): Promise<HookStartOk> {
+    const rep = await this.turnPathRequest('hook/start', TURN_PATH_BUDGET_MS, false, (budgetMs) =>
+      this.budgetedRequest('hook/start', payload, budgetMs, orgId)
+    )
+    if (rep.type !== 'hook/start/ok') {
+      throw new WireError('INTERNAL', `expected hook/start/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as HookStartOk
+  }
+
+  /** Presign the PUT for a `workspace/upload` snapshot (source-cache-file-transfer.md §5). */
+  async signTransfer(payload: TransferSignReq, orgId?: string): Promise<TransferSignOk> {
+    this.requireReady('transfer/sign')
+    const rep = await this.request('transfer/sign', payload, orgId)
+    if (rep.type !== 'transfer/sign/ok') {
+      throw new WireError('INTERNAL', `expected transfer/sign/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as TransferSignOk
+  }
+
+  /** Report a begun `workspace/upload/begin` outcome; the control plane records it once on the ticket. */
+  async settleTransfer(payload: TransferSettleReq, orgId?: string): Promise<TransferSettleOk> {
+    this.requireReady('transfer/settle')
+    const rep = await this.request('transfer/settle', payload, orgId)
+    if (rep.type !== 'transfer/settle/ok') {
+      throw new WireError('INTERNAL', `expected transfer/settle/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as TransferSettleOk
+  }
+
+  /** Presign the PUT of a shared image's staged original (webchat-generated-images.md §5). */
+  async signSharedImagePut(payload: SharedImagePutReq, orgId?: string): Promise<SharedImagePutOk> {
+    this.requireReady('image/original/put')
+    const rep = await this.request('image/original/put', payload, orgId)
+    if (rep.type !== 'image/original/put/ok') {
+      throw new WireError('INTERNAL', `expected image/original/put/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as SharedImagePutOk
+  }
+
+  /** Presign a browser GET for a cached shared-image original; `missing` when the bucket no longer holds it. */
+  async signSharedImageGet(payload: SharedImageGetReq, orgId?: string): Promise<SharedImageGetOk> {
+    this.requireReady('image/original/get')
+    const rep = await this.request('image/original/get', payload, orgId)
+    if (rep.type !== 'image/original/get/ok') {
+      throw new WireError('INTERNAL', `expected image/original/get/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as SharedImageGetOk
+  }
+
+  /** Presign the agent's GET for a console upload; no `url` when the bucket does not hold those bytes. */
+  async transferGet(payload: TransferGetReq, orgId?: string): Promise<TransferGetOk> {
+    this.requireReady('transfer/get')
+    const rep = await this.request('transfer/get', payload, orgId)
+    if (rep.type !== 'transfer/get/ok') {
+      throw new WireError('INTERNAL', `expected transfer/get/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as TransferGetOk
+  }
+
+  /** One-attempt, action-time formal-review purpose token. */
+  async authorizeGithubReview(payload: GithubReviewAuthorize, orgId?: string): Promise<GithubReviewAuthorized> {
+    this.requireReady('github/review-authorize')
+    const rep = await this.request('github/review-authorize', payload, orgId)
+    if (rep.type !== 'github/review-authorized') {
+      throw new WireError('INTERNAL', `expected github/review-authorized, got ${rep.type}`, false)
+    }
+    return rep.payload as GithubReviewAuthorized
+  }
+
+  /** Pick, or click-time revalidate, a pending approval's DM recipient (slack-approval-dm.md §4.2). */
+  async approvalRoute(payload: AgentApprovalRoute, orgId?: string): Promise<AgentApprovalRouted> {
+    this.requireReady('agent/approval-route')
+    const rep = await this.request('agent/approval-route', payload, orgId)
+    if (rep.type !== 'agent/approval-routed') {
+      throw new WireError('INTERNAL', `expected agent/approval-routed, got ${rep.type}`, false)
+    }
+    return rep.payload as AgentApprovalRouted
+  }
+
+  /** The current link's registration count: a follow-up watch set is sent again on a new one (assistant-mode.md §5.14). */
+  registration(): number {
+    return this.linkGeneration
+  }
+
+  /** An agent's follow-up watches (assistant-mode.md §5.14), single-shot: a new watch reads its object on the code host first. */
+  async followUpWatch(payload: AssistantFollowUpWatchReq, orgId?: string): Promise<AssistantFollowUpWatchResult> {
+    this.requireReady('assistant/follow-up-watch')
+    const rep = await this.correlator.request(
+      this.scopedFrame('assistant/follow-up-watch', payload, orgId),
+      (e) => this.transport!.send(e),
+      { maxTries: 1, ackTimeoutMs: FOLLOW_UP_WATCH_BUDGET_MS }
+    )
+    if (rep.type !== 'assistant/follow-up-watch/result') {
+      throw new WireError('INTERNAL', `expected assistant/follow-up-watch/result, got ${rep.type}`, false)
+    }
+    return rep.payload as AssistantFollowUpWatchResult
+  }
+
+  /** An agent's capability request (capability-requests.md §4.1), single-shot: the CP deduplicates by target, so a lost ack is asked again by the agent, not by this socket. */
+  async capabilityRequest(payload: CapabilityRequestReq, orgId?: string): Promise<CapabilityRequestResult> {
+    return await this.capabilityCall('capability/request', payload, orgId)
+  }
+
+  /** The agent no longer needs its open request (§4.5); nobody is woken. */
+  async capabilityWithdraw(payload: CapabilityWithdrawReq, orgId?: string): Promise<CapabilityWithdrawResult> {
+    return await this.capabilityCall('capability/withdraw', payload, orgId)
+  }
+
+  /** A Decline clicked on a card, settled by the CP's compare-and-set (§4.4.4). */
+  async capabilityDecide(payload: CapabilityDecideReq, orgId?: string): Promise<CapabilityDecideResult> {
+    return await this.capabilityCall('capability/decide', payload, orgId)
+  }
+
+  /** An agent's own cron operation (`cron/self`), single-shot: a lost reply is retried by the agent, not by this socket. */
+  async agentCron(payload: AgentCronReq, orgId?: string): Promise<AgentCronResult> {
+    this.requireReady('cron/self')
+    const rep = await this.correlator.request(
+      this.scopedFrame('cron/self', payload, orgId),
+      (e) => this.transport!.send(e),
+      {
+        maxTries: 1,
+        ackTimeoutMs: CAPABILITY_CALL_BUDGET_MS
+      }
+    )
+    if (rep.type !== 'cron/self/result')
+      throw new WireError('INTERNAL', `expected cron/self/result, got ${rep.type}`, false)
+    return rep.payload as AgentCronResult
+  }
+
+  private async capabilityCall<T>(
+    type: 'capability/request' | 'capability/withdraw' | 'capability/decide',
+    payload: unknown,
+    orgId?: string
+  ): Promise<T> {
+    this.requireReady(type)
+    const rep = await this.correlator.request(this.scopedFrame(type, payload, orgId), (e) => this.transport!.send(e), {
+      maxTries: 1,
+      ackTimeoutMs: CAPABILITY_CALL_BUDGET_MS
+    })
+    if (rep.type !== `${type}/result`)
+      throw new WireError('INTERNAL', `expected ${type}/result, got ${rep.type}`, false)
+    return rep.payload as T
+  }
+
+  /** Which of an agent's sessions the console user behind an asker could see, for the read rule (assistant-mode.md §5.5). */
+  async readAccess(payload: AgentReadAccess, orgId?: string): Promise<AgentReadAccessOk> {
+    this.requireReady('agent/read-access')
+    const rep = await (payload.includeCommitAuthors
+      ? this.budgetedRequest('agent/read-access', payload, 2_000, orgId)
+      : this.request('agent/read-access', payload, orgId))
+    if (rep.type !== 'agent/read-access/ok') {
+      throw new WireError('INTERNAL', `expected agent/read-access/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as AgentReadAccessOk
+  }
+
+  /** Immediate body-free outcome; HookReport repeats it for lost-reply recovery. */
+  async reportGithubReviewResult(payload: GithubReviewResultReport, orgId?: string): Promise<GithubReviewResultOk> {
+    this.requireReady('github/review-result')
+    const rep = await this.request('github/review-result', payload, orgId)
+    if (rep.type !== 'github/review-result/ok') {
+      throw new WireError('INTERNAL', `expected github/review-result/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as GithubReviewResultOk
+  }
+
+  /** The observed outcome of ONE desired run projection generation (gitlab-com-integration.md §16). */
+  async reportCodeHostNoteResult(payload: CodeHostNoteResult, orgId?: string): Promise<CodeHostNoteResultOk> {
+    this.requireReady('codehost/note-result')
+    const rep = await this.request('codehost/note-result', payload, orgId)
+    if (rep.type !== 'codehost/note-result/ok') {
+      throw new WireError('INTERNAL', `expected codehost/note-result/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as CodeHostNoteResultOk
+  }
+
+  /**
+   * The provider-neutral formal-review surface (gitlab-com-integration.md §15).
+   * `codehost/review-authz` acquires the durable publication lease and its fence;
+   * the ledger, renewal, and terminal result ride the three frames below. Review
+   * bodies never travel on any of them.
+   */
+  async authorizeCodeHostReview(payload: CodeHostReviewAuthorize, orgId?: string): Promise<CodeHostReviewAuthorized> {
+    this.requireReady('codehost/review-authz')
+    const rep = await this.request('codehost/review-authz', payload, orgId)
+    if (rep.type !== 'codehost/review-authz/result') {
+      throw new WireError('INTERNAL', `expected codehost/review-authz/result, got ${rep.type}`, false)
+    }
+    return rep.payload as CodeHostReviewAuthorized
+  }
+
+  /** One step of the §15.1 single-use operation ledger. */
+  async operateCodeHostReview(payload: CodeHostReviewOpRequest, orgId?: string): Promise<CodeHostReviewOpAccepted> {
+    this.requireReady('codehost/review-op')
+    const rep = await this.request('codehost/review-op', payload, orgId)
+    if (rep.type !== 'codehost/review-op/ok') {
+      throw new WireError('INTERNAL', `expected codehost/review-op/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as CodeHostReviewOpAccepted
+  }
+
+  /** Owner-only publication-lease extension; expiry alone never transfers authority. */
+  async renewCodeHostReviewLease(
+    payload: CodeHostReviewLeaseRenew,
+    orgId?: string
+  ): Promise<CodeHostReviewLeaseRenewed> {
+    const rep = await this.turnPathRequest('codehost/review-lease-renew', TURN_PATH_BUDGET_MS, true, (budgetMs) =>
+      this.budgetedRequest('codehost/review-lease-renew', payload, budgetMs, orgId)
+    )
+    if (rep.type !== 'codehost/review-lease-renew/ok') {
+      throw new WireError('INTERNAL', `expected codehost/review-lease-renew/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as CodeHostReviewLeaseRenewed
+  }
+
+  /** The body-free terminal classification; it is also what releases or locks the lease. */
+  async reportCodeHostReviewResult(
+    payload: CodeHostReviewResultReport,
+    orgId?: string
+  ): Promise<CodeHostReviewResultOk> {
+    this.requireReady('codehost/review-result')
+    const rep = await this.request('codehost/review-result', payload, orgId)
+    if (rep.type !== 'codehost/review-result/ok') {
+      throw new WireError('INTERNAL', `expected codehost/review-result/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as CodeHostReviewResultOk
+  }
+
+  async ahpSessionReserve(payload: AhpSessionReserve): Promise<AhpSessionResult> {
+    this.requireReady('ahp/session/reserve')
+    const rep = await this.request('ahp/session/reserve', payload, payload.orgId)
+    if (rep.type !== 'ahp/session/reserve/ok') {
+      throw new WireError('INTERNAL', `expected ahp/session/reserve/ok, got ${rep.type}`, false)
+    }
+    return AhpSessionResult.parse(rep.payload)
+  }
+
+  async ahpSessionFinalize(payload: AhpSessionFinalize): Promise<AhpSessionResult> {
+    this.requireReady('ahp/session/finalize')
+    const rep = await this.request('ahp/session/finalize', payload, payload.orgId)
+    if (rep.type !== 'ahp/session/finalize/ok') {
+      throw new WireError('INTERNAL', `expected ahp/session/finalize/ok, got ${rep.type}`, false)
+    }
+    return AhpSessionResult.parse(rep.payload)
+  }
+
+  async ahpSessionResolve(payload: AhpSessionResolve): Promise<AhpSessionResult> {
+    this.requireReady('ahp/session/resolve')
+    const rep = await this.request('ahp/session/resolve', payload, payload.orgId)
+    if (rep.type !== 'ahp/session/resolve/ok') {
+      throw new WireError('INTERNAL', `expected ahp/session/resolve/ok, got ${rep.type}`, false)
+    }
+    return AhpSessionResult.parse(rep.payload)
+  }
+
+  async ahpSessionList(payload: AhpSessionList): Promise<AhpSessionListResult> {
+    this.requireReady('ahp/session/list')
+    const rep = await this.request('ahp/session/list', payload, payload.orgId)
+    if (rep.type !== 'ahp/session/list/ok') {
+      throw new WireError('INTERNAL', `expected ahp/session/list/ok, got ${rep.type}`, false)
+    }
+    return AhpSessionListResult.parse(rep.payload)
+  }
+
+  async issueWebchatMcpGrant(payload: WebchatMcpGrantIssue, orgId?: string): Promise<WebchatMcpGrantIssued> {
+    this.requireReady('webchat/mcp-grant/issue')
+    const rep = await this.request('webchat/mcp-grant/issue', payload, orgId)
+    if (rep.type !== 'webchat/mcp-grant/issued') {
+      throw new WireError('INTERNAL', `expected webchat/mcp-grant/issued, got ${rep.type}`, false)
+    }
+    return rep.payload as WebchatMcpGrantIssued
+  }
+
+  async acceptWebchatMcpGrant(payload: WebchatMcpGrantAccept, orgId?: string): Promise<WebchatMcpGrantActivate> {
+    this.requireReady('webchat/mcp-grant/accept')
+    const rep = await this.request('webchat/mcp-grant/accept', payload, orgId)
+    if (rep.type !== 'webchat/mcp-grant/activate') {
+      throw new WireError('INTERNAL', `expected webchat/mcp-grant/activate, got ${rep.type}`, false)
+    }
+    return rep.payload as WebchatMcpGrantActivate
+  }
+
+  /** An older CP rejects the unknown frame outright, so without {@link WEBCHAT_MCP_GRANT_RENEW_FEATURE} the caller rotates instead. */
+  async renewWebchatMcpGrant(
+    payload: WebchatMcpGrantRenew,
+    orgId?: string
+  ): Promise<WebchatMcpGrantRenewed | 'unsupported'> {
+    this.requireReady('webchat/mcp-grant/renew')
+    if (!this.supportsServerFeature(WEBCHAT_MCP_GRANT_RENEW_FEATURE)) return 'unsupported'
+    const rep = await this.request('webchat/mcp-grant/renew', payload, orgId)
+    if (rep.type !== 'webchat/mcp-grant/renewed') {
+      throw new WireError('INTERNAL', `expected webchat/mcp-grant/renewed, got ${rep.type}`, false)
+    }
+    return rep.payload as WebchatMcpGrantRenewed
+  }
+
+  async revokeWebchatMcpGrant(payload: WebchatMcpGrantRevoke, orgId?: string): Promise<WebchatMcpGrantRevoked> {
+    this.requireReady('webchat/mcp-grant/revoke')
+    const rep = await this.request('webchat/mcp-grant/revoke', payload, orgId)
+    if (rep.type !== 'webchat/mcp-grant/revoked') {
+      throw new WireError('INTERNAL', `expected webchat/mcp-grant/revoked, got ${rep.type}`, false)
+    }
+    return rep.payload as WebchatMcpGrantRevoked
+  }
+
+  /** The §2.1 legal-state gate every request checks: READY or DRAINING, over a live transport. */
+  connected(): boolean {
+    return (this.state === 'READY' || this.state === 'DRAINING') && this.transport !== undefined
+  }
+
+  private requireReady(op: string): void {
+    if (!this.connected()) {
+      throw new WireError('INTERNAL', `control plane unreachable for ${op} (client ${this.state})`, true)
+    }
+  }
+
+  /** Resolve true once connected; false after `timeoutMs`, outside the handoff window, or on stop or a fatal close. */
+  waitConnected(timeoutMs = CP_HANDOFF_WAIT_MS): Promise<boolean> {
+    if (this.connected()) return Promise.resolve(true)
+    const waitMs = Math.min(timeoutMs, this.handoffWaitLeft())
+    if (this.stopped || this.fatal || waitMs <= 0) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
+      const waiter: { resolve: (ready: boolean) => void; timer?: TimerHandle } = { resolve }
+      waiter.timer = this.deps.clock.setTimeout(() => {
+        this.readyWaiters.delete(waiter)
+        resolve(false)
+      }, waitMs)
+      this.readyWaiters.add(waiter)
+    })
+  }
+
+  private handoffWaitLeft(): number {
+    return this.droppedAt === undefined ? 0 : Math.max(0, this.droppedAt + CP_HANDOFF_WINDOW_MS - this.deps.clock.now())
+  }
+
+  private releaseReadyWaiters(ready: boolean): void {
+    for (const waiter of [...this.readyWaiters]) {
+      this.readyWaiters.delete(waiter)
+      if (waiter.timer !== undefined) this.deps.clock.clearTimeout(waiter.timer)
+      waiter.resolve(ready)
+    }
+  }
+
+  /** One turn-path request in one total deadline: wait out a reconnect before sending, and re-send an idempotent read once only over a replaced link. */
+  private async turnPathRequest<T>(
+    op: string,
+    budgetMs: number,
+    idempotent: boolean | (() => boolean),
+    send: (ackTimeoutMs: number) => Promise<T>
+  ): Promise<T> {
+    const deadline = this.deps.clock.now() + budgetMs
+    const remaining = () => Math.max(MIN_TURN_SEND_MS, deadline - this.deps.clock.now())
+    for (let attempt = 0; ; attempt++) {
+      if (!this.connected()) await this.waitConnected(Math.min(CP_HANDOFF_WAIT_MS, remaining() - MIN_TURN_SEND_MS))
+      this.requireReady(op)
+      const generation = this.linkGeneration
+      try {
+        return await send(remaining())
+      } catch (err) {
+        const resendable = typeof idempotent === 'function' ? idempotent() : idempotent
+        if (!resendable || attempt > 0 || !(err instanceof WireError) || !err.retryable) throw err
+        const replaced = await this.waitConnected(Math.min(CP_HANDOFF_WAIT_MS, remaining() - MIN_TURN_SEND_MS))
+        if (!replaced || this.linkGeneration === generation) throw err
+        this.deps.log.warn(`cp: ${op} lost its link (${err.message}) — retrying once across the reconnect`)
+      }
+    }
+  }
+
+  private request(type: string, payload: unknown, explicitOrgId?: string): Promise<AnyFrame> {
+    const frame = this.scopedFrame(type, payload, explicitOrgId)
+    return this.correlator.request(frame, (e) => this.transport!.send(e))
+  }
+
+  /** A request whose retransmits fit in `budgetMs`, so time spent waiting out a handoff comes out of the caller's deadline. */
+  private budgetedRequest(type: string, payload: unknown, budgetMs: number, explicitOrgId?: string): Promise<AnyFrame> {
+    const ackTimeoutMs = Math.min(ACK_TIMEOUT_MS, budgetMs)
+    const frame = this.scopedFrame(type, payload, explicitOrgId)
+    return this.correlator.request(frame, (e) => this.transport!.send(e), {
+      ackTimeoutMs,
+      maxTries: Math.max(1, Math.floor(budgetMs / ackTimeoutMs))
+    })
+  }
+
+  /** Request a short-lived git credential: waits out a CP handoff, one send per link, inside the helper's IPC timeout. */
+  async requestGitCred(payload: GitCredRequest): Promise<GitCredGrant> {
+    const rep = await this.turnPathRequest('gitcred/request', CREDENTIAL_TOTAL_BUDGET_MS, true, (ackTimeoutMs) =>
+      this.correlator.request(this.scopedFrame('gitcred/request', payload), (e) => this.transport!.send(e), {
+        maxTries: 1,
+        ackTimeoutMs: Math.min(10_000, ackTimeoutMs)
+      })
+    )
+    if (rep.type !== 'gitcred/grant') {
+      throw new WireError('INTERNAL', `expected gitcred/grant, got ${rep.type}`, false)
+    }
+    return rep.payload as GitCredGrant
+  }
+
+  /** Request a fresh Linear access token (linear-integration.md §7.3), same posture as `requestGitCred`, never a logged payload. */
+  async requestLinearCred(payload: LinearCredRequest): Promise<LinearCredGrant> {
+    const rep = await this.turnPathRequest('linearcred/request', CREDENTIAL_TOTAL_BUDGET_MS, true, (ackTimeoutMs) =>
+      this.correlator.request(this.scopedFrame('linearcred/request', payload), (e) => this.transport!.send(e), {
+        maxTries: 1,
+        ackTimeoutMs: Math.min(10_000, ackTimeoutMs)
+      })
+    )
+    if (rep.type !== 'linearcred/grant') {
+      throw new WireError('INTERNAL', `expected linearcred/grant, got ${rep.type}`, false)
+    }
+    return rep.payload as LinearCredGrant
+  }
+
+  async requestProviderCredentials(
+    payload: ProviderCredentialsRequest,
+    signal?: AbortSignal
+  ): Promise<ProviderCredentialsReply> {
+    signal?.throwIfAborted()
+    const orgId = this.deps.orgForAgent?.(payload.agentId)
+    const cacheKey = JSON.stringify([orgId, payload.agentId, payload.provider])
+    const now = this.providerCredentialNow()
+    const cached = this.providerCredentials.get(cacheKey)
+    if (orgId && cached && cached.expiresAt > now && !this.terminallyClosed()) return structuredClone(cached.reply)
+    this.providerCredentials.delete(cacheKey)
+    if (!this.connected()) await this.waitConnected(CP_HANDOFF_WAIT_MS)
+    signal?.throwIfAborted()
+    this.requireReady('provider credentials')
+    if (!this.supportsServerFeature(PROVIDER_CREDENTIALS_V1_FEATURE))
+      throw new WireError('SCOPE_DENIED', 'control plane does not support provider credentials', false)
+    const epoch = this.providerCredentialEpoch
+    const frame = this.scopedFrame('provider-credentials/request', payload)
+    const abort = () => this.correlator.reject(frame.id, signal!.reason)
+    signal?.addEventListener('abort', abort, { once: true })
+    try {
+      const rep = await this.correlator.request(frame, (encoded) => this.transport!.send(encoded), {
+        maxTries: 1,
+        ackTimeoutMs: 5_000
+      })
+      if (rep.type !== 'provider-credentials/reply')
+        throw new WireError('INTERNAL', 'unexpected provider credential reply', false)
+      if (epoch !== this.providerCredentialEpoch || orgId !== this.deps.orgForAgent?.(payload.agentId))
+        throw new WireError('SCOPE_DENIED', 'provider credential read was invalidated', true)
+      const reply = rep.payload as ProviderCredentialsReply
+      if (orgId && now + 60_000 > this.providerCredentialNow()) {
+        if (this.providerCredentials.size >= 256)
+          this.providerCredentials.delete(this.providerCredentials.keys().next().value!)
+        this.providerCredentials.set(cacheKey, { reply: structuredClone(reply), expiresAt: now + 60_000 })
+      }
+      return reply
+    } finally {
+      signal?.removeEventListener('abort', abort)
+    }
+  }
+
+  private clearProviderCredentials(): void {
+    this.providerCredentialEpoch++
+    this.providerCredentials.clear()
+  }
+
+  /**
+   * `duty/release` (D→C REQ → `ack`) — surrender duty groups on drain instead of
+   * waiting out the CP's reassignment window. Install-wide: duty groups span
+   * orgs, so the frame carries no org (protocol `INSTALL_WIDE_FRAME_TYPES`).
+   * Best-effort by contract — a failed release just falls back to lease expiry,
+   * so callers log rather than fail the drain.
+   */
+  async releaseDuties(groupIds: string[]): Promise<void> {
+    if (groupIds.length === 0) return
+    if ((this.state !== 'READY' && this.state !== 'DRAINING') || !this.transport) {
+      throw new WireError('INTERNAL', `control plane unreachable (client ${this.state})`, true)
+    }
+    const rep = await this.request('duty/release', { groupIds })
+    if (rep.type !== 'ack') throw new WireError('INTERNAL', `expected ack, got ${rep.type}`, false)
+    // Handed back, so their deadlines are not ours to run any more — and a released group must not
+    // sit in the map holding the timer earlier than a group this member still serves.
+    this.forgetLeaseDeadlines(groupIds)
+  }
+
+  /** `duty/claim`: the activation rendezvous for a trigger that landed here; the CP refreshes a repeat by the holder, so it is re-sent once over a replaced link. */
+  async claimDuty(agentId: string): Promise<DutyClaimOk> {
+    const rep = await this.turnPathRequest('duty/claim', TURN_PATH_BUDGET_MS, true, (budgetMs) =>
+      this.budgetedRequest('duty/claim', { agentId }, budgetMs)
+    )
+    if (rep.type !== 'duty/claim/ok') {
+      throw new WireError('INTERNAL', `expected duty/claim/ok, got ${rep.type}`, false)
+    }
+    const claim = rep.payload as DutyClaimOk
+    // A won claim creates this member's lease, so start that one group's fence countdown now.
+    if (claim.granted && claim.grant) this.noteLeasesGranted([claim.grant.groupId])
+    return claim
+  }
+
+  /**
+   * `duty/fetch` (D→C REQ → `duty/fetch/ok`) — pull the complete definition of
+   * an agent this member won a duty for but does not have. A grant only opens
+   * the serving gate; installation is this pull. The frame carries the granted
+   * entry's `orgId` rather than joining the install-wide set: it is about ONE
+   * agent in ONE org, and the CP still resolves the owning org from the agent
+   * itself before authorizing on the duty holding.
+   */
+  async fetchDutyAgent(agentId: string, orgId: string): Promise<DutyFetchOk> {
+    if ((this.state !== 'READY' && this.state !== 'DRAINING') || !this.transport) {
+      throw new WireError('INTERNAL', `control plane unreachable (client ${this.state})`, true)
+    }
+    const rep = await this.request('duty/fetch', { agentId }, orgId)
+    if (rep.type !== 'duty/fetch/ok') {
+      throw new WireError('INTERNAL', `expected duty/fetch/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as DutyFetchOk
+  }
+
+  /** `agent/exists` (D→C REQ): which of these agents the CP still knows, as the pool's orphan reconciler asks it. Throws when it cannot be asked, which a caller must never read as "gone". */
+  async agentsExist(agentIds: string[]): Promise<Set<string>> {
+    this.requireReady('agent/exists')
+    if (!this.serverFeatures.has(AGENT_EXISTS_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer agent/exists', false)
+    }
+    const existing = new Set<string>()
+    for (let at = 0; at < agentIds.length; at += AGENT_EXISTS_MAX) {
+      const rep = await this.request('agent/exists', { agentIds: agentIds.slice(at, at + AGENT_EXISTS_MAX) })
+      if (rep.type !== 'agent/exists/ok') {
+        throw new WireError('INTERNAL', `expected agent/exists/ok, got ${rep.type}`, false)
+      }
+      for (const id of (rep.payload as AgentExistsOk).existing) existing.add(id)
+    }
+    return existing
+  }
+
+  /** `computer-channel/grant` (computer-use.md §3.7): a session token for a desktop's `/mcp`; NEVER log the reply, it is a bearer credential. */
+  async computerChannelGrant(
+    payload: ComputerChannelGrantRequest,
+    orgId?: string
+  ): Promise<ComputerChannelGrantResult> {
+    this.requireReady('computer-channel/grant')
+    if (!this.supportsServerFeature(COMPUTER_CHANNEL_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer computer-channel/grant', false)
+    }
+    const rep = await this.request('computer-channel/grant', payload, orgId)
+    if (rep.type !== 'computer-channel/grant/result') {
+      throw new WireError('INTERNAL', `expected computer-channel/grant/result, got ${rep.type}`, false)
+    }
+    return ComputerChannelGrantResult.parse(rep.payload)
+  }
+
+  /** `computer-lease/acquire` (computer-use.md §4.4): take or renew one session's control lease; `waitMs` queues for it. */
+  async computerLeaseAcquire(payload: ComputerLeaseAcquire, orgId?: string): Promise<ComputerLeaseAcquireResult> {
+    this.requireReady('computer-lease/acquire')
+    if (!this.supportsServerFeature(COMPUTER_LEASE_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer computer-lease/acquire', false)
+    }
+    const queued = this.supportsServerFeature(COMPUTER_LEASE_QUEUE_FEATURE)
+    // An older CP knows no queue: it is asked without `waitMs` and answers busy at once.
+    const { waitMs, ...plain } = payload
+    const rep =
+      queued && waitMs !== undefined
+        ? await this.correlator.request(
+            this.scopedFrame('computer-lease/acquire', payload, orgId),
+            (e) => this.transport!.send(e),
+            // The CP holds a queued reply up to `waitMs`: one send, timed past the hold.
+            { maxTries: 1, ackTimeoutMs: waitMs + ACK_TIMEOUT_MS }
+          )
+        : await this.request('computer-lease/acquire', plain, orgId)
+    if (rep.type !== 'computer-lease/acquire/result') {
+      throw new WireError('INTERNAL', `expected computer-lease/acquire/result, got ${rep.type}`, false)
+    }
+    return ComputerLeaseAcquireResult.parse(rep.payload)
+  }
+
+  /** `computer-lease/release`: give up one session's control lease; a no-op when it holds none. */
+  async computerLeaseRelease(payload: ComputerLeaseRelease, orgId?: string): Promise<void> {
+    this.requireReady('computer-lease/release')
+    if (!this.supportsServerFeature(COMPUTER_LEASE_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer computer-lease/release', false)
+    }
+    const rep = await this.request('computer-lease/release', payload, orgId)
+    if (rep.type !== 'ack' || rep.payload.ok !== true) {
+      throw new WireError('INTERNAL', `computer-lease/release was refused (${rep.type})`, false)
+    }
+  }
+
+  /** `computer-pool/acquire` (computer-use.md §15.1): the session's managed computer, or wake a granted one; pending asks again. */
+  async computerPoolAcquire(payload: ComputerPoolAcquire, orgId?: string): Promise<ComputerPoolAcquireResult> {
+    this.requireReady('computer-pool/acquire')
+    if (!this.supportsServerFeature(COMPUTER_POOL_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer computer-pool/acquire', false)
+    }
+    const rep = await this.request('computer-pool/acquire', payload, orgId)
+    if (rep.type !== 'computer-pool/acquire/result') {
+      throw new WireError('INTERNAL', `expected computer-pool/acquire/result, got ${rep.type}`, false)
+    }
+    return ComputerPoolAcquireResult.parse(rep.payload)
+  }
+
+  /**
+   * The three executor requests (session-executors.md §6). `candidates` answers facts a holder
+   * places from; `prepare` and `release` are relayed to the executor after the CP's ledger check.
+   *
+   * An older Control Plane answers none of them, and a holder that cannot ask does not spread —
+   * which is why the missing feature refuses here rather than waiting out an `UNKNOWN_FRAME`.
+   */
+  async executorCandidates(payload: ExecutorCandidatesReq, orgId?: string): Promise<ExecutorCandidatesResult> {
+    const rep = await this.executorRequest('executor/candidates', payload, orgId)
+    return ExecutorCandidatesResult.parse(rep.payload)
+  }
+
+  /** NEVER log this reply: its `ready` arm carries the pipe's pre-shared key. */
+  async executorPrepare(payload: ExecutorPrepareReq, orgId?: string): Promise<ExecutorPrepareResult> {
+    const rep = await this.executorRequest('executor/prepare', payload, orgId)
+    return ExecutorPrepareResult.parse(rep.payload)
+  }
+
+  async executorRelease(payload: ExecutorReleaseReq, orgId?: string): Promise<ExecutorReleaseResult> {
+    const rep = await this.executorRequest('executor/release', payload, orgId)
+    return ExecutorReleaseResult.parse(rep.payload)
+  }
+
+  /** The selector's installation rosters for one agent (multi-repository-workspaces.md, The selector): one send, a 10 s wait since the CP may walk pages, and only of a CP that advertises the pair. */
+  async repoCandidates(payload: RepoCandidatesRequest, signal?: AbortSignal): Promise<RepoCandidatesReply> {
+    signal?.throwIfAborted()
+    this.requireReady('repo-candidates/request')
+    if (!this.supportsServerFeature(REPO_CANDIDATES_V1_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', 'this control plane does not answer repo-candidates/request', false)
+    }
+    const frame = this.scopedFrame('repo-candidates/request', payload)
+    const abort = () => this.correlator.reject(frame.id, signal!.reason)
+    signal?.addEventListener('abort', abort, { once: true })
+    try {
+      const rep = await this.correlator.request(frame, (encoded) => this.transport!.send(encoded), {
+        maxTries: 1,
+        ackTimeoutMs: 10_000
+      })
+      if (rep.type !== 'repo-candidates/reply') {
+        throw new WireError('INTERNAL', `expected repo-candidates/reply, got ${rep.type}`, false)
+      }
+      return RepoCandidatesReply.parse(rep.payload)
+    } finally {
+      signal?.removeEventListener('abort', abort)
+    }
+  }
+
+  private async executorRequest(type: string, payload: unknown, orgId?: string): Promise<AnyFrame> {
+    this.requireReady(type)
+    if (!this.serverFeatures.has(SESSION_EXECUTORS_V1_FEATURE)) {
+      throw new WireError('UNKNOWN_FRAME', `this control plane does not answer ${type}`, false)
+    }
+    const rep = await this.request(type, payload, orgId)
+    if (rep.type !== `${type}/result`) {
+      throw new WireError('INTERNAL', `expected ${type}/result, got ${rep.type}`, false)
+    }
+    return rep
+  }
+
+  /** The local address this control connection leaves from — where a LAN peer reaches this machine (session-executors.md §13). */
+  localAddress(): string | undefined {
+    // A dual-stack socket reports an IPv4 peer's interface in its mapped form, which is not an address to publish.
+    return this.transport?.localAddress?.replace(/^::ffff:/i, '')
+  }
+
+  /** How this connection is tenanted: `connection` = one org (an API-key daemon),
+   *  `frame` = install-wide, every frame carries its own org. Duty leases exist
+   *  only on the latter. */
+  organizationScope(): 'connection' | 'frame' {
+    return this.organizationMode
+  }
+
+  /** The member set this connection belongs to, as `auth/ok` announced it; null ⇒ in none
+   *  (daemon-groups.md §3). This is the duty-enforcement predicate: membership, not tenancy. */
+  memberSet(): { setId: string; name: string } | null {
+    return this.memberSetRef
+  }
+
+  /**
+   * Does this connection take part in the duty ledger? MEMBERSHIP decides, and it must be the same
+   * predicate the daemon gates service on (`dutyEnforced`), or the two disagree in the worst
+   * possible direction: it refuses to serve what it holds no lease for while never asking for one.
+   *
+   * This used to read `organizationMode === 'frame'`, which was the same answer only while the
+   * install-wide pool was the one set that existed — org-scoped daemons authenticate in
+   * `connection` mode, so once an org could own a group its members went duty-gated and silent,
+   * and the CP never granted them anything.
+   */
+  private reportsDuties(): boolean {
+    return this.memberSetRef !== null
+  }
+
+  /** Additive CP feature negotiation for rolling daemon/CP upgrades. */
+  supportsServerFeature(feature: string): boolean {
+    return this.serverFeatures.has(feature)
+  }
+
+  /** `channel/agents`: this agent's callable peers, waiting out a CP handoff; the caller negotiates the org-wide form. */
+  async channelAgents(payload: ChannelAgentsReq): Promise<ChannelAgentsOk> {
+    const rep = await this.turnPathRequest('channel/agents', TURN_PATH_BUDGET_MS, true, (budgetMs) =>
+      this.budgetedRequest('channel/agents', payload, budgetMs)
+    )
+    if (rep.type !== 'channel/agents/ok') {
+      throw new WireError('INTERNAL', `expected channel/agents/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as ChannelAgentsOk
+  }
+
+  /**
+   * `session/child-status` (D→C REQ) → the status of a child session that lives on ANOTHER daemon
+   * (session-concept §5.4). Same shape and state gate as {@link channelAgents}: the daemon cannot
+   * address another daemon directly, so it asks the CP — the placement authority — which forwards
+   * the lineage pair to the owning daemon and returns its answer. Metadata only; the CP stores
+   * nothing. `parentSessionId` is the asking session's own id, taken from the trusted session
+   * store, and the CP verifies this daemon actually reported it.
+   */
+  async childSessionStatus(payload: ChildSessionStatusReq, orgId?: string): Promise<ChildSessionStatus> {
+    if ((this.state !== 'READY' && this.state !== 'DRAINING') || !this.transport) {
+      throw new WireError('INTERNAL', `control plane unreachable (client ${this.state})`, true)
+    }
+    const frame = this.scopedFrame('session/child-status', payload, orgId)
+    const rep = await this.correlator.request(frame, (e) => this.transport!.send(e))
+    if (rep.type !== 'session/child-status/ok') {
+      throw new WireError('INTERNAL', `expected session/child-status/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as ChildSessionStatus
+  }
+
+  async knowledgeSearch(payload: KnowledgeSearchReq): Promise<KnowledgeSearchOk> {
+    if (!this.supportsServerFeature(ORGANIZATION_KNOWLEDGE_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not support organization knowledge', false)
+    }
+    const rep = await this.turnPathRequest('knowledge/search', TURN_PATH_BUDGET_MS, true, (budgetMs) =>
+      this.budgetedRequest('knowledge/search', payload, budgetMs)
+    )
+    if (rep.type !== 'knowledge/search/ok') {
+      throw new WireError('INTERNAL', `expected knowledge/search/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as KnowledgeSearchOk
+  }
+
+  // One op against the agent's CP-homed tree (memory-evolution.md §3.2.1); typed refusals ride inside the reply.
+  async memoryTransaction(payload: MemoryTransactionReq): Promise<MemoryTransactionResult> {
+    if (!this.supportsServerFeature(MEMORY_TRANSACTION_V1_FEATURE))
+      throw new WireError('INTERNAL', 'control plane does not support memory transactions', false)
+    if (payload.operation === 'capture-status' && !this.supportsServerFeature(MEMORY_CAPTURE_FENCE_V1_FEATURE))
+      throw new WireError('INTERNAL', 'control plane does not support capture fences', false)
+    // Reads, and a commit the CP deduplicates by its operation id, so one re-send over a replaced link is safe.
+    const rep = await this.turnPathRequest('memory/transaction/v1', MEMORY_STORE_TIMEOUT_MS, true, (ackTimeoutMs) =>
+      this.correlator.request(this.scopedFrame('memory/transaction/v1', payload), (e) => this.transport!.send(e), {
+        maxTries: 1,
+        ackTimeoutMs
+      })
+    )
+    if (rep.type !== 'memory/transaction/v1/result')
+      throw new WireError('INTERNAL', 'unexpected memory transaction reply', false)
+    return rep.payload as MemoryTransactionResult
+  }
+
+  async memoryStore(payload: MemoryStoreReq): Promise<MemoryFsReply> {
+    if (!this.supportsServerFeature(AGENT_MEMORY_STORE_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not serve the memory store', false)
+    }
+    // A read may be re-sent over a replaced link; a write only under an operation id the CP deduplicates.
+    const operationId = MEMORY_FS_READS.has(payload.op.op) ? undefined : randomUUID()
+    let sends = 0
+    let sentWithId = false
+    const rep = await this.turnPathRequest(
+      'memory/store',
+      MEMORY_STORE_TIMEOUT_MS,
+      () => operationId === undefined || sentWithId,
+      (ackTimeoutMs) => {
+        const withId =
+          operationId !== undefined && this.supportsServerFeature(AGENT_MEMORY_STORE_OPERATION_ID_V1_FEATURE)
+        // The re-send is safe only under the id the first send carried; a CP that stopped deduplicating gets none.
+        if (sends++ > 0 && operationId !== undefined && !withId) {
+          throw new WireError('INTERNAL', 'control plane no longer deduplicates memory writes', true)
+        }
+        sentWithId = withId
+        const request = withId ? { ...payload, operationId } : payload
+        return this.correlator.request(this.scopedFrame('memory/store', request), (e) => this.transport!.send(e), {
+          maxTries: 1,
+          ackTimeoutMs
+        })
+      }
+    )
+    if (rep.type !== 'memory/store/ok') {
+      throw new WireError('INTERNAL', `expected memory/store/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as MemoryFsReply
+  }
+
+  // `memory/history/append` (D→C REQ): one best-effort batch of change-log records for a CP-homed store, sent like
+  // `memoryStore` — one send on one deadline. Every record carries its own id, so the CP could take a resend, but the
+  // sender holds the store's memory-dir lock while it waits, and one deadline keeps that wait bounded.
+  async memoryHistoryAppend(payload: MemoryHistoryAppendReq): Promise<MemoryHistoryAppendOk> {
+    this.requireReady('memory/history/append')
+    if (!this.supportsServerFeature(AGENT_MEMORY_STORE_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not serve the memory store', false)
+    }
+    const frame = this.scopedFrame('memory/history/append', payload)
+    const rep = await this.correlator.request(frame, (e) => this.transport!.send(e), {
+      maxTries: 1,
+      ackTimeoutMs: MEMORY_STORE_TIMEOUT_MS
+    })
+    if (rep.type !== 'memory/history/append/ok') {
+      throw new WireError('INTERNAL', `expected memory/history/append/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as MemoryHistoryAppendOk
+  }
+
+  // `memory/history/read` (D→C REQ): one page of a CP-homed store's change log, read back for the common entry history.
+  async memoryHistoryRead(payload: MemoryHistoryReadReq): Promise<MemoryHistoryReadOk> {
+    this.requireReady('memory/history/read')
+    if (!this.supportsServerFeature(AGENT_MEMORY_HISTORY_READ_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not page the memory change log', false)
+    }
+    const frame = this.scopedFrame('memory/history/read', payload)
+    const rep = await this.correlator.request(frame, (e) => this.transport!.send(e), {
+      maxTries: 1,
+      ackTimeoutMs: MEMORY_STORE_TIMEOUT_MS
+    })
+    if (rep.type !== 'memory/history/read/ok') {
+      throw new WireError('INTERNAL', `expected memory/history/read/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as MemoryHistoryReadOk
+  }
+
+  // `memory/home/migrated` (D→C REQ): the one-way copy of this agent's tree is complete — one send on one deadline, like
+  // `memoryStore`. A repeated report is the same success on the CP, so a lost reply is retried by the caller, never here.
+  async memoryHomeMigrated(payload: MemoryHomeMigratedReq): Promise<MemoryHomeMigratedOk> {
+    this.requireReady('memory/home/migrated')
+    if (!this.supportsServerFeature(AGENT_MEMORY_STORE_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not serve the memory store', false)
+    }
+    const frame = this.scopedFrame('memory/home/migrated', payload)
+    const rep = await this.correlator.request(frame, (e) => this.transport!.send(e), {
+      maxTries: 1,
+      ackTimeoutMs: MEMORY_STORE_TIMEOUT_MS
+    })
+    if (rep.type !== 'memory/home/migrated/ok') {
+      throw new WireError('INTERNAL', `expected memory/home/migrated/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as MemoryHomeMigratedOk
+  }
+
+  async decisionList(payload: DecisionListRequest): Promise<DecisionListReply> {
+    this.requireReady('decision/list')
+    if (!this.supportsServerFeature(DECISION_TOOLS_V1_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not support this Decision read', false)
+    }
+    const rep = await this.request('decision/list', payload)
+    if (rep.type !== 'decision/list/result') {
+      throw new WireError('INTERNAL', 'unexpected Decision list reply', false)
+    }
+    return DecisionListReply.parse(rep.payload)
+  }
+
+  async decisionGet(payload: DecisionGetRequest): Promise<DecisionGetReply> {
+    this.requireReady('decision/get')
+    if (
+      !this.supportsServerFeature(
+        payload.purpose === 'model_selection' ? DECISION_MODEL_SELECTION_V1_FEATURE : DECISION_TOOLS_V1_FEATURE
+      )
+    ) {
+      throw new WireError('INTERNAL', 'control plane does not support this Decision read', false)
+    }
+    const rep = await this.request('decision/get', payload)
+    if (rep.type !== 'decision/get/result') {
+      throw new WireError('INTERNAL', 'unexpected Decision read reply', false)
+    }
+    return DecisionGetReply.parse(rep.payload)
+  }
+
+  async knowledgeList(payload: KnowledgeListReq): Promise<KnowledgeListOk> {
+    this.requireReady('knowledge/list')
+    if (!this.supportsServerFeature(ORGANIZATION_KNOWLEDGE_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not support organization knowledge', false)
+    }
+    const rep = await this.request('knowledge/list', payload)
+    if (rep.type !== 'knowledge/list/ok') {
+      throw new WireError('INTERNAL', `expected knowledge/list/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as KnowledgeListOk
+  }
+
+  // One organization record entry for an assistant-mode agent's memory tools (assistant-mode.md §5.16).
+  async knowledgeRecordRead(payload: KnowledgeRecordReadReq): Promise<KnowledgeRecordOk> {
+    this.requireReady('knowledge/record/read')
+    if (!this.supportsServerFeature(KNOWLEDGE_RECORD_FEATURE))
+      throw new WireError('INTERNAL', 'control plane does not keep the organization record', false)
+    const rep = await this.request('knowledge/record/read', payload)
+    if (rep.type !== 'knowledge/record/ok' || (rep.payload as KnowledgeRecordOk).content === undefined)
+      throw new WireError('INTERNAL', `expected knowledge/record/ok, got ${rep.type}`, false)
+    return rep.payload as KnowledgeRecordOk
+  }
+
+  // A revision-checked write of one record entry; a stale base revision answers the current entry.
+  async knowledgeRecordWrite(
+    payload: KnowledgeRecordWriteReq
+  ): Promise<{ ok: KnowledgeRecordOk } | { conflict: KnowledgeRecordConflict }> {
+    this.requireReady('knowledge/record/write')
+    if (!this.supportsServerFeature(KNOWLEDGE_RECORD_FEATURE))
+      throw new WireError('INTERNAL', 'control plane does not keep the organization record', false)
+    const rep = await this.request('knowledge/record/write', payload)
+    if (rep.type === 'knowledge/record/conflict') return { conflict: rep.payload as KnowledgeRecordConflict }
+    if (rep.type !== 'knowledge/record/ok')
+      throw new WireError('INTERNAL', `expected knowledge/record/ok, got ${rep.type}`, false)
+    return { ok: rep.payload as KnowledgeRecordOk }
+  }
+
+  async orgSkills(payload: OrgSkillsReq): Promise<OrgSkillsOk> {
+    this.requireReady('skills/org')
+    if (!this.supportsServerFeature(ORGANIZATION_KNOWLEDGE_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not support organization skills', false)
+    }
+    const rep = await this.request('skills/org', payload)
+    if (rep.type !== 'skills/org/ok') {
+      throw new WireError('INTERNAL', `expected skills/org/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as OrgSkillsOk
+  }
+
+  async syncOrganizationSuggestions(
+    payload: OrganizationSuggestionsSyncReq,
+    orgId?: string
+  ): Promise<OrganizationSuggestionsSyncOk> {
+    this.requireReady('knowledge/suggestions/sync')
+    if (!this.supportsServerFeature(ORGANIZATION_KNOWLEDGE_FEATURE)) return { decisions: [] }
+    const rep = await this.request('knowledge/suggestions/sync', payload, orgId)
+    if (rep.type !== 'knowledge/suggestions/sync/ok') {
+      throw new WireError('INTERNAL', `expected knowledge/suggestions/sync/ok, got ${rep.type}`, false)
+    }
+    return rep.payload as OrganizationSuggestionsSyncOk
+  }
+
+  async readManagedSkill(payload: ManagedSkillReadReq): Promise<ManagedSkillChunk> {
+    this.requireReady('managed-skill/read')
+    if (!this.supportsServerFeature(ORGANIZATION_KNOWLEDGE_FEATURE)) {
+      throw new WireError('INTERNAL', 'control plane does not support managed skills', false)
+    }
+    const rep = await this.request('managed-skill/read', payload)
+    if (rep.type !== 'managed-skill/chunk') {
+      throw new WireError('INTERNAL', `expected managed-skill/chunk, got ${rep.type}`, false)
+    }
+    return rep.payload as ManagedSkillChunk
+  }
+
+  private async onText(text: string, source: Transport, assembled = false): Promise<void> {
+    // A superseded socket must not settle the current connection's correlator or
+    // enter its post-register FIFO.
+    if (source !== this.transport) return
+    // The CP authors every frame on this socket, so read it tolerantly: a field it added must strip, not fail.
+    const decoded = decodeCpEnvelope(text, assembled ? { maxBytes: MAX_ASSEMBLED_FRAME_BYTES } : {})
+    if (!decoded.ok) {
+      const code = this.decodeErrorCode(decoded.msg)
+      this.sendError(decoded.id, code, decoded.msg, false)
+      // The envelope may be a correlated REP whose payload alone is malformed.
+      // Preserve that correlation and fail the local request immediately; otherwise
+      // the original REQ stays pending for the full 5x timeout budget and reports the
+      // misleading "no ack" seen in the rc.282 register/ok incident.
+      if (decoded.corr) {
+        this.correlator.reject(decoded.corr, new WireError(code, `invalid correlated reply: ${decoded.msg}`, false))
+      }
+      return
+    }
+    const frame = decoded.frame
+    if (frame.type === 'frame/fragment') {
+      if (assembled) return this.deps.log.warn('cp: dropped a fragment nested in a reassembled frame')
+      const result = this.fragments.push(frame.payload as FrameFragment)
+      if ('error' in result) this.deps.log.warn(`cp: dropped a fragmented frame: ${result.error}`)
+      else if (result.done) await this.onText(result.text, source, true)
+      return
+    }
+    const barrier = this.registerControlBarrier
+    if (
+      barrier !== undefined &&
+      frame.type === 'register/ok' &&
+      frame.corr === barrier.registerRequestId &&
+      barrier.transport === source
+    ) {
+      // Open the FIFO before settling the register request. A transport may
+      // deliver register/ok and the first control in the same JS turn, before
+      // the handshake continuation gets a chance to run.
+      barrier.snapshotApplying = true
+    }
+    // A correlated REP/error settles a pending daemon-issued REQ — after the org fence: a reply that
+    // does not carry the org of the REQ it answers fails that REQ locally and is never applied.
+    if (frame.corr) {
+      const request = this.correlator.requested(frame.corr)
+      if (request) {
+        const verdict = checkReplyFrameOrg(request, frame, this.orgPeer())
+        if (!verdict.ok) {
+          this.deps.log.warn(`cp: dropped ${frame.type} reply to ${request.type}: ${verdict.message}`)
+          this.correlator.reject(frame.corr, new WireError('SCOPE_DENIED', verdict.message, false))
+          return
+        }
+      }
+      if (this.correlator.settle(frame)) return
+    }
+    if (barrier?.transport === source && barrier.snapshotApplying) {
+      if (barrier.controls.length >= REGISTERING_CONTROL_QUEUE_LIMIT) {
+        this.sendError(frame.id, 'PROTOCOL_STATE', 'post-register control queue full', true)
+        source.close(1011, 'post-register control queue full')
+        return
+      }
+      barrier.controls.push({ frame, epoch: decoded.ext?.epoch })
+      return
+    }
+    // §2.1 legal-state gate: control frames are only legal in READY/DRAINING.
+    if (this.state !== 'READY' && this.state !== 'DRAINING') {
+      this.sendError(frame.id, 'PROTOCOL_STATE', `${frame.type} illegal in ${this.state}`, false)
+      return
+    }
+    this.dispatchFencedControl(frame, decoded.ext?.epoch)
+  }
+
+  /** Drain through a stable barrier so controls arriving during the drain join
+   *  its tail instead of overtaking it on the newly READY connection. */
+  private drainRegisterControls(barrier: RegisterControlBarrier): void {
+    while (barrier.controls.length > 0) {
+      const queued = barrier.controls.shift()!
+      this.dispatchFencedControl(queued.frame, queued.epoch)
+      if (this.registerControlBarrier !== barrier) return
+    }
+  }
+
+  private dispatchFencedControl(frame: AnyFrame, epoch?: number): void {
+    // Fencing (protocol §4.2): reject any control frame issued under a stale epoch.
+    if (epoch !== undefined && epoch < this.sessionEpoch) {
+      this.sendError(frame.id, 'STALE_EPOCH', 'epoch < current', true)
+      return
+    }
+    // Org fence (M4): the shared frame-scope gate, then the org named against the resource this
+    // daemon knows the frame targets. A frame that fails is refused with an error and never applied.
+    const verdict = checkInboundFrameOrg(frame, this.orgPeer())
+    if (!verdict.ok) {
+      this.deps.log.warn(`cp: refused ${frame.type}: ${verdict.message}`)
+      this.sendError(frame.id, 'SCOPE_DENIED', verdict.message, false)
+      return
+    }
+    const expectedOrgId = this.organizationForControl(frame)
+    if (frame.orgId && expectedOrgId && frame.orgId !== expectedOrgId) {
+      this.deps.log.warn(`cp: refused ${frame.type}: organization does not match the targeted resource`)
+      this.sendError(frame.id, 'SCOPE_DENIED', 'organization does not match the targeted resource', false)
+      return
+    }
+    if (frame.type === 'provider-credentials/changed') {
+      this.clearProviderCredentials()
+      return
+    }
+    this.dispatchControl(frame)
+  }
+
+  /** How this end reads the wire: frame mode knows no connection org; connection mode learns none either (the CP owns it). */
+  private orgPeer(): FrameOrgPeer {
+    return { mode: this.organizationMode, orgId: null }
+  }
+
+  private organizationForControl(frame: AnyFrame): string | undefined {
+    const payload = frame.payload && typeof frame.payload === 'object' ? (frame.payload as Record<string, unknown>) : {}
+    if (typeof payload.orgId === 'string') return payload.orgId
+    const spec =
+      payload.spec && typeof payload.spec === 'object' ? (payload.spec as Record<string, unknown>) : undefined
+    if (typeof spec?.orgId === 'string') return spec.orgId
+    const agentId = [
+      payload.agentId,
+      payload.requesterAgentId,
+      payload.sourceAgentId,
+      payload.callerAgentId,
+      payload.childAgentId,
+      spec?.agentId
+    ].find((value): value is string => typeof value === 'string')
+    if (agentId) return this.deps.orgForAgent?.(agentId)
+    if (typeof payload.integrationId === 'string') return this.deps.orgForIntegration?.(payload.integrationId)
+    if (typeof payload.cronId === 'string') return this.deps.orgForCron?.(payload.cronId)
+    return undefined
+  }
+
+  /** Every D→C send resolves its org here: install-wide frames carry none, org-scoped ones must resolve one in frame mode. */
+  private scopedFrame(type: string, payload: unknown, explicitOrgId?: string): AnyFrame {
+    if (isInstallWideFrameType(type)) return buildEnvelope(type as Parameters<typeof buildEnvelope>[0], payload)
+    let orgId = explicitOrgId
+    if (!orgId && payload && typeof payload === 'object') {
+      const p = payload as Record<string, unknown>
+      const agentId = [p.agentId, p.requesterAgentId, p.sourceAgentId, p.callerAgentId, p.childAgentId].find(
+        (value): value is string => typeof value === 'string'
+      )
+      if (agentId) orgId = this.deps.orgForAgent?.(agentId)
+      else if (typeof p.integrationId === 'string') orgId = this.deps.orgForIntegration?.(p.integrationId)
+    }
+    if (this.organizationMode === 'frame' && !orgId) {
+      throw new WireError('SCOPE_DENIED', `cannot resolve organization for ${type}`, false)
+    }
+    return buildEnvelope(type as Parameters<typeof buildEnvelope>[0], payload, orgId ? { orgId } : {})
+  }
+
+  private decodeErrorCode(msg: string): 'UNKNOWN_FRAME' | 'FRAME_TOO_LARGE' | 'BAD_PAYLOAD' {
+    if (msg === 'FRAME_TOO_LARGE') return 'FRAME_TOO_LARGE'
+    if (msg === 'UNKNOWN_FRAME') return 'UNKNOWN_FRAME'
+    return 'BAD_PAYLOAD'
+  }
+
+  private sendError(
+    corr: string,
+    code: string,
+    message: string,
+    retryable: boolean,
+    details?: Record<string, unknown>
+  ): void {
+    if (!this.transport) return
+    this.transport.send(
+      encode(buildEnvelope('error', { code, message, retryable, ...(details ? { details } : {}) }, { corr }))
+    )
+  }
+
+  private onClose(source: Transport, code: number, _reason: string): void {
+    if (source !== this.transport) return
+    const wasConnected = this.connected()
+    this.stopHeartbeat()
+    // Drop the dead transport: `ws.send` on a CLOSED socket is silently
+    // swallowed, so anything still holding it would hang for a full retransmit
+    // budget instead of failing fast.
+    this.transport = undefined
+    if (this.registerControlBarrier?.transport === source) this.registerControlBarrier = undefined
+    this.correlator.rejectAll(new WireError('INTERNAL', 'connection closed', true))
+    // The fence needs nothing here: it has been running off the last confirmed renewal since that
+    // renewal arrived, and a closed socket is simply one more way for the next one not to.
+    if (code === 4401) {
+      this.clearProviderCredentials()
+      this.fatal = true
+      this.state = 'CLOSED'
+      this.releaseReadyWaiters(false)
+      // An API key is minted by a human and a rejected one stays rejected, so redialing it forever
+      // is noise — the daemon stays up and says what to fix. A projected identity is different: it
+      // is re-read from the pod's volume at every boot, the process is restart-supervised, and boot
+      // BLOCKS on the first registration — so a live container that took a 4401 can never become
+      // servable. Exit instead and let the supervisor's restart backoff redial.
+      if (this.deps.clusterIdentityToken) {
+        this.deps.log.error('cp: AUTH_FAILED (4401) — exiting; the restart re-reads the projected identity and redials')
+        this.deps.onAuthFatal?.()
+        return
+      }
+      this.deps.log.error('cp: AUTH_FAILED (4401) — not reconnecting; re-mint the daemon token')
+      return
+    }
+    if (this.stopped) {
+      this.state = 'CLOSED'
+      this.releaseReadyWaiters(false)
+      return
+    }
+    if (wasConnected) this.droppedAt = this.deps.clock.now()
+    if (wasConnected && code === 1012) this.handoffRedialUntil = this.deps.clock.now() + CP_HANDOFF_WAIT_MS
+    this.state = 'DEGRADED'
+    this.scheduleReconnect()
+  }
+
+  private armHeartbeat(): void {
+    this.heartbeatTimer = this.deps.clock.setTimeout(() => {
+      // Skip the send mid-drain (we report `degraded` differently), but keep the
+      // loop alive so heartbeats resume once we transition DRAINING → READY.
+      if (this.state === 'READY') this.sendHeartbeat()
+      if (this.state === 'READY' || this.state === 'DRAINING') this.armHeartbeat()
+    }, this.heartbeatMs)
+  }
+
+  /**
+   * Report the duty digest NOW instead of waiting out the interval.
+   *
+   * The digest is the CP's proof that a grant is installed — a grant is applied here only after
+   * its install succeeds, so "in the digest" is the first moment this member is provably serving,
+   * and the CP holds every projection that ADDRESSES this member until it sees one. Letting an
+   * admission sit until the next tick therefore costs up to a full heartbeat of unroutable time
+   * for an agent that is already running, which is the gap a peer wake falls into.
+   *
+   * Coalesced onto one extra beat: an admission routinely settles several groups, and each one
+   * calls this. Dormant off a non-member connection, where there is no digest at all.
+   */
+  reportDutiesNow(): void {
+    if (!this.reportsDuties() || this.state !== 'READY' || this.dutyReportTimer !== undefined) return
+    this.dutyReportTimer = this.deps.clock.setTimeout(() => {
+      this.dutyReportTimer = undefined
+      if (this.state === 'READY') this.sendHeartbeat()
+    }, 0)
+  }
+
+  private sendHeartbeat(): void {
+    // The duty lease exchange rides this beat (frames/duty.ts). Absent on a daemon in no member
+    // set, which keeps the whole CP-side path dormant.
+    const duties = this.reportsDuties() ? this.deps.duties?.() : undefined
+    const hostedSessions = this.deps.hostedSessions?.()
+    const live = this.transport
+    live?.send(
+      encode(
+        buildEnvelope('heartbeat', {
+          load: this.deps.loadSnapshot(),
+          health: 'ok',
+          activeSessions: this.deps.activeSessions(),
+          ...(hostedSessions === undefined ? {} : { hostedSessions }),
+          degradedScopes: this.deps.degradedScopes?.() ?? [],
+          ...(duties ? { duties } : {})
+        })
+      )
+    )
+    // Sending is not renewing: on a half-open socket this `send` succeeds locally and the CP never runs
+    // `renewHeld`, so against a confirming CP the anchor moves only in `onDutyRenewed`. Against one that
+    // confirms nothing this is the best evidence available, and it is weaker on exactly that failure.
+    if (duties && live && !this.dutyRenewalsConfirmed) this.noteLeasesRenewed()
+  }
+
+  /** `duty/renewed` EVT — the CP renewed this member's leases for `leaseMs` more, as of a moment strictly before
+   *  this frame arrived. The only thing that restarts the fence countdown against a confirming CP. */
+  private onDutyRenewed(leaseMs: number): void {
+    this.dutyLeaseMs = leaseMs
+    this.noteLeasesRenewed()
+  }
+
+  /** A renewal restarts the countdown of EVERY group this member holds — `renewHeld` renews by holder with no id
+   *  filter, so one confirmation genuinely does refresh them all, and the per-group map collapses back to a single
+   *  value after each one. It is also where the map is pruned: the daemon's digest is the authoritative held set. */
+  private noteLeasesRenewed(): void {
+    // "What we intend to hold" = the digest PLUS the admissions still in flight. A pending group is
+    // absent from the digest by design (it is not servable yet), and pruning its deadline here is what
+    // would leave it serving with no fence the moment its admission completes.
+    const ours = new Set([
+      ...(this.deps.duties?.()?.held ?? []).map((entry) => entry.groupId),
+      ...(this.deps.dutyPending?.() ?? [])
+    ])
+    for (const groupId of this.dutyDeadlines.keys()) if (!ours.has(groupId)) this.dutyDeadlines.delete(groupId)
+    const now = this.deps.clock.now()
+    for (const groupId of ours) this.dutyDeadlines.set(groupId, this.deadlineFrom(now))
+    this.armDutyFence()
+  }
+
+  /** A grant or a won claim CREATES (or re-terms) exactly one lease, so only that group's countdown restarts —
+   *  postponing an older group's deadline because a new one arrived is precisely the split this prevents.
+   *  Receipt-anchored: the CP wrote `expiresAt` strictly before the frame reached us. This is also what arms a
+   *  first grant whose renewal confirmation never lands, and what re-arms a group granted back after a fence. */
+  private noteLeasesGranted(groupIds: string[]): void {
+    if (groupIds.length === 0) return
+    const now = this.deps.clock.now()
+    for (const groupId of groupIds) this.dutyDeadlines.set(groupId, this.deadlineFrom(now))
+    this.armDutyFence()
+  }
+
+  /** A revoked group is no longer ours to fence — drop its deadline so it cannot fire, and so it cannot hold the
+   *  timer at an earlier point than any group still held. */
+  private forgetLeaseDeadlines(groupIds: string[]): void {
+    let dropped = false
+    for (const groupId of groupIds) dropped = this.dutyDeadlines.delete(groupId) || dropped
+    if (dropped) this.armDutyFence()
+  }
+
+  private deadlineFrom(now: number): { anchoredAt: number; deadline: number } {
+    const horizon = this.dutyLeaseMs ?? DUTY_LEASE_FALLBACK_MS
+    return { anchoredAt: now, deadline: now + Math.floor(horizon * DUTY_FENCE_HORIZON_FRACTION) }
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.heartbeatTimer)
+      this.heartbeatTimer = undefined
+    }
+  }
+
+  /** Arm on the EARLIEST deadline any held group has. Deliberately armed while the link is UP, not on disconnect:
+   *  a half-open socket produces no close event and no renewal either, and only a running deadline fences it.
+   *  A healthy member simply re-arms every renewal, long before the deadline it set the time before. */
+  private armDutyFence(): void {
+    this.clearDutyFence()
+    if (!this.deps.onDutyFence || this.dutyDeadlines.size === 0) return // no lease the CP could reassign
+    let earliest = Infinity
+    for (const { deadline } of this.dutyDeadlines.values()) earliest = Math.min(earliest, deadline)
+    const delay = Math.max(0, earliest - this.deps.clock.now())
+    this.dutyFenceTimer = this.deps.clock.setTimeout(() => {
+      this.dutyFenceTimer = undefined
+      this.fireDutyFence()
+    }, delay)
+  }
+
+  /** Fence the groups whose own deadline has passed and re-arm at the next earliest — a group whose lease the CP
+   *  still honours keeps serving. Each fenced group's deadline is dropped, so nothing re-arms it but a fresh grant
+   *  or renewal: a link that flaps for an hour fences a given group once, not once per drop. */
+  private fireDutyFence(): void {
+    const now = this.deps.clock.now()
+    const expired: string[] = []
+    let oldest = now
+    for (const [groupId, entry] of this.dutyDeadlines) {
+      if (entry.deadline > now) continue
+      expired.push(groupId)
+      oldest = Math.min(oldest, entry.anchoredAt)
+      this.dutyDeadlines.delete(groupId)
+    }
+    if (expired.length > 0) {
+      this.deps.log.warn(
+        `cp: duty self-fence — ${expired.length} group(s) with no confirmed lease renewal for ${now - oldest}ms; ` +
+          `releasing them before the CP can reassign them (${this.dutyDeadlines.size} still leased)`
+      )
+      this.deps.onDutyFence?.(expired)
+    }
+    this.armDutyFence()
+  }
+
+  private clearDutyFence(): void {
+    if (this.dutyFenceTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.dutyFenceTimer)
+      this.dutyFenceTimer = undefined
+    }
+  }
+
+  /** C→D control dispatch. The CP changes config, never live routing. A frame kind with no
+   *  registry entry is ignored — webchat content moved off this control WS (milestone A4) and
+   *  rides the relay's rd/* wire now, so a stray legacy webchat/* frame lands here. */
+  private async dispatchControl(frame: AnyFrame): Promise<void> {
+    const handler = CONTROL_HANDLERS.get(frame.type)
+    if (!handler) {
+      this.deps.log.debug(`cp: ignoring ${frame.type}`)
+      return
+    }
+    await handler(frame, this.controlDeps, this.wire)
+  }
+
+  private reply(req: AnyFrame, type: string, payload: unknown): void {
+    this.transport?.send(
+      encode(
+        buildEnvelope(type as Parameters<typeof buildEnvelope>[0], payload, {
+          corr: req.id,
+          ...(req.orgId ? { orgId: req.orgId } : {})
+        })
+      )
+    )
+  }
+
+  /** Emit an uncorrelated EVT (e.g. `drain/progress`). */
+  private emit(type: string, payload: unknown): void {
+    this.transport?.send(encode(buildEnvelope(type as Parameters<typeof buildEnvelope>[0], payload)))
+  }
+}

@@ -1,0 +1,680 @@
+import { chmodSync, existsSync, lstatSync, mkdirSync, realpathSync, unlinkSync } from 'node:fs'
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { sandboxBoundary, writeSandboxSettings, type SandboxMechanism } from '../acp/sandbox.js'
+import { prepareSandboxTempDir, SANDBOX_TEMP_DIR_ENV } from '../acp/sandbox-temp.js'
+import { hostKeyDirName, hostKeySessionKey, type HostKey } from '../acp/host-key.js'
+import type { RuntimeDef, SandboxMount } from '../config/config-schema.js'
+import { AGENT_CHANNEL_SOCKET_ENV } from '../agent-channel/env.js'
+import { shimPaths } from '../shim/sandbox-paths.js'
+import { prepareMicrosandboxLaunch } from '../microsandbox/launch.js'
+import {
+  isRecognizedCredentialEnv,
+  type MicrosandboxCredentials,
+  type MicrosandboxSecret
+} from '../microsandbox/secrets.js'
+import { replaceEnvironmentSecrets } from '../microsandbox/secret-values.js'
+import { compactReadRoots, protectedSandboxRoots } from '../runtimes/read-roots.js'
+import { prepareSharedRuntimeCredentials, sharedCredentialProfile } from '../runtimes/runtime-credentials.js'
+import { applyOpenCodeHostKeys, openCodeHostKeys } from '../runtimes/opencode-host-keys.js'
+import {
+  CLAUDE_STATE_SECRETS,
+  CODEX_STATE_SECRETS,
+  privateRuntimeState,
+  type PrivateRuntimeState
+} from '../runtimes/private-runtime-state.js'
+import {
+  hostPackageCacheEnv,
+  prepareRuntimeHome,
+  runtimeHomeEnvironment,
+  runtimeHomePath
+} from '../runtimes/runtime-home.js'
+import { primaryCheckoutIn, secondaryCheckoutsIn } from '../workspace/secondary-layout.js'
+import { confinedSessionDirIn, sessionGitDirsIn, sessionHomeIn } from '../workspace/session-layout.js'
+import {
+  prepareClaudeProtectedSettings,
+  claudeProviderCredentialFiles,
+  isClaudeRuntimeDef
+} from '../runtime-defs/claude-runtime.js'
+import { applyCodexPermissionProfile } from '../acp/codex-permission-profiles.js'
+import type { AcpToolSandbox } from '../acp/acp-host.js'
+
+/** Canonicalize the deepest existing prefix, so a path below a symlink still reads as the kernel sees it. */
+function existingRealpath(path: string): string {
+  let current = resolve(path)
+  const missing: string[] = []
+  for (;;) {
+    try {
+      return resolve(realpathSync(current), ...missing.reverse())
+    } catch {
+      const parent = dirname(current)
+      if (parent === current) return resolve(path)
+      missing.push(basename(current))
+      current = parent
+    }
+  }
+}
+
+function inside(root: string, path: string): boolean {
+  const rel = relative(root, path)
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
+/** Every `.git` DIRECTORY this agent's checkouts own — where a worktree's index, refs, and objects land. */
+function gitMetadataDirsIn(agentRoot: string, primaryCheckout: string): string[] {
+  return [primaryCheckout, ...secondaryCheckoutsIn(agentRoot)]
+    .map((checkout) => join(checkout, '.git'))
+    .filter((gitDir) => existsSync(gitDir) && lstatSync(gitDir).isDirectory())
+}
+
+/** The session directory a confined session host launches for (git-workspace-model §11) — the SAME record preparation reads, so the two tiers cannot disagree; undefined for the shared host, and for a session host with no clones (a dream, a model session). */
+function confinedSessionDirOf(agentRoot: string, hostKey: HostKey | undefined): string | undefined {
+  const sessionKey = hostKey === undefined ? undefined : hostKeySessionKey(hostKey)
+  return sessionKey === undefined ? undefined : confinedSessionDirIn(agentRoot, sessionKey)
+}
+
+/** The private HOME a host launches with: a confined session's under its own directory (§11), any other host's under the agent dir. */
+export function privateRuntimeHomeFor(scopeDir: string, hostKey: HostKey | undefined): string {
+  const sessionDir = confinedSessionDirOf(existingRealpath(scopeDir), hostKey)
+  return sessionDir === undefined ? runtimeHomePath(scopeDir) : sessionHomeIn(sessionDir)
+}
+
+/** Discover canonical Git roots owned by this workspace; callers grant only those their outer boundary exposes. */
+export function runtimeGitMetadataRoots(
+  scopeDir: string,
+  trustedPrimaryCheckout?: string,
+  sessionDir?: string
+): string[] {
+  const agentRoot = existingRealpath(scopeDir)
+  const primaryCheckout = existingRealpath(trustedPrimaryCheckout ?? primaryCheckoutIn(agentRoot))
+  const gitDirs =
+    sessionDir === undefined ? gitMetadataDirsIn(agentRoot, primaryCheckout) : sessionGitDirsIn(sessionDir)
+  return compactReadRoots(
+    gitDirs.map((gitDir) => realpathSync(gitDir)).filter((gitDir) => gitDir !== agentRoot && inside(agentRoot, gitDir))
+  )
+}
+
+/** Drop a private-HOME link an earlier shared sign-in left where a protected file is now projected; a link is never followed. */
+function unlinkSharedCredentialLinks(home: string, destinations: readonly string[]): void {
+  const root = realpathSync(home)
+  for (const destination of destinations) {
+    const path = resolve(root, destination)
+    if (!inside(root, path) || !existsSync(dirname(path)) || !inside(root, realpathSync(dirname(path)))) continue
+    try {
+      if (lstatSync(path).isSymbolicLink()) unlinkSync(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+}
+
+/** Ambient desktop/session IPC must not reconnect a sandboxed runtime to host
+ * services merely because the daemon inherited a pointer to their socket. */
+const HOST_SOCKET_POINTER_ENV = [
+  'SSH_AUTH_SOCK',
+  'SSH_AGENT_PID',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'DBUS_SYSTEM_BUS_ADDRESS',
+  'DISPLAY',
+  'WAYLAND_DISPLAY',
+  'PULSE_SERVER',
+  'PIPEWIRE_REMOTE',
+  'GPG_AGENT_INFO',
+  'GNOME_KEYRING_CONTROL',
+  'SESSION_MANAGER',
+  'TMUX',
+  'VSCODE_IPC_HOOK_CLI',
+  'NOTIFY_SOCKET',
+  'TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE'
+] as const
+
+const LOCAL_CONTAINER_ENDPOINT_ENV = ['DOCKER_HOST', 'CONTAINER_HOST', 'BUILDKIT_HOST', 'PODMAN_HOST'] as const
+function isLocalSocketEndpoint(value: string): boolean {
+  const endpoint = value.trim().toLowerCase()
+  return endpoint.startsWith('/') || /^(?:unix|npipe|fd):/.test(endpoint)
+}
+
+function isolateHostSocketEnvironment(env: Record<string, string>, runtimeHome: string): void {
+  const runtimeDir = join(runtimeHome, '.run')
+  if (existsSync(runtimeDir)) {
+    const stat = lstatSync(runtimeDir)
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`private XDG runtime path must be a real directory: ${runtimeDir}`)
+    }
+  }
+  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 })
+  chmodSync(runtimeDir, 0o700)
+
+  for (const name of HOST_SOCKET_POINTER_ENV) delete env[name]
+  for (const name of LOCAL_CONTAINER_ENDPOINT_ENV) {
+    if (env[name] && isLocalSocketEndpoint(env[name])) delete env[name]
+  }
+  env.XDG_RUNTIME_DIR = realpathSync(runtimeDir)
+}
+
+/** Point the confined child's temp state at this host's own `<agentDir>/t/<8 hex>` and return it. The private HOME is the wrong home for it: SRT's multiplexer socket lives directly under TMPDIR, and a per-session HOME made that socket path overflow `sun_path` (#1763). */
+function isolateSandboxTempEnvironment(env: Record<string, string>, scopeDir: string, hostKey: HostKey | undefined) {
+  const tempDir = prepareSandboxTempDir(scopeDir, hostKey)
+  env.TMPDIR = tempDir
+  env.CLAUDE_CODE_TMPDIR = tempDir
+  env.CLAUDE_TMPDIR = tempDir
+  // The provider reads this one and drops it before wrapping, so the daemon decides the path instead of recomputing it from HOME.
+  env[SANDBOX_TEMP_DIR_ENV] = tempDir
+  return tempDir
+}
+
+/** Point a shim-launched runtime at the shim's temp root, which SRT's sockets fit under, and at its git-credential tunnel. */
+export function shimEnvironment(env: Record<string, string>, runtimeRoot: string): void {
+  const tempDir = join(runtimeRoot, 't')
+  env.TMPDIR = tempDir
+  env.CLAUDE_CODE_TMPDIR = tempDir
+  env.CLAUDE_TMPDIR = tempDir
+  env[AGENT_CHANNEL_SOCKET_ENV] = shimPaths(runtimeRoot).tunnels.agent
+}
+
+export interface PreparedRuntimeLaunch {
+  env: Record<string, string>
+  /** Sandboxed launches carry a sanitized environment; unsandboxed launches inherit the daemon environment. */
+  inheritProcessEnv: boolean
+  /** The `.git` directories this launch reopened for the runtime's Git writes — empty when nothing
+   *  was confined or nothing was found. Logged at spawn so a stale grant is visible after the fact. */
+  gitMetadataWriteRoots: string[]
+  runtimeHome?: string
+  microsandbox?: { mounts: SandboxMount[]; workspaceRoot: string; secrets?: MicrosandboxSecret[] }
+  /** A launch through an SRT-wrapped shim: the environment its boundary is composed from (session-executors.md §11). */
+  srt?: { mounts: SandboxMount[]; workspaceRoot: string; cwd?: string }
+  toolSandbox?: AcpToolSandbox
+  sandbox?: {
+    mechanism: SandboxMechanism
+    writable: string[]
+    settingsPath: string
+    cwd: string
+    denyReadRoots: string[]
+    allowReadRoots: string[]
+  }
+}
+
+/** Daemon policy overrides the per-agent preference. Without an available host
+ * mechanism, an optional sandbox request is ineffective. An externalExecution
+ * runtime downgrades an optional request (its execution lives outside any local
+ * sandbox), while requireSandbox stays true so the launch is refused loudly. */
+export function effectiveRunInSandbox(
+  requireSandbox: boolean,
+  requested: boolean,
+  mechanism: SandboxMechanism | undefined,
+  runtime?: Pick<RuntimeDef, 'externalExecution'>
+): boolean {
+  return requireSandbox || (requested && mechanism !== undefined && runtime?.externalExecution !== true)
+}
+
+/** A session placed on another machine (session-executors.md §7, §8): HOME, XDG and runtime state under the HOME it seeded, and none of this machine's env, sign-in or sandbox. */
+function prepareExecutorLaunch(
+  opts: {
+    runtimeId: string
+    runtime?: RuntimeDef
+    explicitEnv?: Record<string, string>
+    inheritRuntimeCredentials?: boolean
+    sessionGitDirs?: string[]
+  },
+  executor: { home: string; codexState?: PrivateRuntimeState },
+  allowModelToolUnixSockets: boolean
+): PreparedRuntimeLaunch {
+  const { home, codexState } = executor
+  // An empty host env: this daemon's own variables describe a machine the runtime is not on.
+  const env = runtimeHomeEnvironment(opts.runtimeId, home, opts.explicitEnv, {})
+  // The executor supplies ambient credentials; an explicit organization provider travels with the launch.
+  for (const name of Object.keys(env))
+    if (opts.inheritRuntimeCredentials !== false && isRecognizedCredentialEnv(opts.runtimeId, opts.runtime, name))
+      delete env[name]
+  if (sharedCredentialProfile(opts.runtimeId, opts.runtime) !== 'codex') {
+    return { env, inheritProcessEnv: false, runtimeHome: home, gitMetadataWriteRoots: [] }
+  }
+  // The private-HOME profile of an unconfined launch, and the clones' `.git` as its caller found them on that machine.
+  const gitMetadataWriteRoots = [...(opts.sessionGitDirs ?? [])]
+  // The HOME is on the executor, so its `.codex` cannot be listed from here, nor can the shared file its
+  // `auth.json` links to: the split that machine reported, else (an older executor) the directory denied whole,
+  // with Codex's helper reopened below it.
+  applyCodexPermissionProfile(env, {
+    ...(codexState
+      ? { protectedRoots: codexState.secret, readOnlyRoots: codexState.readOnly }
+      : { protectedRoots: [join(home, '.codex')] }),
+    sessionGitMetadataRoots: gitMetadataWriteRoots,
+    sessionHomeRoot: home,
+    allowModelToolUnixSockets
+  })
+  return { env, inheritProcessEnv: false, runtimeHome: home, gitMetadataWriteRoots }
+}
+
+/** Prepare one ACP adapter launch. A private HOME is normally part of sandbox
+ * isolation, but security probes and runtimes with generated private policy may
+ * request the same environment isolation without an OS sandbox. */
+export function prepareRuntimeLaunch(opts: {
+  runtimeId: string
+  runtime?: RuntimeDef
+  scopeDir: string
+  cwd: string
+  /** Which host this launch is for; its sandbox policy lives in a per-host directory. Absent only for
+   *  a single-launch scope such as a probe, which then takes the shared host's leaf. */
+  hostKey?: HostKey
+  runInSandbox: boolean
+  isolateHome?: boolean
+  explicitEnv?: Record<string, string>
+  inheritRuntimeCredentials?: boolean
+  // Host state roots seed the private HOME separately from the probe's child environment.
+  stateSourceEnv?: NodeJS.ProcessEnv
+  hostEnv?: NodeJS.ProcessEnv
+  /** True when the runtime will run in a sandbox pod rather than on this host. */
+  k8s?: boolean
+  /** Trusted daemon root. Required for an enforced sandbox so all daemon-owned
+   * state is hidden before current-agent surfaces are carved back. */
+  daemonRoot?: string
+  /** Configured agents directory when it is outside daemonRoot. */
+  agentsRoot?: string
+  /** Daemon/registry-owned executable and package roots needed to start the
+   * runtime and its configured stdio children. Never derive this from agent env. */
+  trustedRuntimeReadRoots?: string[]
+  /** Additional daemon-derived workspace parents (for session worktrees).
+   * Every entry is revalidated as a strict descendant of scopeDir. */
+  trustedWorkspaceWriteRoots?: string[]
+  trustedPrimaryCheckout?: string
+  /** Operator-declared host dirs (writable `sandbox.mounts`) reopened writable: a shared package store, never the daemon's own. */
+  trustedOperatorWriteRoots?: string[]
+  /** Test seam. Shared login remains Linux-only with the sandbox rollout. */
+  credentialPlatform?: NodeJS.Platform
+  sandboxMechanism?: SandboxMechanism
+  mcpSocketPath?: string
+  /** Permit the runtime-native tool sandbox to reach a daemon-owned Unix
+   * channel. An enabled outer sandbox remains the surrounding boundary. */
+  allowModelToolUnixSockets?: boolean
+  /** Probe launches only: keep npx/uvx on the HOST package cache (see
+   * hostPackageCacheEnv). A probe never runs a model turn; an agent launch must not
+   * get this, so its confined tool use cannot write another runtime's install tree. */
+  hostPackageCache?: boolean
+  microsandbox?: {
+    mounts: SandboxMount[]
+    homeKey?: HostKey
+    nativeMemory?: boolean
+    trustedSessionDir?: string
+    trustedMounts?: SandboxMount[]
+  }
+  /** A session placed on another machine: its HOME there, which that machine's strategy — never this one's sandbox — confines,
+   *  and its `.codex` as that machine classified it. */
+  executor?: { home: string; codexState?: PrivateRuntimeState }
+  /** A launch through the SRT-wrapped shim rooted here: its boundary, not a per-host policy, confines the runtime (§11). */
+  srtShim?: { runtimeRoot: string }
+  /** A session whose clones are off this disk (a pool pod, an executor): their `.git`, found where they are as `sessionGitDirsIn` finds this disk's. */
+  sessionGitDirs?: string[]
+  /** An srt launch's host provider keys, each behind its credential-proxy placeholder in the env and private HOME. */
+  ambientCredentials?: MicrosandboxCredentials
+}): PreparedRuntimeLaunch {
+  if (opts.executor) return prepareExecutorLaunch(opts, opts.executor, opts.allowModelToolUnixSockets === true)
+  if (opts.runInSandbox && opts.microsandbox) {
+    return prepareMicrosandboxLaunch({ ...opts, ...opts.microsandbox })
+  }
+  const credentialProfile = sharedCredentialProfile(opts.runtimeId, opts.runtime)
+  // A confined session's own directory (§11), read before anything branches: the tier is the session's and
+  // does not follow the boundary, so an unsandboxed launch of one still runs against its clones, not the agent's.
+  const sessionDir = confinedSessionDirOf(existingRealpath(opts.scopeDir), opts.hostKey)
+  const sessionHome = sessionDir === undefined ? undefined : sessionHomeIn(sessionDir)
+  if (!opts.runInSandbox && !opts.isolateHome) {
+    const env = { ...(opts.explicitEnv ?? {}) }
+    // No outer boundary here: the Codex profile must both reopen the Git metadata and close hooks/config.
+    // A session whose clones are off this disk (a pool pod's) comes with their `.git` as its caller found them there.
+    const gitMetadataWriteRoots =
+      credentialProfile === 'codex'
+        ? [...(opts.sessionGitDirs ?? runtimeGitMetadataRoots(opts.scopeDir, opts.trustedPrimaryCheckout, sessionDir))]
+        : []
+    if (credentialProfile === 'codex') {
+      applyCodexPermissionProfile(
+        env,
+        {
+          protectedRoots: [],
+          // A session's clones take the exact per-clone entries; an owner checkout's `.git` takes the worktree ones.
+          ...(sessionDir === undefined && opts.sessionGitDirs === undefined
+            ? { writableGitMetadataRoots: gitMetadataWriteRoots }
+            : { sessionGitMetadataRoots: gitMetadataWriteRoots }),
+          allowModelToolUnixSockets: opts.allowModelToolUnixSockets === true
+        },
+        (opts.hostEnv ?? process.env).CODEX_CONFIG
+      )
+    }
+    // NOT in k8s: the runtime runs in a sandbox pod, so the daemon's own environment describes a
+    // different machine. Inheriting it sent this daemon's HOME across, and the runtime then tried
+    // to open its state under a path that exists only here. The pod supplies its own basics.
+    return { env, inheritProcessEnv: opts.k8s !== true, gitMetadataWriteRoots }
+  }
+  if (opts.runInSandbox && opts.runtime?.externalExecution) {
+    throw new Error(
+      `runtime "${opts.runtimeId}" executes in an external machine-local service the OS sandbox cannot contain — it can only launch unconfined`
+    )
+  }
+  if (opts.runInSandbox && !opts.sandboxMechanism) {
+    throw new Error('OS sandbox requested but this host has no supported Linux SRT/bwrap mechanism')
+  }
+  if (opts.runInSandbox && !opts.daemonRoot) {
+    throw new Error('OS sandbox requested without the trusted AgentConnect daemon root')
+  }
+
+  const stateSourceEnv = opts.stateSourceEnv ?? opts.hostEnv ?? process.env
+  const safeRoot = (path: string, label: string): string => {
+    if (!isAbsolute(path)) throw new Error(`unsafe ${label} for sandboxing: ${path}`)
+    const real = existingRealpath(path)
+    if (real === sep) throw new Error(`unsafe ${label} for sandboxing: ${path}`)
+    return real
+  }
+
+  // Validate every broad boundary and the current-agent layout before touching
+  // host credentials. A bad daemon root or escaping workspace must fail without
+  // partially migrating login state.
+  let protectedRoots: string[] = []
+  let protectedBoundaryRoots: string[] = []
+  let protectedRuntimeStateRoots: string[] = []
+  let denyReadRoots: string[] = []
+  if (opts.runInSandbox) {
+    sandboxBoundary({
+      agentDir: opts.scopeDir,
+      cwd: opts.cwd,
+      runtimeHome: sessionHome ?? runtimeHomePath(opts.scopeDir)
+    })
+    const daemonRoot = safeRoot(opts.daemonRoot!, 'AgentConnect daemon root')
+    const protectedPaths = protectedSandboxRoots({
+      daemonRoot,
+      scopeDir: opts.scopeDir,
+      agentsRoot: opts.agentsRoot,
+      hostEnv: stateSourceEnv
+    })
+    protectedBoundaryRoots = protectedPaths.boundary.map((path) => safeRoot(path, 'protected sandbox boundary'))
+    protectedRuntimeStateRoots = protectedPaths.runtimeState.map((path) => safeRoot(path, 'host runtime state root'))
+    protectedRoots = [...protectedBoundaryRoots, ...protectedRuntimeStateRoots]
+    denyReadRoots = compactReadRoots(protectedRoots)
+  }
+
+  const validateException = (path: string, label: string): string => {
+    const trusted = safeRoot(path, label)
+    // An exception may sit below a hidden root, but must never equal or contain
+    // one: that would reopen HOME, daemon state, temp, or an entire agent root.
+    const broadened = protectedRoots.find((denied) => inside(trusted, denied))
+    if (broadened) throw new Error(`${label} "${trusted}" would reopen protected path "${broadened}"`)
+    return trusted
+  }
+  const trustedRuntimeReadRoots = compactReadRoots(
+    (opts.trustedRuntimeReadRoots ?? [])
+      .map((path) => validateException(path, 'trusted runtime read root'))
+      // The root filesystem is already read-only. A carve-back is needed only
+      // when a broad read deny would otherwise hide this installation path.
+      .filter((trusted) => denyReadRoots.some((denied) => inside(denied, trusted)))
+  )
+
+  // The host's API keys an srt launch protects replace the sign-in files they live in, which are then projected rather than shared.
+  const ambient =
+    opts.runInSandbox && opts.srtShim && opts.inheritRuntimeCredentials !== false ? opts.ambientCredentials : undefined
+  const credentials =
+    opts.inheritRuntimeCredentials === false || ambient?.shareNativeCredentials === false
+      ? undefined
+      : prepareSharedRuntimeCredentials({
+          runtimeId: opts.runtimeId,
+          runtime: opts.runtime,
+          hostEnv: stateSourceEnv,
+          platform: opts.credentialPlatform
+        })
+  const runtimeHome = prepareRuntimeHome(
+    opts.runtimeId,
+    opts.scopeDir,
+    stateSourceEnv,
+    sessionHome,
+    [...(credentials?.seedExclusions ?? []), ...(ambient?.seedExclusions ?? [])],
+    opts.inheritRuntimeCredentials
+  )
+  if (ambient) {
+    unlinkSharedCredentialLinks(runtimeHome, ambient.seedExclusions)
+    ambient.preparePrivateHome(runtimeHome)
+  }
+  credentials?.preparePrivateHome(runtimeHome)
+  const packageCacheEnv = opts.hostPackageCache ? hostPackageCacheEnv(opts.runtime?.command, stateSourceEnv) : {}
+  const env = {
+    ...runtimeHomeEnvironment(opts.runtimeId, runtimeHome, opts.explicitEnv, opts.hostEnv),
+    ...packageCacheEnv,
+    ...credentials?.env
+  }
+  // OpenCode keeps sign-ins in its own database, which a private HOME does not copy; its API keys arrive as variables instead.
+  if (opts.inheritRuntimeCredentials !== false && opts.k8s !== true && opts.runtimeId === 'opencode' && !ambient)
+    applyOpenCodeHostKeys(env, openCodeHostKeys(stateSourceEnv))
+  if (ambient) {
+    replaceEnvironmentSecrets(env, ambient.replacements)
+    for (const secret of ambient.secrets) env[secret.env] = secret.placeholder
+    ambient.prepareEnv?.(env)
+  }
+
+  // The shim is the boundary, with its own temp root and the tunnels that reach this daemon's sockets.
+  const shimRoot = opts.runInSandbox ? opts.srtShim?.runtimeRoot : undefined
+  let sandboxTempDir: string | undefined
+  if (opts.runInSandbox) {
+    isolateHostSocketEnvironment(env, runtimeHome)
+    if (shimRoot !== undefined) shimEnvironment(env, shimRoot)
+    // NOT in k8s: a sandbox pod supplies its own temp dir, and this daemon must not name a path on a machine it is not on.
+    else if (opts.k8s !== true) sandboxTempDir = isolateSandboxTempEnvironment(env, opts.scopeDir, opts.hostKey)
+  }
+
+  if (!opts.runInSandbox) {
+    const gitMetadataWriteRoots =
+      credentialProfile === 'codex'
+        ? runtimeGitMetadataRoots(opts.scopeDir, opts.trustedPrimaryCheckout, sessionDir)
+        : []
+    if (credentialProfile === 'codex') {
+      const privateCodex = join(runtimeHome, '.codex')
+      applyCodexPermissionProfile(env, {
+        protectedRoots: existsSync(privateCodex) ? [realpathSync(privateCodex)] : [],
+        // A session's clones take the exact per-clone entries and its own HOME (§11); an owner checkout's `.git` takes the worktree ones.
+        ...(sessionDir === undefined
+          ? { writableGitMetadataRoots: gitMetadataWriteRoots }
+          : { sessionGitMetadataRoots: gitMetadataWriteRoots, sessionHomeRoot: existingRealpath(runtimeHome) }),
+        allowModelToolUnixSockets: opts.allowModelToolUnixSockets === true
+      })
+    }
+    return { env, inheritProcessEnv: false, runtimeHome, gitMetadataWriteRoots }
+  }
+
+  // PATH entries supplied by version managers are commonly symlinks below the
+  // now-hidden host HOME. Resolve existing absolute entries while still outside
+  // the namespace so runtime-spawned tools use the reviewed real installation.
+  if (env.PATH) {
+    env.PATH = env.PATH.split(delimiter)
+      .map((entry) => {
+        if (!isAbsolute(entry) || !existsSync(entry)) return entry
+        try {
+          return realpathSync(entry)
+        } catch {
+          return entry
+        }
+      })
+      .join(delimiter)
+  }
+  const credentialWritableRoots = compactReadRoots(
+    (credentials?.writablePaths ?? []).map((path) => {
+      const trusted = safeRoot(path, 'shared credential write root')
+      // A credential capability may equal one hidden runtime-state root (the
+      // default Claude layout), but it must not contain another protected root
+      // or reopen HOME, daemon state, an agent root, or shared temp wholesale.
+      const broadened =
+        protectedBoundaryRoots.find((denied) => inside(trusted, denied)) ??
+        protectedRuntimeStateRoots.find((denied) => trusted !== denied && inside(trusted, denied))
+      if (broadened) {
+        throw new Error(`shared credential write root "${trusted}" would reopen protected path "${broadened}"`)
+      }
+      return trusted
+    })
+  )
+  // npm/uv must WRITE their cache (tarballs, index, the npx install tree), so the
+  // pinned host cache needs a write carve-back below the hidden host HOME. Same rule
+  // as a shared credential root: it may sit under a protected root, never contain one.
+  const packageCacheWriteRoots = compactReadRoots(
+    Object.values(packageCacheEnv).map((path) => {
+      const trusted = safeRoot(path, 'host package cache root')
+      const broadened = protectedRoots.find((denied) => inside(trusted, denied))
+      if (broadened) throw new Error(`host package cache root "${trusted}" would reopen protected path "${broadened}"`)
+      return trusted
+    })
+  )
+  // An operator write root follows the exception rule: it may sit below the hidden host HOME (a pnpm store does), never equal or contain HOME, daemon state, an agent root, or shared temp.
+  const operatorWriteRoots = compactReadRoots(
+    (opts.trustedOperatorWriteRoots ?? []).map((path) => validateException(path, 'writable sandbox.mounts source'))
+  )
+  const agentRoot = safeRoot(opts.scopeDir, 'agent root')
+  const trustedWorkspaceWriteRoots = compactReadRoots(
+    (opts.trustedWorkspaceWriteRoots ?? []).map((path) => {
+      const trusted = safeRoot(path, 'trusted workspace write root')
+      if (trusted === agentRoot || !inside(agentRoot, trusted)) {
+        throw new Error(`trusted workspace write root "${trusted}" is outside the agent root`)
+      }
+      return trusted
+    })
+  )
+  // A confined session's clones own their `.git` (§11), so the primary's is never reopened for it; otherwise an isolated session's worktree keeps its index, refs and objects in the OWNER checkout's `.git`, which no other carve-back covers and which the daemon names (a locally authored agent may keep a path the layout does not).
+  const primaryCheckout = opts.trustedPrimaryCheckout
+    ? safeRoot(opts.trustedPrimaryCheckout, 'trusted primary checkout')
+    : primaryCheckoutIn(agentRoot)
+  if (primaryCheckout === agentRoot || !inside(agentRoot, primaryCheckout)) {
+    throw new Error(`trusted primary checkout "${primaryCheckout}" is outside the agent root`)
+  }
+  const gitMetadataWriteRoots = compactReadRoots(
+    (sessionDir === undefined ? gitMetadataDirsIn(agentRoot, primaryCheckout) : sessionGitDirsIn(sessionDir)).map(
+      (gitDir) => {
+        const trusted = safeRoot(gitDir, 'git metadata root')
+        if (trusted === agentRoot || !inside(agentRoot, trusted)) {
+          throw new Error(`git metadata root "${trusted}" is outside the agent root`)
+        }
+        return trusted
+      }
+    )
+  )
+  const claudeRuntime = Boolean(opts.runtime && isClaudeRuntimeDef(opts.runtime))
+  const protectedClaudeSettings = claudeRuntime ? prepareClaudeProtectedSettings(opts.scopeDir, env) : undefined
+  const providerCredentialFiles = claudeRuntime ? claudeProviderCredentialFiles(env, opts.cwd) : []
+  const providerCredentialReadRoots = compactReadRoots(
+    providerCredentialFiles.map(({ envName, path }) => {
+      const canonical = validateException(path, 'Claude provider credential file')
+      // The exception is canonical; point the trusted parent at that same path so
+      // a credential symlink below a hidden HOME cannot become unreadable.
+      if (envName) env[envName] = canonical
+      return canonical
+    })
+  )
+  // Runtime user state is copied into the private HOME for the trusted parent. Its seeded files may hold
+  // settings.env secrets or MCP credentials, so those are denied to the inner tool sandbox; the rest of the
+  // directory is read-only to it, since the runtime stores what its own tools read back there (privateRuntimeState).
+  const claudeState = claudeRuntime
+    ? privateRuntimeState(join(runtimeHome, '.claude'), CLAUDE_STATE_SECRETS)
+    : { readOnly: [], secret: [] }
+  const privateClaudeStateRoots = claudeRuntime
+    ? [
+        ...claudeState.secret,
+        ...[join(runtimeHome, '.claude.json')].filter(existsSync).map((path) => realpathSync(path))
+      ]
+    : []
+  const codexState =
+    credentialProfile === 'codex'
+      ? privateRuntimeState(join(runtimeHome, '.codex'), CODEX_STATE_SECRETS)
+      : { readOnly: [], secret: [] }
+  const privateCodexStateRoots = codexState.secret
+  const readOnlyStateRoots = [...claudeState.readOnly, ...codexState.readOnly]
+
+  const boundary = sandboxBoundary({
+    agentDir: opts.scopeDir,
+    cwd: opts.cwd,
+    runtimeHome,
+    mcpSocketPath: opts.mcpSocketPath,
+    trustedReadRoots: [...trustedRuntimeReadRoots, ...providerCredentialReadRoots],
+    trustedWriteRoots: [
+      ...credentialWritableRoots,
+      ...trustedWorkspaceWriteRoots,
+      ...packageCacheWriteRoots,
+      ...operatorWriteRoots,
+      ...gitMetadataWriteRoots,
+      // Inside the agent dir like every other writable root, so the agent-dir rule needs no exemption for it.
+      ...(sandboxTempDir === undefined ? [] : [sandboxTempDir])
+    ]
+  })
+  // SRT write roots must exist before spawn.
+  // This also initializes workspace/memory for a newly-created agent.
+  for (const path of boundary.writable) {
+    if (!existsSync(path)) mkdirSync(path, { recursive: true })
+  }
+  // The shim's boundary is composed from these mounts on this machine (§11); a per-host policy is only for a runtime wrapped alone.
+  // Compacted, so the cwd, the HOME and the clones' `.git` fold into the session directory and the environment is the same whatever the cwd.
+  const writable = compactReadRoots(boundary.writable)
+  // A confined session's environment is its directory; every other host's is the agent's, whose agent.json only the mounts below leave hidden.
+  const srt =
+    shimRoot === undefined
+      ? undefined
+      : {
+          workspaceRoot: sessionDir ?? agentRoot,
+          // An agent-scoped environment starts where its host does, which anchors SRT's own protections as a runtime wrapped alone's cwd does.
+          ...(sessionDir === undefined ? { cwd: boundary.gitSafeDirectories[0]! } : {}),
+          mounts: [
+            ...writable.map((path) => ({ source: path, target: path, mode: 'writable' as const })),
+            ...compactReadRoots(boundary.allowRead)
+              .filter((path) => !writable.some((root) => inside(root, path)))
+              .map((path) => ({ source: path, target: path, mode: 'readonly' as const }))
+          ]
+        }
+  const settingsPath =
+    srt !== undefined
+      ? undefined
+      : writeSandboxSettings(opts.scopeDir, hostKeyDirName(opts.hostKey), {
+          writable: boundary.writable,
+          // Host user data is default-denied. Re-open only the current agent surfaces
+          // plus trusted executable/package roots above; never an agent-provided path.
+          denyRead: denyReadRoots,
+          allowRead: boundary.allowRead,
+          gitSafeDirectories: boundary.gitSafeDirectories
+        })
+  const protectedCredentialRoots = compactReadRoots([
+    ...credentialWritableRoots,
+    ...providerCredentialReadRoots,
+    ...privateClaudeStateRoots,
+    ...privateCodexStateRoots
+  ])
+  if (credentialProfile === 'codex') {
+    // Codex's :workspace protects `.git` and pins writes to the cwd: re-open only what the outer sandbox already made writable.
+    const outerWritable = (path: string): boolean => boundary.writable.some((root) => inside(root, path))
+    const writableGitMetadataRoots = gitMetadataWriteRoots.filter(outerWritable)
+    // A confined session's HOME is a SIBLING of the cwd (§11), so `:workspace` leaves it unwritable and no package manager can reach its own cache.
+    const sessionHomeRoot = sessionDir === undefined ? undefined : existingRealpath(runtimeHome)
+    applyCodexPermissionProfile(env, {
+      protectedRoots: protectedCredentialRoots,
+      readOnlyRoots: readOnlyStateRoots,
+      // A session's clones take the exact per-clone entries; an owner checkout's `.git` takes the worktree ones.
+      ...(sessionDir === undefined
+        ? { writableGitMetadataRoots }
+        : { sessionGitMetadataRoots: writableGitMetadataRoots }),
+      ...(sessionHomeRoot !== undefined && outerWritable(sessionHomeRoot) ? { sessionHomeRoot } : {}),
+      sharedWriteRoots: operatorWriteRoots.filter(outerWritable),
+      allowModelToolUnixSockets: opts.allowModelToolUnixSockets === true,
+      disableUnifiedExec: true
+    })
+  }
+  return {
+    env,
+    inheritProcessEnv: false,
+    runtimeHome,
+    gitMetadataWriteRoots,
+    ...(srt !== undefined
+      ? { srt }
+      : {
+          sandbox: {
+            mechanism: opts.sandboxMechanism!,
+            writable: boundary.writable,
+            settingsPath: settingsPath!,
+            cwd: boundary.gitSafeDirectories[0]!,
+            denyReadRoots,
+            allowReadRoots: boundary.allowRead
+          }
+        }),
+    toolSandbox: {
+      protectedCredentialRoots,
+      ...(readOnlyStateRoots.length > 0 ? { readOnlyStateRoots } : {}),
+      ...(opts.allowModelToolUnixSockets ? { allowModelToolUnixSockets: true } : {}),
+      ...(protectedClaudeSettings ? { claudeProtectedSettings: protectedClaudeSettings } : {}),
+      ...(operatorWriteRoots.length > 0 ? { sharedWriteRoots: operatorWriteRoots } : {})
+    }
+  }
+}

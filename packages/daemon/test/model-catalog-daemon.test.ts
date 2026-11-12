@@ -1,0 +1,960 @@
+import { describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import type { SessionConfigOption } from '@agentclientprotocol/sdk/unstable'
+import type { FactsRuntimeProfile } from '@agentconnect.md/protocol'
+import { Daemon } from '../src/daemon.js'
+import { statePath } from '../src/paths.js'
+import { LocalStore } from '../src/store/local-store.js'
+import { catalogFingerprint } from '../src/runtimes/model-catalog.js'
+import { PROBE_TTL_MS } from '../src/runtimes/facts-registry.js'
+import type { ResolvedRuntimeCatalog } from '../src/runtimes/registry.js'
+import type { RuntimeDef } from '../src/config/config-schema.js'
+import { preparedProbeLaunch, type ProbeOptions, type RuntimeProbeResult } from '../src/runtimes/runtime-prober.js'
+import { FakeClock } from './cp/fake-clock.js'
+
+/** Daemon-level integration tests for the runtime-model-catalog wiring
+ *  (design runtime-model-catalog.md §4/§6/§9): startup hydrate, the sweep
+ *  fold's phase-1 seeding + provenance flip, last-good advertisement fallback,
+ *  and the cached-provenance activation gate. */
+
+const FAKE_RT: RuntimeDef = { command: 'fake-agent', args: ['--acp'], env: [] }
+
+function root(): string {
+  const path = mkdtempSync(join(tmpdir(), 'ac-model-catalog-daemon-'))
+  writeFileSync(join(path, 'config.json'), JSON.stringify({ version: 1, controlPlane: { enabled: false } }))
+  return path
+}
+
+/** Installed catalog of non-curated (user-source) runtimes — always admitted,
+ *  so hydrate + the ordinary sweep cover them without ACP admission. */
+function catalogOf(runtimes: Record<string, RuntimeDef>): ResolvedRuntimeCatalog {
+  return {
+    entries: Object.fromEntries(
+      Object.entries(runtimes).map(([id, rt]) => [
+        id,
+        { runtime: rt, source: 'user' as const, name: id, version: '', skillsAgentId: null }
+      ])
+    ),
+    runtimes
+  }
+}
+
+/** Pre-write last-good cache rows into the LocalStore the daemon will open. */
+async function seedCache(
+  rootDir: string,
+  rows: Array<{
+    runtimeId: string
+    models: Array<{
+      id: string
+      caps: { efforts?: Array<{ value: string; name?: string }>; defaultEffort?: string; fastMode?: boolean }
+    }>
+    defaultModel?: string
+  }>
+): Promise<void> {
+  const store = await LocalStore.open(statePath(rootDir))
+  for (const row of rows) {
+    await store.recordRuntimeCatalogMeta({
+      runtimeId: row.runtimeId,
+      fingerprint: 'fp-cache',
+      source: 'acp',
+      ...(row.defaultModel ? { defaultModel: row.defaultModel } : {}),
+      permissionModes: [{ value: 'safe', name: 'Safe' }],
+      observedAt: 1_000
+    })
+    for (const m of row.models)
+      await store.upsertRuntimeModelCap({
+        runtimeId: row.runtimeId,
+        modelId: m.id,
+        fingerprint: 'fp-cache',
+        caps: m.caps,
+        observedAt: 1_000
+      })
+  }
+  await store.close()
+}
+
+/** Exactly the payload the CP client's `runtimeProfiles()` dep produces for the
+ *  register-time `facts/daemon-runtimes` snapshot (cp/client.ts sends it at READY). */
+function firstSnapshot(daemon: Daemon): FactsRuntimeProfile[] {
+  const d = daemon as any
+  return d.admittedRuntimeIds().map((id: string) => d.runtimeFacts.profileFor(id))
+}
+
+/** Capture post-sweep `facts/daemon-runtimes` emissions via the injected-cpClient
+ *  idiom (daemon-hook.test.ts) — CP is disabled, so no real client exists. */
+function captureEmits(daemon: Daemon): FactsRuntimeProfile[][] {
+  const emitted: FactsRuntimeProfile[][] = []
+  ;(daemon as any).cpClient = {
+    emitDaemonRuntimes: (profiles: FactsRuntimeProfile[]) => {
+      emitted.push(profiles)
+    },
+    stop: vi.fn(async () => {})
+  }
+  return emitted
+}
+
+/** Replace the real ModelCatalogService with a recording stub: these tests cover
+ *  the daemon.ts wiring (hydrate / phase-1 fold / report path); the phase-2 gate
+ *  and enumerator are unit-tested in model-catalog.test.ts. The stub also proves
+ *  no phase-2 discovery is needed for the behaviors asserted here. */
+function stubCatalogSvc(daemon: Daemon): ReturnType<typeof vi.fn> {
+  const noteProbe = vi.fn()
+  ;(daemon as any).modelCatalogSvc = { noteProbe, stop: vi.fn(async () => {}) }
+  return noteProbe
+}
+
+function daemonWith(opts: {
+  root: string
+  catalog: ResolvedRuntimeCatalog
+  clock: FakeClock
+  probe: (runtimes: Record<string, RuntimeDef>) => Promise<RuntimeProbeResult[]>
+}): Daemon {
+  return new Daemon({
+    root: opts.root,
+    clock: opts.clock,
+    resolveCatalog: async () => opts.catalog,
+    installed: (runtimes) => runtimes,
+    probeRuntimes: opts.probe as never,
+    hostFactory: () => ({}) as never,
+    sandboxMechanism: null
+  })
+}
+
+const neverProbe = async (): Promise<RuntimeProbeResult[]> => []
+
+describe('daemon model-catalog cache hydrate', () => {
+  it('serves last-good models + matrix in the first facts snapshot, ignoring uninstalled runtimes', async () => {
+    const dir = root()
+    await seedCache(dir, [
+      {
+        runtimeId: 'fake',
+        defaultModel: 'm-a',
+        models: [
+          { id: 'm-a', caps: { efforts: [{ value: 'low' }], defaultEffort: 'low', fastMode: false } },
+          { id: 'm-b', caps: { efforts: [] } }
+        ]
+      },
+      // Cache rows for a runtime that is NOT in the installed catalog: hydrate
+      // must skip them (no advertise, no report) while keeping the rows on disk.
+      { runtimeId: 'ghost', models: [{ id: 'm-ghost', caps: {} }] }
+    ])
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    const daemon = daemonWith({ root: dir, catalog: catalogOf({ fake: FAKE_RT }), clock, probe: neverProbe })
+
+    try {
+      await daemon.start()
+      const profiles = firstSnapshot(daemon)
+      expect(profiles.map((p) => p.runtime)).toEqual(['fake'])
+      const fake = profiles[0]!
+      // Advertisement comes back from the cache, marked with its provenance.
+      expect(fake.models).toEqual(['m-a', 'm-b'])
+      expect(fake.modelsSource).toBe('cached')
+      // The capability matrix rides the same first frame (raw efforts — non-claude
+      // runtimes get no synthetic tiers).
+      expect(fake.modelCatalog).toEqual({
+        modelSwitching: true,
+        models: [
+          { id: 'm-a', efforts: [{ value: 'low' }], defaultEffort: 'low', fastMode: false },
+          { id: 'm-b', efforts: [] }
+        ],
+        defaultModel: 'm-a',
+        permissionModes: [{ value: 'safe', name: 'Safe' }],
+        source: 'acp',
+        observedAt: new Date(1_000).toISOString()
+      })
+      // The uninstalled runtime is absent from memory but retained on disk
+      // (it may only be temporarily unresolved).
+      expect((daemon as any).runtimeFacts.models.has('ghost')).toBe(false)
+      expect((daemon as any).runtimeFacts.catalogs.has('ghost')).toBe(false)
+      expect(await ((daemon as any).store as LocalStore).getRuntimeCatalogMeta('ghost')).toBeDefined()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('never hydrates or advertises a catalog past its retention window', async () => {
+    // Retention runs BEFORE the hydrate, synchronously — the ordering the removed
+    // gcRuntimeCatalog used to provide. Without it this member boots advertising models it
+    // has not seen in over a month, and the cached provenance keeps the activation gate
+    // permissive over them.
+    const dir = root()
+    await seedCache(dir, [
+      { runtimeId: 'fake', defaultModel: 'm-stale', models: [{ id: 'm-stale', caps: { efforts: [] } }] }
+    ])
+    const clock = new FakeClock()
+    clock.advance(1_000 + 31 * 24 * 3_600_000)
+    const daemon = daemonWith({ root: dir, catalog: catalogOf({ fake: FAKE_RT }), clock, probe: neverProbe })
+
+    try {
+      await daemon.start()
+      const fake = firstSnapshot(daemon)[0]!
+      expect(fake.models).toEqual([])
+      expect(fake.modelsSource).toBeUndefined()
+      expect(fake.modelCatalog).toBeUndefined()
+      // Collected, not merely ignored: both catalog tables are empty afterwards.
+      const store = (daemon as any).store as LocalStore
+      expect(await store.listRuntimeCatalogMetas()).toEqual([])
+      expect(await store.listRuntimeModelCaps()).toEqual([])
+    } finally {
+      await daemon.stop()
+    }
+  })
+})
+
+describe('daemon native catalog for a runtime with no ACP model selector', () => {
+  // A successful probe without models needs a native catalog to fill the picker.
+  const noSelector: RuntimeProbeResult = { runtime: 'fake', ok: true, models: [], probedVersion: '1.0.0' }
+  const loggedOut: RuntimeProbeResult = {
+    runtime: 'fake',
+    ok: false,
+    models: [],
+    error: 'Authentication required',
+    authRequired: true
+  }
+
+  /** Start a daemon whose sweeps answer with whatever `probes.results` holds at the time. */
+  async function startDaemon(probes: { results: RuntimeProbeResult[] }): Promise<{ daemon: Daemon; clock: FakeClock }> {
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    const catalog = catalogOf({ fake: FAKE_RT })
+    const daemon = daemonWith({ root: root(), catalog, clock, probe: async () => probes.results })
+    await daemon.start()
+    stubCatalogSvc(daemon)
+    return { daemon, clock }
+  }
+
+  /** Commit a driver catalog the way ModelCatalogService does (meta, caps, prune), then rebuild like onUpdated. */
+  async function commitNative(daemon: Daemon, clock: FakeClock, ids: string[]): Promise<void> {
+    const store = (daemon as any).store as LocalStore
+    await store.recordRuntimeCatalogMeta({
+      runtimeId: 'fake',
+      fingerprint: 'fp-native',
+      source: 'native',
+      observedAt: clock.now()
+    })
+    for (const id of ids)
+      await store.upsertRuntimeModelCap({
+        runtimeId: 'fake',
+        modelId: id,
+        fingerprint: 'fp-native',
+        caps: { name: id.toUpperCase() },
+        observedAt: clock.now()
+      })
+    await store.pruneRuntimeModelCaps('fake', ids)
+    await (daemon as any).runtimeFacts.rebuildCatalog('fake')
+  }
+
+  /** A real re-probe: inside the probe TTL a sweep only re-emits the last snapshot. */
+  async function sweep(daemon: Daemon, clock: FakeClock): Promise<void> {
+    clock.advance(PROBE_TTL_MS + 1)
+    await (daemon as any).runtimeFacts.probeAndEmit(true)
+  }
+
+  const profile = (daemon: Daemon): FactsRuntimeProfile => (daemon as any).runtimeFacts.profileFor('fake')
+
+  it('advertises the native catalog after a successful probe that advertised none', async () => {
+    const { daemon, clock } = await startDaemon({ results: [noSelector] })
+    try {
+      await sweep(daemon, clock)
+      expect(profile(daemon).models).toEqual([])
+      await commitNative(daemon, clock, ['g-flash', 'g-pro'])
+      expect(profile(daemon)).toMatchObject({ models: ['g-flash', 'g-pro'], modelsSource: 'cached' })
+      expect(profile(daemon).modelCatalog?.source).toBe('native')
+      expect(profile(daemon).modelCatalog?.modelSwitching).toBe(false)
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('keeps the catalog advertisement across later sweeps that again advertise nothing', async () => {
+    const { daemon, clock } = await startDaemon({ results: [noSelector] })
+    try {
+      await sweep(daemon, clock)
+      await commitNative(daemon, clock, ['g-flash'])
+      await sweep(daemon, clock)
+      expect(profile(daemon)).toMatchObject({ models: ['g-flash'], modelsSource: 'cached' })
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('follows the native catalog when a refresh adds and drops models', async () => {
+    const { daemon, clock } = await startDaemon({ results: [noSelector] })
+    try {
+      await sweep(daemon, clock)
+      await commitNative(daemon, clock, ['g-flash', 'g-pro'])
+      await commitNative(daemon, clock, ['g-flash', 'g-ultra'])
+      expect(profile(daemon)).toMatchObject({ models: ['g-flash', 'g-ultra'], modelsSource: 'cached' })
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('never replaces an advertisement the runtime really made, even after an auth failure empties it', async () => {
+    const probes = { results: [{ ...noSelector, models: ['real-a'] }] }
+    const { daemon, clock } = await startDaemon(probes)
+    try {
+      await sweep(daemon, clock)
+      await commitNative(daemon, clock, ['g-flash'])
+      expect(profile(daemon)).toMatchObject({ models: ['real-a'], modelsSource: 'probed' })
+      probes.results = [loggedOut]
+      await sweep(daemon, clock)
+      // A discovery already in flight lands after the logout.
+      await commitNative(daemon, clock, ['g-flash'])
+      expect(profile(daemon)).toMatchObject({ models: [], modelsSource: 'probed', authRequired: true })
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('empties on an auth failure and advertises the catalog again once a probe succeeds', async () => {
+    const probes = { results: [noSelector] }
+    const { daemon, clock } = await startDaemon(probes)
+    try {
+      await sweep(daemon, clock)
+      await commitNative(daemon, clock, ['g-flash'])
+      probes.results = [loggedOut]
+      await sweep(daemon, clock)
+      await commitNative(daemon, clock, ['g-flash'])
+      expect(profile(daemon).models).toEqual([])
+      probes.results = [noSelector]
+      await sweep(daemon, clock)
+      expect(profile(daemon)).toMatchObject({ models: ['g-flash'], modelsSource: 'cached' })
+    } finally {
+      await daemon.stop()
+    }
+  })
+})
+
+describe('daemon activation gate provenance rule', () => {
+  it('is permissive for a cache-hydrated model list and turns strict after the first live probe', async () => {
+    const dir = root()
+    await seedCache(dir, [{ runtimeId: 'fake', models: [{ id: 'm-old', caps: {} }] }])
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    const probe = vi.fn(async (): Promise<RuntimeProbeResult[]> => [{ runtime: 'fake', ok: true, models: ['m-old'] }])
+    const daemon = daemonWith({ root: dir, catalog: catalogOf({ fake: FAKE_RT }), clock, probe })
+    const agent = { runtime: 'fake', runtimeOverrides: { model: 'm-new' }, mcpServers: [] } as never
+
+    try {
+      await daemon.start()
+      // Hydrated advertisement is non-empty but cached ⇒ NOT live knowledge: a
+      // model added while the daemon was down must not be rejected at startup.
+      expect((daemon as any).runtimeFacts.models.get('fake')).toEqual(['m-old'])
+      expect((daemon as any).activationCapabilityError(agent)).toBeUndefined()
+
+      stubCatalogSvc(daemon)
+      const emitted = captureEmits(daemon)
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+
+      // The sweep flips provenance cached→probed in the emitted snapshot...
+      expect(emitted).toHaveLength(1)
+      expect(emitted[0]![0]).toMatchObject({ runtime: 'fake', models: ['m-old'], modelsSource: 'probed' })
+      // ...and the gate now enforces the live list.
+      expect((daemon as any).activationCapabilityError(agent)).toBe('model "m-new" is not offered by runtime "fake"')
+    } finally {
+      await daemon.stop()
+    }
+  })
+})
+
+describe('microsandbox runtime facts', () => {
+  it.each(['srt', 'microsandbox'])('reports installation and stored login independently with %s', async (backend) => {
+    const dir = root()
+    const hostHome = join(dir, 'host-home')
+    for (const part of ['.grok', '.pi/agent', '.local/share/amp']) mkdirSync(join(hostHome, part), { recursive: true })
+    writeFileSync(
+      join(hostHome, '.grok/auth.json'),
+      JSON.stringify({ 'xai::api_key': { key: 'fixture-key', auth_mode: 'api_key' } })
+    )
+    writeFileSync(
+      join(hostHome, '.pi/agent/auth.json'),
+      JSON.stringify({ anthropic: { type: 'api_key', key: 'fixture-key' } })
+    )
+    let catalog = catalogOf({})
+    const probe = vi.fn(async (runtimes: Record<string, RuntimeDef>): Promise<RuntimeProbeResult[]> =>
+      Object.keys(runtimes).map((runtime) => ({ runtime, ok: true, models: ['enumerated-without-login'] }))
+    )
+    const daemon = new Daemon({
+      root: dir,
+      clock: new FakeClock(),
+      resolveCatalog: async () => catalog,
+      probeRuntimes: probe,
+      hostFactory: () => ({}) as never,
+      sandboxMechanism: null
+    })
+    try {
+      await daemon.start()
+      vi.stubEnv('HOME', hostHome)
+      vi.stubEnv('USERPROFILE', hostHome)
+      vi.stubEnv('GROK_AUTH_PATH', join(hostHome, '.grok/auth.json'))
+      vi.stubEnv('PI_CODING_AGENT_DIR', join(hostHome, '.pi/agent'))
+      vi.stubEnv('XDG_DATA_HOME', join(hostHome, '.local/share'))
+      const available = { command: process.execPath, args: [], env: [] }
+      const missing = { command: join(dir, 'missing-binary'), args: [], env: [] }
+      catalog = catalogOf({ 'grok-build': available, 'amp-acp': available, 'pi-acp': missing, unknown: missing })
+      const d = daemon as any
+      if (backend === 'microsandbox') {
+        d.microsandboxTable = {
+          runtimes: ['grok-build', 'amp-acp'].map((id) => ({ id, command: `/image/bin/${id}`, args: ['acp'] }))
+        }
+      }
+      await d.discoverRuntimes(dir, d.cfg, [])
+      expect(d.reportedRuntimeIds().sort()).toEqual(['amp-acp', 'grok-build', 'pi-acp'])
+      await d.runtimeFacts.probeAndEmit(true)
+      expect(probe.mock.calls.map(([runtimes]) => Object.keys(runtimes))).toEqual([['grok-build', 'amp-acp']])
+      expect(d.runtimeFacts.profileFor('grok-build')).toMatchObject({
+        hostAvailable: true,
+        credentialsConfigured: true
+      })
+      expect(d.runtimeFacts.profileFor('grok-build').authRequired).toBeUndefined()
+      expect(d.runtimeFacts.profileFor('amp-acp')).toMatchObject({
+        hostAvailable: true,
+        credentialsConfigured: false,
+        authRequired: true,
+        models: ['enumerated-without-login']
+      })
+      // The runtime-level reading is the host install's whatever the strategy; the image's is on the per-strategy entry.
+      expect(d.runtimeFacts.profileFor('pi-acp')).toMatchObject({
+        hostAvailable: false,
+        credentialsConfigured: true,
+        unavailableReason: 'host-binary-missing'
+      })
+      writeFileSync(
+        join(hostHome, '.local/share/amp/secrets.json'),
+        JSON.stringify({ 'apiKey@https://ampcode.example.test/': 'fixture-key' })
+      )
+      expect(d.runtimeFacts.profileFor('amp-acp').credentialsConfigured).toBe(true)
+      expect(d.runtimeFacts.profileFor('amp-acp').authRequired).toBeUndefined()
+    } finally {
+      vi.unstubAllEnvs()
+      await daemon.stop()
+    }
+  })
+
+  it.each([true, false])(
+    'retains stored logins through host probes and model refreshes (expired runtime in image: %s)',
+    async (expiredInImage) => {
+      const dir = root()
+      const hostHome = join(dir, 'host-home')
+      for (const part of ['.codex', '.grok', '.pi/agent', '.local/share/amp']) {
+        mkdirSync(join(hostHome, part), { recursive: true })
+      }
+      writeFileSync(join(hostHome, '.codex', 'auth.json'), JSON.stringify({ OPENAI_API_KEY: 'fixture-key' }))
+      writeFileSync(
+        join(hostHome, '.grok', 'auth.json'),
+        JSON.stringify({ 'xai::api_key': { key: 'fixture-key', auth_mode: 'api_key' } })
+      )
+      writeFileSync(
+        join(hostHome, '.pi', 'agent', 'auth.json'),
+        JSON.stringify({
+          anthropic: { type: 'oauth', access: 'fixture-access', refresh: 'fixture-refresh', expires: 1 }
+        })
+      )
+      writeFileSync(join(hostHome, '.local', 'share', 'amp', 'secrets.json'), '{}')
+      const clock = new FakeClock()
+      clock.advance(10_000)
+      let catalog = catalogOf({})
+      const probe = vi.fn(
+        async (runtimes: Record<string, RuntimeDef>, options: ProbeOptions): Promise<RuntimeProbeResult[]> =>
+          Object.entries(runtimes).map(([runtime, definition]) => {
+            const cwd = join(dir, 'probes', runtime, 'workspace')
+            mkdirSync(cwd, { recursive: true })
+            expect(preparedProbeLaunch(runtime, definition, cwd, options)).toBeDefined()
+            return runtime === 'pi-acp'
+              ? { runtime, ok: false, models: [], authRequired: true, error: 'Authentication required' }
+              : { runtime, ok: true, models: ['host-model'], probedVersion: 'host-version', acpProtocolVersion: 1 }
+          })
+      )
+      const daemon = new Daemon({
+        root: dir,
+        clock,
+        resolveCatalog: async () => catalog,
+        installed: (runtimes) => runtimes,
+        probeRuntimes: probe,
+        hostFactory: () => ({}) as never,
+        sandboxMechanism: null
+      })
+
+      try {
+        await daemon.start()
+        vi.stubEnv('HOME', hostHome)
+        vi.stubEnv('USERPROFILE', hostHome)
+        vi.stubEnv('CODEX_HOME', join(hostHome, '.codex'))
+        vi.stubEnv('GROK_HOME', join(hostHome, '.grok'))
+        vi.stubEnv('GROK_AUTH_PATH', join(hostHome, '.grok', 'auth.json'))
+        vi.stubEnv('PI_CODING_AGENT_DIR', join(hostHome, '.pi', 'agent'))
+        vi.stubEnv('XDG_DATA_HOME', join(hostHome, '.local', 'share'))
+        catalog = catalogOf({ 'grok-build': FAKE_RT, 'codex-acp': FAKE_RT, 'pi-acp': FAKE_RT, 'amp-acp': FAKE_RT })
+        catalog.entries['codex-acp']!.source = 'curated'
+        catalog.entries['pi-acp']!.source = 'curated'
+        const d = daemon as any
+        d.microsandboxTable = {
+          runtimes: ['codex-acp', ...(expiredInImage ? ['pi-acp'] : []), 'amp-acp'].map((id) => ({
+            id,
+            command: `/image/bin/${id}`,
+            args: ['acp'],
+            version: 'image-version',
+            models: ['image-model'],
+            acp: { protocolVersion: 9 }
+          }))
+        }
+        await d.discoverRuntimes(dir, d.cfg, [])
+        expect(d.reportedRuntimeIds().sort()).toEqual(['amp-acp', 'codex-acp', 'grok-build', 'pi-acp'])
+        expect(d.microsandboxCatalog.entries['amp-acp']).toBeDefined()
+        await d.hydrateRuntimeCaches()
+        expect(d.runtimeFacts.profileFor('codex-acp').models).toEqual([])
+        expect(d.runtimeFacts.profileFor('codex-acp').hostVersion).toBe('')
+        const onCatalogUpdated = d.modelCatalogSvc.deps.onUpdated
+        const noteProbe = stubCatalogSvc(daemon)
+        const emitted = captureEmits(daemon)
+
+        await d.runtimeFacts.probeAndEmit(true)
+
+        expect(probe.mock.calls.map(([runtimes]) => Object.keys(runtimes))).toEqual([
+          ['grok-build', 'amp-acp'],
+          ['codex-acp', 'pi-acp']
+        ])
+        expect(noteProbe.mock.calls.map(([input]) => input.runtimeId).sort()).toEqual([
+          'amp-acp',
+          'codex-acp',
+          'grok-build'
+        ])
+        expect(d.runtimeFacts.profileFor('codex-acp')).toMatchObject({
+          runtime: 'codex-acp',
+          version: 'image-version',
+          hostVersion: 'host-version',
+          models: ['host-model'],
+          modelsSource: 'probed',
+          acpProtocolVersion: 1
+        })
+        expect(d.runtimeFacts.profileFor('codex-acp').unavailableReason).toBeUndefined()
+        expect(d.runtimeFacts.profileFor('grok-build')).toMatchObject({
+          hostVersion: 'host-version',
+          models: ['host-model']
+        })
+        expect(d.runtimeFacts.profileFor('grok-build').unavailableReason).toBeUndefined()
+        expect(d.runtimeFacts.profileFor('pi-acp')).toMatchObject({ authRequired: true })
+        expect(d.runtimeFacts.profileFor('amp-acp')).toMatchObject({
+          authRequired: true,
+          credentialsConfigured: false
+        })
+        expect(d.runtimeFacts.profileFor('pi-acp').unavailableReason).toBeUndefined()
+        expect(d.curatedRuntimeAdmission.status('codex-acp', 'curated')).toBe('verified')
+        expect(d.curatedRuntimeAdmission.status('pi-acp', 'curated')).toBe('failed')
+        expect(d.reportedRuntimeIds().sort()).toEqual(['amp-acp', 'codex-acp', 'grok-build', 'pi-acp'])
+        expect(d.localRuntimeCatalog.runtimes['codex-acp'].command).toBe('fake-agent')
+        expect(d.microsandboxCatalog.runtimes['codex-acp'].command).toBe('/image/bin/codex-acp')
+        await onCatalogUpdated('codex-acp')
+        expect(
+          emitted
+            .at(-1)
+            ?.map((profile) => profile.runtime)
+            .sort()
+        ).toEqual(['amp-acp', 'codex-acp', 'grok-build', 'pi-acp'])
+        probe.mockClear()
+        d.runtimeFacts.armProbeRefresh()
+        clock.advance(5 * 60_000)
+        await vi.waitFor(() => expect(probe).toHaveBeenCalledOnce())
+        expect(Object.keys(probe.mock.calls[0]![0])).toEqual(['codex-acp', 'pi-acp'])
+      } finally {
+        vi.unstubAllEnvs()
+        await daemon.stop()
+      }
+    }
+  )
+})
+
+describe('daemon last-good advertisement fallback', () => {
+  it('a transient first probe failure keeps cached models + catalog; a later success replaces them without phase 2', async () => {
+    const dir = root()
+    await seedCache(dir, [
+      { runtimeId: 'fake', defaultModel: 'm-a', models: [{ id: 'm-a', caps: { efforts: [{ value: 'low' }] } }] }
+    ])
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    let results: RuntimeProbeResult[] = [{ runtime: 'fake', ok: false, models: [], error: 'spawn failed' }]
+    const probe = vi.fn(async () => results)
+    const daemon = daemonWith({ root: dir, catalog: catalogOf({ fake: FAKE_RT }), clock, probe })
+
+    try {
+      await daemon.start()
+      const cachedCatalog = firstSnapshot(daemon)[0]!.modelCatalog
+      expect(cachedCatalog).toBeDefined()
+      const noteProbe = stubCatalogSvc(daemon)
+      const emitted = captureEmits(daemon)
+
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      expect(probe).toHaveBeenCalledTimes(1)
+      const failed = emitted[0]![0]!
+      // A disposable refresh can fail while established runtime homes remain
+      // usable. Keep the last-good advertisement permissive until live evidence
+      // replaces it, instead of making the picker disappear after restart.
+      expect(failed.models).toEqual(['m-a'])
+      expect(failed.modelsSource).toBe('cached')
+      // Capability knowledge also survives the failure, on the wire and on disk.
+      expect(failed.modelCatalog).toEqual(cachedCatalog)
+      expect((await ((daemon as any).store as LocalStore).listRuntimeModelCaps('fake')).map((r) => r.modelId)).toEqual([
+        'm-a'
+      ])
+      expect(noteProbe).not.toHaveBeenCalled() // failures never reach phase 2
+
+      // Runtime comes back: the next sweep restores the advertisement directly —
+      // no phase-2 rediscovery involved (the catalog service stub can't run one).
+      clock.advance(6 * 60_000) // past the 5-minute probe TTL
+      results = [{ runtime: 'fake', ok: true, models: ['m-a', 'm-b'] }]
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      expect(probe).toHaveBeenCalledTimes(2)
+      const restored = emitted[1]![0]!
+      expect(restored.models).toEqual(['m-a', 'm-b'])
+      expect(restored.modelsSource).toBe('probed')
+      expect(restored.modelCatalog).toEqual(cachedCatalog)
+    } finally {
+      await daemon.stop()
+    }
+  })
+})
+
+describe('daemon auth-required probe fold', () => {
+  it.each(['srt', 'microsandbox'])(
+    'shares one probe and live login state across compatibility ids under %s',
+    async (backend) => {
+      const dir = root()
+      const clock = new FakeClock()
+      clock.advance(10_000)
+      let catalog = catalogOf({})
+      const probe = vi.fn(async (runtimes: Record<string, RuntimeDef>): Promise<RuntimeProbeResult[]> =>
+        Object.keys(runtimes).map((runtime) => ({
+          runtime,
+          ok: true,
+          models: ['m1'],
+          probedVersion: 'host-v1',
+          acpProtocolVersion: 1,
+          mcpCapabilities: { http: true, sse: false }
+        }))
+      )
+      const daemon = new Daemon({
+        root: dir,
+        clock,
+        resolveCatalog: async () => catalog,
+        installed: (r) => r,
+        probeRuntimes: probe,
+        hostFactory: () => ({}) as never,
+        sandboxMechanism: null
+      })
+      try {
+        await daemon.start()
+        catalog = catalogOf({ native: FAKE_RT, legacy: FAKE_RT })
+        catalog.entries.native!.source = 'curated'
+        catalog.entries.legacy = { ...catalog.entries.native!, aliasOf: 'native' }
+        const d = daemon as any
+        if (backend === 'microsandbox')
+          d.microsandboxTable = {
+            runtimes: [{ id: 'legacy', command: '/image/bin/native', version: 'image-v2', acp: { protocolVersion: 1 } }]
+          }
+        await d.discoverRuntimes(dir, d.cfg, [])
+        stubCatalogSvc(daemon)
+        captureEmits(daemon)
+        await d.runtimeFacts.probeAndEmit(true)
+
+        expect(probe).toHaveBeenCalledTimes(1)
+        expect(Object.keys(probe.mock.calls[0]![0])).toEqual(['native'])
+        expect(d.admittedRuntimeIds()).toEqual(expect.arrayContaining(['native', 'legacy']))
+        expect(d.runtimeFacts.profileFor('legacy')).toEqual({
+          ...d.runtimeFacts.profileFor('native'),
+          runtime: 'legacy',
+          aliasOf: 'native'
+        })
+        expect(d.runtimeFacts.profileFor('native')).toMatchObject({
+          hostAvailable: true,
+          hostVersion: 'host-v1',
+          version: backend === 'microsandbox' ? 'image-v2' : 'host-v1',
+          models: ['m1']
+        })
+        expect(d.runtimeFacts.offeredModels('legacy')).toEqual(['m1'])
+        expect(d.runtimeFacts.mcpCapabilities('legacy')).toEqual({ http: true, sse: false })
+        d.runtimeFacts.noteAuthFromTurn('legacy', true)
+        expect(d.runtimeFacts.profileFor('native').authRequired).toBe(true)
+        expect(d.runtimeFacts.profileFor('legacy').authRequired).toBe(true)
+        d.runtimeFacts.noteAuthFromTurn('native', false)
+        expect(d.runtimeFacts.profileFor('legacy').authRequired).toBeUndefined()
+        await d.runtimeFacts.applySandboxProbe({ runtime: 'legacy', ok: true, models: ['m2'] })
+        expect(d.runtimeFacts.offeredModels('native')).toEqual(['m2'])
+        expect(d.runtimeFacts.offeredModels('legacy')).toEqual(['m2'])
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  it('flags authRequired in the snapshot on an auth-rejected probe and clears it once a probe succeeds', async () => {
+    const dir = root()
+    await seedCache(dir, [{ runtimeId: 'fake', models: [{ id: 'm-cached', caps: {} }] }])
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    let results: RuntimeProbeResult[] = [
+      { runtime: 'fake', ok: false, models: [], error: 'Authentication required', authRequired: true }
+    ]
+    const probe = vi.fn(async () => results)
+    const daemon = daemonWith({ root: dir, catalog: catalogOf({ fake: FAKE_RT }), clock, probe })
+
+    try {
+      await daemon.start()
+      stubCatalogSvc(daemon)
+      const emitted = captureEmits(daemon)
+
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      // Authentication rejection is authoritative and clears even a warm cache.
+      expect(emitted[0]![0]).toMatchObject({
+        runtime: 'fake',
+        models: [],
+        modelsSource: 'probed',
+        authRequired: true
+      })
+
+      // Logged in meanwhile: the next sweep drops the flag off the frame
+      // entirely (absent ⇒ ok, matching older-daemon semantics).
+      clock.advance(6 * 60_000) // past the 5-minute probe TTL
+      results = [{ runtime: 'fake', ok: true, models: ['m-a'] }]
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      expect(emitted[1]![0]!.runtime).toBe('fake')
+      expect(emitted[1]![0]!.authRequired).toBeUndefined()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('does not flag authRequired for non-auth probe failures', async () => {
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    const probe = vi.fn(async (): Promise<RuntimeProbeResult[]> => [
+      { runtime: 'fake', ok: false, models: [], error: 'probe timed out after 30000ms' }
+    ])
+    const daemon = daemonWith({ root: root(), catalog: catalogOf({ fake: FAKE_RT }), clock, probe })
+
+    try {
+      await daemon.start()
+      stubCatalogSvc(daemon)
+      const emitted = captureEmits(daemon)
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      expect(emitted[0]![0]!.authRequired).toBeUndefined()
+      // With no last-good cache, there is nothing to preserve.
+      expect(emitted[0]![0]).toMatchObject({ models: [], modelsSource: 'probed' })
+    } finally {
+      await daemon.stop()
+    }
+  })
+})
+
+describe('daemon sweep phase-1 catalog seeding', () => {
+  const configOptions = [
+    {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'a',
+      options: [
+        { value: 'a', name: 'Model A', description: 'Model A · the everyday one' },
+        { value: 'b', name: 'Model B' }
+      ]
+    },
+    {
+      id: 'thought-level',
+      name: 'Thinking',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: 'high',
+      options: [
+        { value: 'low', name: 'Low' },
+        { value: 'high', name: 'High' }
+      ]
+    },
+    {
+      id: 'permission-mode',
+      name: 'Permissions',
+      category: 'mode',
+      type: 'select',
+      currentValue: 'safe',
+      options: [
+        { value: 'safe', name: 'Safe', description: 'Ask before editing files or running commands.' },
+        { value: 'yolo', name: 'YOLO', description: 'Run without approval prompts.' }
+      ]
+    },
+    {
+      id: 'fast-mode',
+      name: 'Fast',
+      category: 'model_config',
+      type: 'select',
+      currentValue: 'off',
+      options: [
+        { value: 'on', name: 'On' },
+        { value: 'off', name: 'Off' }
+      ]
+    }
+  ] as unknown as SessionConfigOption[]
+
+  const rawEfforts = [
+    { value: 'low', name: 'Low' },
+    { value: 'high', name: 'High' }
+  ]
+
+  it.each([
+    ['fake-agent', false],
+    ['claude-code-acp', true]
+  ])(
+    'seeds the default model raw in the cache and reports augmented efforts iff the command is claude (%s)',
+    async (command, claude) => {
+      const rt: RuntimeDef = { command, args: ['--acp'], env: [] }
+      const clock = new FakeClock()
+      clock.advance(10_000)
+      const probe = vi.fn(async (): Promise<RuntimeProbeResult[]> => [
+        { runtime: 'probed', ok: true, models: ['a', 'b'], currentModel: 'a', probedVersion: '1.0', configOptions }
+      ])
+      const daemon = daemonWith({ root: root(), catalog: catalogOf({ probed: rt }), clock, probe })
+
+      try {
+        await daemon.start()
+        const noteProbe = stubCatalogSvc(daemon)
+        const emitted = captureEmits(daemon)
+        await (daemon as any).runtimeFacts.probeAndEmit(true)
+
+        // Store: phase-1 meta (fingerprint, resolved default model, permission
+        // modes) with the discovery gate left OPEN (complete=false)...
+        const store = (daemon as any).store as LocalStore
+        expect(await store.getRuntimeCatalogMeta('probed')).toEqual({
+          runtimeId: 'probed',
+          fingerprint: catalogFingerprint('probed', '1.0', rt),
+          source: 'acp',
+          defaultModel: 'a',
+          permissionModes: [
+            { value: 'safe', name: 'Safe', description: 'Ask before editing files or running commands.' },
+            { value: 'yolo', name: 'YOLO', description: 'Run without approval prompts.' }
+          ],
+          // The mode select's currentValue — the runtime's own default mode.
+          defaultPermissionMode: 'safe',
+          complete: false,
+          observedAt: 10_000
+        })
+        // ...a full row for the default model, storing RAW advertised efforts
+        // (augmentation is report-time only, never persisted), plus a
+        // display-only row for every other advertised model — the whole
+        // picker's names/descriptions come from this one response.
+        const caps = await store.listRuntimeModelCaps('probed')
+        expect(caps.map((r) => r.modelId)).toEqual(['a', 'b'])
+        expect(caps[0]!.caps).toEqual({
+          name: 'Model A',
+          description: 'Model A · the everyday one',
+          efforts: rawEfforts,
+          defaultEffort: 'high',
+          fastMode: true
+        })
+        expect(caps[1]!.caps).toEqual({ name: 'Model B' })
+
+        // Wire: the emitted catalog entry augments claude runtimes with the
+        // synthetic tiers; non-claude runtimes report the raw levels as-is.
+        expect(emitted).toHaveLength(1)
+        const profile = emitted[0]![0]!
+        expect(profile).toMatchObject({ runtime: 'probed', models: ['a', 'b'], modelsSource: 'probed' })
+        expect(profile.modelCatalog).toEqual({
+          modelSwitching: true,
+          models: [
+            {
+              id: 'a',
+              name: 'Model A',
+              description: 'Model A · the everyday one',
+              efforts: claude ? [...rawEfforts, { value: 'max' }, { value: 'ultracode' }] : rawEfforts,
+              defaultEffort: 'high',
+              fastMode: true
+            },
+            // Advertised but not yet enumerated: display metadata only, so the
+            // picker can label and hover it while `efforts` stays undiscovered.
+            { id: 'b', name: 'Model B' }
+          ],
+          defaultModel: 'a',
+          permissionModes: [
+            { value: 'safe', name: 'Safe', description: 'Ask before editing files or running commands.' },
+            { value: 'yolo', name: 'YOLO', description: 'Run without approval prompts.' }
+          ],
+          defaultPermissionMode: 'safe',
+          source: 'acp',
+          observedAt: new Date(10_000).toISOString()
+        })
+
+        // The fold hands the probe outcome to the phase-2 discovery gate.
+        expect(noteProbe).toHaveBeenCalledWith({ runtimeId: 'probed', rt, probedVersion: '1.0', models: ['a', 'b'] })
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  it('a re-probe refreshes display metadata without wiping a same-fingerprint enumerated matrix', async () => {
+    const rt: RuntimeDef = { command: 'fake-agent', args: ['--acp'], env: [] }
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    const probe = vi.fn(async (): Promise<RuntimeProbeResult[]> => [
+      { runtime: 'probed', ok: true, models: ['a', 'b'], currentModel: 'a', probedVersion: '1.0', configOptions }
+    ])
+    const daemon = daemonWith({ root: root(), catalog: catalogOf({ probed: rt }), clock, probe })
+    try {
+      await daemon.start()
+      stubCatalogSvc(daemon)
+      const store = (daemon as any).store as LocalStore
+      // What phase 2 left behind for the model the probe session never sits on.
+      await store.upsertRuntimeModelCap({
+        runtimeId: 'probed',
+        modelId: 'b',
+        fingerprint: catalogFingerprint('probed', '1.0', rt),
+        caps: { efforts: [{ value: 'low' }], fastMode: false },
+        observedAt: 5_000
+      })
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      const caps = await store.listRuntimeModelCaps('probed')
+      expect(caps.find((r) => r.modelId === 'b')!.caps).toEqual({
+        name: 'Model B',
+        efforts: [{ value: 'low' }],
+        fastMode: false
+      })
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('seeds caps under a runtime-advertised literal "default" model; meta.defaultModel stays unset', async () => {
+    const rt: RuntimeDef = { command: 'fake-agent', args: ['--acp'], env: [] }
+    const clock = new FakeClock()
+    clock.advance(10_000)
+    // Probe session sits on the literal "default" the runtime advertises.
+    const defaultOpts = configOptions.map((o) =>
+      (o as { id?: string }).id === 'model' ? { ...o, currentValue: 'default' } : o
+    ) as unknown as SessionConfigOption[]
+    const probe = vi.fn(async (): Promise<RuntimeProbeResult[]> => [
+      {
+        runtime: 'probed',
+        ok: true,
+        models: ['default', 'a', 'b'],
+        currentModel: 'default',
+        probedVersion: '1.0',
+        configOptions: defaultOpts
+      }
+    ])
+    const daemon = daemonWith({ root: root(), catalog: catalogOf({ probed: rt }), clock, probe })
+    try {
+      await daemon.start()
+      stubCatalogSvc(daemon)
+      await (daemon as any).runtimeFacts.probeAndEmit(true)
+      const store = (daemon as any).store as LocalStore
+      // meta.defaultModel is never the literal "default" (feeds the concrete
+      // preselection/hint) — but the caps row IS seeded under "default" so
+      // selecting it surfaces the runtime's own effort/fast.
+      expect(await store.getRuntimeCatalogMeta('probed')).not.toHaveProperty('defaultModel')
+      expect((await store.listRuntimeModelCaps('probed')).map((r) => r.modelId)).toEqual(['a', 'b', 'default'])
+    } finally {
+      await daemon.stop()
+    }
+  })
+})

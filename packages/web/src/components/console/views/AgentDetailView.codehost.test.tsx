@@ -1,0 +1,506 @@
+// @vitest-environment happy-dom
+/**
+ * The code-host panes list ONE flat row per `(repo, family)` subscription — no
+ * repo header, no group control. A repository's rows sit adjacent with change
+ * proposals first, secondary row actions fold into a ⋯ menu, and a family the
+ * repo does not watch yet is offered by a + menu on its first row.
+ */
+import { act, type ReactNode } from 'react'
+import { createRoot, type Root } from 'react-dom/client'
+import { SWRConfig } from 'swr'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+
+const mocks = vi.hoisted(() => ({
+  hooks: [] as unknown[],
+  grants: [] as unknown[],
+  installations: [] as unknown[],
+  hookRuns: [] as unknown[],
+  createGithubHook: vi.fn(),
+  updateGithubHook: vi.fn(),
+  openModal: vi.fn()
+}))
+
+vi.mock('next/navigation', () => ({
+  useParams: () => ({ id: 'agent-1' }),
+  useSearchParams: () => new URLSearchParams(),
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() })
+}))
+vi.mock('next/link', () => ({ default: ({ children }: { children?: ReactNode }) => <span>{children}</span> }))
+vi.mock('@/lib/profile', () => ({ useProfile: () => ({ me: null }) }))
+vi.mock('@/lib/org-context', () => ({
+  useOrgs: () => ({ activeOrg: { id: 'org-1' }, myRole: 'owner', orgPath: (path: string) => path })
+}))
+vi.mock('@/components/console/PlaygroundProvider', () => ({ usePlayground: () => ({ openPlayground: vi.fn() }) }))
+vi.mock('@/components/console/ModalProvider', () => ({ useModal: () => ({ openModal: mocks.openModal }) }))
+vi.mock('@/lib/use-session-list', () => ({ useSessionList: () => ({ sessions: [], total: 0, isLoading: false }) }))
+vi.mock('@/lib/acp-registry', () => ({ useAcpRegistry: () => ({ runtimes: [] }), acpRuntime: () => null }))
+vi.mock('@/lib/data-context', () => ({
+  useConsoleData: () => ({
+    agents: [agent],
+    getAgent: () => agent,
+    getSessions: () => [],
+    daemons: [],
+    daemonsLoading: false,
+    integrations: [],
+    agentsLoading: false,
+    updateAgent: vi.fn(async () => undefined),
+    refresh: vi.fn(),
+    memberSets: [],
+    orgSetIds: new Set<string>()
+  })
+}))
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/api')>()),
+  fetchAgentHooks: vi.fn(async () => mocks.hooks),
+  fetchAgentRepos: vi.fn(async () => []),
+  fetchAgentInstallations: vi.fn(async () => mocks.grants),
+  fetchGithubInstallations: vi.fn(async () => ({
+    enabled: mocks.installations.length > 0,
+    installations: mocks.installations
+  })),
+  fetchGitlabConnections: vi.fn(async () => ({ enabled: false, connections: [] })),
+  fetchHookRuns: vi.fn(async () => mocks.hookRuns),
+  createGithubHook: mocks.createGithubHook,
+  updateGithubHook: mocks.updateGithubHook
+}))
+
+const agent = {
+  id: 'agent-1',
+  name: 'pilot',
+  model: 'sonnet',
+  runtime: 'claude',
+  desc: '',
+  outputMode: '—',
+  showFooter: true,
+  showStatusBar: false,
+  reasoning: '',
+  fastMode: false,
+  pause: false,
+  memoryProvider: 'none',
+  memoryAutoDistill: false,
+  status: 'online',
+  workspace: { mode: 'scratch', files: [] },
+  integrations: [],
+  visibility: 'org'
+} as unknown as Parameters<typeof Object.freeze>[0]
+
+function githubHook(partial: Record<string, unknown>): unknown {
+  return {
+    agentId: 'agent-1',
+    kind: 'github',
+    enabled: true,
+    commentFamilies: [],
+    labelFilter: [],
+    skipDrafts: false,
+    mentionOnly: false,
+    reviewPolicy: 'off',
+    reportingMode: 'off',
+    gateMode: 'informational',
+    ...partial
+  }
+}
+
+// acme/api is watched for EVERY offered subject; acme/web only for issues.
+const PR_ROW = githubHook({
+  id: 'hook-pr',
+  repoId: '1',
+  name: 'acme/api',
+  repoFullName: 'acme/api',
+  family: 'pull_request',
+  events: ['pull_request:*', 'issue_comment:created']
+})
+const ISSUES_ROW = githubHook({
+  id: 'hook-issues',
+  repoId: '1',
+  name: 'acme/api',
+  repoFullName: 'acme/api',
+  family: 'issues',
+  events: ['issues:*', 'issue_comment:created'],
+  labelFilter: ['bug', 'p0', 'ux']
+})
+const DEPLOY_ROW = githubHook({
+  id: 'hook-deploy',
+  repoId: '1',
+  name: 'acme/api',
+  repoFullName: 'acme/api',
+  family: 'deployment',
+  events: ['deployment:created']
+})
+const RELEASE_ROW = githubHook({
+  id: 'hook-release',
+  repoId: '1',
+  name: 'acme/api',
+  repoFullName: 'acme/api',
+  family: 'release',
+  events: ['release:published']
+})
+const WEB_ISSUES_ROW = githubHook({
+  id: 'hook-web',
+  repoId: '2',
+  name: 'acme/web',
+  repoFullName: 'acme/web',
+  family: 'issues',
+  events: ['issues:*', 'issue_comment:created']
+})
+
+const AgentDetailView = (await import('./AgentDetailView')).default
+
+let root: Root | undefined
+let host: HTMLDivElement | undefined
+
+async function render(): Promise<HTMLDivElement> {
+  host = document.createElement('div')
+  document.body.appendChild(host)
+  root = createRoot(host)
+  await act(async () => {
+    root!.render(
+      <SWRConfig value={{ provider: () => new Map() }}>
+        <AgentDetailView />
+      </SWRConfig>
+    )
+  })
+  return host
+}
+
+/** Elements by their tooltip/aria text — the console's own handles on a control. */
+function byTitle(scope: HTMLElement, title: string): HTMLElement[] {
+  return [...scope.querySelectorAll<HTMLElement>(`[title="${title}"]`)]
+}
+
+/** An open flyout's item by label — the menu is body-portaled, so search the document. */
+function menuItem(label: string): HTMLElement | undefined {
+  return [...document.querySelectorAll<HTMLElement>('button.fopt')].find((el) => el.textContent?.trim() === label)
+}
+
+/** The mono spans that name a repository — one per responsive tree, on the block's FIRST row only. */
+function repoNames(scope: HTMLElement, repo: string): HTMLElement[] {
+  return [...scope.querySelectorAll<HTMLElement>('span.mono, a.mono')].filter((el) => el.textContent === repo)
+}
+
+/** The element sitting immediately before one row's trigger control — where the family marker belongs. */
+function markerBeforeTrigger(scope: HTMLElement, ariaLabel: string): HTMLElement | null {
+  const button = scope.querySelector<HTMLElement>(`[aria-label="${ariaLabel}"]`)
+  const select = button?.closest('span.inline-flex') ?? null
+  return (select?.previousElementSibling as HTMLElement | null) ?? null
+}
+
+/** Every trigger control in list order, named by the row it belongs to. */
+function triggerOrder(scope: HTMLElement): string[] {
+  return [...scope.querySelectorAll<HTMLElement>('[aria-label^="Trigger for "]')].map(
+    (el) => el.getAttribute('aria-label') ?? ''
+  )
+}
+
+beforeEach(() => {
+  mocks.hooks = [ISSUES_ROW, PR_ROW, DEPLOY_ROW, RELEASE_ROW, WEB_ISSUES_ROW]
+  mocks.grants = []
+  mocks.installations = []
+  mocks.hookRuns = []
+  mocks.updateGithubHook.mockReset()
+  mocks.updateGithubHook.mockRejectedValue(new Error('offline'))
+  mocks.createGithubHook.mockReset()
+  mocks.createGithubHook.mockResolvedValue({ id: 'hook-new' })
+  mocks.openModal.mockReset()
+})
+
+afterEach(async () => {
+  if (root) await act(async () => root!.unmount())
+  host?.remove()
+  root = undefined
+  host = undefined
+})
+
+describe('AgentDetailView, code-host repository blocks', () => {
+  it('keeps a repository one row per family and names it once', async () => {
+    const scope = await render()
+    // Four families ⇒ four rows, and exactly one of them names the repo (once per responsive tree).
+    expect(repoNames(scope, 'acme/api')).toHaveLength(2)
+    expect(repoNames(scope, 'acme/web')).toHaveLength(2)
+    expect(repoNames(scope, 'acme/api')[0]?.getAttribute('href')).toBe('https://github.com/acme/api')
+    // Repos sorted by name, a repo's rows adjacent, change proposals before issues before deployments before releases.
+    expect(triggerOrder(scope)).toEqual([
+      'Trigger for acme/api PRs',
+      'Trigger for acme/api Issues',
+      'Trigger for acme/api Deploys',
+      'Trigger for acme/api Releases',
+      'Trigger for acme/web Issues'
+    ])
+  })
+
+  it('has no repository header or group-level remove', async () => {
+    const scope = await render()
+    expect(byTitle(scope, 'Remove repository')).toHaveLength(0)
+    // Every row's own X is the only removal — a repo goes away one family at a time.
+    expect(byTitle(scope, 'Stop watching PRs')).toHaveLength(1)
+    expect(byTitle(scope, 'Stop watching Issues')).toHaveLength(2)
+    expect(byTitle(scope, 'Stop watching Deploys')).toHaveLength(1)
+  })
+
+  it('titles the card by the host even when every repo shares one owner', async () => {
+    const scope = await render()
+    // Both fixtures live under acme; the card still says GitHub, so a second account never relabels it.
+    const titles = [...scope.querySelectorAll<HTMLElement>('span.font-semibold')]
+      .map((el) => el.textContent?.trim())
+      .filter((text) => text === 'GitHub' || text === 'acme')
+    expect(titles).toEqual(['GitHub'])
+  })
+
+  it('deletes just one family from the per-row control', async () => {
+    const scope = await render()
+    const removeIssues = byTitle(scope, 'Stop watching Issues')[0]!
+    await act(async () => removeIssues.click())
+    expect(mocks.openModal).toHaveBeenCalledWith('deleteHook', expect.objectContaining({ id: 'hook-issues' }))
+  })
+
+  it('states the family as a plain label at the head of the row control cluster', async () => {
+    const scope = await render()
+    for (const [ariaLabel, family] of [
+      ['Trigger for acme/api PRs', 'PRs'],
+      ['Trigger for acme/api Issues', 'Issues']
+    ] as const) {
+      const marker = markerBeforeTrigger(scope, ariaLabel)
+      expect(marker?.textContent).toBe(family)
+      // A label, never a control: no button, no segmented container around it.
+      expect(marker?.tagName).toBe('SPAN')
+      expect(marker?.querySelector('button')).toBeNull()
+      expect(marker?.className).not.toContain('border')
+    }
+  })
+
+  it('offers a + menu only on a repository missing a family, inline on its first row', async () => {
+    const scope = await render()
+    // acme/api watches every offered subject, so only acme/web carries the + (once per responsive tree).
+    const triggers = byTitle(scope, 'Watch another subject')
+    expect(triggers).toHaveLength(2)
+    for (const trigger of triggers) {
+      expect(trigger.closest('div')!.textContent).toContain('acme/web')
+    }
+    // The menu (body-portaled) lists only what is missing.
+    await act(async () => triggers[0]!.click())
+    expect(menuItem('Add Pull requests')).toBeTruthy()
+    expect(menuItem('Add Deployments')).toBeTruthy()
+    expect(menuItem('Add Releases')).toBeTruthy()
+    expect(menuItem('Add Issues')).toBeUndefined()
+  })
+
+  it('offers the same three cadences on an issues row as on a PR row', async () => {
+    const scope = await render()
+    // The menu is body-portaled, so read it off the document after opening.
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="Trigger for acme/api Issues"]')!.click())
+    expect(menuItem('labeled')).toBeUndefined()
+    expect(menuItem('Opened')).toBeTruthy()
+    expect(menuItem('Any update')).toBeTruthy()
+    await act(async () => menuItem('@-mention')!.click())
+
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="Trigger for acme/api PRs"]')!.click())
+    expect(menuItem('labeled')).toBeUndefined()
+    expect(menuItem('Any update')).toBeTruthy()
+  })
+
+  it('names a deployment row by its own cadences, at rest and in its menu', async () => {
+    const scope = await render()
+    // Both responsive trees: no row here is on a thread's opened cadence, so nothing reads Opened.
+    expect([...scope.querySelectorAll('span')].filter((el) => el.textContent === 'Opened')).toEqual([])
+    expect([...scope.querySelectorAll('span')].some((el) => el.textContent === 'Published')).toBe(true)
+    const trigger = scope.querySelector<HTMLElement>('[aria-label="Trigger for acme/api Deploys"]')!
+    expect(trigger.textContent).toContain('Created')
+    await act(async () => trigger.click())
+    expect(menuItem('Created')).toBeTruthy()
+    expect(menuItem('Any status')).toBeTruthy()
+    expect(menuItem('Opened')).toBeUndefined()
+  })
+
+  it('explains the hovered cadence under a Run on heading instead of in a tooltip', async () => {
+    const scope = await render()
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="Trigger for acme/api PRs"]')!.click())
+    const menu = () => document.querySelector<HTMLElement>('[role="menu"]')!
+    expect(menu().textContent).toContain('Run on')
+    expect(menu().textContent).toContain('Any update — Runs when a PR is opened, on every push, and on every comment.')
+    expect(menuItem('Opened')!.title).toBe('')
+    await act(async () => menuItem('Opened')!.dispatchEvent(new MouseEvent('mouseover', { bubbles: true })))
+    expect(menu().textContent).toContain('Opened — Runs when a PR is opened, and on later @-mentions of the agent.')
+  })
+
+  it('shows a row’s label filter at rest and settles it in the settings dialog of any thread row', async () => {
+    const scope = await render()
+    // Two labels and the overflow count at rest; the full list on hover.
+    const hint = byTitle(scope, 'Label filter: bug, p0, ux')
+    expect(hint).toHaveLength(1)
+    expect(hint[0]!.textContent).toContain('bug, p0')
+    expect(hint[0]!.textContent).toContain('+1')
+    // Settings… is on the issues row too: the label filter is, even though reviews are not.
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="More for acme/api Issues"]')!.click())
+    await act(async () => menuItem('Settings…')!.click())
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+    expect(dialog.textContent).toContain('Issues settings')
+    expect(dialog.textContent).not.toContain('Skip drafts')
+    expect(dialog.textContent?.toLowerCase()).not.toContain('review')
+    expect(dialog.querySelectorAll('[data-label-filter="open"] [aria-label^="Remove label "]')).toHaveLength(3)
+  })
+
+  it('creates the missing family row at the default trigger', async () => {
+    // The same default the wizard opens the subject on: every update, for a PR.
+    const scope = await render()
+    await act(async () => byTitle(scope, 'Watch another subject')[0]!.click())
+    await act(async () => menuItem('Add Pull requests')!.click())
+    expect(mocks.createGithubHook).toHaveBeenCalledTimes(1)
+    expect(mocks.createGithubHook).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentId: 'agent-1',
+        repoFullName: 'acme/web',
+        family: 'pull_request',
+        events: ['pull_request:*', 'issue_comment:created'],
+        commentFamilies: ['pull_request'],
+        mentionOnly: false
+      })
+    )
+  })
+
+  it('surfaces a refused create instead of wedging the pane', async () => {
+    mocks.createGithubHook.mockRejectedValue(new Error('No GitHub App installation for acme/web'))
+    const scope = await render()
+    await act(async () => byTitle(scope, 'Watch another subject')[0]!.click())
+    await act(async () => menuItem('Add Pull requests')!.click())
+    expect(scope.textContent).toContain('No GitHub App installation for acme/web')
+    // The + is still there and still clickable — the failure is not terminal.
+    expect(byTitle(scope, 'Watch another subject')).toHaveLength(2)
+  })
+
+  it('offers settings on every thread row, with the review surface on the PR row alone', async () => {
+    const scope = await render()
+    // Desktop folds settings into the row's ⋯ menu; mobile keeps an inline icon on each THREAD row —
+    // both issues rows and the PR row, never the deployment, which has nothing to settle.
+    expect(byTitle(scope, 'Settings')).toHaveLength(3)
+    const prMore = scope.querySelector<HTMLElement>('[aria-label="More for acme/api PRs"]')!
+    await act(async () => prMore.click())
+    await act(async () => menuItem('Settings…')!.click())
+    const prDialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+    expect(prDialog.textContent).toContain('Pull requests settings')
+    expect(prDialog.textContent).toContain('PR review')
+    expect(prDialog.textContent).toContain('Only with labels')
+    expect(prDialog.textContent).toContain('Skip drafts until marked ready for review')
+    expect(prDialog.textContent).toContain('Trusted users')
+    await act(async () => byTitle(prDialog, 'Close')[0]!.click())
+
+    const deployMore = scope.querySelector<HTMLElement>('[aria-label="More for acme/api Deploys"]')!
+    await act(async () => deployMore.click())
+    expect(menuItem('Settings…')).toBeUndefined()
+    expect(menuItem('Recent deliveries')).toBeTruthy()
+  })
+
+  it('names each recent delivery by its event, keeping the delivery id in the tooltip', async () => {
+    const run = {
+      status: 'success',
+      durationMs: 8000,
+      sessionId: null,
+      reason: null,
+      startedAt: new Date().toISOString()
+    }
+    mocks.hookRuns = [
+      { ...run, id: 'run-1', deliveryKey: 'delivery-merged', event: 'pull_request:merged' },
+      { ...run, id: 'run-2', deliveryKey: 'delivery-legacy', event: null }
+    ]
+    const scope = await render()
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="More for acme/api PRs"]')!.click())
+    await act(async () => menuItem('Recent deliveries')!.click())
+    const merged = byTitle(scope, 'delivery-merged')[0]!
+    expect(merged.textContent).toBe('pull_request:merged')
+    // A row recorded before events were stamped still reads as its delivery id.
+    expect(byTitle(scope, 'delivery-legacy')[0]!.textContent).toBe('delivery-legacy')
+  })
+})
+
+describe('AgentDetailView, repositories an installation grant covers', () => {
+  it('badges a scratch agent’s watch as unauthorized until a grant covers its owner', async () => {
+    mocks.hooks = [WEB_ISSUES_ROW]
+    const uncovered = await render()
+    expect(uncovered.textContent).toContain('write-back unauthorized')
+    await act(async () => root!.unmount())
+    host?.remove()
+
+    mocks.grants = [{ id: 'grant-1', provider: 'github', installationId: 12345, accountLogin: 'acme', access: 'read' }]
+    const covered = await render()
+    expect(covered.textContent).toContain('acme/web')
+    expect(covered.textContent).not.toContain('write-back unauthorized')
+  })
+})
+
+describe('AgentDetailView, an installation-wide row', () => {
+  const INSTALLATION_PR_ROW = githubHook({
+    id: 'hook-installation-pr',
+    repoId: null,
+    name: 'acme/*',
+    repoFullName: null,
+    installationAccount: 'acme',
+    family: 'pull_request',
+    events: ['pull_request:*', 'issue_comment:created'],
+    commentFamilies: ['pull_request'],
+    reviewPolicy: 'comment',
+    reportingMode: 'check'
+  })
+  const WRITE_GRANT = {
+    id: 'grant-1',
+    provider: 'github',
+    installationId: 12345,
+    accountLogin: 'acme',
+    access: 'write'
+  }
+
+  it('adds another subject by the installation’s account', async () => {
+    mocks.hooks = [INSTALLATION_PR_ROW]
+    mocks.grants = [WRITE_GRANT]
+    const scope = await render()
+    await act(async () => byTitle(scope, 'Watch another subject')[0]!.click())
+    await act(async () => menuItem('Add Issues')!.click())
+    const [input] = mocks.createGithubHook.mock.calls[0] as [Record<string, unknown>]
+    expect(input).toMatchObject({ agentId: 'agent-1', name: 'acme/*', githubAccount: 'acme', family: 'issues' })
+    expect(input).not.toHaveProperty('repoFullName')
+  })
+
+  it('saves review settings on the installation grant and live installation', async () => {
+    mocks.hooks = [INSTALLATION_PR_ROW]
+    mocks.grants = [WRITE_GRANT]
+    mocks.installations = [
+      {
+        id: 'inst-1',
+        installationId: 12345,
+        accountLogin: 'acme',
+        accountType: 'Organization',
+        repositorySelection: 'all',
+        suspended: false,
+        permissionsStatus: 'current',
+        pullRequestsPermission: 'write',
+        checksPermission: 'write',
+        settingsUrl: 'https://github.example.test/settings/installations/12345',
+        createdAt: '2026-09-01T00:00:00.000Z'
+      }
+    ]
+    mocks.updateGithubHook.mockResolvedValue(INSTALLATION_PR_ROW)
+    const scope = await render()
+    await act(async () => scope.querySelector<HTMLElement>('[aria-label="More for acme/* PRs"]')!.click())
+    await act(async () => menuItem('Settings…')!.click())
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!
+    // No repository to keep a trusted-users list on, so the dialog offers none.
+    expect(dialog.textContent).not.toContain('Trusted users')
+    const skipDrafts = [...dialog.querySelectorAll('label')]
+      .find((label) => label.textContent?.includes('Skip drafts until marked ready for review'))!
+      .querySelector<HTMLInputElement>('input[type="checkbox"]')!
+    expect(skipDrafts.checked).toBe(false)
+    await act(async () => skipDrafts.click())
+    const save = [...dialog.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => b.textContent?.trim() === 'Save'
+    )!
+    expect(save.disabled).toBe(false)
+    await act(async () => save.click())
+    const [, input] = mocks.updateGithubHook.mock.calls[0] as [string, Record<string, unknown>]
+    expect(input).toMatchObject({
+      githubAccount: 'acme',
+      reviewPolicy: 'comment',
+      reportingMode: 'check',
+      skipDrafts: true
+    })
+    expect(input).not.toHaveProperty('repoFullName')
+  })
+})

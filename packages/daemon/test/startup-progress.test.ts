@@ -1,0 +1,63 @@
+import { describe, expect, it, vi } from 'vitest'
+import { observeStartup, withStartupPhase, shareStartup, awaitStartup } from '../src/session/startup-progress.js'
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+describe('startup progress lifetime', () => {
+  it('keeps the failed nested phase and propagates the startup error', async () => {
+    const report = vi.fn()
+    const operation = shareStartup(() =>
+      withStartupPhase('sandbox', async () => {
+        throw new Error('sandbox failed')
+      })
+    )
+    await expect(
+      observeStartup(report, () => withStartupPhase('workspace', () => awaitStartup(operation)))
+    ).rejects.toThrow('sandbox failed')
+    expect(report).toHaveBeenLastCalledWith('sandbox')
+  })
+
+  it('keeps a shared start visible to its later waiter after the first turn leaves', async () => {
+    const workspace = deferred()
+    const cancelled = deferred()
+    const first = vi.fn()
+    const second = vi.fn()
+    const operation = shareStartup(() =>
+      withStartupPhase('workspace', async () => {
+        await workspace.promise
+        await withStartupPhase('runtime', async () => {})
+      })
+    )
+    const a = observeStartup(first, () => Promise.race([awaitStartup(operation), cancelled.promise]))
+    const b = observeStartup(second, () => awaitStartup(operation))
+    expect(first).toHaveBeenCalledWith('workspace')
+    expect(second).toHaveBeenCalledWith('workspace')
+    cancelled.resolve()
+    await a
+    first.mockClear()
+    workspace.resolve()
+    await b
+    expect(first).not.toHaveBeenCalled()
+    expect(second).toHaveBeenCalledWith('runtime')
+  })
+
+  it('lets work spawned inside a shared start wait on that start without observing itself', async () => {
+    // A host's event handlers are created inside its shared start and inherit its context, so a
+    // later wake fired from one of them reaches ensureHostStarted with the start's own broadcaster
+    // as observer. Registering that as a listener made every report recurse until the stack blew.
+    const report = vi.fn()
+    const wake = deferred<unknown>()
+    const operation: Promise<void> = shareStartup(async () => {
+      setTimeout(() => wake.resolve(awaitStartup(operation)), 0)
+    })
+    await operation
+    await expect(wake.promise).resolves.toBeUndefined()
+    await expect(observeStartup(report, () => awaitStartup(operation))).resolves.toBeUndefined()
+  })
+})

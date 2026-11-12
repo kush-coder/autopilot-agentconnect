@@ -1,0 +1,231 @@
+import { createHash } from 'node:crypto'
+import { addressFor } from './address.js'
+import { bucketEndpoint, SOURCE_CACHE_GRACE_SECONDS, type BucketLocation } from './config.js'
+import type { CredentialsProvider } from './credentials.js'
+import { amzDate, canonicalQuery, canonicalUri, sha256Hex, signHeaders } from './sigv4.js'
+
+// Header-signed requests made with the bucket's own credentials (source-cache.md §9, §10): HEAD, retag, delete, multipart start, and the lifecycle read.
+
+export type SourceCacheLifecycleTag = 'ac-cache=live' | 'ac-cache=unreferenced'
+
+export type SourceCacheObjectHead =
+  | { exists: false }
+  | { exists: true; contentLength?: number; checksumSha256?: string; etag?: string; lastModified?: number }
+
+/** Whether a HEAD proves the object is exactly these bytes: a stored checksum decides, the length only when there is none. */
+export function headHolds(
+  head: SourceCacheObjectHead,
+  expected: { bytes: number; sha256: string; composite?: boolean }
+): boolean {
+  if (!head.exists) return false
+  if (head.contentLength !== undefined && head.contentLength !== expected.bytes) return false
+  // The PUT signed both checksum and length, so a matching checksum proves the length a proxy may drop from a HEAD.
+  if (head.checksumSha256 === undefined) return head.contentLength === expected.bytes
+  if (head.checksumSha256 === expected.sha256) return true
+  // A multipart object reports `<compositeSha256>-<parts>`, and each part's PUT signed its own checksum and length.
+  return (
+    expected.composite === true &&
+    /^-[1-9]\d{0,4}$/.test(head.checksumSha256.slice(expected.sha256.length)) &&
+    head.checksumSha256.startsWith(expected.sha256)
+  )
+}
+
+/** The base64 COMPOSITE SHA-256 S3 reports for a multipart object: the digest of its parts' raw digests, in order. */
+export function compositeSha256(parts: readonly string[]): string {
+  const hash = createHash('sha256')
+  for (const part of parts) hash.update(Buffer.from(part, 'base64'))
+  return hash.digest('base64')
+}
+
+export interface SourceCacheObjectClient<K extends string = string> {
+  head(key: K): Promise<SourceCacheObjectHead>
+  putTagging(key: K, tagging: SourceCacheLifecycleTag): Promise<void>
+  /** Start a SHA-256-checksummed multipart upload tagged `tagging` (`k=v`), returning the store's upload id. */
+  createMultipartUpload(key: K, tagging: string): Promise<string>
+  /** Delete an object; an object already gone resolves too. */
+  delete(key: K): Promise<void>
+  /** The bucket's lifecycle configuration XML, or `none` when the bucket has none. */
+  getBucketLifecycle(): Promise<SourceCacheBucketLifecycle>
+}
+
+export type SourceCacheBucketLifecycle = { kind: 'none' } | { kind: 'rules'; xml: string }
+
+export class SourceCacheObjectError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined,
+    operation: string
+  ) {
+    super(`Source Cache ${operation} failed: HTTP ${status}${code ? ` ${code}` : ''}`)
+    this.name = 'SourceCacheObjectError'
+  }
+}
+
+export interface ObjectClientOptions<K extends string> {
+  config: BucketLocation
+  credentials: CredentialsProvider
+  /** The only keys this client may touch; anything else throws before a request is signed. */
+  isKey: (key: string) => key is K
+  fetch?: typeof fetch
+  now?: () => number
+  /** Test seam: an endpoint the config schema would refuse (a plain-http fixture). */
+  endpointOverride?: string
+}
+
+const EMPTY_PAYLOAD_SHA256 = sha256Hex('')
+const REQUEST_TIMEOUT_MS = 30_000
+/** A lifecycle configuration holds at most 1,000 rules; anything past this is not one the daemon reads. */
+const LIFECYCLE_MAX_BYTES = 256 * 1024
+
+function tagParts(tagging: SourceCacheLifecycleTag): [string, string] {
+  const [key, value] = tagging.split('=')
+  return [key!, value!]
+}
+
+function taggingXml(tagging: SourceCacheLifecycleTag): string {
+  const [key, value] = tagParts(tagging)
+  return `<Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet><Tag><Key>${key}</Key><Value>${value}</Value></Tag></TagSet></Tagging>`
+}
+
+async function boundedText(res: Response, maxBytes: number): Promise<string | undefined> {
+  const reader = res.body?.getReader()
+  if (!reader) return ''
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      // Not awaited: a cancel settles only once every branch of a teed body is cancelled.
+      void reader.cancel().catch(() => undefined)
+      return undefined
+    }
+    chunks.push(value)
+  }
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+async function errorCode(res: Response): Promise<string | undefined> {
+  const body = await res.text().catch(() => '')
+  return /<Code>([A-Za-z0-9.]{1,64})<\/Code>/.exec(body.slice(0, 4096))?.[1]
+}
+
+export function createObjectClient<K extends string>(opts: ObjectClientOptions<K>): SourceCacheObjectClient<K> {
+  const { config, credentials } = opts
+  const doFetch = opts.fetch ?? fetch
+  const now = opts.now ?? Date.now
+  const address = addressFor(opts.endpointOverride ?? bucketEndpoint(config), config.bucket, config.forcePathStyle)
+  const objectPath = (key: K): string => {
+    if (!opts.isKey(key)) throw new Error('object key is not one this client may touch')
+    return `${address.basePath}${config.prefix ? `${config.prefix}/` : ''}${key}`
+  }
+
+  const send = async (input: {
+    method: 'HEAD' | 'PUT' | 'POST' | 'DELETE' | 'GET'
+    /** An object key, or `bucket` for a bucket-level subresource such as `?lifecycle`. */
+    key: K | 'bucket'
+    query?: Record<string, string>
+    headers: Record<string, string>
+    body?: string
+  }): Promise<Response> => {
+    const path = input.key === 'bucket' ? address.basePath : objectPath(input.key)
+    const creds = await credentials.get(SOURCE_CACHE_GRACE_SECONDS * 1000)
+    const payloadHash = input.body === undefined ? EMPTY_PAYLOAD_SHA256 : sha256Hex(input.body)
+    const headers = { ...input.headers, 'x-amz-date': amzDate(now()), 'x-amz-content-sha256': payloadHash }
+    const signed = signHeaders({
+      method: input.method,
+      protocol: address.protocol,
+      host: address.host,
+      path,
+      ...(input.query ? { query: input.query } : {}),
+      headers,
+      credentials: creds,
+      region: config.region,
+      datetime: headers['x-amz-date'],
+      payloadHash
+    })
+    const query = input.query ? `?${canonicalQuery(input.query)}` : ''
+    return await doFetch(`${address.protocol}//${address.host}${canonicalUri(path)}${query}`, {
+      method: input.method,
+      headers: {
+        ...headers,
+        ...(creds.sessionToken ? { 'x-amz-security-token': creds.sessionToken } : {}),
+        authorization: signed.authorization
+      },
+      ...(input.body === undefined ? {} : { body: input.body }),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    })
+  }
+
+  return {
+    async head(key) {
+      const res = await send({ method: 'HEAD', key, headers: { 'x-amz-checksum-mode': 'ENABLED' } })
+      if (res.status === 404) return { exists: false }
+      if (res.status !== 200) throw new SourceCacheObjectError(res.status, undefined, 'HEAD')
+      // A HEAD may omit Content-Length (RFC 9110 §9.3.2), as a compressing proxy does, so absent is not zero.
+      const rawLength = res.headers.get('content-length')
+      if (rawLength !== null && !(/^\d+$/.test(rawLength) && Number.isSafeInteger(Number(rawLength))))
+        throw new SourceCacheObjectError(res.status, 'NoLength', 'HEAD')
+      const length = rawLength === null ? undefined : Number(rawLength)
+      const checksum = res.headers.get('x-amz-checksum-sha256') ?? undefined
+      const etag = res.headers.get('etag') ?? undefined
+      const lastModified = Date.parse(res.headers.get('last-modified') ?? '')
+      return {
+        exists: true,
+        ...(length !== undefined ? { contentLength: length } : {}),
+        ...(checksum ? { checksumSha256: checksum } : {}),
+        ...(etag ? { etag } : {}),
+        ...(Number.isFinite(lastModified) ? { lastModified } : {})
+      }
+    },
+    async putTagging(key, tagging) {
+      const body = taggingXml(tagging)
+      const res = await send({
+        method: 'PUT',
+        key,
+        query: { tagging: '' },
+        headers: {
+          'content-type': 'application/xml',
+          'content-md5': createHash('md5').update(body).digest('base64')
+        },
+        body
+      })
+      if (res.status < 200 || res.status >= 300)
+        throw new SourceCacheObjectError(res.status, await errorCode(res), 'retag')
+      await res.body?.cancel().catch(() => undefined)
+    },
+    async createMultipartUpload(key, tagging) {
+      const res = await send({
+        method: 'POST',
+        key,
+        query: { uploads: '' },
+        headers: { 'x-amz-checksum-algorithm': 'SHA256', 'x-amz-tagging': tagging }
+      })
+      if (res.status !== 200) throw new SourceCacheObjectError(res.status, await errorCode(res), 'multipart start')
+      const uploadId = /<UploadId>([^<]{1,1024})<\/UploadId>/.exec((await boundedText(res, 64 * 1024)) ?? '')?.[1]
+      if (!uploadId) throw new SourceCacheObjectError(res.status, 'NoUploadId', 'multipart start')
+      return uploadId
+    },
+    async delete(key) {
+      const res = await send({ method: 'DELETE', key, headers: {} })
+      if (res.status === 200 || res.status === 204) return void (await res.body?.cancel().catch(() => undefined))
+      const code = await errorCode(res)
+      // S3 answers 204 for an absent key; a 404 counts as gone too, unless the bucket itself is missing.
+      if (res.status === 404 && code !== 'NoSuchBucket') return
+      throw new SourceCacheObjectError(res.status, code, 'DELETE')
+    },
+    async getBucketLifecycle() {
+      const res = await send({ method: 'GET', key: 'bucket', query: { lifecycle: '' }, headers: {} })
+      if (res.status === 200) {
+        const xml = await boundedText(res, LIFECYCLE_MAX_BYTES)
+        if (xml === undefined) throw new SourceCacheObjectError(res.status, 'TooLarge', 'lifecycle read')
+        return { kind: 'rules', xml }
+      }
+      const code = await errorCode(res)
+      if (res.status === 404 && code === 'NoSuchLifecycleConfiguration') return { kind: 'none' }
+      throw new SourceCacheObjectError(res.status, code, 'lifecycle read')
+    }
+  }
+}

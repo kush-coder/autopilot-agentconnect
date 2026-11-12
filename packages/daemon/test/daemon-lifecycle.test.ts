@@ -1,0 +1,4489 @@
+import { describe, it, expect, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { MAX_TASK_LIST_TASKS, type SessionPurged } from '@agentconnect.md/protocol'
+import { agentHostKey, sessionHostKey, sessionKeyDirName } from '../src/acp/host-key.js'
+import { Daemon } from '../src/daemon.js'
+import { LONG_IDLE_SKIP_AFTER_TTLS, LONG_IDLE_SKIP_REPORT_INTERVAL_MS } from '../src/daemon/constants.js'
+import { buildCpClientDeps } from '../src/cp/cp-client-deps.js'
+import { ExecutorPlane } from '../src/execution/executor-plane.js'
+import { TaskViolationError } from '../src/cp/task-reader.js'
+import { configFilesDir } from '../src/shim/config-file-env.js'
+import { ClusterSkillCoordinator } from '../src/skills/cluster-skill-coordinator.js'
+import { readSkillLedger, skillLedgerLocation } from '../src/skills/skill-install-ledger.js'
+import { cwdWorkspaceIncarnation, workspaceIncarnationOf } from '../src/skills/workspace-incarnation.js'
+import { sessionKey, transcriptChannelKey } from '../src/store/local-store.js'
+import { NO_RESPONSE_SENTINEL } from '../src/session/no-response.js'
+import { localWorkspaceFiles } from '../src/workspace/workspace-files.js'
+import { LocalGitRunner } from '../src/workspace/git-runner.js'
+import { FakeClock } from './cp/fake-clock.js'
+import { fakeSlackAppFactory } from './fakes/slack-app.js'
+import { inProcessShimExecutor } from './fixtures/in-process-shim.js'
+import { PodWorkspaceFs } from './fixtures/pod-workspace-fs.js'
+import { WAIT, waitBudget } from './wait-support.js'
+import { testPlane } from './workspace-plane-support.js'
+import { fifoWriter, killFifoWriters, mkfifo, statsBeforeSwap } from './fifo-support.js'
+
+const TRANSPORT_SCOPE = `slack:${createHash('sha256').update('slack\0p').digest('hex').slice(0, 24)}`
+
+/** A daemon root with one DM-less agent (we attach routing + a fake conn by hand,
+ *  exactly like daemon-commands.test.ts). `limits` overrides the lifecycle tunables. */
+function scaffold(limits: Record<string, number> = {}, sessions?: Record<string, string>): string {
+  const root = mkdtempSync(join(tmpdir(), 'ac-life-'))
+  writeFileSync(
+    join(root, 'config.json'),
+    JSON.stringify({
+      version: 1,
+      controlPlane: { enabled: false },
+      runtimes: { claude: { command: 'node', args: ['unused'] } },
+      limits,
+      ...(sessions ? { sessions } : {})
+    })
+  )
+  const adir = join(root, 'agents', 'bot-a')
+  mkdirSync(adir, { recursive: true })
+  writeFileSync(
+    join(adir, 'agent.json'),
+    JSON.stringify({
+      id: 'bot-a',
+      name: 'bot-a',
+      status: 'active',
+      runtime: 'claude',
+      workspace: { mode: 'from-scratch', path: join(adir, 'workspace') },
+      integrations: [],
+      output: { mode: 'medium' }
+    })
+  )
+  return root
+}
+
+function quietHost() {
+  return {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => 'acp-1'),
+    prompt: vi.fn(async () => 'end_turn'),
+    cancel: vi.fn(async () => {}),
+    stop: vi.fn(async () => {})
+  }
+}
+
+function blockingHost() {
+  let release!: () => void
+  const blocked = new Promise<void>((r) => (release = r))
+  let calls = 0
+  const host = {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => 'acp-1'),
+    prompt: vi.fn(async () => {
+      if (++calls === 1) await blocked
+      return 'end_turn'
+    }),
+    cancel: vi.fn(async () => {}),
+    stop: vi.fn(async () => {})
+  }
+  return { host, release: () => release() }
+}
+
+function multiBlockingHost() {
+  let release!: () => void
+  const blocked = new Promise<void>((resolve) => (release = resolve))
+  let nextSession = 0
+  const host = {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => `acp-${++nextSession}`),
+    hasSession: vi.fn(() => true),
+    prompt: vi.fn(async () => {
+      await blocked
+      return { stopReason: 'end_turn' }
+    }),
+    cancel: vi.fn(async (_sessionId: string) => {}),
+    stop: vi.fn(async () => {})
+  }
+  return { host, release: () => release() }
+}
+
+function coldBlockingHost() {
+  let releaseSession!: () => void
+  const sessionBlocked = new Promise<void>((resolve) => (releaseSession = resolve))
+  const host = {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => {
+      await sessionBlocked
+      return 'acp-cold'
+    }),
+    hasSession: vi.fn(() => true),
+    prompt: vi.fn(async () => ({ stopReason: 'end_turn' })),
+    cancel: vi.fn(async () => {}),
+    stop: vi.fn(async () => {})
+  }
+  return { host, releaseSession: () => releaseSession() }
+}
+
+/** A host serving the daemon's own distillation pass, whose prompt runs until released or until the host stops under it. */
+function passHost() {
+  let settle!: (error?: Error) => void
+  const running = new Promise<void>((resolve, reject) => (settle = (error) => (error ? reject(error) : resolve())))
+  const host = {
+    start: vi.fn(async () => {}),
+    newSession: vi.fn(async () => 'distill-1'),
+    hasSession: vi.fn(() => true),
+    usesMetaSystemPrompt: vi.fn(() => true),
+    permissionModeOptions: vi.fn(() => ({ modes: ['read-only'] })),
+    setSessionPermissionMode: vi.fn(async () => true),
+    discardSession: vi.fn(() => {}),
+    prompt: vi.fn(async () => {
+      await running
+      return { stopReason: 'end_turn' }
+    }),
+    cancel: vi.fn(async () => {}),
+    stop: vi.fn(async () => settle(new Error('connection closed')))
+  }
+  return { host, release: () => settle() }
+}
+
+function writePause(root: string, pause: boolean): void {
+  const path = join(root, 'agents', 'bot-a', 'agent.json')
+  const agent = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  writeFileSync(path, JSON.stringify({ ...agent, pause }))
+}
+
+function makeRoutable(daemon: Daemon) {
+  const a = (daemon as any).agents.get('bot-a')
+  a.integrations = [
+    {
+      id: 'int-a',
+      platform: 'slack',
+      core: { bindRules: [{ match: { kind: 'dm' } }] },
+      config: { botToken: 'b', appToken: 'p' }
+    }
+  ]
+  let post = 0
+  const conn = {
+    workspaceId: vi.fn(() => 'T1'),
+    setStatus: vi.fn(async () => {}),
+    setTitle: vi.fn(async () => {}),
+    postMessage: vi.fn(async () => `ts-${++post}`),
+    updateBlocks: vi.fn(async () => true),
+    finalizeResponse: vi.fn(async () => true)
+  }
+  ;(daemon as any).connByIntegration.set('int-a', conn)
+  return conn
+}
+
+const dm = (ts: string, text: string, thread = 'T1') => ({
+  msgId: `slack:C1:${ts}`,
+  traceId: ts,
+  source: 'user' as const,
+  platform: 'slack' as const,
+  channel: 'C1',
+  thread,
+  transportScope: TRANSPORT_SCOPE,
+  sender: { id: 'U1', isBot: false },
+  text,
+  mentionedBots: [] as string[],
+  isDm: true,
+  trigger: 'dm' as const
+})
+
+const KEY = sessionKey('slack', 'C1', 'T1', 'bot-a', TRANSPORT_SCOPE)
+/** `sdkLeaseKey('bot-a', 'acp-1')` — leases are per (agent, ACP session), not per session id. */
+const LEASE_KEY = JSON.stringify(['bot-a', 'acp-1'])
+
+/** The wake fence is two counters — armed timers and in-flight deliveries. "Settled" means
+ *  both are clear; `armedWakes` alone hits 0 the moment a delivery starts. */
+function wakeFenceHeld(daemon: Daemon): boolean {
+  const lease = (daemon as any).sdkLease.get(LEASE_KEY)
+  return !!lease && (lease.armedWakes > 0 || lease.deliveringWakes > 0)
+}
+
+function pendingFor(daemon: Daemon, acpSessionId: string): any {
+  return [...(daemon as any).pending.values()].find(
+    (pending: any) => pending.plan.agentId === 'bot-a' && pending.acpSessionId === acpSessionId
+  )
+}
+
+describe('Daemon session lifecycle (#118)', () => {
+  it('finishes credential cleanup after a local environment release fails and the other release settles', async () => {
+    const root = scaffold()
+    const daemon = new Daemon({ root, hostFactory: () => quietHost() as never })
+    let finishRelease!: () => void
+    const releasing = new Promise<void>((resolve) => (finishRelease = resolve))
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const warn = vi.spyOn(d.log, 'warn').mockImplementation(() => {})
+      vi.spyOn(d.localExecutor, 'releaseAgent').mockImplementation(() => {
+        throw new Error('environment stop failed')
+      })
+      const releaseSrt = vi.spyOn(d.localSrtExecutor, 'releaseAgent').mockReturnValue(releasing)
+      const releaseProxy = vi.spyOn(d.credentialProxy.proxy, 'release')
+      const releaseModels = vi.spyOn(d.modelSessions, 'releaseForAgent')
+      const revokeGrants = vi.spyOn(d.webchatMcpRevocations, 'revokeRemoteWebchatGrantsForAgent')
+      d.providerSlots.set('bot-a', new Map())
+      d.hostKeyReaders.set('bot-a', new Map())
+      rmSync(join(root, 'agents', 'bot-a', 'agent.json'))
+      const reconciling = daemon.reconcile()
+      await vi.waitFor(() => expect(releaseSrt).toHaveBeenCalledWith('bot-a'))
+      expect(releaseProxy).not.toHaveBeenCalled()
+      finishRelease()
+      await expect(reconciling).resolves.toBeUndefined()
+      expect(d.providerSlots.has('bot-a')).toBe(false)
+      expect(d.hostKeyReaders.has('bot-a')).toBe(false)
+      expect(releaseProxy).toHaveBeenCalledWith('bot-a')
+      expect(releaseModels).toHaveBeenCalledWith('bot-a')
+      expect(revokeGrants).toHaveBeenCalledWith('bot-a', 'agent_detached')
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('environment stop failed'))
+    } finally {
+      finishRelease()
+      vi.restoreAllMocks()
+      await daemon.stop()
+    }
+  })
+
+  it.each(['from-scratch', 'git-repo'])('reopens a suspended primary %s workspace through its VM', async (mode) => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      agent.workspace.mode = mode
+      mkdirSync(agent.workspace.path, { recursive: true })
+      const environment = {
+        id: 'bot-a/primary',
+        workspaceRoot: agent.dir,
+        mounts: [{ source: agent.workspace.path, target: agent.workspace.path, mode: 'writable' }]
+      }
+      d.microsandbox = { environment: () => undefined, stopAll: async () => {} }
+      const context = vi.spyOn(d, 'microsandboxContext').mockReturnValue({ environment })
+      expect(d.workspaces.trustedWorkspaceWriteRoots(agent)).not.toContain(agent.workspace.path)
+      expect(d.microsandboxWorkspaceEnvironment(agent, agent.workspace.path)).toBe(environment)
+      expect(context).toHaveBeenCalledExactlyOnceWith(agent, agent.workspace.path)
+      expect(d.microsandboxWorkspaceEnvironment(agent, join(agent.dir, 'unmounted'))).toBeUndefined()
+      d.microsandbox = undefined
+      expect(d.microsandboxWorkspaceEnvironment(agent, agent.workspace.path)).toBeUndefined()
+      expect(d.workspaceFilesFor(agent.id)).toBeUndefined()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it.each([false, true])('replaces a managed VM workspace before mounting it (running VM: %s)', async (running) => {
+    const root = scaffold()
+    const daemon = new Daemon({ root, hostFactory: () => quietHost() as never })
+    const git = (cwd: string, args: string[]) =>
+      execFileSync('git', args, {
+        cwd,
+        encoding: 'utf8',
+        env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'empty-gitconfig') }
+      }).trim()
+    try {
+      await daemon.start()
+      const d = daemon as any
+      await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+      const agent = d.agents.get('bot-a')
+      agent.execution = 'microsandbox'
+      Object.assign(agent.workspace, {
+        mode: 'git-repo',
+        gitRepo: 'https://github.com/example-org/old-repo.git',
+        gitCredential: 'github-app'
+      })
+      mkdirSync(agent.workspace.path, { recursive: true })
+      git(agent.workspace.path, ['init', '-q', '--initial-branch=main'])
+      writeFileSync(join(agent.workspace.path, 'old.txt'), 'previous workspace')
+      d.workspaces.recordWorkspaceMaterialization(agent)
+
+      const source = join(root, 'source')
+      mkdirSync(source)
+      git(source, ['init', '-q', '--initial-branch=main'])
+      writeFileSync(join(source, 'new.txt'), 'replacement workspace')
+      git(source, ['add', 'new.txt'])
+      git(source, ['-c', 'user.name=Example', '-c', 'user.email=agent@example.test', 'commit', '-qm', 'initial'])
+      // Substitute only upstream transport; activation, helper configuration and publication use real Git and files.
+      const clone = vi.spyOn(LocalGitRunner.prototype, 'clone').mockImplementation(async (_repo, target, options) => {
+        git(root, ['clone', ...(options ?? []), source, target])
+        return undefined
+      })
+      vi.spyOn(d.gitCreds, 'get').mockResolvedValue(undefined)
+      const environment = {
+        id: 'bot-a/agent',
+        workspaceRoot: agent.dir,
+        mounts: [{ source: agent.workspace.path, target: agent.workspace.path, mode: 'writable' }]
+      }
+      d.microsandbox = {
+        environment: () => (running ? environment : undefined),
+        environmentIds: async () => [],
+        stopAll: async () => {}
+      }
+      d.wirePlaneResolver(d.microsandboxPlane)
+      vi.spyOn(d, 'microsandboxContext').mockReturnValue({ environment, launch: { env: { PATH: process.env.PATH } } })
+      const executor = inProcessShimExecutor()
+      d.localExecutor.withEnvironment = executor.withEnvironment
+
+      agent.workspace.gitRepo = 'https://github.com/example-org/new-repo.git'
+      await d.workspaces.prepareWorkspaceForActivation(agent, { reconcileMaterialization: true })
+
+      expect(clone).toHaveBeenCalledExactlyOnceWith(agent.workspace.gitRepo, expect.stringContaining('.clone-'), [
+        '--branch',
+        'main',
+        '--single-branch'
+      ])
+      expect(executor.seen.length).toBe(0)
+      expect(readFileSync(join(agent.workspace.path, 'new.txt'), 'utf8')).toBe('replacement workspace')
+      expect(existsSync(join(agent.workspace.path, 'old.txt'))).toBe(false)
+      expect(git(agent.workspace.path, ['config', '--get', 'credential.https://github.com.useHttpPath'])).toBe('true')
+      expect(d.workspaces.readMaterialization(agent)).toBe(d.workspaces.materializationKey(agent))
+      // Once published under the mounted path, Git still runs through the VM's shim.
+      expect((await d.workspaces.runnerFor(agent.id, agent.workspace.path).status()).current).toBe('main')
+      expect(executor.seen).toHaveLength(1)
+      expect(executor.seen[0]!.environment).toBe(environment)
+    } finally {
+      vi.restoreAllMocks()
+      await daemon.stop()
+    }
+  })
+
+  // An executor's coordinates are POSIX: its `host` strategy needs Linux (session-executors.md §5).
+  it.skipIf(process.platform === 'win32')(
+    'lists a spread session’s files on its executor through the console, and never off this holder',
+    async () => {
+      const root = scaffold()
+      const executorClone = mkdtempSync(join(tmpdir(), 'ac-exec-clone-'))
+      writeFileSync(join(executorClone, 'on-executor.md'), 'executor')
+      const daemon = new Daemon({ root, hostFactory: () => quietHost() as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+        const agent = d.agents.get('bot-a')
+        agent.workspace.mode = 'git-repo'
+        agent.workspace.gitRepo = 'https://github.com/example-org/example-repo'
+        mkdirSync(agent.workspace.path, { recursive: true })
+        writeFileSync(join(agent.workspace.path, 'on-holder.md'), 'holder')
+        const row = { key: KEY, sessionId: 'outward-1', workspaceIsolation: 'session' }
+        vi.spyOn(d.store, 'getSessionByOutwardId').mockImplementation(async (id: any) =>
+          id === 'outward-1' ? row : undefined
+        )
+        // This holder's own plane, with the session placed on another machine of its group and no pool here.
+        const plane = new ExecutorPlane({
+          prepare: async () => ({ status: 'refused', reason: 'draining' }),
+          release: async () => ({ status: 'released' }),
+          replace: async () => undefined,
+          log: { info: () => {}, warn: () => {} }
+        })
+        const { subject } = plane.place({
+          agentId: 'bot-a',
+          sessionKey: KEY,
+          executorDaemonId: 'exec-a',
+          strategy: 'host'
+        })
+        d.executorPlane = plane
+        d.wirePlaneResolver()
+        // Its pipe up: the executor's shim answers from that machine's clone, whatever this disk holds at the root.
+        const asked: Array<{ capability: string; op: string; root: string }> = []
+        const pipe = {
+          request: async (capability: string, payload: any) => {
+            asked.push({ capability, op: payload.op, root: payload.root })
+            return { ok: true, value: await localWorkspaceFiles.list(executorClone, payload.req) }
+          }
+        }
+        const bound = vi
+          .spyOn(plane as any, 'boundSession')
+          .mockImplementation((s) => (s === subject ? pipe : undefined))
+        const deps = buildCpClientDeps(d.cpClientDepsHost(root, 'wss://cp.example.test', () => {}))
+        const names = async (sessionId?: string) =>
+          (await deps.workspaceRead!.list({ agentId: 'bot-a', sessionId, path: '', limit: 50 })).entries.map(
+            (entry: { name: string }) => entry.name
+          )
+
+        expect(await names('outward-1')).toEqual(['on-executor.md'])
+        expect(asked).toEqual([
+          {
+            capability: 'read',
+            op: 'list',
+            root: expect.stringMatching(`/sessions/${sessionKeyDirName(KEY)}/workspace$`)
+          }
+        ])
+        // The agent's own checkout stays on this holder (§7).
+        expect(await names()).toEqual(['on-holder.md'])
+
+        // Its pipe closed: refused, rather than an empty tree read off this holder at the session's path.
+        bound.mockReturnValue(undefined)
+        await expect(names('outward-1')).rejects.toMatchObject({ reason: 'sandbox-unavailable' })
+        expect(asked).toHaveLength(1)
+      } finally {
+        await daemon.stop()
+        rmSync(executorClone, { recursive: true, force: true })
+      }
+    }
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'reads a spread session’s Git on its executor through the console, and never off this holder',
+    async () => {
+      const root = scaffold()
+      const daemon = new Daemon({ root, hostFactory: () => quietHost() as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+        const agent = d.agents.get('bot-a')
+        agent.workspace.mode = 'git-repo'
+        agent.workspace.gitRepo = 'https://github.com/example-org/example-repo'
+        execFileSync('git', ['init', '-q', '-b', 'on-holder', agent.workspace.path])
+        const row = { key: KEY, sessionId: 'outward-1', workspaceIsolation: 'session' }
+        vi.spyOn(d.store, 'getSessionByOutwardId').mockImplementation(async (id: any) =>
+          id === 'outward-1' ? row : undefined
+        )
+        const plane = new ExecutorPlane({
+          prepare: async () => ({ status: 'refused', reason: 'draining' }),
+          release: async () => ({ status: 'released' }),
+          replace: async () => undefined,
+          log: { info: () => {}, warn: () => {} }
+        })
+        const { subject } = plane.place({
+          agentId: 'bot-a',
+          sessionKey: KEY,
+          executorDaemonId: 'exec-a',
+          strategy: 'host'
+        })
+        d.executorPlane = plane
+        d.wirePlaneResolver()
+        // An attached executor session has a current launch for each Git operation to retain.
+        await (plane as any).ensureLaunch(subject)
+        // Its pipe up: the executor's shim runs git in that machine's clone, which is on a branch of its own.
+        const asked: Array<{ cwd?: string; args: string[] }> = []
+        const pipe = {
+          request: async (capability: string, payload: any) => {
+            expect(capability).toBe('exec')
+            asked.push({ cwd: payload.cwd, args: payload.args })
+            if (payload.args[0] === 'rev-parse') return { code: 0, stdout: '\n', stderr: '' }
+            if (payload.args[0] === 'status') return { code: 0, stdout: '# branch.head on-executor\0', stderr: '' }
+            if (payload.args[0] === 'diff') return { code: 0, stdout: '', stderr: '' }
+            if (payload.args[0] === 'ls-files') return { code: 0, stdout: 'notes.md\0', stderr: '' }
+            return { code: 128, stdout: '', stderr: 'fatal: no commits yet' }
+          }
+        }
+        const bound = vi
+          .spyOn(plane as any, 'boundSession')
+          .mockImplementation((s) => (s === subject ? pipe : undefined))
+        const deps = buildCpClientDeps(d.cpClientDepsHost(root, 'wss://cp.example.test', () => {}))
+        const status = (sessionId?: string) => deps.workspaceGit!.status('bot-a', sessionId)
+
+        await expect(status('outward-1')).resolves.toMatchObject({ isRepo: true, branch: 'on-executor' })
+        expect(asked[0]).toEqual({
+          cwd: expect.stringMatching(`/sessions/${sessionKeyDirName(KEY)}/workspace$`),
+          args: ['rev-parse', '--show-prefix']
+        })
+        // An unchanged file's existence is asked of git there as well, never of this disk, where the session's directory is not.
+        const diff = { agentId: 'bot-a', sessionId: 'outward-1', path: 'notes.md', staged: false }
+        await expect(deps.workspaceGit!.diff(diff)).resolves.toMatchObject({ isRepo: true, exists: true })
+        // The agent's own checkout stays on this holder (§7).
+        const seen = asked.length
+        await expect(status()).resolves.toMatchObject({ isRepo: true, branch: 'on-holder' })
+        expect(asked).toHaveLength(seen)
+
+        // Its pipe closed: refused, rather than git run on this holder at the session's path.
+        bound.mockReturnValue(undefined)
+        await expect(status('outward-1')).rejects.toMatchObject({ reason: 'sandbox-unavailable' })
+        expect(asked).toHaveLength(seen)
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  it.each([false, true])('sweeps retired microsandbox roots only with a warm VM (warm: %s)', async (warm) => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      agent.execution = 'microsandbox'
+      const environment = { id: 'bot-a/agent' }
+      d.microsandbox = {
+        environment: (id: string) => (warm && id === environment.id ? environment : undefined),
+        stopAll: async () => {}
+      }
+      const list = vi.spyOn(d.workspaces, 'retiredSecondaryRoots').mockResolvedValue([])
+      await d.sweepRetiredWorkspaceRoots()
+      // The second argument is what session snapshots still hold, none here.
+      if (warm) expect(list).toHaveBeenCalledExactlyOnceWith(agent, [])
+      else expect(list).not.toHaveBeenCalled()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  // Pod coordinates are POSIX by construction.
+  it.skipIf(process.platform === 'win32')(
+    'puts a pool session’s attachment and image read on its own pod when the agent pod never bound here',
+    async () => {
+      const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        // The startup retention pass must not meet the fake plane below.
+        await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+        const agent = d.agents.get('bot-a')
+        agent.workspace.mode = 'git-repo'
+        agent.workspace.gitRepo = 'https://github.com/example-org/example-repo'
+        const row = { key: KEY, sessionId: 'outward-1', workspaceIsolation: 'session' }
+        const getSession = d.store.getSession.bind(d.store)
+        vi.spyOn(d.store, 'getSession').mockImplementation(async (key: any) => (key === KEY ? row : getSession(key)))
+        vi.spyOn(d.store, 'getSessionByOutwardId').mockResolvedValue(row)
+        const pod = new PodWorkspaceFs('/agent')
+        const clone = `/agent/sessions/${sessionKeyDirName(KEY)}/workspace`
+        const png = Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+          'base64'
+        )
+        vi.spyOn(pod, 'readFileBytes').mockImplementation(async (path) =>
+          path === `${clone}/out/chart.png` ? { bytes: png } : undefined
+        )
+        let bound = true
+        const plane = {
+          ...testPlane({
+            workspacesOffDisk: true,
+            workspaceFsFor: () => (bound ? { fs: pod, mount: '/agent' } : undefined)
+          }),
+          // Only the session pod ever bound on this member, so the agent pod has no recorded mount.
+          workspaceRootFor: (subject: string) => (subject === 'bot-a' ? undefined : '/agent'),
+          stop: async () => {}
+        }
+        d.k8sPlane = plane
+        d.wirePlaneResolver(plane)
+        const ctx = {
+          agentId: 'bot-a',
+          platform: 'slack',
+          channel: 'C1',
+          thread: 'T1',
+          transportScope: TRANSPORT_SCOPE
+        }
+
+        expect(await d.mcp.deps.saveAttachment(ctx, 'report.pdf', Buffer.from('%PDF-1'))).toEqual({
+          ok: true,
+          path: 'uploads/report.pdf'
+        })
+        expect(String(pod.files.get(`${clone}/uploads/report.pdf`))).toBe('%PDF-1')
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/chart.png')).toMatchObject({
+          ok: true,
+          mimeType: 'image/png'
+        })
+
+        // No pod of the agent bound: both refuse rather than fall back to this member's own disk.
+        bound = false
+        expect(await d.mcp.deps.saveAttachment(ctx, 'other.pdf', Buffer.from('%PDF-2'))).toEqual({
+          ok: false,
+          reason: 'sandboxed'
+        })
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/chart.png')).toEqual({ ok: false, reason: 'sandboxed' })
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  // An executor's coordinates are POSIX: its `host` strategy needs Linux (session-executors.md §5).
+  it.skipIf(process.platform === 'win32')(
+    'puts a spread session’s attachment and image read on its executor, at that machine’s own root',
+    async () => {
+      const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+        const agent = d.agents.get('bot-a')
+        agent.workspace.mode = 'git-repo'
+        agent.workspace.gitRepo = 'https://github.com/example-org/example-repo'
+        const row = { key: KEY, sessionId: 'outward-1', workspaceIsolation: 'session' }
+        const getSession = d.store.getSession.bind(d.store)
+        vi.spyOn(d.store, 'getSession').mockImplementation(async (key: any) => (key === KEY ? row : getSession(key)))
+        vi.spyOn(d.store, 'getSessionByOutwardId').mockResolvedValue(row)
+        // The executor's own daemon root, where its shim reported the session's directory: never the pool's `/agent`.
+        const executorRoot = '/srv/executor'
+        const machine = new PodWorkspaceFs(executorRoot)
+        const clone = `${executorRoot}/sessions/${sessionKeyDirName(KEY)}/workspace`
+        const png = Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+          'base64'
+        )
+        vi.spyOn(machine, 'readFileBytes').mockImplementation(async (path) =>
+          path === `${clone}/out/chart.png` ? { bytes: png } : undefined
+        )
+        let bound = true
+        // This holder runs no pool; only the one placed session, and the paths in its environment, resolve to the executor.
+        const executor = {
+          ...testPlane({
+            workspacesOffDisk: true,
+            workspaceFsFor: () => (bound ? { fs: machine, mount: executorRoot } : undefined)
+          }),
+          placementOf: (key: string) => (key === KEY ? { agentId: 'bot-a', sessionKey: KEY } : undefined),
+          planeFor: (scope: { agentId: string; sessionKey?: string; path?: string }) =>
+            scope.agentId === 'bot-a' &&
+            (scope.sessionKey === undefined ? scope.path?.startsWith(`${executorRoot}/`) : scope.sessionKey === KEY)
+              ? executor
+              : undefined,
+          launched: () => [],
+          releaseAgent: () => {},
+          stop: async () => {}
+        }
+        d.executorPlane = executor
+        d.wirePlaneResolver()
+        const ctx = {
+          agentId: 'bot-a',
+          platform: 'slack',
+          channel: 'C1',
+          thread: 'T1',
+          transportScope: TRANSPORT_SCOPE
+        }
+
+        expect(await d.mcp.deps.saveAttachment(ctx, 'report.pdf', Buffer.from('%PDF-1'))).toEqual({
+          ok: true,
+          path: 'uploads/report.pdf'
+        })
+        expect(String(machine.files.get(`${clone}/uploads/report.pdf`))).toBe('%PDF-1')
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/chart.png')).toMatchObject({
+          ok: true,
+          mimeType: 'image/png'
+        })
+
+        // Its pipe closed: both refuse rather than reach for this holder's own disk.
+        bound = false
+        expect(await d.mcp.deps.saveAttachment(ctx, 'other.pdf', Buffer.from('%PDF-2'))).toEqual({
+          ok: false,
+          reason: 'sandboxed'
+        })
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/chart.png')).toEqual({ ok: false, reason: 'sandboxed' })
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'reads a local image from one regular-file descriptor and refuses a FIFO swapped in after the check',
+    async () => {
+      const root = scaffold({ maxOutboundFileBytes: 128 })
+      const daemon = new Daemon({ root, hostFactory: () => quietHost() as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        await vi.waitFor(() => expect(d.sessionRetentionSweepInFlight).toBe(false))
+        const out = join(root, 'agents', 'bot-a', 'workspace', 'out')
+        mkdirSync(out, { recursive: true })
+        const png = Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+          'base64'
+        )
+        writeFileSync(join(out, 'chart.png'), png)
+        writeFileSync(join(out, 'large.png'), Buffer.concat([png, Buffer.alloc(200)]))
+        const ctx = {
+          agentId: 'bot-a',
+          platform: 'slack',
+          channel: 'C1',
+          thread: 'T1',
+          transportScope: TRANSPORT_SCOPE
+        }
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/chart.png')).toMatchObject({
+          ok: true,
+          mimeType: 'image/png'
+        })
+        expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/large.png')).toEqual({
+          ok: false,
+          reason: 'too-large',
+          detail: `${png.length + 200} bytes > 128-byte cap`
+        })
+
+        const pipe = join(out, 'pipe.png')
+        mkfifo(pipe)
+        fifoWriter(pipe, png)
+        const restore = statsBeforeSwap([pipe], join(out, 'chart.png'))
+        try {
+          expect(await d.mcp.deps.readWorkspaceFile(ctx, 'out/pipe.png')).toEqual({ ok: false, reason: 'not-found' })
+        } finally {
+          restore()
+        }
+      } finally {
+        killFifoWriters()
+        await daemon.stop()
+      }
+    }
+  )
+
+  it('retries microsandbox skill authority after a transient store failure', async () => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      mkdirSync(agent.workspace.path, { recursive: true })
+      const environment = { id: 'bot-a/agent' }
+      d.microsandbox = { environment: () => environment, stopAll: async () => {} }
+      // The VM's bound shim, as the in-process executor entry hands it over (session-executors.md §11 step 4).
+      vi.spyOn(d.localExecutor, 'withEnvironment').mockImplementation((async (
+        _environment: unknown,
+        run: (session: unknown) => Promise<unknown>
+      ) => run({ hasCapability: () => true, generation: 1, isAttached: () => true })) as never)
+      vi.spyOn(d, 'microsandboxContext').mockReturnValue({ environment })
+      vi.spyOn(d.store, 'clusterSkillLedger').mockResolvedValue({ revision: 1, ledger: { roots: [] } })
+      const prepare = vi.spyOn(d, 'reconcileSandboxSkills').mockResolvedValue({ roots: [] })
+      const fence = vi
+        .spyOn(d.store, 'projectDutyWriteFence')
+        .mockRejectedValueOnce(new Error('store busy'))
+        .mockResolvedValue(true)
+      await expect(d.reconcileMicrosandboxSkills(agent, agent.workspace.path)).rejects.toThrow('store busy')
+      await expect(d.reconcileMicrosandboxSkills(agent, agent.workspace.path)).resolves.toEqual([
+        '.agentconnect/cluster-skill-state'
+      ])
+      expect(fence).toHaveBeenCalledTimes(2)
+      expect(prepare).toHaveBeenCalledOnce()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('adopts the ledger a microsandbox workspace kept under its device-bearing key', async () => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      mkdirSync(agent.workspace.path, { recursive: true })
+      const environment = { id: 'bot-a/agent' }
+      d.microsandbox = { environment: () => environment, stopAll: async () => {} }
+      vi.spyOn(d.localExecutor, 'withEnvironment').mockImplementation((async (
+        _environment: unknown,
+        run: (session: unknown) => Promise<unknown>
+      ) => run({ hasCapability: () => true, generation: 1, isAttached: () => true })) as never)
+      vi.spyOn(d, 'microsandboxContext').mockReturnValue({ environment })
+      const { incarnation, deviceIncarnation } = await workspaceIncarnationOf(agent.workspace.path)
+      // Kept before the key dropped the device, which a reboot can renumber under unchanged files.
+      const kept = {
+        roots: [
+          { path: '.claude/skills/a', sourceId: 'managed:a', sourceKind: 'managed', digest: 'a'.repeat(64), files: [] }
+        ]
+      }
+      const ledgers = new Map([[deviceIncarnation, { revision: 3, ledger: kept }]])
+      vi.spyOn(d.store, 'clusterSkillLedger').mockImplementation((async (_id: string, key: string) =>
+        ledgers.get(key)) as never)
+      const prepare = vi.spyOn(d, 'reconcileSandboxSkills').mockResolvedValue(kept)
+      await d.reconcileMicrosandboxSkills(agent, agent.workspace.path)
+      expect(prepare.mock.calls[0]![1]).toMatchObject({ workspaceIncarnation: incarnation, initialLedger: kept })
+
+      // Once a ledger is kept under the stable key, the old one is no longer consulted.
+      ledgers.set(incarnation, { revision: 1, ledger: { roots: [] } })
+      await d.reconcileMicrosandboxSkills(agent, agent.workspace.path)
+      expect((prepare.mock.calls[1]![1] as { initialLedger?: unknown }).initialLedger).toBeUndefined()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it("adopts a placed session's ledger kept under its executor's device-bearing identity", async () => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      const cwd = '/srv/executor/sessions/leaf/workspace'
+      const kept = { roots: [] }
+      d.executorPlane = {
+        placementOf: (key: string) =>
+          key === KEY ? { agentId: 'bot-a', sessionKey: KEY, subject: 'bot-a/leaf' } : undefined,
+        withEnvironment: (_subject: string, work: () => Promise<unknown>) => work(),
+        mountFor: () => '/srv/executor',
+        skillClientFor: () => undefined,
+        workspaceIncarnationFor: () => 'workspace:stable',
+        deviceWorkspaceIncarnationFor: () => 'workspace:device',
+        shimGenerationFor: () => 1,
+        planeFor: () => undefined,
+        launched: () => [],
+        releaseAgent: () => {},
+        stop: async () => {}
+      }
+      vi.spyOn(d.workspaces, 'prepareExecutorWorkspace').mockResolvedValue(cwd)
+      vi.spyOn(d.workspaces, 'excludePlacedSessionSkills').mockResolvedValue(undefined)
+      const ledgers = new Map([[cwdWorkspaceIncarnation('workspace:device', cwd), { revision: 2, ledger: kept }]])
+      vi.spyOn(d.store, 'clusterSkillLedger').mockImplementation((async (_id: string, key: string) =>
+        ledgers.get(key)) as never)
+      const prepare = vi.spyOn(d, 'reconcileSandboxSkills').mockResolvedValue(kept)
+      expect(await d.runAgentWorkspacePreparation(agent, { sessionKey: KEY, isolation: 'session' })).toBe(cwd)
+      expect(prepare.mock.calls[0]![1]).toMatchObject({
+        workspaceIncarnation: cwdWorkspaceIncarnation('workspace:stable', cwd),
+        initialLedger: kept
+      })
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it("installs a placed session's skills into its checkout and retires those at its session directory", async () => {
+    const daemon = new Daemon({ root: scaffold(), hostFactory: () => quietHost() as never })
+    try {
+      await daemon.start()
+      const d = daemon as any
+      const agent = d.agents.get('bot-a')
+      d.runtimeCatalog.entries.claude = { ...d.runtimeCatalog.entries.claude, skillsAgentId: 'claude' }
+      const cwd = '/srv/executor/sessions/leaf/workspace'
+      const reported = 'workspace:reported'
+      const atCwd = cwdWorkspaceIncarnation(reported, cwd)
+      const root = (path: string) => ({
+        path,
+        sourceId: 'managed:a',
+        sourceKind: 'managed' as const,
+        digest: 'a'.repeat(64),
+        files: []
+      })
+      const clients = new Map<string | undefined, unknown>([
+        [undefined, { manifestLimits: { maxFiles: 1, maxTotalBytes: 1 } }],
+        [cwd, { manifestLimits: { maxFiles: 1, maxTotalBytes: 1 } }]
+      ])
+      d.executorPlane = {
+        placementOf: (key: string) =>
+          key === KEY ? { agentId: 'bot-a', sessionKey: KEY, subject: 'bot-a/leaf' } : undefined,
+        withEnvironment: (_subject: string, work: () => Promise<unknown>) => work(),
+        mountFor: () => '/srv/executor',
+        skillClientFor: (_subject: string, at?: string) => clients.get(at),
+        workspaceIncarnationFor: () => reported,
+        shimGenerationFor: () => 1,
+        planeFor: () => undefined,
+        launched: () => [],
+        releaseAgent: () => {},
+        stop: async () => {}
+      }
+      vi.spyOn(d.workspaces, 'prepareExecutorWorkspace').mockResolvedValue(cwd)
+      const exclude = vi.spyOn(d.workspaces, 'excludePlacedSessionSkills').mockResolvedValue(undefined)
+      vi.spyOn(d.duties, 'dutyForAgent').mockReturnValue({ groupId: 'group-a', term: '1' })
+      // An older daemon installed at the shim's root, the session directory; the checkout holds nothing yet.
+      const ledgers = new Map([[reported, { revision: 1, ledger: { roots: [root('.claude/skills/a')] } }]])
+      vi.spyOn(d.store, 'clusterSkillLedger').mockImplementation((async (_id: string, key: string) =>
+        ledgers.get(key)) as never)
+      let retirementFails = true
+      const reconcile = vi.spyOn(ClusterSkillCoordinator.prototype, 'reconcile').mockImplementation(async (input) => {
+        const at = input.authority.workspaceIncarnation
+        if (at === reported && retirementFails) {
+          retirementFails = false
+          throw new Error('shim busy')
+        }
+        const roots = at === atCwd ? [root('.claude/skills/a')] : []
+        ledgers.set(at, { revision: 2, ledger: { roots } })
+        return { roots }
+      })
+      const request = { sessionKey: KEY, isolation: 'session' }
+
+      // A failed retirement leaves the launch alone; the next preparation retries it.
+      expect(await d.runAgentWorkspacePreparation(agent, request)).toBe(cwd)
+      expect(reconcile.mock.calls.map(([input]) => [input.authority.workspaceIncarnation, input.client])).toEqual([
+        [atCwd, clients.get(cwd)],
+        [reported, clients.get(undefined)]
+      ])
+      expect(reconcile.mock.calls[1]![0].sources).toEqual([])
+      expect(exclude).toHaveBeenCalledWith(agent, cwd, ['.claude/skills/a', '.agentconnect/cluster-skill-state'])
+
+      reconcile.mockClear()
+      await d.runAgentWorkspacePreparation(agent, request)
+      expect(reconcile.mock.calls.map(([input]) => input.authority.workspaceIncarnation)).toEqual([atCwd, reported])
+      expect(ledgers.get(reported)?.ledger.roots).toEqual([])
+
+      // Nothing is left there, so later preparations ask nothing of the session directory.
+      reconcile.mockClear()
+      await d.runAgentWorkspacePreparation(agent, request)
+      expect(reconcile.mock.calls.map(([input]) => input.authority.workspaceIncarnation)).toEqual([atCwd])
+    } finally {
+      vi.restoreAllMocks()
+      await daemon.stop()
+    }
+  })
+
+  it.each(['microsandbox', 'host'])(
+    'installs a host runtime only for local execution (execution=%s)',
+    async (execution) => {
+      const root = scaffold()
+      const host = quietHost()
+      const daemon = new Daemon({ root, hostFactory: () => host as never })
+      try {
+        await daemon.start()
+        const d = daemon as any
+        d.agents.get('bot-a').execution = execution
+        vi.spyOn(d, 'prepareAgentWorkspace').mockResolvedValue(join(root, 'workspace'))
+        const install = vi.spyOn(d, 'ensureRuntimeInstalled').mockResolvedValue(undefined)
+
+        await d.ensureHostAsync('bot-a')
+
+        expect(host.start).toHaveBeenCalledOnce()
+        if (execution === 'microsandbox') expect(install).not.toHaveBeenCalled()
+        else expect(install).toHaveBeenCalledExactlyOnceWith('claude', true)
+      } finally {
+        await daemon.stop()
+      }
+    }
+  )
+
+  it('prepares the workspace before every direct cold-host lifecycle start', async () => {
+    const root = scaffold()
+    const workspace = join(root, 'agents', 'bot-a', 'workspace')
+    const host = quietHost()
+    const factory = vi.fn(() => {
+      // ensureHostAsync is shared by memory/Dream extraction, activation proof,
+      // CP launch, and ordinary session startup. Construction itself must not
+      // happen until the complete workspace preparation gate has settled.
+      expect(existsSync(workspace)).toBe(true)
+      return host as any
+    })
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+    expect(existsSync(workspace)).toBe(false)
+
+    await (daemon as any).ensureHostAsync('bot-a')
+
+    expect(factory).toHaveBeenCalledOnce()
+    expect(host.start).toHaveBeenCalledOnce()
+    await daemon.stop()
+  })
+
+  // Boot is the one moment every host of the agent is provably stopped, so it is where a crash's
+  // leftover host temp directories are reclaimed. Only leaves of a temp root the daemon proved it
+  // owns go: an operator's data at the same short name, marker-less, is left untouched.
+  it("reclaims an agent's stale host temp directories at boot", async () => {
+    const root = scaffold()
+    const tempRoot = join(root, 'agents', 'bot-a', 't')
+    const orphaned = join(tempRoot, 'deadbeef')
+    const stranger = join(tempRoot, 'operator-notes')
+    mkdirSync(orphaned, { recursive: true })
+    mkdirSync(stranger, { recursive: true })
+    writeFileSync(join(tempRoot, '.agentconnect-runtime-temp'), '')
+
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => quietHost() as any })
+    await daemon.start()
+
+    expect(existsSync(orphaned)).toBe(false)
+    expect(existsSync(stranger)).toBe(true)
+    await daemon.stop()
+  })
+
+  // An agent whose `workspace.path` resolves to that same name keeps every byte of it.
+  it('never reclaims a temp-root name the daemon did not create', async () => {
+    const root = scaffold()
+    const workspace = join(root, 'agents', 'bot-a', 't')
+    const precious = join(workspace, 'deadbeef')
+    mkdirSync(precious, { recursive: true })
+
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => quietHost() as any })
+    await daemon.start()
+
+    expect(existsSync(precious)).toBe(true)
+    await daemon.stop()
+  })
+
+  it('does not construct or start a cold host when workspace preparation fails', async () => {
+    const root = scaffold()
+    const workspace = join(root, 'agents', 'bot-a', 'workspace')
+    writeFileSync(workspace, 'not a directory')
+    const factory = vi.fn(() => quietHost() as any)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+
+    await expect((daemon as any).ensureHostAsync('bot-a')).rejects.toThrow()
+
+    expect(factory).not.toHaveBeenCalled()
+    expect((daemon as any).hosts.has('bot-a')).toBe(false)
+    await daemon.stop()
+  })
+
+  it('shares one cold preparation between host start and session creation', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const prepare = vi.spyOn(daemon as any, 'prepareAgentWorkspace')
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'cold'), 'int-a')
+    expect(prepare).toHaveBeenCalledTimes(1)
+    // That one preparation is the session's own, so its on-demand clone directory is made before the runtime is handed it.
+    expect(prepare.mock.calls[0]?.[2]).toMatchObject({ isolation: 'shared', sessionKey: expect.any(String) })
+
+    // A different logical session on the already-running host still performs
+    // its one warm new-session preparation.
+    await (daemon as any).dispatch('bot-a', dm('200', 'warm', 'T2'), 'int-a')
+    expect(prepare).toHaveBeenCalledTimes(2)
+    await daemon.stop()
+  })
+
+  it('gives a session that joins a shared cold start its own preparation once the host is up', async () => {
+    let releaseStart!: () => void
+    const started = new Promise<void>((resolve) => (releaseStart = resolve))
+    const host = quietHost()
+    host.start.mockImplementation(async () => await started)
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const prepare = vi.spyOn(daemon as any, 'prepareAgentWorkspace')
+
+    const first = (daemon as any).dispatch('bot-a', dm('100', 'cold'), 'int-a')
+    await vi.waitFor(() => expect(host.start).toHaveBeenCalledTimes(1))
+    const second = (daemon as any).dispatch('bot-a', dm('200', 'joins', 'T2'), 'int-a')
+    await vi.waitFor(() => expect((daemon as any).sessionIsolation.size).toBeGreaterThanOrEqual(2))
+    releaseStart()
+    await Promise.all([first, second])
+
+    // One preparation per session: the starter's inside the cold gate, the joiner's after the host started.
+    const sessions = prepare.mock.calls.map((call) => (call[2] as { sessionKey?: string } | undefined)?.sessionKey)
+    expect(sessions).toHaveLength(2)
+    expect(new Set(sessions).size).toBe(2)
+    expect(sessions.every((key) => typeof key === 'string')).toBe(true)
+    await daemon.stop()
+  })
+
+  it('gives each of two sessions arriving together at a cold shared host its own preparation', async () => {
+    let releaseStart!: () => void
+    const started = new Promise<void>((resolve) => (releaseStart = resolve))
+    const host = quietHost()
+    host.start.mockImplementation(async () => await started)
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const prepare = vi.spyOn(daemon as any, 'prepareAgentWorkspace')
+
+    // Both enter hostFor in one tick, so neither has registered the start when the other decides.
+    const hostFor = (daemon as any).sessions.deps.hostFor as (
+      agentId: string,
+      request: { sessionKey: string; isolation: 'shared' },
+      cwd?: string
+    ) => Promise<unknown>
+    const both = Promise.all([
+      hostFor('bot-a', { sessionKey: 'slack:C1:100:bot-a', isolation: 'shared' }),
+      hostFor('bot-a', { sessionKey: 'slack:C1:200:bot-a', isolation: 'shared' })
+    ])
+    await vi.waitFor(() => expect(host.start).toHaveBeenCalledTimes(1))
+    releaseStart()
+    await both
+
+    const sessions = prepare.mock.calls.map((call) => (call[2] as { sessionKey?: string } | undefined)?.sessionKey)
+    expect(sessions).toHaveLength(2)
+    expect(new Set(sessions).size).toBe(2)
+    expect(sessions.every((key) => typeof key === 'string')).toBe(true)
+    await daemon.stop()
+  })
+
+  it('earns one extra host start attempt when it repairs the runtime install', async () => {
+    const root = scaffold({ agentStartAttempts: 1, agentStartBackoffMs: 0 })
+    const failing = quietHost()
+    failing.start.mockRejectedValue(
+      new Error('Codex process has exited with code 1:\nError: Missing optional dependency @openai/codex-linux-x64')
+    )
+    const started = quietHost()
+    const factory = vi.fn().mockReturnValueOnce(failing).mockReturnValueOnce(started)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+    const repair = vi.spyOn(daemon as any, 'repairAgentRuntimeInstall').mockResolvedValue('repaired')
+
+    await expect((daemon as any).ensureHostAsync('bot-a')).resolves.toBe(started)
+    expect(repair).toHaveBeenCalledTimes(1)
+    expect((daemon as any).lastStartFailure.has('bot-a')).toBe(false)
+    await daemon.stop()
+  })
+
+  it('does not spend its one repair on a failure that was never a broken install', async () => {
+    const root = scaffold({ agentStartAttempts: 2, agentStartBackoffMs: 0 })
+    const unrelated = quietHost()
+    unrelated.start.mockRejectedValue(new Error('initialize failed'))
+    const missing = quietHost()
+    missing.start.mockRejectedValue(new Error('Error: Missing optional dependency @openai/codex-linux-x64'))
+    const started = quietHost()
+    const factory = vi.fn().mockReturnValueOnce(unrelated).mockReturnValueOnce(missing).mockReturnValueOnce(started)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+    const repair = vi
+      .spyOn(daemon as any, 'repairAgentRuntimeInstall')
+      .mockResolvedValueOnce('declined')
+      .mockResolvedValueOnce('repaired')
+
+    await expect((daemon as any).ensureHostAsync('bot-a')).resolves.toBe(started)
+    expect(repair).toHaveBeenCalledTimes(2)
+    await daemon.stop()
+  })
+
+  it('records the redacted cause when no repair rescues the start', async () => {
+    const root = scaffold({ agentStartAttempts: 1, agentStartBackoffMs: 0 })
+    const failing = quietHost()
+    failing.start.mockRejectedValue(
+      new Error('Codex process has exited with code 1:\nError: Missing optional dependency @openai/codex-linux-x64')
+    )
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root,
+      hostFactory: vi.fn(() => failing as any)
+    })
+    await daemon.start()
+    const repair = vi.spyOn(daemon as any, 'repairAgentRuntimeInstall').mockResolvedValue('failed')
+
+    await expect((daemon as any).ensureHostAsync('bot-a')).rejects.toThrow('Missing optional dependency')
+    expect(repair).toHaveBeenCalledTimes(1)
+    expect((daemon as any).lastStartFailure.get('bot-a')).toBe(
+      'Error: Missing optional dependency @openai/codex-linux-x64'
+    )
+    await daemon.stop()
+  })
+
+  it('declines a repair it cannot own: no matching tree, or a cluster-launched runtime', async () => {
+    const root = scaffold()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root,
+      hostFactory: vi.fn(() => quietHost() as any)
+    })
+    await daemon.start()
+
+    expect(await (daemon as any).repairAgentRuntimeInstall('bot-a', new Error('initialize failed'))).toBe('declined')
+    ;(daemon as any).k8sPlane = { stop: async () => {} }
+    const missing = new Error('Error: Missing optional dependency @openai/codex-linux-x64')
+    expect(await (daemon as any).repairAgentRuntimeInstall('bot-a', missing)).toBe('declined')
+    await daemon.stop()
+  })
+
+  it('re-runs the workspace receipt gate before every fresh host retry', async () => {
+    const root = scaffold({ agentStartAttempts: 2, agentStartBackoffMs: 0 })
+    const workspace = join(root, 'agents', 'bot-a', 'workspace')
+    const sentinel = join(workspace, 'tampered-by-failed-host')
+    const first = quietHost()
+    first.start.mockImplementation(async () => {
+      writeFileSync(sentinel, 'tampered')
+      throw new Error('initialize failed')
+    })
+    const second = quietHost()
+    const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+    const realPrepare = (daemon as any).prepareAgentWorkspace.bind(daemon)
+    let preparations = 0
+    vi.spyOn(daemon as any, 'prepareAgentWorkspace').mockImplementation(async (agent: unknown) => {
+      preparations += 1
+      if (preparations === 2 && existsSync(sentinel)) throw new Error('skill receipt changed after failed host')
+      return realPrepare(agent)
+    })
+
+    await expect((daemon as any).ensureHostAsync('bot-a')).rejects.toThrow('skill receipt changed')
+
+    expect(preparations).toBe(2)
+    expect(factory).toHaveBeenCalledTimes(1)
+    expect(first.stop).toHaveBeenCalledOnce()
+    expect(second.start).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+
+  it('drains a superseded cold preparation before reconcile admits the next generation', async () => {
+    const root = scaffold()
+    const host = quietHost()
+    const factory = vi.fn(() => host as any)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory })
+    await daemon.start()
+
+    const realPrepare = (daemon as any).prepareAgentWorkspace.bind(daemon)
+    let releaseFirst!: () => void
+    const firstBlocked = new Promise<void>((resolve) => (releaseFirst = resolve))
+    let markFirstEntered!: () => void
+    const firstEntered = new Promise<void>((resolve) => (markFirstEntered = resolve))
+    const preparedModels: Array<string | undefined> = []
+    let preparations = 0
+    vi.spyOn(daemon as any, 'prepareAgentWorkspace').mockImplementation(async (agent: any) => {
+      preparations += 1
+      preparedModels.push(agent.runtimeOverrides?.model)
+      if (preparations === 1) {
+        markFirstEntered()
+        await firstBlocked
+      }
+      return realPrepare(agent)
+    })
+
+    const firstStart = (daemon as any).ensureHostAsync('bot-a') as Promise<unknown>
+    const firstRejected = expect(firstStart).rejects.toThrow(
+      /host start superseded|workspace preparation blocked while agent authority is draining/
+    )
+    await firstEntered
+
+    const agentPath = join(root, 'agents', 'bot-a', 'agent.json')
+    const agent = JSON.parse(readFileSync(agentPath, 'utf8')) as Record<string, unknown>
+    writeFileSync(agentPath, JSON.stringify({ ...agent, runtimeOverrides: { model: 'opus' } }))
+    let reconciled = false
+    const reconciling = daemon.reconcile().then(() => {
+      reconciled = true
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    expect(reconciled).toBe(false)
+    expect(factory).not.toHaveBeenCalled()
+    releaseFirst()
+    await firstRejected
+    await reconciling
+
+    await (daemon as any).ensureHostAsync('bot-a')
+    expect(preparedModels).toEqual([undefined, 'opus'])
+    expect(factory).toHaveBeenCalledOnce()
+    expect(host.start).toHaveBeenCalledOnce()
+    await daemon.stop()
+  })
+
+  it('serializes an aborted warm preparation before the reconciled host prepares and starts', async () => {
+    const root = scaffold()
+    const configPath = join(root, 'config.json')
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, any>
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        ...config,
+        runtimes: { ...config.runtimes, codex: { command: 'node', args: ['unused'] } }
+      })
+    )
+    const firstHost = quietHost()
+    const secondHost = quietHost()
+    const factory = vi.fn().mockReturnValueOnce(firstHost).mockReturnValueOnce(secondHost)
+    const clock = new FakeClock()
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: factory, clock })
+    await daemon.start()
+    makeRoutable(daemon)
+    await (daemon as any).ensureHostAsync('bot-a')
+
+    const realRunPreparation = (daemon as any).runAgentWorkspacePreparation.bind(daemon)
+    let releaseWarm!: () => void
+    const warmBlocked = new Promise<void>((resolve) => (releaseWarm = resolve))
+    let markWarmEntered!: () => void
+    const warmEntered = new Promise<void>((resolve) => (markWarmEntered = resolve))
+    const preparedRuntimes: string[] = []
+    let preparations = 0
+    vi.spyOn(daemon as any, 'runAgentWorkspacePreparation').mockImplementation(async (agent: any) => {
+      preparations += 1
+      preparedRuntimes.push(agent.runtime)
+      if (preparations === 1) {
+        markWarmEntered()
+        await warmBlocked
+      }
+      return realRunPreparation(agent)
+    })
+
+    const warmDispatch = (daemon as any).dispatch('bot-a', dm('200', 'warm', 'T2'), 'int-a') as Promise<unknown>
+    await warmEntered
+
+    const agentPath = join(root, 'agents', 'bot-a', 'agent.json')
+    const agent = JSON.parse(readFileSync(agentPath, 'utf8')) as Record<string, unknown>
+    writeFileSync(agentPath, JSON.stringify({ ...agent, runtime: 'codex' }))
+    await daemon.reconcile()
+
+    // Reconcile interrupted the pre-session turn and stopped its warm host. The
+    // cold backstop aborts only SessionManager's caller; the helper remains live.
+    clock.advance(30_000)
+    await expect(warmDispatch).resolves.toBeNull()
+    expect((daemon as any).workspacePreparationTails.has('bot-a')).toBe(true)
+
+    const replacement = (daemon as any).ensureHostAsync('bot-a') as Promise<unknown>
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(factory).toHaveBeenCalledTimes(1)
+    expect(preparedRuntimes).toEqual(['claude'])
+
+    releaseWarm()
+    await replacement
+
+    expect(preparedRuntimes).toEqual(['claude', 'codex'])
+    expect(factory).toHaveBeenCalledTimes(2)
+    expect(secondHost.start).toHaveBeenCalledOnce()
+    const workspace = join(root, 'agents', 'bot-a', 'workspace')
+    const ledger = await readSkillLedger(await skillLedgerLocation(workspace, join(root, 'skill-installs')))
+    expect(ledger).toMatchObject({ phase: 'ready', agentId: 'bot-a', runtime: 'codex' })
+    await daemon.stop()
+  })
+
+  it('rejects a late warm preparation after its host generation was stopped', async () => {
+    const firstHost = quietHost()
+    const secondHost = quietHost()
+    const factory = vi.fn().mockReturnValueOnce(firstHost).mockReturnValueOnce(secondHost)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold(), hostFactory: factory })
+    await daemon.start()
+    await (daemon as any).ensureHostAsync('bot-a')
+    const capturedAgent = (daemon as any).agents.get('bot-a')
+    const preparation = vi.spyOn(daemon as any, 'runAgentWorkspacePreparation')
+
+    await (daemon as any).stopHost('bot-a')
+    await (daemon as any).ensureHostAsync('bot-a')
+    expect(preparation).toHaveBeenCalledOnce()
+    expect(factory).toHaveBeenCalledTimes(2)
+
+    expect(() => (daemon as any).prepareAgentWorkspace(capturedAgent, firstHost)).toThrow(/superseded warm host/)
+    expect(preparation).toHaveBeenCalledOnce()
+    expect((daemon as any).hosts.get('bot-a')).toBe(secondHost)
+    await daemon.stop()
+  })
+
+  it('keeps stopAgent fenced until an aborted warm preparation quiesces', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    await (daemon as any).ensureHostAsync('bot-a')
+
+    const realRunPreparation = (daemon as any).runAgentWorkspacePreparation.bind(daemon)
+    let releaseWarm!: () => void
+    const warmBlocked = new Promise<void>((resolve) => (releaseWarm = resolve))
+    let markWarmEntered!: () => void
+    const warmEntered = new Promise<void>((resolve) => (markWarmEntered = resolve))
+    vi.spyOn(daemon as any, 'runAgentWorkspacePreparation').mockImplementationOnce(async (agent: any) => {
+      markWarmEntered()
+      await warmBlocked
+      return realRunPreparation(agent)
+    })
+
+    const warmTurn = (daemon as any).dispatch('bot-a', dm('200', 'warm', 'T2'), 'int-a') as Promise<unknown>
+    await warmEntered
+    let stopped = false
+    const stop = ((daemon as any).stopAgent('bot-a') as Promise<void>).then(() => {
+      stopped = true
+    })
+    await expect(warmTurn).resolves.toBeNull()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(false)
+    expect((daemon as any).workspacePreparationTails.has('bot-a')).toBe(true)
+
+    releaseWarm()
+    await stop
+    expect(stopped).toBe(true)
+    expect((daemon as any).workspacePreparationTails.has('bot-a')).toBe(false)
+    await daemon.stop()
+  })
+
+  it('coordinates a console git write like a file write, minus the host stop', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    const agent = (daemon as any).agents.get('bot-a')
+    const stopHost = vi.spyOn(daemon as any, 'stopHost')
+
+    // Same per-agent serial tail: a preparation in flight holds the git write out.
+    let releasePreparation!: () => void
+    const preparationBlocked = new Promise<void>((resolve) => (releasePreparation = resolve))
+    let markPreparationEntered!: () => void
+    const preparationEntered = new Promise<void>((resolve) => (markPreparationEntered = resolve))
+    const preparing = (daemon as any).enqueueAgentWorkspacePreparation(agent, async () => {
+      markPreparationEntered()
+      await preparationBlocked
+    }) as Promise<void>
+    await preparationEntered
+
+    let wrote = false
+    const writing = (daemon as any).withWorkspaceIndexWrite('bot-a', async () => {
+      wrote = true
+    }) as Promise<void>
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(wrote).toBe(false)
+    releasePreparation()
+    await preparing
+    await writing
+    expect(wrote).toBe(true)
+    // The distinguishing property: a stage toggle must not evict the warm ACP host, while a file
+    // write still does — the two coordinators differ in exactly this.
+    expect(stopHost).not.toHaveBeenCalled()
+    await (daemon as any).withWorkspaceFileWrite('bot-a', async () => undefined)
+    expect(stopHost).toHaveBeenCalledWith('bot-a')
+
+    // The turn-admission fence a dispatch waits on is published for a git write too.
+    let releaseWrite!: () => void
+    const writeBlocked = new Promise<void>((resolve) => (releaseWrite = resolve))
+    let markWriting!: () => void
+    const writeEntered = new Promise<void>((resolve) => (markWriting = resolve))
+    const fenced = (daemon as any).withWorkspaceIndexWrite('bot-a', async () => {
+      markWriting()
+      await writeBlocked
+    }) as Promise<void>
+    await writeEntered
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true)
+    releaseWrite()
+    await fenced
+    // The fence is dropped in its own continuation, so let that microtask land before reading it.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(false)
+
+    // And "busy" is the same predicate both coordinators refuse on.
+    ;(daemon as any).drainingAgents.add('bot-a')
+    await expect((daemon as any).withWorkspaceIndexWrite('bot-a', async () => 'ran')).rejects.toThrow(
+      /agent is working in this workspace/
+    )
+    ;(daemon as any).drainingAgents.delete('bot-a')
+    await daemon.stop()
+  })
+
+  it('pulls the agent’s own checkout without stopping a confined session’s host', async () => {
+    const root = scaffold()
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => quietHost() as any })
+    await daemon.start()
+    try {
+      const d = daemon as any
+      mkdirSync(join(root, 'agents', 'bot-a', 'workspace'), { recursive: true })
+      // A confined session stands in its own directory, where every root is a clone of its own.
+      mkdirSync(join(root, 'agents', 'bot-a', 'sessions', sessionKeyDirName(KEY)), { recursive: true })
+      d.sessionIsolation.set(KEY, 'session')
+      const confined = sessionHostKey('bot-a', KEY)
+      // A session-bound host that is not confined (a microsandbox runtime) shares the checkout like the agent's own.
+      const sharing = sessionHostKey('bot-a', 'slack:C1:shared')
+      const hosts = new Map([
+        [agentHostKey('bot-a'), quietHost()],
+        [confined, quietHost()],
+        [sharing, quietHost()]
+      ])
+      for (const [key, host] of hosts) d.hosts.set(key, host)
+      const stopHost = vi.spyOn(d, 'stopHost')
+      // Through the production wiring, where the console's pull frame lands.
+      const deps = buildCpClientDeps(d.cpClientDepsHost(root, 'wss://cp.example.test', () => {}))
+
+      await expect(deps.workspaceGit!.pull('bot-a')).resolves.toMatchObject({ isRepo: false })
+      expect(hosts.get(confined)!.stop).not.toHaveBeenCalled()
+      expect(hosts.get(agentHostKey('bot-a'))!.stop).toHaveBeenCalledOnce()
+      expect(hosts.get(sharing)!.stop).toHaveBeenCalledOnce()
+      expect([...d.hosts.keys()]).toEqual([confined])
+      expect(stopHost).not.toHaveBeenCalled()
+
+      // With no confined host to spare, a pull stops every host exactly as a file write does.
+      d.hosts.delete(confined)
+      await deps.workspaceGit!.pull('bot-a')
+      expect(stopHost).toHaveBeenCalledExactlyOnceWith('bot-a')
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('waits out a workspace mutation instead of failing an admitted cold host start', async () => {
+    const host = quietHost()
+    const factory = vi.fn(() => host as any)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold(), hostFactory: factory })
+    await daemon.start()
+
+    // A per-session worktree cleanup fences the WHOLE agent, so a cold turn admitted just
+    // before it used to die on an unrelated session's cleanup rather than wait the seconds out.
+    let releaseMutation!: () => void
+    const mutationBlocked = new Promise<void>((resolve) => (releaseMutation = resolve))
+    const mutating = (daemon as any).withWorkspaceAdmissionFence('bot-a', () => mutationBlocked) as Promise<void>
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true)
+
+    const starting = (daemon as any).ensureHostAsync('bot-a') as Promise<unknown>
+    const settled = vi.fn()
+    void starting.then(settled, settled)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    // Still the old invariant: no child is constructed while the mutation holds the tree.
+    expect(settled).not.toHaveBeenCalled()
+    expect(factory).not.toHaveBeenCalled()
+
+    releaseMutation()
+    await mutating
+    await expect(starting).resolves.toBe(host)
+    expect(host.start).toHaveBeenCalledOnce()
+    await daemon.stop()
+  })
+
+  it('still refuses a host start when a hard gate closes while the mutation drains', async () => {
+    const factory = vi.fn(() => quietHost() as any)
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root: scaffold(), hostFactory: factory })
+    await daemon.start()
+
+    let releaseMutation!: () => void
+    const mutationBlocked = new Promise<void>((resolve) => (releaseMutation = resolve))
+    const mutating = (daemon as any).withWorkspaceAdmissionFence('bot-a', () => mutationBlocked) as Promise<void>
+    const starting = (daemon as any).ensureHostAsync('bot-a') as Promise<unknown>
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    // Joining the fence must not launder a real refusal: the gates are re-read on the far side.
+    ;(daemon as any).drainingAgents.add('bot-a')
+    releaseMutation()
+    await mutating
+    await expect(starting).rejects.toThrow(/agent is draining/)
+    expect(factory).not.toHaveBeenCalled()
+    ;(daemon as any).drainingAgents.delete('bot-a')
+    await daemon.stop()
+  })
+
+  it('serializes workspace preparation and file publication in both admission orders', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    const agent = (daemon as any).agents.get('bot-a')
+
+    let releasePreparation!: () => void
+    const preparationBlocked = new Promise<void>((resolve) => (releasePreparation = resolve))
+    let markPreparationEntered!: () => void
+    const preparationEntered = new Promise<void>((resolve) => (markPreparationEntered = resolve))
+    const preparing = (daemon as any).enqueueAgentWorkspacePreparation(agent, async () => {
+      markPreparationEntered()
+      await preparationBlocked
+    }) as Promise<void>
+    await preparationEntered
+
+    let publicationEntered = false
+    const publishingAfterPreparation = (daemon as any).withWorkspaceFileWrite('bot-a', async () => {
+      publicationEntered = true
+    }) as Promise<void>
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(publicationEntered).toBe(false)
+
+    releasePreparation()
+    await preparing
+    await publishingAfterPreparation
+    expect(publicationEntered).toBe(true)
+
+    let releasePublication!: () => void
+    const publicationBlocked = new Promise<void>((resolve) => (releasePublication = resolve))
+    let markPublicationEntered!: () => void
+    const publicationStarted = new Promise<void>((resolve) => (markPublicationEntered = resolve))
+    const publishing = (daemon as any).withWorkspaceFileWrite('bot-a', async () => {
+      markPublicationEntered()
+      await publicationBlocked
+    }) as Promise<void>
+    await publicationStarted
+
+    let laterPreparationEntered = false
+    const preparingAfterPublication = (daemon as any).enqueueAgentWorkspacePreparation(agent, async () => {
+      laterPreparationEntered = true
+    }) as Promise<void>
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(laterPreparationEntered).toBe(false)
+
+    releasePublication()
+    await publishing
+    await preparingAfterPublication
+    expect(laterPreparationEntered).toBe(true)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect((daemon as any).workspacePreparationTails.has('bot-a')).toBe(false)
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(false)
+    await daemon.stop()
+  })
+
+  it('writes the session back to idle once a turn finishes (no longer stuck prompting)', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+    await daemon.stop()
+  })
+
+  it('does not post a cron anchor while the target agent is paused', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+    ;(daemon as any).agents.get('bot-a').pause = true
+
+    await expect(
+      (daemon as any).fireTrigger(
+        'bot-a',
+        { ...dm('100', 'scheduled'), source: 'cron' },
+        { channel: 'C1', integrationId: 'int-a' },
+        '⏰ scheduled',
+        'cron "c1"'
+      )
+    ).resolves.toBeNull()
+    expect(conn.postMessage).not.toHaveBeenCalled()
+    expect(host.prompt).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+
+  it('attributes a cron anchor to its agent and uses its Slack timestamp for follow-ups', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    Object.assign((daemon as any).agents.get('bot-a'), {
+      displayName: 'Review Bot',
+      iconUrl: 'https://console.example.test/icons/review-bot'
+    })
+    const conn = makeRoutable(daemon)
+    const postMessage = vi.fn(async () => '100.100000')
+    Object.assign(conn, {
+      postMessage,
+      postBlocks: vi.fn(async () => 'status-1'),
+      updateBlocks: vi.fn(async () => {})
+    })
+
+    await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-1:trace-1'),
+        msgId: 'cron:cron-1:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        isDm: false
+      },
+      { channel: 'C1', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-1"'
+    )
+
+    expect(postMessage).toHaveBeenCalledWith('C1', '⏰ scheduled', undefined, {
+      username: 'Review Bot',
+      icon_url: 'https://console.example.test/icons/review-bot',
+      agentAuthorId: 'bot-a'
+    })
+    const key = sessionKey('slack', 'C1', '100.100000', 'bot-a', TRANSPORT_SCOPE)
+    expect((await (daemon as any).store.getSession(key))?.lastDeliveredTs).toBe('100.100000')
+
+    await (daemon as any).dispatch(
+      'bot-a',
+      { ...dm('100.200000', 'are you sure?', '100.100000'), isDm: false },
+      'int-a'
+    )
+    expect(host.prompt).toHaveBeenCalledTimes(2)
+    const secondPrompt = ((host.prompt as any).mock.calls[1][1] as Array<{ text?: string }>)
+      .map((block) => block.text ?? '')
+      .join('\n')
+    expect(secondPrompt).toContain('are you sure?')
+    await daemon.stop()
+  })
+
+  it('§6.8: a telegram anchored fire keys the session by that platform conversation model', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const postMessage = vi.fn(async () => '777')
+    // Re-home int-a onto the telegram connection map (makeRoutable wires the slack
+    // map, which the integration lookup checks first).
+    ;(daemon as any).connByIntegration.delete('int-a')
+    ;(daemon as any).tgConnByIntegration.set('int-a', {
+      postMessage,
+      postChrome: vi.fn(async () => {}),
+      updateMessage: vi.fn(async () => {})
+    })
+
+    await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-tg:trace-1'),
+        msgId: 'cron:cron-tg:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        platform: 'telegram',
+        channel: '-100123',
+        isDm: false
+      },
+      { channel: '-100123', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-tg"'
+    )
+
+    expect(postMessage).toHaveBeenCalledWith('-100123', '⏰ scheduled')
+    // threadKeyForPost: a Telegram reply chain resolves to `tg:<root>` — the anchor
+    // session must mint the SAME key or follow-up replies open a different session.
+    const key = sessionKey('telegram', '-100123', 'tg:777', 'bot-a', TRANSPORT_SCOPE)
+    expect(await (daemon as any).store.getSession(key)).toBeTruthy()
+    await daemon.stop()
+  })
+
+  it('§6.8: a telegram DM anchored fire keys `dm` and classifies as a DM session', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const postMessage = vi.fn(async () => '888')
+    const getChannelInfo = vi.fn(async () => ({ isIm: true }))
+    ;(daemon as any).connByIntegration.delete('int-a')
+    ;(daemon as any).tgConnByIntegration.set('int-a', {
+      postMessage,
+      getChannelInfo,
+      postChrome: vi.fn(async () => {}),
+      updateMessage: vi.fn(async () => {})
+    })
+
+    await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-dm:trace-1'),
+        msgId: 'cron:cron-dm:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        platform: 'telegram',
+        channel: '42',
+        isDm: false
+      },
+      { channel: '42', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-dm"'
+    )
+
+    expect(getChannelInfo).toHaveBeenCalledWith('42')
+    // A Telegram DM is ONE continuous conversation keyed `dm` — the anchor must
+    // join it, not open a `tg:<messageId>` session no inbound reply resolves to.
+    const key = sessionKey('telegram', '42', 'dm', 'bot-a', TRANSPORT_SCOPE)
+    expect(await (daemon as any).store.getSession(key)).toBeTruthy()
+    await daemon.stop()
+  })
+
+  it('§6.8: a discord DM anchored fire classifies as a private DM session', async () => {
+    // A Discord DM is one continuous conversation keyed by its channel. The same
+    // classification also drives `conversationKind` and the private-capture gate.
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const postMessage = vi.fn(async () => 'msg-1')
+    const getChannelInfo = vi.fn(async () => ({ id: 'D-1', isIm: true }))
+    ;(daemon as any).connByIntegration.delete('int-a')
+    ;(daemon as any).dcConnByIntegration.set('int-a', {
+      postMessage,
+      getChannelInfo,
+      postChrome: vi.fn(async () => {}),
+      updateMessage: vi.fn(async () => {})
+    })
+
+    await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-dc:trace-1'),
+        msgId: 'cron:cron-dc:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        platform: 'discord',
+        channel: 'D-1',
+        isDm: false
+      },
+      { channel: 'D-1', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-dc"'
+    )
+
+    expect(getChannelInfo).toHaveBeenCalledWith('D-1')
+    const key = sessionKey('discord', 'D-1', 'D-1', 'bot-a', TRANSPORT_SCOPE)
+    const rec = await (daemon as any).store.getSession(key)
+    expect(rec?.conversationKind).toBe('dm')
+    // The private-capture gate follows the same bit.
+    expect(await (daemon as any).store.isCaptureExcluded('bot-a', rec?.acpSessionId)).toBe(true)
+    await daemon.stop()
+  })
+
+  it('§6.8: a discord guild anchored fire materializes its native thread before dispatch', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const postMessage = vi.fn(async () => 'msg-1')
+    const getChannelInfo = vi.fn(async () => ({ id: 'C-1', isIm: false }))
+    const createThread = vi.fn(async () => 'msg-1')
+    ;(daemon as any).connByIntegration.delete('int-a')
+    ;(daemon as any).dcConnByIntegration.set('int-a', {
+      postMessage,
+      getChannelInfo,
+      createThread,
+      postChrome: vi.fn(async () => {}),
+      updateMessage: vi.fn(async () => {})
+    })
+
+    await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-dc-guild:trace-1'),
+        msgId: 'cron:cron-dc-guild:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        platform: 'discord',
+        channel: 'C-1',
+        isDm: false
+      },
+      { channel: 'C-1', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-dc-guild"'
+    )
+
+    expect(createThread).toHaveBeenCalledWith('C-1', 'msg-1', '⏰ scheduled')
+    const key = sessionKey('discord', 'C-1', 'msg-1', 'bot-a', TRANSPORT_SCOPE)
+    expect(await (daemon as any).store.getSession(key)).toBeTruthy()
+    await daemon.stop()
+  })
+
+  it('§6.8: a discord guild anchored fire starts no session when thread creation fails', async () => {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const createThread = vi.fn(async () => undefined)
+    ;(daemon as any).connByIntegration.delete('int-a')
+    ;(daemon as any).dcConnByIntegration.set('int-a', {
+      postMessage: vi.fn(async () => 'msg-1'),
+      getChannelInfo: vi.fn(async () => ({ id: 'C-1', isIm: false })),
+      createThread,
+      postChrome: vi.fn(async () => {}),
+      updateMessage: vi.fn(async () => {})
+    })
+
+    const result = await (daemon as any).fireTrigger(
+      'bot-a',
+      {
+        ...dm('ignored', 'scheduled', 'cron:cron-dc-failed:trace-1'),
+        msgId: 'cron:cron-dc-failed:trace-1',
+        traceId: 'trace-1',
+        source: 'cron',
+        trigger: 'cron',
+        platform: 'discord',
+        channel: 'C-1',
+        isDm: false
+      },
+      { channel: 'C-1', integrationId: 'int-a' },
+      '⏰ scheduled',
+      'cron "cron-dc-failed"'
+    )
+
+    expect(result).toBeNull()
+    expect(
+      await (daemon as any).store.getSession(sessionKey('discord', 'C-1', 'msg-1', 'bot-a', TRANSPORT_SCOPE))
+    ).toBeUndefined()
+    expect(host.prompt).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+
+  it('reports a cron session before its turn finishes', async () => {
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+    Object.assign(conn, {
+      postBlocks: vi.fn(async () => 'status-1'),
+      updateBlocks: vi.fn(async () => {})
+    })
+    const emitCronReport = vi.fn()
+    const syncCronReport = vi.fn(async () => 'acknowledged' as const)
+    ;(daemon as any).cpClient = {
+      state: 'READY',
+      emitCronReport,
+      syncCronReport,
+      emitEventSession: vi.fn(),
+      emitUsageReport: vi.fn(),
+      stop: vi.fn(async () => {})
+    }
+
+    const run = (daemon as any).onCronFire(
+      'bot-a',
+      { ...dm('100', 'scheduled'), source: 'cron' },
+      {
+        id: 'cron-1',
+        schedule: '0 9 * * *',
+        timezone: 'UTC',
+        trigger: 'scheduled',
+        enabled: true,
+        origin: 'cp',
+        target: { platform: 'slack', channel: 'C1', integrationId: 'int-a' }
+      }
+    )
+
+    await vi.waitFor(() => expect(blocked.host.prompt).toHaveBeenCalledWith('acp-1', expect.any(Array)), WAIT)
+    expect(emitCronReport).toHaveBeenCalledTimes(2)
+    expect(emitCronReport.mock.calls[0]![0]).not.toHaveProperty('sessionId')
+    // A cron run is a console deep link on the CP side, so it is reported under the session's
+    // outward id (session-concept.md §1.1) — the same one on the ready report and the close.
+    const outward = (await (daemon as any).store.getSessionByAcpId('acp-1'))!.sessionId
+    expect(outward).not.toBe('acp-1')
+    expect(emitCronReport.mock.calls[1]![0]).toMatchObject({ sessionId: outward })
+    expect(emitCronReport.mock.calls[1]![0]).not.toHaveProperty('status')
+    const admitted = await (daemon as any).store.listInboxBySessionKeyFifo()
+    expect(JSON.parse(admitted[0]!.msg).cronRun).toEqual({
+      cronId: 'cron-1',
+      firedAt: emitCronReport.mock.calls[0]![0].firedAt
+    })
+
+    blocked.release()
+    await run
+    // The close is the one report held until the CP acknowledges it.
+    await vi.waitFor(
+      () =>
+        expect(syncCronReport).toHaveBeenCalledWith(expect.objectContaining({ status: 'success', sessionId: outward })),
+      WAIT
+    )
+    expect(emitCronReport).toHaveBeenCalledTimes(2)
+    await daemon.stop()
+  })
+
+  it('!stop sets cancelling, and the backstop force-stops the host if the agent ignores cancel', async () => {
+    const clock = new FakeClock()
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any,
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(pendingFor(daemon, 'acp-1')).toBeDefined(), WAIT)
+
+    await (daemon as any).onInboundOutcome(dm('200', '!stop'))
+    expect(blocked.host.cancel).toHaveBeenCalledWith('acp-1')
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('cancelling')
+
+    // agent ignores session/cancel → after cancelBackstopMs the host is force-stopped
+    clock.advance(30_000)
+    await vi.waitFor(() => expect(blocked.host.stop).toHaveBeenCalled(), WAIT)
+    expect((daemon as any).hosts.has('bot-a')).toBe(false)
+    await vi.waitFor(async () => expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle'), WAIT)
+
+    blocked.release()
+    await turn.catch(() => {})
+    await daemon.stop()
+  })
+
+  it('pausing interrupts every active session, drops queued turns, and keeps the host warm', async () => {
+    const root = scaffold()
+    const blocked = multiBlockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root,
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+
+    const first = (daemon as any).dispatch('bot-a', dm('100', 'first', 'T1'))
+    const second = (daemon as any).dispatch('bot-a', dm('200', 'second', 'T2'))
+    await vi.waitFor(() => expect((daemon as any).pending.size).toBe(2), WAIT)
+    const queued = (daemon as any).dispatch('bot-a', dm('300', 'queued', 'T1'))
+    await vi.waitFor(() => expect((daemon as any).serialQueue.get(KEY)).toHaveLength(1), WAIT)
+
+    writePause(root, true)
+    await daemon.reconcile()
+
+    expect((daemon as any).agents.get('bot-a').pause).toBe(true)
+    expect(blocked.host.cancel).toHaveBeenCalledTimes(2)
+    expect(new Set(blocked.host.cancel.mock.calls.map(([id]) => id))).toEqual(new Set(['acp-1', 'acp-2']))
+    await expect(queued).resolves.toBeNull()
+    expect((daemon as any).serialQueue.size).toBe(0)
+    expect(await (daemon as any).store.listInboxBySessionKeyFifo()).toHaveLength(0)
+    expect(blocked.host.stop).not.toHaveBeenCalled()
+
+    const promptCount = blocked.host.prompt.mock.calls.length
+    await expect((daemon as any).dispatch('bot-a', dm('400', 'paused', 'T3'))).resolves.toBeNull()
+    expect(blocked.host.prompt).toHaveBeenCalledTimes(promptCount)
+
+    blocked.release()
+    await Promise.all([first, second])
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    writePause(root, false)
+    await daemon.reconcile()
+    await expect((daemon as any).dispatch('bot-a', dm('500', 'resumed', 'T3'))).resolves.toBe('acp-3')
+    expect(blocked.host.prompt).toHaveBeenCalledTimes(promptCount + 1)
+
+    await daemon.stop()
+  })
+
+  it('pausing suppresses renderer actions already queued by the old turn', async () => {
+    const root = scaffold()
+    const blocked = blockingHost()
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => blocked.host as any })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'stream', 'T1'))
+    await vi.waitFor(() => expect(pendingFor(daemon, 'acp-1')).toBeDefined(), WAIT)
+    const pending = pendingFor(daemon, 'acp-1')
+    let releaseApply!: () => void
+    pending.signals.applyChain = new Promise<void>((resolve) => (releaseApply = resolve))
+    ;(daemon as any).enqueueApply(pending, { kind: 'post', text: 'must not post' })
+
+    writePause(root, true)
+    await daemon.reconcile()
+    expect(pending.outputSuppressed).toBe('pause')
+    releaseApply()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(conn.postMessage).not.toHaveBeenCalledWith('C1', 'must not post', 'T1')
+
+    // New ACP chunks after the pause are ignored too.
+    ;(daemon as any).onAcpUpdate('bot-a', 'acp-1', {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'also suppressed' }
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(conn.postMessage).not.toHaveBeenCalled()
+
+    blocked.release()
+    await expect(turn).resolves.toBeNull()
+    await daemon.stop()
+  })
+
+  it('does not revive a cold pre-pause turn after a quick unpause', async () => {
+    const root = scaffold()
+    const cold = coldBlockingHost()
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => cold.host as any })
+    await daemon.start()
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'cold', 'T1'))
+    await vi.waitFor(() => expect(cold.host.newSession).toHaveBeenCalledTimes(1), WAIT)
+    expect((daemon as any).pending.size).toBe(0)
+
+    writePause(root, true)
+    await daemon.reconcile()
+    // Unpause before the cold newSession resolves. The old entry must retain its
+    // per-turn cancellation latch, and the agent-level drain gate stays closed until
+    // that entry fully unwinds.
+    writePause(root, false)
+    await daemon.reconcile()
+    expect((daemon as any).agents.get('bot-a').pause).toBe(false)
+    await expect((daemon as any).dispatch('bot-a', dm('150', 'too early', 'T2'))).resolves.toBeNull()
+    cold.releaseSession()
+
+    await expect(turn).resolves.toBeNull()
+    expect(cold.host.prompt).not.toHaveBeenCalled()
+    expect(cold.host.cancel).not.toHaveBeenCalled()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    await vi.waitFor(() => expect((daemon as any).safetyDrainingAgents.has('bot-a')).toBe(false), WAIT)
+    await expect((daemon as any).dispatch('bot-a', dm('200', 'fresh', 'T2'))).resolves.toBe('acp-cold')
+    expect(cold.host.prompt).toHaveBeenCalledTimes(1)
+
+    await daemon.stop()
+  })
+})
+
+describe('Daemon predicted next prompt', () => {
+  const suggest = (text?: string) => ({
+    sessionUpdate: 'session_info_update',
+    _meta: { promptSuggestions: { suggestions: text === undefined ? [] : [{ text }] } }
+  })
+
+  it('shows a prediction that lands after the turn in the Slack DM it came from, and clears it', async () => {
+    const host = quietHost()
+    let onUpdate!: (sessionId: string, update: unknown) => Promise<void>
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: (_agent, update) => {
+        onUpdate = update as typeof onUpdate
+        return host as any
+      }
+    })
+    await daemon.start()
+    const conn = Object.assign(makeRoutable(daemon), { setDmSuggestedPrompt: vi.fn(async () => {}) })
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    expect((daemon as any).pending.size).toBe(0)
+    await onUpdate('acp-1', suggest('Run the tests next'))
+    await onUpdate('acp-1', suggest())
+    expect(conn.setDmSuggestedPrompt.mock.calls).toEqual([
+      ['C1', 'Run the tests next'],
+      ['C1', null]
+    ])
+    // A prediction is never a title.
+    expect((await (daemon as any).store.getSession(KEY))?.title).toBe('hello')
+    expect(conn.setTitle).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+
+  it('hands a webchat conversation’s prediction to the relays, never to Slack', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    const conn = Object.assign(makeRoutable(daemon), { setDmSuggestedPrompt: vi.fn(async () => {}) })
+    const relays = { sendWebchatPromptSuggestion: vi.fn(), stop: vi.fn(async () => {}) }
+    ;(daemon as any).relays = relays
+    const conversationId = '11111111-1111-4111-8111-111111111111'
+    const agentId = '22222222-2222-4222-8222-222222222222'
+    ;(daemon as any).sessionForAcp = async () => ({
+      key: 'k',
+      agentId,
+      acpSessionId: 'acp-9',
+      platform: 'webchat',
+      channel: conversationId
+    })
+    await (daemon as any).publishPromptSuggestion(agentId, 'acp-9', undefined, 'Run the tests next')
+    await (daemon as any).publishPromptSuggestion(agentId, 'acp-9', undefined, null)
+    expect(relays.sendWebchatPromptSuggestion.mock.calls).toEqual([
+      [{ conversationId, agentId, text: 'Run the tests next' }],
+      [{ conversationId, agentId, text: null }]
+    ])
+    expect(conn.setDmSuggestedPrompt).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+
+  it('leaves a channel conversation alone', async () => {
+    const host = quietHost()
+    let onUpdate!: (sessionId: string, update: unknown) => Promise<void>
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: (_agent, update) => {
+        onUpdate = update as typeof onUpdate
+        return host as any
+      }
+    })
+    await daemon.start()
+    const conn = Object.assign(makeRoutable(daemon), { setDmSuggestedPrompt: vi.fn(async () => {}) })
+    ;(daemon as any).agents.get('bot-a').integrations[0].core.bindRules = [{ match: { kind: 'channel' } }]
+
+    await (daemon as any).dispatch('bot-a', { ...dm('100', 'hello'), isDm: false, trigger: 'mention' }, 'int-a')
+    await onUpdate('acp-1', suggest('Run the tests next'))
+    expect(conn.setDmSuggestedPrompt).not.toHaveBeenCalled()
+    await daemon.stop()
+  })
+})
+
+describe('Daemon idle sweep (#111/#118)', () => {
+  it('reaps an idle host back to provisioned and TTL-closes its session', async () => {
+    const clock = new FakeClock()
+    const host = quietHost()
+    let onUpdate!: (sessionId: string, update: unknown) => void
+    host.stop = vi.fn(async () => {
+      await onUpdate('acp-1', { sessionUpdate: 'session_info_update', title: 'Final stopped title' })
+    })
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 1000 }),
+      hostFactory: (_agent, update) => {
+        onUpdate = update
+        return host as any
+      },
+      clock
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    // advance past the TTL so the next sweep reaps the host + closes the session
+    clock.advance(1001)
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+    expect((await (daemon as any).store.getSession(KEY))?.title).toBe('Final stopped title')
+    await vi.waitFor(() => expect(conn.setTitle).toHaveBeenCalledWith('C1', 'T1', 'Final stopped title'), WAIT)
+
+    await daemon.stop()
+  })
+
+  it('closes a TTL-expired session on a shared host that another session keeps warm, and resumes it on a follow-up (#2923)', async () => {
+    const clock = new FakeClock()
+    const live = new Set<string>()
+    let nextSession = 0
+    const host = {
+      ...quietHost(),
+      newSession: vi.fn(async () => {
+        const id = `acp-${++nextSession}`
+        live.add(id)
+        return id
+      }),
+      hasSession: vi.fn((id: string) => live.has(id)),
+      closeSupported: vi.fn(() => true),
+      closeSession: vi.fn(async (id: string) => live.delete(id)),
+      loadSupported: vi.fn(() => true),
+      loadSession: vi.fn(async (id: string) => {
+        live.add(id)
+      })
+    }
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'first run', 'T1'), 'int-a')
+    clock.advance(600)
+    await (daemon as any).dispatch('bot-a', dm('200', 'second run', 'T2'), 'int-a')
+    clock.advance(500)
+    await (daemon as any).sweepIdle()
+
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+    await vi.waitFor(() => expect(host.closeSession).toHaveBeenCalledWith('acp-1'), WAIT)
+    expect(host.closeSession).not.toHaveBeenCalledWith('acp-2')
+    // The second session's activity keeps the shared host warm; only the expired session's runtime goes.
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    expect(host.stop).not.toHaveBeenCalled()
+
+    // A follow-up in the closed thread resumes the same ACP session (session/load) instead of starting over.
+    await (daemon as any).dispatch('bot-a', dm('300', 'follow-up question', 'T1'), 'int-a')
+    expect(host.loadSession).toHaveBeenCalledWith(
+      'acp-1',
+      expect.any(String),
+      expect.anything(),
+      undefined,
+      undefined,
+      expect.anything(),
+      undefined
+    )
+    expect(host.newSession).toHaveBeenCalledTimes(2)
+    expect(host.prompt).toHaveBeenLastCalledWith('acp-1', expect.anything())
+    const resumed = await (daemon as any).store.getSession(KEY)
+    expect(resumed?.acpSessionId).toBe('acp-1')
+    expect(resumed?.state).toBe('idle')
+
+    await daemon.stop()
+  })
+
+  it('does not TTL-close a session while an admitted initialization owns its dispatch fences', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+
+    let releaseActive!: () => void
+    const active = new Promise<void>((resolve) => (releaseActive = resolve))
+    ;(daemon as any).inflight.add(KEY)
+    ;(daemon as any).activeDispatchDoneByKey.set(KEY, active)
+    ;(daemon as any).activeDispatchesByAgent.set('bot-a', new Set([active]))
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    ;(daemon as any).inflight.delete(KEY)
+    ;(daemon as any).activeDispatchDoneByKey.delete(KEY)
+    ;(daemon as any).activeDispatchesByAgent.delete('bot-a')
+    releaseActive()
+    await (daemon as any).sweepIdle()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+
+    await daemon.stop()
+  })
+
+  it('names what keeps a long-quiet host at info once an hour, and at debug before and in between', async () => {
+    const clock = new FakeClock()
+    // Reproduce slow startup by leaving the fake clock behind the store's wall-clock timestamps.
+    clock.advance(Date.now() - 10_000)
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => blocked.host as any,
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    const inner = daemon as any
+    const turn = inner.dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(blocked.host.prompt).toHaveBeenCalled(), WAIT)
+    // The turn waits on a permission card nobody answers, which the stall watchdog leaves alone by design.
+    vi.spyOn(inner.permissions, 'awaitingHuman').mockReturnValue(true)
+    const info = vi.spyOn(inner.log, 'info')
+    const debug = vi.spyOn(inner.log, 'debug')
+    const held = 'a turn awaits a human answer to a permission or question'
+    const named = (): number =>
+      info.mock.calls.filter(([line]) => String(line).startsWith('idle: the host "bot-a" is still up after')).length
+
+    // Measure idle time after setup, whose wall-clock duration varies across runners.
+    clock.advance(Date.now() - clock.now() + 2001)
+    await inner.sweepIdle()
+    expect(debug).toHaveBeenCalledWith(`idle: skipping host "bot-a" — ${held}`)
+    expect(named()).toBe(0)
+    clock.advance(LONG_IDLE_SKIP_AFTER_TTLS * 1000)
+    await inner.sweepIdle()
+    expect(info).toHaveBeenCalledWith(
+      `idle: the host "bot-a" is still up after 0 min without recorded activity — ${held}`
+    )
+    clock.advance(LONG_IDLE_SKIP_REPORT_INTERVAL_MS - 1)
+    await inner.sweepIdle()
+    expect(named()).toBe(1)
+    clock.advance(1)
+    await inner.sweepIdle()
+    expect(named()).toBe(2)
+    expect(inner.hosts.has('bot-a')).toBe(true)
+
+    blocked.release()
+    await turn
+    await daemon.stop()
+  })
+
+  it('removes the materialized config-file secrets when the host stops', async () => {
+    const clock = new FakeClock()
+    const host = quietHost()
+    const root = scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 1000 })
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => host as any, clock })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    // Simulate what the real spawn path materializes (the hostFactory seam skips
+    // the runtime-env work); the reaper must remove it with the host.
+    const secretsDir = configFilesDir(join(root, 'agents', 'bot-a'))
+    mkdirSync(secretsDir, { recursive: true })
+    writeFileSync(join(secretsDir, 'kubeconfig'), 'apiVersion: v1')
+
+    clock.advance(1001)
+    // The host leaves the map synchronously at the top of stopHost; the secret
+    // files go away when the teardown settles — wait for that edge separately.
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    await vi.waitFor(() => expect(existsSync(secretsDir)).toBe(false), WAIT)
+
+    await daemon.stop()
+  })
+
+  it('idle-sweeps config-file secrets while the host stays warm, and re-materializes before the next turn', async () => {
+    const clock = new FakeClock()
+    const host = quietHost()
+    const root = scaffold({ agentIdleTimeoutMs: 1_000_000, idleSweepMs: 10_000_000, configFilesIdleMs: 1000 })
+    const adir = join(root, 'agents', 'bot-a')
+    const kubeFile = join(configFilesDir(adir), 'kubeconfig')
+    // Record whether the file was on disk at the moment each turn reached the child.
+    const sawFileAtPrompt: boolean[] = []
+    host.prompt = vi.fn(async () => {
+      sawFileAtPrompt.push(existsSync(kubeFile))
+      return 'end_turn'
+    })
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => host as any, clock })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    // Simulate what the real spawn path records + materializes (the hostFactory
+    // seam skips the runtime-env work).
+    const entry = (daemon as any).hostConfigFiles.get('bot-a')
+    entry.childEnv = { KUBECONFIG_DATA: 'apiVersion: v1' }
+    entry.materialized = true
+    mkdirSync(configFilesDir(adir), { recursive: true })
+    writeFileSync(kubeFile, 'apiVersion: v1')
+    const configRootInode = statSync(configFilesDir(adir)).ino
+
+    // Quiet past configFilesIdleMs → the files go, the host and its bind-mounted
+    // config root stay warm.
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect(existsSync(kubeFile)).toBe(false)
+    expect(statSync(configFilesDir(adir)).ino).toBe(configRootInode)
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    // The next turn re-writes the file BEFORE the prompt reaches the child.
+    await (daemon as any).dispatch('bot-a', dm('101', 'again'), 'int-a')
+    expect(sawFileAtPrompt.at(-1)).toBe(true)
+    expect(readFileSync(kubeFile, 'utf8')).toBe('apiVersion: v1')
+    expect(statSync(configFilesDir(adir)).ino).toBe(configRootInode)
+
+    await daemon.stop()
+  })
+
+  it('does not sweep config-file secrets while a turn is in flight', async () => {
+    const clock = new FakeClock()
+    const blocked = multiBlockingHost()
+    const root = scaffold({ agentIdleTimeoutMs: 1_000_000, idleSweepMs: 10_000_000, configFilesIdleMs: 1000 })
+    const adir = join(root, 'agents', 'bot-a')
+    const kubeFile = join(configFilesDir(adir), 'kubeconfig')
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root,
+      hostFactory: () => blocked.host as any,
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(blocked.host.prompt).toHaveBeenCalled(), WAIT)
+    const entry = (daemon as any).hostConfigFiles.get('bot-a')
+    entry.childEnv = { KUBECONFIG_DATA: 'apiVersion: v1' }
+    entry.materialized = true
+    mkdirSync(configFilesDir(adir), { recursive: true })
+    writeFileSync(kubeFile, 'apiVersion: v1')
+
+    // Way past the quiet window, but the turn is still running → files must stay.
+    clock.advance(5000)
+    await (daemon as any).sweepIdle()
+    expect(existsSync(kubeFile)).toBe(true)
+
+    blocked.release()
+    await turn
+    await daemon.stop()
+  })
+
+  it('sweeps config-file secrets left behind by a non-graceful exit at startup', async () => {
+    const root = scaffold()
+    const secretsDir = configFilesDir(join(root, 'agents', 'bot-a'))
+    mkdirSync(secretsDir, { recursive: true })
+    writeFileSync(join(secretsDir, 'kubeconfig'), 'stale')
+
+    const daemon = new Daemon({ slackAppFactory: fakeSlackAppFactory(), root, hostFactory: () => quietHost() as any })
+    await daemon.start()
+    expect(existsSync(secretsDir)).toBe(false)
+    await daemon.stop()
+  })
+
+  it('does not instantly reclaim a freshly-started host that has served no turn', async () => {
+    // Regression: a host that is up but has recorded NO session activity has an unset
+    // `agentLastActivityTs` (⇒ 0). At a realistic wall-clock the reaper's `now - 0`
+    // dwarfs the TTL, so the host was reclaimed the instant it came up — racing its
+    // own first dispatch (ACP "connection closed" → "already started" → "Session not
+    // found"). The idle window must run from when the host STARTED, not from epoch.
+    const clock = new FakeClock()
+    clock.advance(1_700_000_000_000) // a realistic epoch, so `now - 0` ≫ TTL (the bug's trigger)
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+
+    // Bring the host up WITHOUT a turn (no activity stamped).
+    await (daemon as any).ensureHostAsync('bot-a')
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    // A sweep BEFORE the TTL-from-start must NOT reclaim it (pre-fix: reclaimed).
+    clock.advance(500)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    // Past the TTL measured from host start → now genuinely idle → reclaimed.
+    clock.advance(600) // 1100ms since start > 1000ms TTL
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+
+    await daemon.stop()
+  })
+
+  // A distillation pass stamps no session row, so only its own hold keeps the agent's host under it (k8s-daemon-pool §4).
+  it('never reaps the shared host under a distillation pass, and lets it go one window after the pass settles', async () => {
+    const clock = new FakeClock()
+    clock.advance(1_700_000_000_000)
+    const { host, release } = passHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+    const inner = daemon as any
+    const pass = inner.runMemoryExtraction('bot-a', 'distill this turn', { agentId: 'bot-a' })
+    await vi.waitFor(() => expect(host.prompt).toHaveBeenCalled(), WAIT)
+
+    // Five windows past the host's start with the pass still running, and no session activity at all.
+    clock.advance(5000)
+    await inner.sweepIdle()
+    expect(host.stop).not.toHaveBeenCalled()
+    expect(inner.hosts.get(agentHostKey('bot-a'))).toBe(host)
+
+    release()
+    await expect(pass).resolves.toBe('')
+    // The settled pass restarts the host's clock: it keeps a full window from there, then goes.
+    await inner.sweepIdle()
+    expect(host.stop).not.toHaveBeenCalled()
+    clock.advance(1001)
+    await inner.sweepIdle()
+    await vi.waitFor(() => expect(host.stop).toHaveBeenCalled(), WAIT)
+    expect(inner.hosts.has(agentHostKey('bot-a'))).toBe(false)
+
+    await daemon.stop()
+    for (const dir of inner.memoryExtractionDirs.values()) rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('stops holding the shared host for a pass older than the lifetime ceiling, so a wedged one cannot pin it', async () => {
+    const clock = new FakeClock()
+    clock.advance(1_700_000_000_000)
+    const { host } = passHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 1000, idleSweepMs: 10_000_000, agentMaxLifetimeMs: 10_000 }),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+    const inner = daemon as any
+    const pass = inner.runMemoryExtraction('bot-a', 'distill this turn', { agentId: 'bot-a' })
+    await vi.waitFor(() => expect(host.prompt).toHaveBeenCalled(), WAIT)
+
+    clock.advance(5000)
+    await inner.sweepIdle()
+    expect(host.stop).not.toHaveBeenCalled()
+    // Past the ceiling the pass is taken as wedged, and stopping the host is what ends it.
+    clock.advance(6000)
+    await inner.sweepIdle()
+    await vi.waitFor(() => expect(host.stop).toHaveBeenCalled(), WAIT)
+    await expect(pass).rejects.toThrow('connection closed')
+
+    await daemon.stop()
+    for (const dir of inner.memoryExtractionDirs.values()) rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+describe('Daemon idle sweep — background terminals', () => {
+  // A turn that ends while a command it started keeps running, as a Codex unified exec terminal does.
+  async function bootWithBackgroundExec(clock: FakeClock, limits: Record<string, number>) {
+    let onUpdate!: (sessionId: string, update: unknown) => unknown
+    const host = {
+      ...quietHost(),
+      prompt: vi.fn(async () => {
+        await onUpdate('acp-1', {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'exec-1',
+          kind: 'execute',
+          status: 'in_progress',
+          title: 'python3 observer.py'
+        })
+        return 'end_turn'
+      })
+    }
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(limits),
+      hostFactory: (_agent, update) => {
+        onUpdate = update
+        return host as any
+      },
+      clock
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+    await (daemon as any).dispatch('bot-a', dm('100', 'watch the rebuild'), 'int-a')
+    return { daemon, host, update: async (u: unknown) => await onUpdate('acp-1', u) }
+  }
+
+  it('keeps the session and its host while the command runs, then reclaims once it exits', async () => {
+    const clock = new FakeClock()
+    const { daemon, host, update } = await bootWithBackgroundExec(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+    expect((daemon as any).agentHasLiveSdkWork('bot-a')).toBe(true) // the gate on idle secret-file removal
+
+    // The command exits between turns; its end arrives outside any turn.
+    await update({ sessionUpdate: 'tool_call_update', toolCallId: 'exec-1', status: 'completed' })
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+
+    await daemon.stop()
+  })
+
+  it('stops holding once the command has run past agentMaxLifetimeMs', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithBackgroundExec(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 5000,
+      idleSweepMs: 10_000_000
+    })
+
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    clock.advance(4500)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+
+    await daemon.stop()
+  })
+})
+
+describe('Daemon idle sweep — background-task lease', () => {
+  const evt = (subtype: string, extra: Record<string, unknown> = {}) => ({ type: 'system', subtype, ...extra })
+
+  async function bootWithTurn(clock: FakeClock, limits: Record<string, number>) {
+    const host = quietHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(limits),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+    await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    return { daemon, host, conn }
+  }
+
+  it('defers host reclaim + session TTL-close while a background task is live, then reclaims once it settles', async () => {
+    const clock = new FakeClock()
+    const { daemon, host } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+
+    // A run_in_background task starts — the lease is non-empty.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+
+    // Past the idle TTL, but the lease defers reclaim AND spares the session from close.
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    // The task settles, but its completion wake is now armed — that still fences reclaim, or
+    // the sweep would close the session out from under a delivery about to happen.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+    clock.advance(1001) // past the TTL again, still inside the wake's grace window
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle')
+
+    // Wake fires and is delivered; the fence is held until that turn SETTLES, not until it is
+    // dispatched, so wait on the count rather than on the timer set.
+    clock.advance(4000)
+    await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+    await vi.waitFor(async () => expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle'), WAIT)
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+
+    await daemon.stop()
+  })
+
+  it('a running SDK cycle (followup turn) with no tasks defers reclaim until it returns to idle', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+
+    // end_turn fired, but Claude self-woke a followup turn to drain a completed task —
+    // no `this.pending` entry, only the SDK cycle is running.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+
+    await daemon.stop()
+  })
+
+  it('an authoritative background_tasks_changed snapshot heals missed settle edges', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+
+    // Two tasks start; both settle edges are LOST — only an empty snapshot arrives.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't2' }))
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true) // still deferred
+
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('background_tasks_changed', { tasks: [] }))
+    // Both settled on that one edge, so both completion wakes are armed and still fence reclaim.
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    clock.advance(4000)
+    await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+
+    await daemon.stop()
+  })
+
+  it('force-reclaims past the absolute lifetime ceiling even with a live background task', async () => {
+    const clock = new FakeClock()
+    // ceiling only just above the idle TTL so we can cross it deterministically
+    const { daemon, host } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 2000,
+      idleSweepMs: 10_000_000
+    })
+
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+
+    // Past the idle TTL but under the ceiling → deferred.
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    expect((daemon as any).hosts.has('bot-a')).toBe(true)
+
+    // Past the ceiling (from host start) → force reclaim despite the live task.
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+
+    await daemon.stop()
+  })
+
+  // A settle posts NOTHING of its own: the human-visible signal is the drain narration
+  // (§5.2) or the wake turn's reply, so a settle edge must not touch the channel directly.
+  it('a post-turn settle posts nothing to the channel by itself', async () => {
+    const clock = new FakeClock()
+    const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+    await (daemon as any).store.setOutputModeOverride(KEY, 'high')
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'Sleep for 15 seconds' })
+    )
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_updated', { task_id: 't1', patch: { status: 'completed' } })
+    )
+    expect(conn.postMessage).not.toHaveBeenCalled()
+    expect((daemon as any).sdkLease.get(LEASE_KEY)?.armedWakes).toBe(1) // the wake carries it instead
+    await daemon.stop()
+  })
+
+  it('does not wake a task that settles inside a live foreground turn', async () => {
+    const clock = new FakeClock()
+    const { host, release } = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({ agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 }),
+      hostFactory: () => host as any,
+      clock
+    })
+    await daemon.start()
+    const conn = makeRoutable(daemon)
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(1), WAIT)
+
+    // The loop is live (running SDK cycle + pending dispatch): the runtime hands the result
+    // to the model in-turn and the turn's chrome shows the step — the daemon stays quiet.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'Wait 5 seconds' })
+    )
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_updated', { task_id: 't1', patch: { status: 'completed' } })
+    )
+
+    expect(conn.postMessage).not.toHaveBeenCalled()
+    expect((daemon as any).sdkLease.get(LEASE_KEY)?.armedWakes).toBe(0)
+    expect((daemon as any).bgWakeTimers.size).toBe(0)
+    // Still retained for the tasks panel — only the wake is skipped.
+    expect((daemon as any).sdkLease.get(LEASE_KEY)?.settled?.length).toBe(1)
+
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+    release()
+    await turn
+    clock.advance(10_000)
+    await new Promise((r) => setImmediate(r))
+    expect(host.prompt).toHaveBeenCalledTimes(1) // no wake turn either
+    await daemon.stop()
+  })
+
+  // The `run_in_background` "you will be notified when it completes" contract is a HARNESS
+  // promise, not an SDK one. Under ACP the foreground turn has already returned end_turn by
+  // the time the task settles, so the daemon has to deliver the completion itself or the work
+  // (and anything the model owed on the back of it) is stranded.
+  describe('waking the session when a background task settles', () => {
+    it('wakes the idle session with a fresh turn once the grace period passes', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low') // a wake is NOT gated on output mode
+      expect(host.prompt).toHaveBeenCalledTimes(1) // just the human turn so far
+
+      await (daemon as any).onSdkLifecycle(
+        'bot-a',
+        'acp-1',
+        evt('task_started', { task_id: 't1', description: 'Sleep 30s then print the time' })
+      )
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      expect(host.prompt).toHaveBeenCalledTimes(1) // deferred, not immediate
+
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      const woken = JSON.stringify((host.prompt as any).mock.calls[1])
+      expect(woken).toContain('background task finished')
+      expect(woken).toContain('Sleep 30s then print the time')
+      expect(woken).toContain('t1')
+      await daemon.stop()
+    })
+
+    // The runtime's own self-drain cycle produces NOTHING a user can see (no Pending ⇒
+    // onAcpUpdate drops it), so the wake waits it out but must never stand down for it.
+    it('waits out the runtime self-drain cycle, then wakes anyway', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      // Claude self-woke a followup cycle to drain it.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+
+      clock.advance(4000) // re-armed, not abandoned
+      await vi.waitFor(() => expect((daemon as any).bgWakeTimers.size).toBe(1), WAIT)
+      expect((daemon as any).sdkLease.get(LEASE_KEY)?.armedWakes).toBe(1) // fence never dipped
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      await daemon.stop()
+    })
+
+    it('gives up re-arming if the runtime cycle never returns to idle', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+
+      // 15 re-arms then nothing left armed — a wedged cycle must not be polled forever.
+      for (let i = 0; i < 16; i++) {
+        clock.advance(4000)
+        await new Promise((r) => setImmediate(r))
+      }
+      expect((daemon as any).bgWakeTimers.size).toBe(0)
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+      await daemon.stop()
+    })
+
+    it('wakes once for the last task, not once per task', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't2' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      clock.advance(4000) // t2 is still live — t1's wake must stand down
+      await new Promise((r) => setImmediate(r))
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't2' }))
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      await daemon.stop()
+    })
+
+    // The armed wake must fence automatic cleanup: `settle()` removes the task before the
+    // timer is armed, so a session whose task outlived the TTL would otherwise be closed
+    // (and its lease dropped) inside the grace window — losing the completion again.
+    it('keeps the session non-quiescent while a wake is armed, and releases it after', async () => {
+      const clock = new FakeClock()
+      const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      expect((daemon as any).sdkLease.get(LEASE_KEY)?.tasks.size).toBe(0) // task already released
+      expect((daemon as any).sdkLease.get(LEASE_KEY)?.armedWakes).toBe(1)
+      expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(false)
+      expect((daemon as any).agentHasLiveSdkWork('bot-a')).toBe(true)
+
+      clock.advance(4000)
+      await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+      expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(true)
+      await daemon.stop()
+    })
+
+    // The hand-off after the fence is released is its own race: `dispatch()` claims the serial
+    // gate synchronously, but `dispatchOne` then awaits thread history / attachments / memory
+    // recall before SessionManager writes `state = 'prompting'`. Releasing at dispatch time
+    // would leave an already-expired session reading quiescent AND idle for that whole window.
+    it('holds the fence through async turn initialization, not just up to dispatch', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, {
+        agentIdleTimeoutMs: 1000,
+        agentMaxLifetimeMs: 10_000_000,
+        idleSweepMs: 10_000_000
+      })
+      // Stall initialization exactly where it is slow in production (managed-memory recall),
+      // i.e. AFTER the wake's dispatch but BEFORE the row leaves `idle`.
+      let releaseRecall!: () => void
+      const recallBlocked = new Promise<void>((resolve) => (releaseRecall = resolve))
+      const memory = (daemon as any).memory
+      const realRecall = memory.recallForTurn.bind(memory)
+      memory.recallForTurn = async (...args: unknown[]) => {
+        await recallBlocked
+        return realRecall(...args)
+      }
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(1), WAIT) // wake dispatched, stalled
+
+      // Past the TTL, mid-initialization: the row is still `idle` and has no Pending, so only
+      // the lease fence can keep the sweep off it.
+      clock.advance(1001)
+      await (daemon as any).sweepIdle()
+      expect((await (daemon as any).store.getSession(KEY))?.state).not.toBe('closed')
+      expect((daemon as any).hosts.has('bot-a')).toBe(true)
+      expect(host.stop).not.toHaveBeenCalled()
+
+      releaseRecall()
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+      await daemon.stop()
+    })
+
+    // The dispatch promise deliberately outlives `host.prompt()` (renderer/finalization still
+    // runs). A task settling in THAT window cannot have been observed in-turn — the model has
+    // already stopped — so it must not be coalesced into the delivery that is finishing.
+    it('delivers a task that settles after a wake prompt returned but before its turn settles', async () => {
+      const clock = new FakeClock()
+      // Hold wake A's turn open (its prompt blocks) while telling the lease the model has gone
+      // idle — that pair IS the post-prompt/pre-cleanup window.
+      let releaseA!: () => void
+      const aBlocked = new Promise<void>((resolve) => (releaseA = resolve))
+      let prompts = 0
+      const host = {
+        start: vi.fn(async () => {}),
+        newSession: vi.fn(async () => 'acp-1'),
+        prompt: vi.fn(async () => {
+          if (++prompts === 2) await aBlocked
+          return 'end_turn'
+        }),
+        cancel: vi.fn(async () => {}),
+        stop: vi.fn(async () => {})
+      }
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({ agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 }),
+        hostFactory: () => host as any,
+        clock
+      })
+      await daemon.start()
+      makeRoutable(daemon)
+      await (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+
+      // Wake A → prompt #2, which blocks. Its dispatch stays pending.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 'a' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 'a' }))
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      // The model is done even though the turn is not — exactly what the SDK reports here.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+
+      // Task B settles inside that window. It must be deferred, not folded into A.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 'b' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 'b' }))
+      for (let i = 0; i < 3; i++) {
+        clock.advance(4000)
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      expect(host.prompt).toHaveBeenCalledTimes(2) // not delivered while A is in flight…
+      expect(wakeFenceHeld(daemon)).toBe(true) // …and still owed, not discarded
+
+      releaseA()
+      // Once A settles, B's deferred wake re-arms and delivers: a THIRD prompt. Without the
+      // deferral B is dropped here and this never reaches 3.
+      await vi.waitFor(
+        async () => {
+          clock.advance(4000)
+          await new Promise((r) => setTimeout(r, 20))
+          expect(host.prompt).toHaveBeenCalledTimes(3)
+        },
+        waitBudget(8000, 50)
+      )
+      await daemon.stop()
+    })
+
+    it('does not wake for an internal subagent task', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle(
+        'bot-a',
+        'acp-1',
+        evt('task_started', { task_id: 's1', subagent_type: 'general' })
+      )
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 's1' }))
+      clock.advance(4000)
+      await new Promise((r) => setImmediate(r))
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+      await daemon.stop()
+    })
+
+    it('does not wake a session whose host was already reclaimed', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      await (daemon as any).stopHost('bot-a') // drops the lease with the ACP session
+
+      clock.advance(4000)
+      await new Promise((r) => setImmediate(r))
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+      await daemon.stop()
+    })
+
+    // A wake has no hopCount to bound and a woken turn may start further background tasks, so
+    // the budget is the only backstop against a self-feeding loop.
+    it('stops waking once the per-session budget is exhausted', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      clock.advance(4000)
+      const lease = (daemon as any).sdkLease.get(LEASE_KEY)
+      await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+      expect(host.prompt).toHaveBeenCalledTimes(2)
+      expect(lease.bgWakes).toBe(1) // a delivered wake is spent
+
+      // Pre-spend the rest rather than driving 19 more real turns: the property under test is
+      // the refusal at the cap, not the arithmetic getting there.
+      lease.bgWakes = 20
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't2' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't2' }))
+      clock.advance(4000)
+      await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT) // fence released, no wake
+      expect(host.prompt).toHaveBeenCalledTimes(2)
+      expect(lease.bgWakes).toBe(20) // never spends past the cap
+      await daemon.stop()
+    })
+  })
+
+  // ACP session ids are runtime-local: two agents can each expose `acp-1`. Sharing one lease
+  // entry would let one agent's task overwrite the other's record, suppress its completion
+  // wake (via `tasks.size`/`sdkState`), or spend its wake budget.
+  // §5.2: the narration a Pending-less runtime drain cycle produces is captured and
+  // delivered as agent speech instead of dropped, and the wake stops asking for a repeat.
+  describe('delivering the drain narration', () => {
+    const chunk = (text: string) => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+
+    it('captures a Pending-less running cycle and posts it as agent speech on the idle edge', async () => {
+      const clock = new FakeClock()
+      const { daemon, host, conn } = await bootWithTurn(clock, {
+        agentIdleTimeoutMs: 10_000_000,
+        idleSweepMs: 10_000_000
+      })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low') // announce off; delivery is not mode-gated
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('first sleep '))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('done'))
+      expect(conn.postMessage).not.toHaveBeenCalled() // buffered, never streamed
+      clock.advance(10)
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await vi.waitFor(() => expect(conn.postMessage).toHaveBeenCalledTimes(1), WAIT)
+      const [channel, text, thread, options] = (conn.postMessage as any).mock.calls[0]
+      expect(channel).toBe('C1')
+      expect(text).toBe('first sleep done')
+      expect(thread).toBe('T1')
+      expect(options).toMatchObject({ username: 'bot-a', agentAuthorId: 'bot-a' })
+      // Recorded like a reply row, so the console reads it back.
+      const rows = await (daemon as any).store.transcriptSince(
+        {
+          transcriptChannel: transcriptChannelKey('C1', TRANSPORT_SCOPE),
+          coordinate: 'T1',
+          sessionKey: 'slack:C1:T1:bot-a',
+          agentId: 'bot-a'
+        },
+        null
+      )
+      expect(rows.some((row: any) => row.sender === 'bot-a' && row.text === 'first sleep done')).toBe(true)
+      // The narration covered this settle, so the wake stands down entirely — no extra turn,
+      // and the fence slot is released so the session can quiesce.
+      clock.advance(4000)
+      await vi.waitFor(() => expect((daemon as any).sdkLease.get(LEASE_KEY)?.armedWakes ?? 0).toBe(0), WAIT)
+      expect(host.prompt).toHaveBeenCalledTimes(1)
+      await daemon.stop()
+    })
+
+    it('a settle AFTER the drain delivery still wakes — per-settle precision, not a latch', async () => {
+      const clock = new FakeClock()
+      const { daemon, host, conn } = await bootWithTurn(clock, {
+        agentIdleTimeoutMs: 10_000_000,
+        idleSweepMs: 10_000_000
+      })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      // t1 settles and its drain narrates — covered, no wake.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('t1 result said here'))
+      clock.advance(10)
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await vi.waitFor(() => expect(conn.postMessage).toHaveBeenCalledTimes(1), WAIT)
+      // t2 settles later and its drain narrates NOTHING — the old delivery must not cover it.
+      clock.advance(2000)
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't2' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't2' }))
+      clock.advance(8000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      const woken = JSON.stringify((host.prompt as any).mock.calls[1])
+      expect(woken).toContain('nothing you said')
+      expect(woken).toContain('t2')
+      await daemon.stop()
+    })
+
+    it('drops a straggler chunk that arrives outside a running cycle', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      // Lease exists but the cycle is over — a late chunk must not be buffered.
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('stale tail'))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await new Promise((r) => setImmediate(r))
+      expect(conn.postMessage).not.toHaveBeenCalled()
+      await daemon.stop()
+    })
+
+    it('a real dispatch claims the buffer and delivers it exactly once', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('early words'))
+      await (daemon as any).dispatch('bot-a', dm('200', 'again'), 'int-a')
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await new Promise((r) => setImmediate(r))
+      const bodies = (conn.postMessage as any).mock.calls.map((call: any[]) => String(call[1]))
+      expect(bodies.filter((body: string) => body === 'early words')).toHaveLength(1)
+      await daemon.stop()
+    })
+
+    it('migrates the attribution footer onto the narration and clears the previous holder', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      // The turn's last reply currently holds the footer — recorded at teardown.
+      ;(daemon as any).lastFooterReply.set(KEY, { channel: 'C1', ts: '111.222', text: 'old body' })
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('narration words'))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await vi.waitFor(() => expect(conn.postMessage).toHaveBeenCalledTimes(1), WAIT)
+      // Born with the footer: the last (only) section carries the attribution context block.
+      const options = (conn.postMessage as any).mock.calls[0][3]
+      expect(JSON.stringify(options.trailingBlocks)).toContain('sent by')
+      // The previous holder loses its footer via the authorship-only re-stamp (no closure).
+      await vi.waitFor(() => expect(conn.updateBlocks).toHaveBeenCalledTimes(1), WAIT)
+      expect((conn.updateBlocks as any).mock.calls[0].slice(0, 3)).toEqual([
+        'C1',
+        '111.222',
+        [{ type: 'markdown', text: 'old body' }]
+      ])
+      expect(conn.finalizeResponse).not.toHaveBeenCalled()
+      // The narration is the new holder, tracked for the next migration.
+      expect((daemon as any).lastFooterReply.get(KEY)).toMatchObject({ ts: 'ts-1', text: 'narration words' })
+      await daemon.stop()
+    })
+
+    it('re-supplies the §5.5 closure when clearing a closure-stamped holder', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      const closure = { responseId: 'resp-9', hopCount: 2, mentionedAgentIds: ['peer-1'], addressedAnyone: true }
+      ;(daemon as any).lastFooterReply.set(KEY, { channel: 'C1', ts: '111.333', text: 'closed body', closure })
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('follow-up'))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await vi.waitFor(() => expect(conn.finalizeResponse).toHaveBeenCalledTimes(1), WAIT)
+      // chat.update replaces metadata wholesale — the closure must ride the clearing edit.
+      expect((conn.finalizeResponse as any).mock.calls[0]).toEqual([
+        'C1',
+        '111.333',
+        [{ type: 'markdown', text: 'closed body' }],
+        'closed body',
+        'bot-a',
+        {
+          responseId: 'resp-9',
+          deliveryState: 'final',
+          hopCount: 2,
+          mentionedAgentIds: ['peer-1'],
+          addressedAnyone: true
+        }
+      ])
+      expect(conn.updateBlocks).not.toHaveBeenCalled()
+      await daemon.stop()
+    })
+
+    it('records the footer holder at teardown, and clears it for a footerless turn', async () => {
+      const clock = new FakeClock()
+      const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      const base = {
+        plan: { sessionKey: KEY, channel: 'C1', sourceHopCount: 1 },
+        reply: {
+          lastReply: { ts: '5.5', text: 'reply body', footerKey: 'fk' },
+          lastResponse: { ts: '5.5', text: 'reply body' },
+          responseId: 'resp-1',
+          closedRouting: { mentionedAgentIds: ['peer-2'], addressedAnyone: false }
+        }
+      }
+      ;(daemon as any).recordFooterHolder(base)
+      expect((daemon as any).lastFooterReply.get(KEY)).toEqual({
+        channel: 'C1',
+        ts: '5.5',
+        text: 'reply body',
+        closure: { responseId: 'resp-1', hopCount: 1, mentionedAgentIds: ['peer-2'], addressedAnyone: false }
+      })
+      // Footer on a NON-terminal message ⇒ no closure to re-supply.
+      ;(daemon as any).recordFooterHolder({
+        ...base,
+        reply: { ...base.reply, lastResponse: { ts: '9.9', text: 'other' } }
+      })
+      expect((daemon as any).lastFooterReply.get(KEY)?.closure).toBeUndefined()
+      // A no-peers conversation skips the closure edit and stays `streaming` on purpose —
+      // recording one would let the clearing edit PROMOTE the reply to final.
+      ;(daemon as any).recordFooterHolder({
+        ...base,
+        reply: { ...base.reply, closedRouting: undefined }
+      })
+      expect((daemon as any).lastFooterReply.get(KEY)?.closure).toBeUndefined()
+      // Born-final terminal section: closed on this ts, closure metadata from finalRouting.
+      ;(daemon as any).recordFooterHolder({
+        ...base,
+        reply: {
+          ...base.reply,
+          closedRouting: undefined,
+          finalStamped: '5.5',
+          finalRouting: { mentionedAgentIds: ['peer-3'], addressedAnyone: true, hasPeers: true, peerSharesBot: false }
+        }
+      })
+      expect((daemon as any).lastFooterReply.get(KEY)?.closure).toEqual({
+        responseId: 'resp-1',
+        hopCount: 1,
+        mentionedAgentIds: ['peer-3'],
+        addressedAnyone: true
+      })
+      // A footerless turn CLEARS the record — a drain must not steal an older response's footer.
+      ;(daemon as any).recordFooterHolder({ ...base, reply: { ...base.reply, lastReply: undefined } })
+      expect((daemon as any).lastFooterReply.get(KEY)).toBeUndefined()
+      await daemon.stop()
+    })
+
+    it('a session whose platform has no integration neither posts nor claims delivery', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      // A webchat-like session: platform backed by NO integration on this agent. The
+      // any-integration fallback used to hand it the Slack client, which would throw on the
+      // webchat channel id AFTER claiming delivery — the wake then wrongly said "delivered".
+      const webKey = sessionKey('webchat', 'chat-1', '', 'bot-a')
+      await (daemon as any).store.upsertSession({
+        key: webKey,
+        agentId: 'bot-a',
+        platform: 'webchat',
+        channel: 'chat-1',
+        thread: '',
+        acpSessionId: 'acp-w',
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: clock.now()
+      })
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-w', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-w', chunk('webchat drain words'))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-w', evt('session_state_changed', { state: 'idle' }))
+      await new Promise((r) => setImmediate(r))
+      expect(conn.postMessage).not.toHaveBeenCalled() // the Slack conn is NOT this session's surface
+      const lease = (daemon as any).sdkLease.get(JSON.stringify(['bot-a', 'acp-w']))
+      expect(lease?.drainDeliveredAt).toBeUndefined() // and delivery is not claimed to the wake
+      await daemon.stop()
+    })
+
+    it('holds the no-response sentinel and an exhausted budget silent', async () => {
+      const clock = new FakeClock()
+      const { daemon, conn } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk(NO_RESPONSE_SENTINEL))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await new Promise((r) => setImmediate(r))
+      expect(conn.postMessage).not.toHaveBeenCalled()
+      // Past the budget the narration drops as it always did — the self-continuation bound.
+      const lease = (daemon as any).sdkLease.get(LEASE_KEY)
+      lease.drainDeliveries = 20
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'running' }))
+      await (daemon as any).onAcpUpdate('bot-a', 'acp-1', chunk('over budget'))
+      await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('session_state_changed', { state: 'idle' }))
+      await new Promise((r) => setImmediate(r))
+      expect(conn.postMessage).not.toHaveBeenCalled()
+      await daemon.stop()
+    })
+
+    it('carries the task_notification summary into the wake prompt', async () => {
+      const clock = new FakeClock()
+      const { daemon, host } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+      await (daemon as any).store.setOutputModeOverride(KEY, 'low')
+      await (daemon as any).onSdkLifecycle(
+        'bot-a',
+        'acp-1',
+        evt('task_started', { task_id: 't1', description: 'Sleep 5' })
+      )
+      await (daemon as any).onSdkLifecycle(
+        'bot-a',
+        'acp-1',
+        evt('task_notification', { task_id: 't1', summary: 'slept five seconds, printed done' })
+      )
+      clock.advance(4000)
+      await vi.waitFor(() => expect(host.prompt).toHaveBeenCalledTimes(2), WAIT)
+      const woken = JSON.stringify((host.prompt as any).mock.calls[1])
+      expect(woken).toContain('Task summary: slept five seconds, printed done')
+      expect(woken).toContain('nothing you said') // no drain delivery happened
+      await daemon.stop()
+    })
+  })
+
+  it('keys the lease per (agent, ACP session) so two agents sharing an id do not collide', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'a-work' })
+    )
+    await (daemon as any).onSdkLifecycle(
+      'bot-b',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'b-work' })
+    )
+    expect((daemon as any).sdkLease.size).toBe(2)
+    expect((daemon as any).sdkLease.get(LEASE_KEY)?.tasks.get('t1')?.description).toBe('a-work')
+
+    // Settling bot-b's identically-named task must not settle bot-a's.
+    await (daemon as any).onSdkLifecycle('bot-b', 'acp-1', evt('task_notification', { task_id: 't1' }))
+    expect((daemon as any).sdkLease.get(LEASE_KEY)?.tasks.size).toBe(1)
+    expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(false)
+    await daemon.stop()
+  })
+
+  // `task/list` needs settled tasks to exist at all, and the ONLY safe place to keep them is
+  // outside `lease.tasks`: every reclaim decision reads that map as the liveness set. These four
+  // cases pin that the retained record is inert — it neither wakes, nor spends the wake budget,
+  // nor keeps a session or a host or a workspace mutation fenced.
+  it('retains a settled task for the panel while keeping it out of every liveness read', async () => {
+    const clock = new FakeClock()
+    const { daemon, host, conn } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 1000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+    await (daemon as any).store.setOutputModeOverride(KEY, 'medium')
+    const lease = () => (daemon as any).sdkLease.get(LEASE_KEY)
+
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'Sleep 15' })
+    )
+    expect((daemon as any).agentHasLiveSdkWork('bot-a')).toBe(true)
+    expect((daemon as any).workspaceMutationBusy('bot-a')).toBe(true) // console edits refused while it runs
+
+    // Settled: released from the liveness set, retained for the panel.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_notification', { task_id: 't1' }))
+    expect(lease().tasks.size).toBe(0)
+    expect(lease().settled.map((t: any) => t.id)).toEqual(['t1'])
+    expect(conn.postMessage).not.toHaveBeenCalled() // a settle posts nothing of its own
+
+    // Its wake delivers once; the fence clears with the retained record still in place.
+    clock.advance(4000)
+    await vi.waitFor(() => expect(wakeFenceHeld(daemon)).toBe(false), WAIT)
+    expect(lease().bgWakes).toBe(1)
+
+    // The next authoritative snapshot no longer lists it. Re-settling a retained record is what
+    // would re-wake and burn the 20-wake budget on EVERY subsequent snapshot.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('background_tasks_changed', { tasks: [] }))
+    expect(lease().bgWakes).toBe(1)
+    expect(wakeFenceHeld(daemon)).toBe(false)
+    expect(conn.postMessage).not.toHaveBeenCalled()
+    expect(lease().settled).toHaveLength(1)
+
+    // Quiescent WITH the record retained, so the session TTL-closes and the host is reclaimed.
+    expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(true)
+    expect((daemon as any).agentHasLiveSdkWork('bot-a')).toBe(false)
+    expect((daemon as any).workspaceMutationBusy('bot-a')).toBe(false)
+    await vi.waitFor(async () => expect((await (daemon as any).store.getSession(KEY))?.state).toBe('idle'), WAIT)
+    clock.advance(1001)
+    await (daemon as any).sweepIdle()
+    await vi.waitFor(() => expect((daemon as any).hosts.has('bot-a')).toBe(false), WAIT)
+    expect(host.stop).toHaveBeenCalled()
+    expect((await (daemon as any).store.getSession(KEY))?.state).toBe('closed')
+
+    await daemon.stop()
+  })
+
+  it('projects the lease for task/list — running, done, and a failure refined by a later edge', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+    const list = async () => await (daemon as any).listBackgroundTasks({ agentId: 'bot-a', sessionId: 'acp-1' })
+    // The console asks by the id it routed on — the outward one (session-concept.md §1.1) — and
+    // must get the same lease back, since the lease itself is keyed by the runtime's id.
+    const outwardList = async () =>
+      await (daemon as any).listBackgroundTasks({
+        agentId: 'bot-a',
+        sessionId: (await (daemon as any).store.getSessionByAcpId('acp-1'))!.sessionId
+      })
+
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't1', description: 'Sleep 15' })
+    )
+    clock.advance(1000)
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_started', { task_id: 't2', subagent_type: 'general' })
+    )
+
+    // Live rows, newest start first. The internal subagent is CARRIED, not filtered at the source:
+    // it fences reclaim exactly like a real task, so hiding it here would make the panel and the
+    // thing deferring reclaim disagree. Consumers filter at render.
+    expect((await list()).tasks.map((t: any) => [t.id, t.state, t.subagent])).toEqual([
+      ['t2', 'running', true],
+      ['t1', 'running', false]
+    ])
+    expect((await list()).tracked).toBe(true)
+    expect((await outwardList()).tasks.map((t: any) => t.id)).toEqual((await list()).tasks.map((t: any) => t.id))
+    expect((await list()).truncated).toBe(false)
+    expect((await list()).tasks[1].description).toBe('Sleep 15')
+    expect((await list()).tasks[1].startedAt).toBe(new Date(0).toISOString()) // the task_started edge's arrival
+    expect((await list()).tasks[1].endedAt).toBeUndefined() // a live task has not ended
+    expect((await list()).tasks[0].description).toBeUndefined() // the runtime omitted it
+
+    // The snapshot settles both and carries NO status, which is the common case — so `done` means
+    // "settled without a reported failure", and `detail` stays absent rather than claiming success.
+    clock.advance(1000)
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('background_tasks_changed', { tasks: [] }))
+    expect((await list()).tasks.map((t: any) => [t.id, t.state, t.endedAt, t.detail])).toEqual([
+      ['t1', 'done', new Date(2000).toISOString(), undefined],
+      ['t2', 'done', new Date(2000).toISOString(), undefined]
+    ])
+
+    // A later terminal edge DOES carry a status. Refining the retained row is the only way `failed`
+    // is reachable at all, and it must stay display-only: no re-announce, no liveness change.
+    await (daemon as any).onSdkLifecycle(
+      'bot-a',
+      'acp-1',
+      evt('task_updated', { task_id: 't1', patch: { status: 'failed' } })
+    )
+    const refined = (await list()).tasks.find((t: any) => t.id === 't1')
+    expect([refined.state, refined.detail]).toEqual(['failed', 'failed'])
+    expect((daemon as any).sdkLease.get(LEASE_KEY).tasks.size).toBe(0)
+    expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(false) // t1's own wake, not the record
+
+    await daemon.stop()
+  })
+
+  it('bounds the retained history and the page, and neither bound touches the liveness set', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+    const list = async () => await (daemon as any).listBackgroundTasks({ agentId: 'bot-a', sessionId: 'acp-1' })
+    // Subagent tasks, so the sweep of settles below never wakes — they are retained
+    // and counted as live exactly like any other task, which is the point.
+    const ids = Array.from({ length: MAX_TASK_LIST_TASKS + 1 }, (_unused, i) => `t${i}`)
+    for (const id of ids) {
+      clock.advance(1)
+      await (daemon as any).onSdkLifecycle(
+        'bot-a',
+        'acp-1',
+        evt('task_started', { task_id: id, subagent_type: 'general' })
+      )
+    }
+    expect((daemon as any).sdkLease.get(LEASE_KEY).tasks.size).toBe(MAX_TASK_LIST_TASKS + 1)
+    expect((await list()).tasks).toHaveLength(MAX_TASK_LIST_TASKS)
+    expect((await list()).truncated).toBe(true)
+
+    // All settle on one snapshot. Retention keeps the newest MAX_SETTLED_TASKS_PER_SESSION (20) and
+    // the liveness set empties completely — the cap evicts history, never a live task.
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('background_tasks_changed', { tasks: [] }))
+    expect((daemon as any).sdkLease.get(LEASE_KEY).tasks.size).toBe(0)
+    expect((await list()).tasks).toHaveLength(20)
+    expect((await list()).truncated).toBe(false)
+    expect((await list()).tasks.map((t: any) => t.id)).not.toContain('t0') // oldest settle evicted first
+    expect((await list()).tasks.every((t: any) => t.state === 'done' && t.subagent)).toBe(true)
+    expect((daemon as any).sessionSdkQuiescent('bot-a', 'acp-1')).toBe(true) // 20 retained rows, still quiescent
+
+    await daemon.stop()
+  })
+
+  it('answers a session with no lease as tracked:false, and an unknown agent as a violation', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, { agentIdleTimeoutMs: 10_000_000, idleSweepMs: 10_000_000 })
+
+    // No lease is NOT "no background tasks": a non-Claude runtime and an adapter without the
+    // lifecycle extension both land here, and the console says so rather than claiming idleness.
+    expect(await (daemon as any).listBackgroundTasks({ agentId: 'bot-a', sessionId: 'acp-9' })).toEqual({
+      agentId: 'bot-a',
+      sessionId: 'acp-9',
+      tracked: false,
+      tasks: [],
+      truncated: false
+    })
+    await expect((daemon as any).listBackgroundTasks({ agentId: 'nope', sessionId: 'acp-1' })).rejects.toThrow(
+      TaskViolationError
+    )
+
+    await daemon.stop()
+  })
+
+  it('drops an agent lease when its host is torn down', async () => {
+    const clock = new FakeClock()
+    const { daemon } = await bootWithTurn(clock, {
+      agentIdleTimeoutMs: 10_000_000,
+      agentMaxLifetimeMs: 10_000_000,
+      idleSweepMs: 10_000_000
+    })
+    await (daemon as any).onSdkLifecycle('bot-a', 'acp-1', evt('task_started', { task_id: 't1' }))
+    expect((daemon as any).sdkLease.size).toBe(1)
+    await (daemon as any).stopHost('bot-a')
+    expect((daemon as any).sdkLease.size).toBe(0)
+    await daemon.stop()
+  })
+})
+
+describe('Daemon graceful shutdown drain (#109)', () => {
+  it('awaits an in-flight turn before tearing the host down (no mid-turn kill)', async () => {
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(pendingFor(daemon, 'acp-1')).toBeDefined(), WAIT)
+
+    let stopped = false
+    const stopping = daemon.stop().then(() => (stopped = true))
+    // new inbound is dropped while draining
+    await (daemon as any).onInboundOutcome(dm('300', 'too late'))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(stopped).toBe(false) // still waiting on the in-flight turn
+
+    blocked.release()
+    await stopping
+    expect(stopped).toBe(true)
+    expect(blocked.host.cancel).not.toHaveBeenCalled() // drained gracefully, not cancelled
+    expect(blocked.host.stop).toHaveBeenCalled()
+  })
+
+  it('keeps the store alive until an admitted workspace file write settles', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => quietHost() as any
+    })
+    await daemon.start()
+    const store = (daemon as any).store
+    const close = vi.spyOn(store, 'close')
+
+    let releaseWrite!: () => void
+    const blocked = new Promise<void>((resolve) => (releaseWrite = resolve))
+    let markWriteEntered!: () => void
+    const entered = new Promise<void>((resolve) => (markWriteEntered = resolve))
+    const writing = (daemon as any).withWorkspaceFileWrite('bot-a', async () => {
+      markWriteEntered()
+      await blocked
+    }) as Promise<void>
+    await entered
+
+    let stopped = false
+    const stopping = daemon.stop().then(() => {
+      stopped = true
+    })
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(stopped).toBe(false)
+    expect(close).not.toHaveBeenCalled()
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true)
+
+    releaseWrite()
+    await writing
+    await stopping
+    expect(close).toHaveBeenCalledOnce()
+    expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(false)
+  })
+})
+
+describe('Daemon CP drain (#109)', () => {
+  const farFuture = '2099-01-01T00:00:00.000Z'
+
+  it('scope:daemon drains in-flight turns, releases them, stops hosts, re-opens the gate', async () => {
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    const turn = (daemon as any).dispatch('bot-a', dm('100', 'hello'), 'int-a')
+    await vi.waitFor(() => expect(pendingFor(daemon, 'acp-1')).toBeDefined(), WAIT)
+
+    const draining = (daemon as any).runDrain({ scope: { kind: 'daemon' }, deadline: farFuture }, () => {})
+    blocked.release() // let the turn finish so the drain completes gracefully
+    await turn
+    const done = await draining
+    expect(done.released).toEqual([{ platform: 'slack', channel: 'C1', thread: 'T1' }])
+    expect((daemon as any).hosts.has('bot-a')).toBe(false) // reclaimed → provisioned
+    expect((daemon as any).draining).toBe(false) // gate re-opened (bare drain is a rebalance)
+
+    await daemon.stop()
+  })
+
+  it('omits the thread for a channel-root session in released[] (matches the CP key)', async () => {
+    const blocked = blockingHost()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold(),
+      hostFactory: () => blocked.host as any
+    })
+    await daemon.start()
+    makeRoutable(daemon)
+
+    const root = {
+      msgId: 'slack:C1:500',
+      traceId: '500',
+      source: 'user' as const,
+      platform: 'slack' as const,
+      channel: 'C1',
+      thread: undefined,
+      sender: { id: 'U1', isBot: false },
+      text: 'hi',
+      mentionedBots: [] as string[],
+      isDm: false,
+      trigger: 'mention' as const
+    }
+    const turn = (daemon as any).dispatch('bot-a', root, 'int-a')
+    await vi.waitFor(() => expect(pendingFor(daemon, 'acp-1')).toBeDefined(), WAIT)
+
+    const draining = (daemon as any).runDrain({ scope: { kind: 'daemon' }, deadline: farFuture }, () => {})
+    blocked.release()
+    await turn
+    const done = await draining
+    // channel-root: released key carries NO thread (CP keys it as `slack:C1:-`)
+    expect(done.released).toEqual([{ platform: 'slack', channel: 'C1' }])
+
+    await daemon.stop()
+  })
+})
+
+describe('Daemon session retention GC (#485)', () => {
+  // `start()` fires its own retention pass, and the sweep drops a call that lands while one is
+  // running — so a test that just called it could assert against a pass that judged the clock it
+  // had before the advance. Wait the startup pass out, then sweep for real.
+  const sweepRetention = async (daemon: Daemon) => {
+    while ((daemon as any).sessionRetentionSweepInFlight) await new Promise((resolve) => setTimeout(resolve, 5))
+    await (daemon as any).sweepSessionRetention()
+  }
+
+  const seedSession = async (
+    daemon: Daemon,
+    key: string,
+    state: 'idle' | 'prompting' | 'closed',
+    updatedAt: number
+  ): Promise<string> => {
+    await (daemon as any).store.upsertSession({
+      key,
+      agentId: 'bot-a',
+      platform: 'slack',
+      channel: 'C1',
+      thread: key,
+      acpSessionId: `acp-${key}`,
+      state,
+      lastDeliveredTs: null,
+      updatedAt
+    })
+    return (await (daemon as any).store.getSession(key))!.sessionId!
+  }
+
+  it('the idle sweep deletes expired sessions but spares live turns and gate-owned keys', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+
+    await seedSession(daemon, 'expired-closed', 'closed', 0)
+    await seedSession(daemon, 'expired-idle', 'idle', 0)
+    await seedSession(daemon, 'fresh-closed', 'closed', 2 * 24 * 3_600_000) // inside the window at sweep time
+    await seedSession(daemon, 'expired-prompting', 'prompting', 0) // live turn — durable state guard
+    await seedSession(daemon, 'expired-gated', 'closed', 0) // owned serial gate — in-memory guard
+    ;(daemon as any).inflight.add('expired-gated')
+
+    // Past the default 7d retention window; the hourly gate inside sweepIdle opens too.
+    clock.advance(8 * 24 * 3_600_000)
+    await vi.waitFor(async () => expect(await (daemon as any).store.getSession('expired-closed')).toBeUndefined(), WAIT)
+    expect(await (daemon as any).store.getSession('expired-idle')).toBeUndefined()
+    expect(await (daemon as any).store.getSession('fresh-closed')).toBeDefined()
+    expect(await (daemon as any).store.getSession('expired-prompting')).toBeDefined()
+    expect(await (daemon as any).store.getSession('expired-gated')).toBeDefined()
+
+    await daemon.stop()
+  })
+
+  it('purges an expired Dream row without judging a directory, since its runner never prepares one', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    await sweepRetention(daemon)
+    // An agent that may own worktrees, so only the Dream rule keeps the row out of the directory judgement.
+    vi.spyOn((daemon as any).workspaces, 'mayOwnSessionWorktrees').mockReturnValue(true)
+    const judge = vi.spyOn(daemon as any, 'judgeSessionDirectories')
+    await (daemon as any).store.upsertSession({
+      key: 'dream:memory:drm-1:bot-a',
+      agentId: 'bot-a',
+      platform: 'dream',
+      channel: 'memory',
+      thread: 'drm-1',
+      acpSessionId: 'acp-dream',
+      state: 'idle',
+      lastDeliveredTs: null,
+      updatedAt: 0
+    })
+
+    clock.advance(8 * 24 * 3_600_000)
+    await vi.waitFor(
+      async () => expect(await (daemon as any).store.getSession('dream:memory:drm-1:bot-a')).toBeUndefined(),
+      WAIT
+    )
+    expect(judge).not.toHaveBeenCalled()
+
+    await daemon.stop()
+  })
+
+  it('keeps the session row until VM destruction succeeds, retries the next sweep, then collects images', async () => {
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock: new FakeClock()
+    })
+    await daemon.start()
+    await sweepRetention(daemon)
+    const discard = vi
+      .fn(async () => {
+        expect(await (daemon as any).store.getSession('expired-vm')).toBeDefined()
+        expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true)
+      })
+      .mockRejectedValueOnce(new Error('temporary VM destroy failure'))
+    const collectImages = vi.fn(async () => {})
+    ;(daemon as any).microsandbox = {
+      discard,
+      collectImages,
+      environmentIds: async () => [],
+      environment: () => undefined,
+      stopAll: vi.fn(async () => {})
+    }
+    try {
+      await seedSession(daemon, 'expired-vm', 'closed', -8 * 24 * 3_600_000)
+      await sweepRetention(daemon)
+      expect(await (daemon as any).store.getSession('expired-vm')).toBeDefined()
+      expect(collectImages).not.toHaveBeenCalled()
+      await sweepRetention(daemon)
+      expect(await (daemon as any).store.getSession('expired-vm')).toBeUndefined()
+      expect(discard).toHaveBeenCalledTimes(2)
+      expect(collectImages).toHaveBeenCalledOnce()
+      // A pass that discards nothing leaves the cache alone.
+      await sweepRetention(daemon)
+      expect(collectImages).toHaveBeenCalledOnce()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  it('backs off a kept session instead of judging it, and waking its pod, every pass (#3281)', async () => {
+    const HOUR = 3_600_000
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    await sweepRetention(daemon)
+    const cleanup = vi
+      .spyOn(daemon as any, 'cleanupSessionWorktree')
+      .mockResolvedValue({ outcome: 'retained', reason: 'dirty' })
+    const judgedAfter = async (ms: number) => {
+      clock.advance(ms)
+      await sweepRetention(daemon)
+      return cleanup.mock.calls.length
+    }
+    try {
+      await seedSession(daemon, 'kept', 'idle', clock.now() - 8 * 24 * HOUR)
+      expect(await judgedAfter(0)).toBe(1)
+      expect(await judgedAfter(0)).toBe(1)
+      expect(await judgedAfter(HOUR)).toBe(2)
+      // The wait doubled: one more pass is too soon.
+      expect(await judgedAfter(HOUR)).toBe(2)
+      expect(await judgedAfter(HOUR)).toBe(3)
+      // A pod that will not come up backs off the same way.
+      cleanup.mockResolvedValue({ outcome: 'failed', error: 'sandbox did not become ready' })
+      expect(await judgedAfter(2 * HOUR)).toBe(3)
+      expect(await judgedAfter(2 * HOUR)).toBe(4)
+      expect(await (daemon as any).store.getSession('kept')).toBeDefined()
+
+      // Activity since the keep starts the back-off over: once the session expires again, the wait is one pass.
+      clock.advance(1)
+      await seedSession(daemon, 'kept', 'idle', clock.now())
+      expect(await judgedAfter(8 * 24 * HOUR)).toBe(5)
+      expect(await judgedAfter(HOUR)).toBe(6)
+      cleanup.mockResolvedValue({ outcome: 'not_applicable' })
+      expect(await judgedAfter(HOUR)).toBe(6)
+      expect(await judgedAfter(HOUR)).toBe(7)
+      expect(await (daemon as any).store.getSession('kept')).toBeUndefined()
+    } finally {
+      await daemon.stop()
+    }
+  })
+
+  describe('session VMs whose row is gone (#2282)', () => {
+    const vmOf = (key: string, agentId = 'bot-a') => `${agentId}/${sessionKeyDirName(key)}`
+
+    // A manager holding `ids` on disk, of which `loaded` are also in memory; a discard removes the VM.
+    const stubMicrosandbox = (daemon: Daemon, ids: string[], loaded: string[] = []) => {
+      const live = new Set(ids)
+      const discard = vi.fn(async (id: string) => void live.delete(id))
+      const collectImages = vi.fn(async () => {})
+      ;(daemon as any).microsandbox = {
+        environmentIds: async () => [...live],
+        environment: (id: string) => (loaded.includes(id) && live.has(id) ? { id } : undefined),
+        discard,
+        collectImages,
+        stopAll: vi.fn(async () => {})
+      }
+      return { discard, collectImages }
+    }
+
+    const startDaemon = async (): Promise<Daemon> => {
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock: new FakeClock()
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      return daemon
+    }
+
+    it('retires an orphan session VM with its HOME, then collects images once', async () => {
+      const daemon = await startDaemon()
+      const home = join((daemon as any).agents.get('bot-a').dir, 'runtime-homes', sessionKeyDirName('purged'))
+      mkdirSync(home, { recursive: true })
+      writeFileSync(join(home, 'state'), 'x')
+      const { discard, collectImages } = stubMicrosandbox(daemon, [vmOf('purged')])
+      try {
+        await sweepRetention(daemon)
+        expect(discard.mock.calls).toEqual([[vmOf('purged')]])
+        expect(existsSync(home)).toBe(false)
+        expect(collectImages).toHaveBeenCalledOnce()
+        await sweepRetention(daemon)
+        expect(discard).toHaveBeenCalledOnce()
+        expect(collectImages).toHaveBeenCalledOnce()
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('leaves row-backed, shared, loaded, dream, hosted and unknown-agent VMs alone', async () => {
+      const daemon = await startDaemon()
+      const store = (daemon as any).store
+      const now = (daemon as any).clock.now()
+      await seedSession(daemon, 'has-row', 'idle', now)
+      // A row with no ACP id yet still owns its VM.
+      await store.upsertSession({
+        key: 'no-acp-id',
+        agentId: 'bot-a',
+        platform: 'slack',
+        channel: 'C1',
+        thread: 'no-acp-id',
+        acpSessionId: null,
+        state: 'idle',
+        lastDeliveredTs: null,
+        updatedAt: now
+      })
+      await store.insertDream({
+        dreamId: 'drm-1',
+        agentId: 'bot-a',
+        status: 'failed',
+        trigger: 'manual',
+        sessionIds: [],
+        snapshotDigest: 'sha256:x',
+        createdAt: '2026-01-01T00:00:00.000Z'
+      })
+      const kept = [
+        vmOf('has-row'),
+        vmOf('no-acp-id'),
+        'bot-a/agent',
+        vmOf('loaded'),
+        vmOf(sessionKey('dream', 'memory', 'drm-1', 'bot-a')),
+        `executor/${sessionKeyDirName('hosted')}`,
+        vmOf('gone', 'ghost-agent')
+      ]
+      const { discard, collectImages } = stubMicrosandbox(daemon, kept, [vmOf('loaded')])
+      try {
+        await sweepRetention(daemon)
+        expect(discard).not.toHaveBeenCalled()
+        expect(collectImages).not.toHaveBeenCalled()
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('keeps a VM whose row reappears while the pass waits for the admission fence', async () => {
+      const daemon = await startDaemon()
+      const { discard, collectImages } = stubMicrosandbox(daemon, [vmOf('reopened')])
+      let release!: () => void
+      const blocked = new Promise<void>((resolve) => (release = resolve))
+      void (daemon as any).enqueueAgentWorkspaceMutation('bot-a', () => blocked)
+      try {
+        const sweep = (daemon as any).sweepSessionRetention()
+        await vi.waitFor(() => expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true), WAIT)
+        await seedSession(daemon, 'reopened', 'idle', (daemon as any).clock.now())
+        release()
+        await sweep
+        expect(discard).not.toHaveBeenCalled()
+        expect(collectImages).not.toHaveBeenCalled()
+      } finally {
+        release()
+        await daemon.stop()
+      }
+    })
+  })
+
+  describe('session directories whose row is gone (#2283)', () => {
+    // A session directory holding only its runtime HOME, which carries no work of its own.
+    const sessionDirOf = (daemon: Daemon, key: string) => {
+      const dir = join((daemon as any).agents.get('bot-a').dir, 'sessions', sessionKeyDirName(key))
+      mkdirSync(join(dir, 'home'), { recursive: true })
+      writeFileSync(join(dir, 'home', 'state'), 'x')
+      return dir
+    }
+
+    const startDaemon = async (): Promise<Daemon> => {
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock: new FakeClock()
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      return daemon
+    }
+
+    it('removes an orphan directory, and keeps row, dream and VM-backed ones and one holding work', async () => {
+      const daemon = await startDaemon()
+      const store = (daemon as any).store
+      await seedSession(daemon, 'has-row', 'closed', (daemon as any).clock.now())
+      await store.insertDream({
+        dreamId: 'drm-1',
+        agentId: 'bot-a',
+        status: 'failed',
+        trigger: 'manual',
+        sessionIds: [],
+        snapshotDigest: 'sha256:x',
+        createdAt: '2026-01-01T00:00:00.000Z'
+      })
+      const dreamKey = sessionKey('dream', 'memory', 'drm-1', 'bot-a')
+      const orphan = sessionDirOf(daemon, 'purged')
+      const kept = ['has-row', dreamKey, 'vm-bound'].map((key) => sessionDirOf(daemon, key))
+      // A file where a clone would be, with no `.git` to judge it by: never discarded.
+      const work = sessionDirOf(daemon, 'holds-work')
+      mkdirSync(join(work, 'workspace'))
+      writeFileSync(join(work, 'workspace', 'notes.md'), 'work\n')
+      const scratch = join((daemon as any).agents.get('bot-a').dir, 'sessions', 'scratch')
+      mkdirSync(scratch)
+      ;(daemon as any).microsandbox = {
+        environmentIds: async () => [`bot-a/${sessionKeyDirName('vm-bound')}`],
+        environment: () => ({ id: 'loaded' }),
+        discard: vi.fn(async () => {}),
+        collectImages: vi.fn(async () => {}),
+        stopAll: vi.fn(async () => {})
+      }
+      try {
+        await sweepRetention(daemon)
+        expect(existsSync(orphan)).toBe(false)
+        for (const dir of [...kept, work, scratch]) expect(existsSync(dir)).toBe(true)
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('judges a microsandbox agent’s directory without this host’s Git', async () => {
+      const daemon = await startDaemon()
+      const orphan = sessionDirOf(daemon, 'purged')
+      ;(daemon as any).usesMicrosandbox = () => true
+      ;(daemon as any).microsandbox = {
+        environmentIds: async () => [],
+        environment: () => ({ id: 'loaded' }),
+        discard: vi.fn(async () => {}),
+        collectImages: vi.fn(async () => {}),
+        stopAll: vi.fn(async () => {})
+      }
+      const judge = vi.spyOn((daemon as any).workspaces, 'removeOrphanSessionDir')
+      try {
+        await sweepRetention(daemon)
+        expect(judge).toHaveBeenCalledWith(expect.objectContaining({ id: 'bot-a' }), sessionKeyDirName('purged'), false)
+        // It holds no clone, so it goes without any Git to judge it by.
+        expect(existsSync(orphan)).toBe(false)
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('lets admitted work keep its own leaf only: one session that never settles does not hold the rest', async () => {
+      const daemon = await startDaemon()
+      const store = (daemon as any).store
+      // A delivery admitted for a row that rejects it at every replay stays pending for good; it pins its session, not its agent.
+      await seedSession(daemon, 'stuck', 'idle', (daemon as any).clock.now())
+      await store.appendInbox({ id: 'm-stuck', sessionKey: 'stuck', agentId: 'bot-a', msg: '{}', enqueuedAt: '1' })
+      // Admitted work with no row yet — a durable inbox row, a gate-owned key, a planned turn — keeps the leaf its key names.
+      await store.appendInbox({
+        id: 'm-admitted',
+        sessionKey: 'admitted',
+        agentId: 'bot-a',
+        msg: '{}',
+        enqueuedAt: '2'
+      })
+      ;(daemon as any).activeGateEntries.set('gated', { agentId: 'bot-a' })
+      ;(daemon as any).pending.set('planned', { plan: { agentId: 'bot-a', sessionKey: 'planned' } })
+      const kept = ['stuck', 'admitted', 'gated', 'planned'].map((key) => sessionDirOf(daemon, key))
+      const orphan = sessionDirOf(daemon, 'purged')
+      try {
+        await sweepRetention(daemon)
+        expect(existsSync(orphan)).toBe(false)
+        for (const dir of kept) expect(existsSync(dir)).toBe(true)
+      } finally {
+        ;(daemon as any).activeGateEntries.delete('gated')
+        ;(daemon as any).pending.delete('planned')
+        await daemon.stop()
+      }
+    })
+
+    it('leaves every directory alone while the manager of a sandboxed agent is down', async () => {
+      const daemon = await startDaemon()
+      const orphan = sessionDirOf(daemon, 'purged')
+      ;(daemon as any).usesMicrosandbox = () => true
+      try {
+        await sweepRetention(daemon)
+        expect(existsSync(orphan)).toBe(true)
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('keeps a directory whose row reappears while the pass waits for the admission fence', async () => {
+      const daemon = await startDaemon()
+      const dir = sessionDirOf(daemon, 'reopened')
+      let release!: () => void
+      const blocked = new Promise<void>((resolve) => (release = resolve))
+      void (daemon as any).enqueueAgentWorkspaceMutation('bot-a', () => blocked)
+      try {
+        const sweep = (daemon as any).sweepSessionRetention()
+        await vi.waitFor(() => expect((daemon as any).workspaceDispatchFences.has('bot-a')).toBe(true), WAIT)
+        await seedSession(daemon, 'reopened', 'idle', (daemon as any).clock.now())
+        release()
+        await sweep
+        expect(existsSync(dir)).toBe(true)
+      } finally {
+        release()
+        await daemon.stop()
+      }
+    })
+  })
+
+  it('retention "never" disables the sweep entirely', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    ;(daemon as any).cfg.sessions.retention = 'never'
+    await seedSession(daemon, 'expired-closed', 'closed', 0)
+
+    clock.advance(8 * 24 * 3_600_000)
+    await sweepRetention(daemon)
+    expect(await (daemon as any).store.getSession('expired-closed')).toBeDefined()
+
+    await daemon.stop()
+  })
+
+  it('reports each purged session to the CP and clears the receipt only on the ACK', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    const emitSessionPurged = vi.fn(async (_purged: SessionPurged) => 'acknowledged' as const)
+    ;(daemon as any).cpClient = { emitSessionPurged, state: 'READY', stop: vi.fn(async () => {}) }
+
+    const expiredA = await seedSession(daemon, 'expired-a', 'closed', 0)
+    const expiredB = await seedSession(daemon, 'expired-b', 'idle', 0)
+    clock.advance(8 * 24 * 3_600_000)
+    await sweepRetention(daemon)
+    await vi.waitFor(() => expect(emitSessionPurged).toHaveBeenCalledOnce(), WAIT)
+
+    // One frame per agent, carrying the sessions' outward ids — the identity the CP knows.
+    expect(emitSessionPurged.mock.calls[0]![0]).toMatchObject({
+      agentId: 'bot-a',
+      reason: 'retention'
+    })
+    expect([...emitSessionPurged.mock.calls[0]![0].sessionIds].sort()).toEqual([expiredA, expiredB].sort())
+    // ACKed ⇒ the durable receipts are released, which the drain does after the report returns.
+    await vi.waitFor(async () => expect(await (daemon as any).store.listSessionPurges(10, 0)).toEqual([]), WAIT)
+
+    await daemon.stop()
+  })
+
+  it('never reports a session under another purge time or agent', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    const emitSessionPurged = vi.fn(async (_purged: SessionPurged) => 'acknowledged' as const)
+    ;(daemon as any).cpClient = { emitSessionPurged, state: 'READY', stop: vi.fn(async () => {}) }
+    const store = (daemon as any).store
+
+    // Two sweeps' worth of receipts plus a second agent: every frame states one
+    // agent + reason + timestamp for all the sessions it carries, so a row may
+    // never ride in a frame that would mislabel when (or by whom) it was purged.
+    await store.deleteSession('x', { reason: 'retention', at: 1_000 }) // absent row — no receipt
+    const sweep1a = await seedSession(daemon, 'sweep-1a', 'closed', 0)
+    const sweep1b = await seedSession(daemon, 'sweep-1b', 'closed', 0)
+    await store.deleteSession('sweep-1a', { reason: 'retention', at: 1_000 })
+    await store.deleteSession('sweep-1b', { reason: 'retention', at: 1_000 })
+    const sweep2 = await seedSession(daemon, 'sweep-2', 'closed', 0)
+    await store.deleteSession('sweep-2', { reason: 'retention', at: 2_000 })
+
+    await (daemon as any).drainSessionPurges()
+
+    expect(emitSessionPurged).toHaveBeenCalledTimes(2)
+    const frames = emitSessionPurged.mock.calls
+      .map((call) => call[0])
+      .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts))
+    expect([...frames[0]!.sessionIds].sort()).toEqual([sweep1a, sweep1b].sort())
+    expect(frames[0]!.ts).toBe(new Date(1_000).toISOString())
+    expect(frames[1]!.sessionIds).toEqual([sweep2])
+    expect(frames[1]!.ts).toBe(new Date(2_000).toISOString())
+    expect(await store.listSessionPurges(10, 0)).toEqual([])
+
+    await daemon.stop()
+  })
+
+  it('leaves the receipts alone while the CP socket is down', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    const emitSessionPurged = vi.fn()
+    ;(daemon as any).cpClient = { emitSessionPurged, state: 'DEGRADED', stop: vi.fn(async () => {}) }
+
+    await seedSession(daemon, 'expired-a', 'closed', 0)
+    clock.advance(8 * 24 * 3_600_000)
+    await sweepRetention(daemon)
+
+    // Not even attempted: the receipt is durable and the reconnect drains it, so a
+    // request here would only log a failure on every sweep of a local-only daemon.
+    expect(emitSessionPurged).not.toHaveBeenCalled()
+    expect(await (daemon as any).store.listSessionPurges(10, 0)).toHaveLength(1)
+
+    await daemon.stop()
+  })
+
+  it('keeps the purge receipts when the CP cannot accept them yet', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    // A CP that does not advertise the feature would reject the unknown frame, so
+    // the receipt must survive for a post-upgrade reconnect.
+    ;(daemon as any).cpClient = {
+      emitSessionPurged: vi.fn(async () => 'unsupported' as const),
+      state: 'READY',
+      stop: vi.fn()
+    }
+
+    const expiredA = await seedSession(daemon, 'expired-a', 'closed', 0)
+    clock.advance(8 * 24 * 3_600_000)
+    await sweepRetention(daemon)
+    await (daemon as any).drainSessionPurges()
+
+    expect(await (daemon as any).store.listSessionPurges(10, 0)).toMatchObject([
+      { agentId: 'bot-a', sessionId: expiredA, reason: 'retention' }
+    ])
+
+    // ...and a reporting failure is equally non-destructive.
+    ;(daemon as any).cpClient = {
+      emitSessionPurged: vi.fn(async () => {
+        throw new Error('control plane unreachable')
+      }),
+      state: 'READY',
+      stop: vi.fn()
+    }
+    await (daemon as any).drainSessionPurges()
+    expect(await (daemon as any).store.listSessionPurges(10, 0)).toHaveLength(1)
+
+    await daemon.stop()
+  })
+
+  it('a session with pending durable inbox work is treated as active and kept', async () => {
+    const clock = new FakeClock()
+    const daemon = new Daemon({
+      slackAppFactory: fakeSlackAppFactory(),
+      root: scaffold({}, { retention: '7d' }),
+      hostFactory: () => quietHost() as any,
+      clock
+    })
+    await daemon.start()
+    await seedSession(daemon, 'expired-queued', 'closed', 0)
+    await (daemon as any).store.appendInbox({
+      id: 'm-queued',
+      sessionKey: 'expired-queued',
+      agentId: 'bot-a',
+      msg: '{}',
+      enqueuedAt: '0000000001'
+    })
+
+    clock.advance(8 * 24 * 3_600_000)
+    await sweepRetention(daemon)
+    expect(await (daemon as any).store.getSession('expired-queued')).toBeDefined()
+
+    await daemon.stop()
+  })
+
+  describe('the workspace window (two-tier retention)', () => {
+    const DAY = 24 * 3_600_000
+    const fakeMicrosandbox = (daemon: Daemon) => {
+      const discard = vi.fn(async (_id: string) => {})
+      ;(daemon as any).microsandbox = {
+        discard,
+        collectImages: vi.fn(async () => {}),
+        environmentIds: async () => [],
+        environment: () => undefined,
+        stopAll: vi.fn(async () => {})
+      }
+      return discard
+    }
+
+    it('reclaims an idle session’s sandbox once, keeps its row until the row window, then purges it without judging again', async () => {
+      const clock = new FakeClock()
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '90d', workspaceRetention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      const discard = fakeMicrosandbox(daemon)
+      const cleanup = vi.spyOn(daemon as any, 'cleanupSessionWorktree')
+      try {
+        await seedSession(daemon, 'idle-ws', 'closed', clock.now())
+        clock.advance(6 * DAY)
+        await sweepRetention(daemon)
+        expect(discard).not.toHaveBeenCalled()
+
+        clock.advance(2 * DAY)
+        await sweepRetention(daemon)
+        expect(discard).toHaveBeenCalledExactlyOnceWith(`bot-a/${sessionKeyDirName('idle-ws')}`)
+        const kept = await (daemon as any).store.getSession('idle-ws')
+        expect(kept.workspaceReclaimedAt).toBe(clock.now())
+        expect(cleanup).toHaveBeenCalledTimes(1)
+
+        // A reclaimed workspace is not judged again, so no pod is woken for it.
+        clock.advance(DAY)
+        await sweepRetention(daemon)
+        expect(cleanup).toHaveBeenCalledTimes(1)
+        expect(discard).toHaveBeenCalledTimes(1)
+
+        clock.advance(90 * DAY)
+        await sweepRetention(daemon)
+        expect(await (daemon as any).store.getSession('idle-ws')).toBeUndefined()
+        expect(cleanup).toHaveBeenCalledTimes(1)
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('judges a session again after new activity, and keeps a workspace holding work with its sandbox', async () => {
+      const clock = new FakeClock()
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '90d', workspaceRetention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      const discard = fakeMicrosandbox(daemon)
+      const cleanup = vi.spyOn(daemon as any, 'cleanupSessionWorktree')
+      try {
+        await seedSession(daemon, 'reused', 'closed', clock.now())
+        clock.advance(8 * DAY)
+        await sweepRetention(daemon)
+        expect(discard).toHaveBeenCalledTimes(1)
+
+        clock.advance(1)
+        await seedSession(daemon, 'reused', 'closed', clock.now())
+        cleanup.mockResolvedValue({ outcome: 'retained', reason: 'dirty' })
+        clock.advance(8 * DAY)
+        await sweepRetention(daemon)
+        expect(cleanup).toHaveBeenCalledTimes(2)
+        expect(discard).toHaveBeenCalledTimes(1)
+        const row = await (daemon as any).store.getSession('reused')
+        expect(row.workspaceReclaimedAt).toBeLessThan(row.updatedAt)
+        expect(row.retentionKeptAt).toBe(clock.now())
+      } finally {
+        await daemon.stop()
+      }
+    })
+
+    it('retries a sandbox the cluster failed to delete instead of marking the workspace reclaimed', async () => {
+      const clock = new FakeClock()
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '90d', workspaceRetention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      const discardSession = vi.fn(async () => {}).mockRejectedValueOnce(new Error('cluster API unavailable'))
+      vi.spyOn(daemon as any, 'cleanupSessionWorktree').mockResolvedValue({ outcome: 'not_applicable' })
+      vi.spyOn(daemon as any, 'stopSessionHost').mockResolvedValue(undefined)
+      ;(daemon as any).k8sPlane = { discardSession, driver: { claimName: () => 'claim' } }
+      try {
+        await seedSession(daemon, 'pod-ws', 'closed', clock.now())
+        clock.advance(8 * DAY)
+        await sweepRetention(daemon)
+        expect(discardSession).toHaveBeenCalledTimes(1)
+        expect((await (daemon as any).store.getSession('pod-ws')).workspaceReclaimedAt ?? null).toBeNull()
+
+        clock.advance(2 * 3_600_000)
+        await sweepRetention(daemon)
+        expect(discardSession).toHaveBeenCalledTimes(2)
+        expect((await (daemon as any).store.getSession('pod-ws')).workspaceReclaimedAt).toBe(clock.now())
+      } finally {
+        ;(daemon as any).k8sPlane = undefined
+        await daemon.stop()
+      }
+    })
+
+    it('leaves the workspace to the purge when both windows are the same', async () => {
+      const clock = new FakeClock()
+      const daemon = new Daemon({
+        slackAppFactory: fakeSlackAppFactory(),
+        root: scaffold({}, { retention: '7d', workspaceRetention: '7d' }),
+        hostFactory: () => quietHost() as any,
+        clock
+      })
+      await daemon.start()
+      await sweepRetention(daemon)
+      const reclaim = vi.spyOn(daemon as any, 'sweepExpiredWorkspaces')
+      const mark = vi.spyOn((daemon as any).store, 'markSessionWorkspaceReclaimed')
+      try {
+        await seedSession(daemon, 'same-window', 'closed', clock.now())
+        clock.advance(8 * DAY)
+        await sweepRetention(daemon)
+        expect(reclaim).toHaveBeenCalled()
+        expect(mark).not.toHaveBeenCalled()
+        expect(await (daemon as any).store.getSession('same-window')).toBeUndefined()
+      } finally {
+        await daemon.stop()
+      }
+    })
+  })
+})

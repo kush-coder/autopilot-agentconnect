@@ -1,0 +1,333 @@
+// The client half of the memory-fs op set (protocol `frames/memory-store.ts`) over any carrier, plus the sandbox carrier.
+// Only the port's primitives cross the wire — history, retention, the write ledger and the dream fence stay daemon policy.
+import { randomUUID } from 'node:crypto'
+import { z } from 'zod'
+import {
+  MemoryFsAppendReplySchema,
+  MemoryFsCommitReplySchema,
+  MemoryFsPayloadSchema,
+  MemoryFsReadReplySchema,
+  MemoryFsReaddirReplySchema,
+  MemoryFsReplySchema,
+  type MemoryFsPayload,
+  type MemoryFsReadReply,
+  type MemoryFsReply
+} from '@agentconnect.md/protocol'
+import { REPLY_BUDGET, fitToBudget, utf8Boundary } from '../wire-slice.js'
+import {
+  MemoryConflictError,
+  MemoryPathError,
+  memoryRelSegments,
+  type MemoryFs,
+  type MemoryFsEncoding,
+  type MemoryFsEntry,
+  type MemoryFsFile,
+  type MemoryFsFileStat,
+  type MemoryFsWriteOptions
+} from '../memory/fs.js'
+import { createFdMemoryFsExecutor } from './fd-memory-fs.js'
+import type { WorkspaceFsKind } from '../workspace/workspace-fs.js'
+import type { ShimRequester } from './channels.js'
+
+/** Cheap discrimination for the exec handler, ahead of the full parse. */
+export function isMemoryFsPayload(payload: unknown): boolean {
+  const op = (payload as { op?: unknown } | null)?.op
+  return typeof op === 'string' && op.startsWith('memory-')
+}
+
+/** The pod-side primitive set the payloads map onto. `rel` paths are relative to `root`. */
+export interface MemoryFsExecutor {
+  read(root: string, rel: string, offset: number, limit: number, encoding: MemoryFsEncoding): Promise<MemoryFsReadReply>
+  append(root: string, rel: string, content: Buffer, create: boolean, mode?: number): Promise<{ size: number }>
+  commit(root: string, rel: string, temp: string, ifMatchMtime?: string, ifAbsent?: boolean): Promise<MemoryFsFileStat>
+  /** What one path IS, never following a symlink; `other` covers a link and every non-regular entry. */
+  stat(root: string, rel: string): Promise<WorkspaceFsKind>
+  readdir(root: string, rel: string): Promise<MemoryFsEntry[]>
+  mkdir(root: string, rel: string): Promise<void>
+  /** Remove `rel` only if it is an empty directory, answering whether it went. */
+  rmdir(root: string, rel: string): Promise<boolean>
+  rename(root: string, from: string, to: string): Promise<boolean>
+  rm(root: string, rel: string): Promise<void>
+  utimes(root: string, rel: string, mtime: string): Promise<void>
+}
+
+/** Apply one memory-fs operation inside the sandbox; `anchor` is the pod's workspace mount. */
+export async function applyMemoryFsPayload(
+  payload: unknown,
+  anchor: string,
+  executor: MemoryFsExecutor = createFdMemoryFsExecutor(anchor)
+): Promise<MemoryFsReply> {
+  const parsed = MemoryFsPayloadSchema.parse(payload)
+  try {
+    return { ok: true, value: await run(parsed, executor) }
+  } catch (err) {
+    if (err instanceof MemoryPathError)
+      return { ok: false, refusal: { kind: 'path', message: err.message.slice(0, 500) } }
+    if (err instanceof MemoryConflictError) {
+      return { ok: false, refusal: { kind: 'conflict', message: err.message.slice(0, 500) } }
+    }
+    throw err
+  }
+}
+
+function run(parsed: MemoryFsPayload, executor: MemoryFsExecutor): Promise<unknown> {
+  // Lexical containment ahead of the executor: the same refusal whatever walks the tree.
+  for (const rel of 'rel' in parsed ? [parsed.rel] : [parsed.from, parsed.to]) memoryRelSegments(rel)
+  if (parsed.op === 'memory-commit' || parsed.op === 'memory-create-commit') memoryRelSegments(parsed.temp)
+  switch (parsed.op) {
+    case 'memory-read':
+      return executor.read(parsed.root, parsed.rel, parsed.offset, parsed.limit, parsed.encoding ?? 'utf8')
+    case 'memory-append':
+      return executor.append(
+        parsed.root,
+        parsed.rel,
+        Buffer.from(parsed.content, parsed.encoding ?? 'utf8'),
+        parsed.create,
+        parsed.mode
+      )
+    case 'memory-commit':
+      return executor.commit(parsed.root, parsed.rel, parsed.temp, parsed.ifMatchMtime)
+    case 'memory-create-commit':
+      return executor.commit(parsed.root, parsed.rel, parsed.temp, undefined, true)
+    case 'memory-stat':
+      return executor.stat(parsed.root, parsed.rel)
+    case 'memory-readdir':
+      return executor.readdir(parsed.root, parsed.rel)
+    case 'memory-mkdir':
+      return executor.mkdir(parsed.root, parsed.rel).then(() => null)
+    case 'memory-rmdir':
+      return executor.rmdir(parsed.root, parsed.rel)
+    case 'memory-rename':
+      return executor.rename(parsed.root, parsed.from, parsed.to)
+    case 'memory-rm':
+      return executor.rm(parsed.root, parsed.rel).then(() => null)
+    case 'memory-utimes':
+      return executor.utimes(parsed.root, parsed.rel, parsed.mtime).then(() => null)
+  }
+}
+
+/** Raw bytes staged per append frame before the encoded-size fit; the fit only ever shrinks it. */
+const WRITE_CHUNK_BYTES = 128 * 1024
+/** How often a whole-file read restarts when the file changed underneath its slices. */
+const READ_RESTARTS = 3
+
+/** Raw bytes per base64 read chunk: fits `REPLY_BUDGET` after 4/3 expansion, and a multiple
+ *  of 3 so every chunk encodes pad-free (decoded per chunk regardless — belt and braces). */
+const BASE64_READ_LIMIT = Math.floor(REPLY_BUDGET / 4) * 3
+
+/** A bound shim channel that knows which agent it serves (a `ShimSession`). */
+export type ShimMemoryChannel = ShimRequester & { readonly agentId: string }
+
+/** One op to whichever carrier holds the tree, answered as the wire reply — the only thing the homes differ in. */
+export type MemoryFsRequester = (op: MemoryFsPayload) => Promise<MemoryFsReply>
+
+/** The shim channel as a requester: one `read`-capability round trip per op. */
+export function shimMemoryFsRequester(channel: ShimRequester, timeoutMs: number): MemoryFsRequester {
+  return async (op) => MemoryFsReplySchema.parse(await channel.request('read', op, { timeoutMs }))
+}
+
+/** Send one op and settle it, the two typed refusals rebuilt as the SAME classes the local port throws. */
+export async function settleMemoryFs<T>(
+  requester: MemoryFsRequester,
+  payload: MemoryFsPayload,
+  schema: z.ZodType<T>
+): Promise<T> {
+  const reply = await requester(payload)
+  if (!reply.ok) {
+    if (reply.refusal.kind === 'conflict') throw new MemoryConflictError(reply.refusal.message)
+    throw new MemoryPathError(reply.refusal.message)
+  }
+  return schema.parse(reply.value)
+}
+
+/** One channel round trip: {@link settleMemoryFs} over the shim requester, for the workspace seam's own primitive. */
+export function requestMemoryFs<T>(
+  channel: ShimMemoryChannel,
+  payload: MemoryFsPayload,
+  schema: z.ZodType<T>,
+  timeoutMs: number
+): Promise<T> {
+  return settleMemoryFs(shimMemoryFsRequester(channel, timeoutMs), payload, schema)
+}
+
+// The daemon's side of the op set over any requester: refusals happen where the files are; this reassembles frames.
+// A carrier supplies the requester, `root` in its coordinates, and a `key` that names the tree the same way across
+// renewals, rebinds and restarts, so the daemon's locks and write ledger follow it.
+export abstract class MemoryFsClient implements MemoryFs {
+  protected constructor(
+    private readonly requester: MemoryFsRequester,
+    readonly root: string,
+    readonly key: string
+  ) {}
+
+  /** The same port re-rooted below this one; how roots compose is the carrier's business. */
+  abstract subdir(rel: string): MemoryFs
+
+  private run<T>(payload: MemoryFsPayload, schema: z.ZodType<T>): Promise<T> {
+    return settleMemoryFs(this.requester, payload, schema)
+  }
+
+  /**
+   * The file's BYTES, chunked over the same read op with `encoding: 'base64'`.
+   *
+   * Two things the text read does not need: the per-chunk request is sized to
+   * {@link BASE64_READ_LIMIT} raw bytes, because the POD base64-encodes exactly the
+   * requested slice with no budget fitting of its own — a `REPLY_BUDGET` request would
+   * expand 4/3 past the frame and lose the channel instead of refusing; and each chunk is
+   * DECODED separately before concatenation, because independently-encoded slices carry
+   * their own padding and their joined strings are not one valid base64 stream.
+   *
+   * `maxBytes` refuses from the FIRST reply's size — one frame, not a whole transfer.
+   */
+  async readFileBytes(
+    rel: string,
+    maxBytes: number
+  ): Promise<{ bytes: Buffer; size: number; mtime: string } | { tooLarge: number } | null> {
+    const read = (offset: number) =>
+      this.run(
+        { op: 'memory-read', root: this.root, rel, offset, limit: BASE64_READ_LIMIT, encoding: 'base64' },
+        MemoryFsReadReplySchema
+      )
+    for (let attempt = 0; attempt < READ_RESTARTS; attempt++) {
+      const first = await read(0)
+      if (!first.exists) return null
+      if (first.size > maxBytes) return { tooLarge: first.size }
+      const parts = [Buffer.from(first.content, 'base64')]
+      let offset = first.nextOffset
+      let stale = false
+      while (offset < first.size) {
+        const next = await read(offset)
+        // A slice from a different version of the file would splice two files together: start over.
+        if (!next.exists || next.mtime !== first.mtime || next.size !== first.size || next.nextOffset <= offset) {
+          stale = true
+          break
+        }
+        parts.push(Buffer.from(next.content, 'base64'))
+        offset = next.nextOffset
+      }
+      if (!stale) return { bytes: Buffer.concat(parts), size: first.size, mtime: first.mtime }
+    }
+    throw new MemoryConflictError('the file kept changing while it was read')
+  }
+
+  async readFile(rel: string, encoding: MemoryFsEncoding = 'utf8'): Promise<MemoryFsFile | null> {
+    const read = (offset: number) =>
+      this.run(
+        { op: 'memory-read', root: this.root, rel, offset, limit: REPLY_BUDGET, encoding },
+        MemoryFsReadReplySchema
+      )
+    for (let attempt = 0; attempt < READ_RESTARTS; attempt++) {
+      const first = await read(0)
+      if (!first.exists) return null
+      const parts = [first.content]
+      let offset = first.nextOffset
+      let stale = false
+      while (offset < first.size) {
+        const next = await read(offset)
+        // A slice from a different version of the file would splice two files together: start over.
+        if (!next.exists || next.mtime !== first.mtime || next.size !== first.size || next.nextOffset <= offset) {
+          stale = true
+          break
+        }
+        parts.push(next.content)
+        offset = next.nextOffset
+      }
+      if (!stale) return { content: parts.join(''), size: first.size, mtime: first.mtime }
+    }
+    throw new MemoryConflictError('the memory file kept changing while it was read')
+  }
+
+  async writeFile(
+    rel: string,
+    content: string | Uint8Array,
+    options: MemoryFsWriteOptions = {}
+  ): Promise<MemoryFsFileStat> {
+    if (options.ifAbsent && options.ifMatchMtime)
+      throw new MemoryPathError('choose exclusive create or conditional replacement')
+    const name = rel.split('/').filter(Boolean).pop()
+    if (!name) throw new MemoryPathError('a file name is required')
+    const temp = `${rel.slice(0, rel.length - name.length)}.agentconnect-memory-${randomUUID()}.tmp`
+    // Bytes travel as base64 (no UTF-8 boundary to keep, ~4/3 the size); text as budget-fitted utf8.
+    const bytes = typeof content === 'string' ? undefined : Buffer.from(content)
+    const buf = bytes ?? Buffer.from(content as string, 'utf8')
+    try {
+      let offset = 0
+      let create = true
+      do {
+        const slice = buf.subarray(offset, offset + WRITE_CHUNK_BYTES)
+        const { end, content: chunk } = bytes
+          ? { end: slice.length, content: slice.toString('base64') }
+          : fitToBudget(slice, utf8Boundary(slice, slice.length))
+        await this.run(
+          {
+            op: 'memory-append',
+            root: this.root,
+            rel: temp,
+            content: chunk,
+            ...(bytes ? { encoding: 'base64' as const } : {}),
+            create,
+            ...(options.mode === undefined ? {} : { mode: options.mode })
+          },
+          MemoryFsAppendReplySchema
+        )
+        create = false
+        offset += end
+      } while (offset < buf.length)
+      return await this.run(
+        {
+          op: options.ifAbsent ? 'memory-create-commit' : 'memory-commit',
+          root: this.root,
+          rel,
+          temp,
+          ...(options.ifMatchMtime ? { ifMatchMtime: options.ifMatchMtime } : {})
+        },
+        MemoryFsCommitReplySchema
+      )
+    } catch (err) {
+      await this.run({ op: 'memory-rm', root: this.root, rel: temp }, z.null()).catch(() => {})
+      throw err
+    }
+  }
+
+  readdir(rel: string): Promise<MemoryFsEntry[]> {
+    return this.run({ op: 'memory-readdir', root: this.root, rel }, MemoryFsReaddirReplySchema)
+  }
+
+  async mkdir(rel: string): Promise<void> {
+    await this.run({ op: 'memory-mkdir', root: this.root, rel }, z.null())
+  }
+
+  rename(from: string, to: string): Promise<boolean> {
+    return this.run({ op: 'memory-rename', root: this.root, from, to }, z.boolean())
+  }
+
+  async rm(rel: string): Promise<void> {
+    await this.run({ op: 'memory-rm', root: this.root, rel }, z.null())
+  }
+
+  async utimes(rel: string, mtime: string): Promise<void> {
+    await this.run({ op: 'memory-utimes', root: this.root, rel, mtime }, z.null())
+  }
+}
+
+/** The port over an agent's bound shim channel: `root` is pod-absolute and `key` is per agent and root. */
+export class ShimMemoryFs extends MemoryFsClient {
+  constructor(
+    private readonly channel: ShimMemoryChannel,
+    root: string,
+    private readonly timeoutMs = 30_000
+  ) {
+    super(shimMemoryFsRequester(channel, timeoutMs), root, `sandbox:${channel.agentId}:${root}`)
+  }
+
+  subdir(rel: string): MemoryFs {
+    return new ShimMemoryFs(this.channel, joinRel(this.root, rel), this.timeoutMs)
+  }
+}
+
+/** POSIX join for a pod path — the root is in the pod's coordinates, never this host's. */
+function joinRel(root: string, rel: string): string {
+  const parts = rel.split('/').filter((part) => part !== '' && part !== '.')
+  if (parts.some((part) => part === '..')) throw new MemoryPathError('path escapes the memory root')
+  return parts.length === 0 ? root : `${root.replace(/\/+$/, '')}/${parts.join('/')}`
+}

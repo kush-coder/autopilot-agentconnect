@@ -1,0 +1,674 @@
+# Design: Unified Memory Operations and Context
+
+**Status:** Implementation in progress. Common reads, bounded search, console history, conditional managed mutations, external record mutations, model/admin projections, and the common console are implemented. Bounded catalog delivery on supported session creation/native resume is implemented; continuously live session refresh remains pending. The console's compatibility views are retired, and native memory has no console view; the legacy file/record tools and routes remain for old clients and the console's overview read. This design does not change the plugin ABI by itself.
+
+**Related:** [Memory evolution](memory-evolution.md), [managed memory](memory-system-plan.md), [Dream](memory-dreaming.md), [product conventions](../product-conventions.md).
+
+**Implementation baseline:** main `b82c936c`. PR [#1861](https://github.com/agentconnect-md/agentconnect/pull/1861) is considered as an independent additive list-tool change.
+
+## Recommendation
+
+Unify **memory entry operations**, their policy enforcement, and their projections into model tools and the console. Keep storage and extraction strategies behind adapters.
+
+One managed topic document is one entry. One external canonical record is one entry. An entry can be a short fact or a Markdown document; the interface must not assume they have equal size or granularity. Managed memory retains its Markdown files, frontmatter, wiki links, generated index, history, and Dream adoption path. An external record does not acquire a fictional filename or filesystem.
+
+The first release should share list/get/create/update contracts and capability discovery, and offer search where actually implemented. It should not require every existing plugin to implement every operation, enable Dream on external backends, add channel scope to the plugin ABI, or move existing data. Those are separate capabilities and migrations.
+
+## 1. What is already shared, and what is not
+
+| Layer              | Managed today                                                 | External today                                                                   | Proposal                                                                   |
+| ------------------ | ------------------------------------------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Provider lifecycle | ensure, standing index, optional turn distillation            | ensure, per-turn recall, optional queued capture                                 | Preserve common lifecycle; keep capture/recall strategies explicit         |
+| Model operations   | readMemory/writeMemory with path and replacement modes        | searchMemory/saveMemory/getMemory/updateMemory/deleteMemory; listMemory in #1861 | One core-owned entry tool family                                           |
+| Administration     | FileMemoryAdmin, path/mtime                                   | RecordMemoryAdmin, id/version                                                    | One MemoryEntries port and common DTOs                                     |
+| Console            | File browser/editor                                           | Record list/editor                                                               | Shared browse/search/detail shell, format-aware editor                     |
+| Identity           | Topic filename within a resolved root                         | Backend record ID within a bound connection and agent                            | Opaque entry reference bound to store and partition                        |
+| Content            | Up to 256,000 UTF-8 bytes; Markdown with optional YAML header | Canonical text and metadata; plugin-dependent bounds                             | Text plus format and explicit byte limits; no forced conversion            |
+| Scope              | Shared layer plus one place or person layer, by audience      | Agent only in admitted v1 plugins                                                | Common resolved view, capability-gated scope availability                  |
+| Consistency        | Existing optional mtime precondition; controlled write path   | Optional backend version; no universal CAS guarantee                             | Advertise actual consistency; never pretend a version field guarantees CAS |
+| Dream              | Managed agent scope; staged tree and fenced adoption          | Unsupported                                                                      | Keep current restriction initially; define a separate draft capability     |
+
+Current `MemoryProvider` already shares lifecycle hooks. Its residual required file methods and `FileMemoryAdmin | RecordMemoryAdmin` split make callers repeatedly branch. The unification belongs here, not in a new backend service or in raw plugin MCP tools.
+
+M-8 managed `home: control-plane` is now implemented in `memory-evolution.md`. This proposal builds on that home authority. Managed adapters must keep using `MemoryFs` and the chosen authoritative home; changing access DTOs must not introduce a second content store or fallback home.
+
+## 2. Canonical entry and reference
+
+Conceptual types below describe the contract, not an immediately compilable API patch:
+
+```ts
+type EntryRef = string
+
+type MemoryEntrySummary = {
+  ref: EntryRef
+  label: string
+  description?: string
+  format: 'markdown' | 'text'
+  byteSize: number
+  createdAt?: string
+  updatedAt?: string
+  revision?: string
+  origin: 'active' | 'inherited'
+  editable: boolean
+}
+
+type MemoryEntryContent = {
+  entry: MemoryEntrySummary
+  text: string
+  complete: boolean
+  nextContentCursor?: string
+  metadata?: Record<string, unknown>
+  links?: Array<{ label: string; ref?: EntryRef; exists: boolean }>
+  backlinks?: Array<{ label: string; ref?: EntryRef; exists: boolean }>
+}
+```
+
+- `ref` identifies `(store lineage, physical partition/layer, provider-local ID)`. A managed local ID can remain the validated topic filename; no rename feature or mass UUID rewrite is required. External backend IDs remain private adapter coordinates. Labels are presentation, never authority.
+- The core encodes or resolves the opaque reference and validates it against the current authorized view on **every** call. Knowing a reference does not grant access. A ref from another agent, connection, partition, replaced store, or abandoned draft is refused. A fresh session cannot use an old connection's coincidentally identical record ID against a new store.
+- Store lineage changes on backend replacement/reset. A physical home migration may preserve lineage only when the migration proves it is the same logical store. Content revision is separate and changes when content changes.
+- A managed topic's `text` is its **complete stored Markdown including frontmatter**. The adapter derives label/description/type for display without deleting or serializing the original header. Nested metadata, comments and unknown YAML keys survive. Derived display fields are not an independently writable copy of the header.
+- External `text` is the canonical record text. Optional backend metadata remains a bounded field only when the adapter can preserve it. Unknown metadata must not be silently dropped on update; omitted metadata means preserve, never clear.
+- Links/backlinks are read-side annotations, never appended to `text`. Existing `[[topic]]` links still resolve through the managed overlay. Other adapters may omit graph support.
+- Timestamps are optional facts. Do not synthesize creation time from a read, or promise newest-first when the provider does not guarantee it.
+- `MEMORY.md` is a **derived overview**, not a normal mutable entry in the new API. It is produced from managed topic headers. A topic whose header says `index: false` gets no line in it but is still listed, read and searched; a getting-to-know task uses this to keep each public channel's own file out of the shared overview every session reads ([assistant-mode.md §5.13](assistant-mode.md#513-getting-to-know)). Existing generated/legacy index access survives through compatibility routes. Legacy hand-authored indexes require an inventory and explicit preservation path before file tools are retired; they must not disappear merely because the new list excludes the generated index.
+
+This is an entry envelope, not a new storage format. It does not flatten a document into individual facts or rebuild embeddings.
+
+## 3. Common operations and tools
+
+Canonical model tools reuse the existing record-family names:
+
+| Tool         | Contract                                                          | Important rule                                                                      |
+| ------------ | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| listMemory   | cursor-page entry summaries                                       | No query required; listing is not semantic search                                   |
+| searchMemory | query -> bounded hits with summary and snippet                    | Report search kind: lexical, semantic or hybrid; no claim of exhaustive enumeration |
+| getMemory    | ref -> content, revision, optional content continuation and links | Missing entry is explicit null/NOT_FOUND, not an empty document                     |
+| saveMemory   | create one entry from text, optional label/metadata               | Create only; no implicit overwrite, merge or extraction                             |
+| updateMemory | ref + revision when required + exactly one replacement mode       | Replace full text, or optional exact-text edit; never an upsert                     |
+| deleteMemory | ref + revision when required                                      | Explicit deletion; an empty text is not deletion                                    |
+
+Six operations avoid overloading one write tool with implicit create/update/delete behavior. If a provider lacks an operation, omit that tool and return `UNSUPPORTED` for a stale/direct call.
+
+`saveMemory` means explicit authored content, while **capture** means observing a completed conversation and allowing an extractor/backend to decide what to remember. Those must not be aliases. If an external backend only exposes extraction, advertise capture, not exact-create; keep existing reviewed v1 create semantics as a compatibility capability until adapter conformance proves stronger guarantees.
+
+`updateMemory` has one validated union: `{text}` OR `{edit:{oldText,newText}}`, never both. Exact edit is available only when the store supports an atomic edit or a conditional read-modify-write. The selected substring must occur exactly once; newText may be empty. Replacements must come from a complete current get or an exact current slice, not a search snippet. A complete replacement must not silently save a truncated get response. Callers preserve the `complete` flag and disable full-save in the UI until all content has loaded.
+
+Existing external tools currently accept `id`/`text`, not `ref`; do not silently change their schema under a live MCP session. Use a versioned tool-contract rollout (§10). For the new contract, all providers expose identical argument/result shapes for the same available operation. A later bounded batch-get can reduce round trips without changing entry identity: cap combined bytes, return per-entry results, and authorize each reference separately.
+
+History remains an optional **console** operation initially. Adding model-readable audit history is a separate product choice. A graph panel is also optional; it must not gate basic editing.
+
+### Enumeration, bytes, cursors and search
+
+- Shared public defaults: list 20 summaries/page, maximum 100; search 5 hits by default, maximum 20. Existing legacy defaults remain unchanged until clients move to the new contract.
+- Per-call effective count is min(request, core maximum, provider maximum). Fix the backend request size too: never request 50, emit 20, and forward a cursor that skips the other 30.
+- Cursor continuation is authoritative. A provider may return a short or empty page with a continuation. The client stops only when continuation is absent; repeated identical continuation is an error, not an infinite retry loop.
+- Cursor is tied to operation, authorized view, store lineage, effective page size and ordering/query. Continuing with a changed page size or another scope fails explicitly. Pinning page size matters for page-number-based services.
+- Existing plugin cursors remain at their v1 bound of 2048 characters. The new public cursor is a core-owned bounded opaque token (also at most 2048), not necessarily a raw backend cursor. If wrapping cannot fit, use a bounded durable continuation record; no unbounded in-memory cache. Expiration returns `CURSOR_EXPIRED`; it never silently restarts from page one.
+- For managed enumeration, build a bounded snapshot of summary metadata under the store's serialization boundary, page a deterministic topic-key order, and record its source revision. External v1 defaults to backend/live ordering and does **not** claim snapshot consistency. Return the actual consistency/order in page metadata. Snapshot export/Dream require stronger capabilities.
+- List returns summaries; search returns explicit snippets; get supplies full text through bounded content pages. Suggested get budget is 32 KiB per page, clamped further to the encoded transport budget. Never reduce the existing 256,000-byte managed item ceiling just to match smaller external records.
+- A large external record may already be fetched whole inside the trusted adapter; it can be delivered to the model in revision-bound slices. No byte truncation may masquerade as a complete entry. Serialized envelope size, UTF-8 boundaries and metadata count toward transport bounds.
+- If a summary page hits its byte cap partway through a provider page, preserve unreturned records in its continuation or refetch via a proven stable coordinate; do not discard them. If one summary is too large, bound its preview fields without losing its reference. Errors/budget exhaustion are distinct from empty results.
+- Managed explicit search can start with deterministic lexical matching of topic name, description and body through `MemoryFs`, with a bounded scan and explicit partial-result indication. No vector DB or semantic claim is necessary. If that implementation is deferred, advertise search=false; do not answer with a fake empty list. Automatic recall remains index-based for managed initially.
+
+## 4. Capability discovery with operational meaning
+
+Expose one core-owned description, with fields consumed by tools, routes and UI:
+
+```ts
+type MemoryCapabilities = {
+  operations: Array<'list' | 'get' | 'search' | 'create' | 'update' | 'delete' | 'history'>
+  searchKind?: 'lexical' | 'semantic' | 'hybrid'
+  supportedScopes: Array<'agent' | 'channel'>
+  writeConsistency: 'conditional' | 'last-write-wins'
+  exactEdit: boolean
+  exactCreate: boolean
+  enumeration: 'snapshot' | 'live' | 'unavailable'
+  graph: boolean
+  limits: { maxItemBytes: number; maxPageItems: number }
+}
+```
+
+Effective capabilities are the intersection of reviewed adapter capabilities, implemented core support, configured policy and caller authority. Read-only inherited entries can further restrict per-entry actions. Every advertised field must have a consumer and conformance test; do not add speculative flags for possible plugins.
+
+Today external v1 advertises operation names, item budgets and capture idempotency, but does not certify all the stronger properties above. Map only proven properties; `version` presence alone cannot imply atomic conditional writes, and capture idempotency cannot automatically imply CRUD idempotency. A future profile revision must negotiate additional properties and pin the new manifest; do not reinterpret existing third-party manifests as claiming them.
+
+Native/none remain distinct lifecycle modes. Native tools are runtime-owned and must not be silently replaced by this entry family. The console does not show native memory. None exposes no memory operations.
+
+## 5. Provider and service boundaries
+
+```text
+Model tools            Console BFF / authorized admin routes
+       \                    /
+        Shared memory operation service
+        - resolve caller + live binding + view
+        - enforce read/write and capability policy
+        - validate canonical request and response
+        - budgets, revisions, operation receipts, provenance
+                     |
+               MemoryEntries port
+                /              \
+       ManagedEntries       ExternalEntries
+       MemoryFs + existing  reviewed plugin client
+       store primitives     -> registered backend
+```
+
+Lifecycle (`runtimeEnv`, ensure, standing context, recall/capture policy) remains a separate facet of `MemoryProvider`. `MemoryEntries` owns describe/list/get/search/create/update/delete/history. Optional operations may be absent, but common service logic must fail closed rather than guessing.
+
+Move core tool descriptors/projection out of provider implementations. Build descriptors and validators from the **same canonical schema**, with per-session capability filtering. `toolsForAgent` can remain a compatibility wrapper during migration. Both model and admin paths call the service with separately authenticated contexts; sharing code does not give the model console administration authority.
+
+The adapters map data and execute storage operations. They do not choose the caller's agent, privacy rule, connection, draft root or write provenance. Plugin credentials and raw plugin MCP tools stay behind the current registry/transport boundary.
+
+### Managed mutation integrity
+
+All mutations must still use the controlled write path: header normalization/stamping, size/path validation, serialized durable write, authoritative write marks, retained history, generated-index refresh, and graph refresh/invalidation. Add create-if-absent, conditional update and explicit delete **at that boundary**, not with raw filesystem writes in an adapter.
+
+Deletion must update the ledger/history/index and obey Dream fences. Managed does not currently expose ordinary per-topic delete; advertise it only after this path exists. Preserve dangling links as such; do not silently rewrite referring documents.
+
+For new managed tools, update/delete require a current revision and create requires atomic create-if-absent. The compatibility surface retains its existing behavior. A revision is a concurrency precondition, not proof that the model comprehended the document. New strong conditional operations require an actual atomic store primitive. A get followed by write under an arbitrary local mutex is insufficient when another daemon or native filesystem writer can mutate the authoritative home. Land the required atomic revision primitives before advertising these stronger managed mutations. Reuse the home authority's transaction/fencing design rather than introducing a second revision database.
+
+### Errors and mutation receipts
+
+A conflict response includes the current revision and, when authority and the byte budget permit, the current text. Otherwise it carries an explicit content continuation. Reconciliation must retain concurrent changes rather than blindly repeat the stale replacement. Shared error codes: `UNSUPPORTED`, `FORBIDDEN`, `NOT_FOUND`, `INVALID_ARGUMENT`, `CONFLICT`, `STALE_BINDING`, `CURSOR_EXPIRED`, `TOO_LARGE`, `UNAVAILABLE`, `AMBIGUOUS_WRITE`. Keep diagnostics bounded and free of backend credentials/URLs. Empty list, missing item and unavailable service are distinct states.
+
+Core assigns an operation ID before mutation egress and preserves it through retries of that operation. Receipt states distinguish completed, accepted/pending, failed and ambiguous. If a backend cannot prove idempotent retries, a timeout is ambiguous; do not blindly repeat create and manufacture duplicate memories. A new independent model call is a new operation unless explicitly tied to a prior receipt by a supported retry flow.
+
+### Bounded context and catalog freshness
+
+Entry access alone does not tell a long-lived session that another session, the console or Dream changed the store. Add a separate `MemoryContext` facet:
+
+```ts
+interface MemoryContextRequest {
+  seenRevision?: string
+  maxBytes: number
+}
+interface MemoryContextResult {
+  catalogRevision?: string
+  freshness: 'current' | 'cached' | 'unknown'
+  coverage: 'complete' | 'partial' | 'unavailable'
+  overview: string
+  changedRefs?: string[]
+}
+```
+
+The core resolves the authorized view; the request does not select a store. Keep managed startup-index behavior, then invalidate the catalog on committed writes/adoption and deliver a bounded refresh at the next activation. A channel-overlay catalog revision covers both the channel and base layers. Fetching every topic body or enumerating an external backend on every user message is not the default.
+
+External v1 does not provide a general change feed or store revision. A cached list is an observation, not proof of current completeness; expose cached/unknown freshness and let explicit list/search refresh it. A partial or stale catalog cannot justify a claim that the whole memory is empty. A relevant summary is a retrieval hint: get the entry before answering from its detailed contents.
+
+Descriptions and aliases remain bounded untrusted data, separate from user requests and authoritative instructions. Deliver updates using each harness's supported context mechanism; do not assume arbitrary mid-session system-message replacement. Reuse an authoritative store's revision where available rather than minting a process-local counter and claiming cross-daemon freshness.
+
+## 6. Scope, overlays and access
+
+The service resolves a trusted view, conceptually `{bindingGeneration, readablePartitions, writablePartition, optionalDraftBinding}`. Models never submit agentId, connectionId, channelKey, person key, root path or actor identity. Console selectors are authorized against the agent and allowed partitions before dispatch. Entry refs/cursors never expand that authority.
+
+### Layers by audience
+
+Managed memory is layered by the audience of the conversation, for every agent and with no setting ([product conventions](../product-conventions.md#memory-layers)). The shared layer is the agent's own store (`memory/`). Beside it each layer is a self-contained root with its own `MEMORY.md`: a place layer under `channels/<key>/` (the folder the retired Channel scope used, keyed by channel and transport scope, with a `channel.json` beside its `memory/` naming the conversation's channel id, platform and display name, written when the session starts and refreshed when a write sees a new name) and a person layer under `people/<key>/`. A view reads the shared layer plus at most one more layer and writes only to the most specific one; `memory/layers.ts` decides which:
+
+| Conversation                                                                                                                                                                                                               | Layer written | Roots read, written first                     |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- | --------------------------------------------- |
+| A public channel whose platform confirms its audience is the organization (`channelPrivacy`, `sharedConversations` and `workspaceMembers` declared; not private, a listing or lookup confirmed not shared, no known guest) | shared        | shared, then the channel's own earlier folder |
+| A 1:1 DM, a webchat or console conversation                                                                                                                                                                                | person        | person, then shared                           |
+| Anything else, or a place that cannot be described yet                                                                                                                                                                     | place         | place, then shared                            |
+| A session that is no conversation (a code host's, a hook's)                                                                                                                                                                | shared        | shared                                        |
+
+A person key is `user:<consoleUserId>` when the chat member linked a console account, resolved through the Control Plane's `agent/read-access` mapping (its reply names the console user) and cached for ten minutes, the last answer standing while the Control Plane cannot be asked; otherwise `<platform>:<tenantScope>:<uid>`. Webchat is always `user:<id>`. The first time a console-keyed layer is used, a platform-keyed layer of the same person, else the DM's own earlier place folder, is moved onto it, once and only while the target does not exist; a second folder is never merged. A DM's person is whoever typed the message at hand, else whom the platform says the DM is with (`getChannelInfo().user`, kept once known), else whoever opened this or an earlier session there; a webchat conversation's is whoever opened it. An agent (a patrol's, a task's or another agent's message, whose sender is an agent UUID) or an automation trigger (`cron:…`, `hook:…`) is never taken for a person, and a conversation whose person cannot be told keeps a place layer. Runs with no person and turns that fold several senders use the layer of their conversation.
+
+Overlay rules: the written layer shadows the other per topic; each layer keeps its own `MEMORY.md`, which never falls through; only the shared store is seeded, so a layer starts with its first write. The session-start index is the shared index followed by the layer's, labeled for whom it is kept. Returned entries indicate actual origin: an entry of the root beneath is inherited, readable, and not writable from that view; an update/delete of an inherited ref is rejected with a clear message, and the model may create an entry in the written layer instead. Deleting an override reveals the inherited entry again.
+
+The memory read and write tools take one optional `layer` argument that names a single layer instead of the view: `shared`, `here` (the layer this conversation writes, alone), or `person` (the asker's own, honoured only when the whole turn is that one person, the way their reads are judged; it is never injected outside their own DM or console conversation). A write naming `shared` from a conversation whose own layer is not shared is honoured only when a person typed one of the turn's messages (`typedByPerson`, over the live turn and every message folded into it); a check, a report round, a wake, a schedule, a hook or another agent's message gets a refusal telling the model to ask the person, while `person` needs no such rule because it reaches only a layer the asker alone reads. A conversation known to hold people from outside (`MemoryLayers.audienceOf`: the integration's recorded external conversations, or a listing or lookup that reports a share, the same flags that keep it a place layer) is refused a `shared` write on every round, a person's own included, so a guest cannot add to what every conversation reads; one it cannot place counts as external. A distillation or dream binding pins its store and refuses `layer`. Writes need no approval card: the layer already keeps them to the audience that said them.
+
+A successful write, edit or delete through these tools names the layer it landed in, as `layer` (`shared`, `person` or `here`) with a one-sentence `note` a person would understand, so the agent can tell them where it went; a distillation or dream binding and external memory keep no layers and name none.
+
+Choosing external capture continues to require its existing egress opt-in. Unifying operation names does not consent to exporting conversations.
+
+External v1 remains the shared layer alone: it captures only from conversations that use the shared layer, refuses a default write from any other conversation (an explicit `layer: "shared"` is the person's call), and has no person or place layer. Do not encode channel or person ids into its agent key and claim that layered memory is supported: this bypasses the reviewed scope contract and makes existing data routing ambiguous. Later support requires an explicit profile/binding revision (a `user` scope maps naturally onto a backend's user id), trusted partition-key derivation, backend conformance, overlay semantics, and a migration plan.
+
+## 7. Dream and capture
+
+A common entry API makes Dream's tools reusable, but does not make external Dream safe automatically. Dream needs more than CRUD:
+
+1. A complete, stable snapshot of the chosen store.
+2. An isolated draft bound to the extraction session, with no read-through to live memory.
+3. Digest-bound review of exact proposed bytes and explicit deletion semantics.
+4. A fenced commit against the base revision, preserving cancellation, existing rebase rules, backup and adoption checks.
+5. Durable recovery with a truthful committed/conflict/ambiguous result.
+
+Keep current managed Dream behavior and safety checks during the tool migration. Its session uses the same entry operations with a daemon-minted draft binding; sources remain `dream`/`distill`/`tool`/`console`, assigned by the caller context. Compatibility aliases must resolve that binding before any live provider lookup.
+
+Do not simultaneously change the existing empty-staged-store/omission guard while renaming tools. A later proposal API can express a typed create/update/delete change set, with omission meaning unchanged; converting today's full-replacement staging to that model requires its own tests and rollout.
+
+An external adapter qualifies for automated Dream only after it proves snapshot and atomic/fenced apply semantics. Sequential remote CRUD plus compensation is not an atomic adoption. V1 external plugins remain unsupported for Dream. A later suggestion-only experience can be separate, but must never say a proposal was adopted if its mutations only partly succeeded.
+
+### Explicit changes and automatic capture
+
+Coordinate direct mutation, post-turn capture and Dream through durable state. A successful explicit correction must not be undone by delayed extraction of the same source turn. Initially, skip automatic extraction for a turn with a completed explicit mutation; preserving unrelated facts from that turn can come later with finer provenance. Failed and ambiguous writes are separate states, not successful-mutation flags.
+
+Record that outcome before enqueuing automatic capture and recheck it before applying capture. Use the authoritative mutation/outbox state across retries, restart and handoff; an in-process boolean is insufficient. Routine capture changes durable facts when warranted; periodic restructuring belongs to Dream. This is a mutation-slice policy change, not a side effect of introducing read DTOs.
+
+Keep automatic capture strategies distinct: managed distillation generates authored entries through the same writer; external capture may asynchronously extract multiple records. Capture receipts must not be mislabeled as exact-create success. Changing tools must not switch manual capture to automatic capture.
+
+### Entry deletion versus a forget workflow
+
+`deleteMemory` deletes a selected entry. It does not promise that historical transcripts, pending capture, retained history, backups or an external service's replicas can no longer contain or regenerate the fact. A user-facing forget workflow needs its own contract:
+
+1. Authorize the actor and exact target. Shared read access does not imply permission to erase shared memory for everyone.
+2. Record suppression against known entry/evidence identities and a source watermark; cancel or filter older queued capture and invalidate affected drafts.
+3. Remove live entries through the mutation service and invalidate the catalog/cache.
+4. Define retention or erasure of history/backups and distinguish these from live removal in the result.
+5. Report external provider-confirmed deletion separately from local suppression.
+
+A suppression record should not retain the removed text as an audit copy. IDs and watermarks can stop known replay, but cannot guarantee semantic forgetting of untracked paraphrases. Stronger guarantees require lineage or exclusion of relevant source material. Specify those limits before offering a stronger product promise; full erasure is not part of the first CRUD release.
+
+### Writer provenance, evidence and aliases
+
+Keep `tool`/`console`/`distill`/`dream` writer provenance, and distinguish it from evidence supporting a claim. Optional evidence can refer to an originating turn, an authorized user decision, or an immutable commit/test artifact. The core stamps origin identity; a model-authored `verified` label is not verification or permission. Evidence references must not leak private source links into a shared catalog.
+
+Persist durable engineering constraints and lessons; retain transient progress in the task system and detailed diagnostics in evidence artifacts. Do not turn a broad acknowledgment into approval of every model-generated detail. Optional subject aliases help retrieval and reduce duplicate topics, but alias equality must not automatically merge subjects or grant authority. Keep logical categories separate from physical paths and ACLs.
+
+Personal preferences require identity and scope support. Do not inject one participant's profile globally into a shared agent. Authorized agent-level operating preferences remain distinguishable from ordinary knowledge; retrieved memory cannot approve actions, alter connection permissions, or override a current authorized instruction.
+
+## 8. Console and admin API
+
+One Memory page offers browse/search, selected-entry content and optional history/links. Entries show label, description/preview, actual updated time when known, and an inherited/read-only indicator where needed. Markdown keeps the existing renderer/editor; plain text uses the same layout with the appropriate content treatment. Backend settings stay collapsed as today.
+
+Use capabilities for actions and availability, not `provider === 'external'` branches throughout the UI. Keep explicit unavailable/error states; a temporarily unreachable backend must not look like an empty memory. Do not render snapshot totals or newest-first labels unless supported. Unknown timestamps display as unknown.
+
+Proposed additive routes under the existing agent resource:
+
+- `GET /agents/:id/memory/capabilities`
+- `GET /agents/:id/memory/entries` (summaries, cursor)
+- `POST /agents/:id/memory/entries/search`
+- `GET /agents/:id/memory/entries/:ref` (bounded content)
+- `POST /agents/:id/memory/entries` (create)
+- `PATCH /agents/:id/memory/entries/:ref` (conditional update)
+- `DELETE /agents/:id/memory/entries/:ref`
+- `GET /agents/:id/memory/entries/:ref/history` when available
+
+A layer picker above the browser offers the shared layer, the signed-in user's own person layer, and every place layer that holds a memory file and that the caller may see. `memory/channels` lists a folder once it holds a memory file, never for the entry lineage marker a session's read leaves in it, and names it from `channel.json`; for a folder without a name the CP takes the newest name the agent's sessions there carry, then the organization's channel directory. A caller may see a place layer only if the console shows them a session of its conversation: the CP judges the layers against the session list's own predicate (`SessionRepo.conversationsIn` with the caller's viewer, linked identities and session access sync included), one query per list. Every route that takes `channelKey` asks the daemon whose conversation the key names (`memory/channels` with that key) and answers 404 for a layer the caller may not see, as for an absent one; a test enumerates those routes from the OpenAPI document. An organization owner's list also carries the other layers with `visible: false`, which `DELETE /agents/:id/memory/channels/:channelKey` clears: the daemon deletes the layer folder whole (`memory/channel/clear`, offered only toward a daemon advertising `memory-place-clear-v1`), a Control-Plane home drops that layer's change log, and an audit row of kind `memory_change` records the clear without content. A non-owner gets 403 for a layer they see and 404 for one they do not. The person layer is read through its own routes, `GET /agents/:id/memory/mine/files` and `GET /agents/:id/memory/mine/file`, which take no person argument: the CP names the authenticated caller as `personUserId` on `memory/list` and `memory/read`, only toward a daemon advertising `memory-person-layer-v1`, so a daemon that would read the shared layer instead is never asked. The person view is read-only, and no route lists person layers.
+
+Add versioned request/reply frames for daemon-owned operations; bounded BFF responses keep current locality and authorization rules. Respect the existing CP-home ownership. No new automatic CP persistence of external memory bodies. Use route schemas/OpenAPI and a negotiated feature bit for mixed-version daemons; do not repurpose old frames with different response shapes.
+
+## 9. Compatibility matrix for the first release
+
+| Capability             | Managed                                                           | External v1                                                          |
+| ---------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------- |
+| List/get               | Common entry facade; topic summaries; generated overview separate | Only with declared list/get                                          |
+| Explicit create/update | Via existing writer plus required mutation primitives             | Only with reviewed create/update; truthful consistency               |
+| Search                 | Optional bounded lexical implementation; otherwise unavailable    | Existing recall/search operation; advertised actual search semantics |
+| Delete                 | After ledger/index/history-aware primitive lands                  | Declared delete                                                      |
+| Graph                  | Existing wiki links/backlinks                                     | Absent unless separately supported                                   |
+| Layers by audience     | Managed only: place and person layers over the shared one         | Unsupported                                                          |
+| Dream                  | Existing managed agent-only path                                  | Unsupported                                                          |
+| Automatic recall       | Existing bounded index                                            | Existing auto/tool-only policy                                       |
+| Automatic capture      | Existing opt-in distillation                                      | Existing manual/turn policy and receipts                             |
+
+Uniform interface means the same operation means the same thing; it does not mean every backend exposes an identical number of buttons or identical guarantees.
+
+## 10. Delivery plan
+
+**Slice A — common read contract.** Add entry DTOs, service, managed/external adapters, capability discovery, list/get, bounded content/catalog freshness and conformance fixtures. Keep current lifecycle, storage, writes and wire compatibility intact. Include managed lexical search here only if it can be bounded and tested; otherwise omit it honestly. PR #1861 can land independently; it is an additive step toward enumeration, not a dependency on this redesign.
+
+Read-foundation implementation notes:
+
+- `protocol/memory-entries.ts` defines strict v1 requests/results. `daemon/memory/entries/` owns authorization rechecks, current-view resolution, opaque references, bounded list/get/context results, and the two adapters. Legacy tools, routes and capture policies retain their compatibility paths.
+- References use a restart-stable daemon key and a managed tree lineage marker. Initial marker publication is exclusive on local, shim, and CP homes; an older peer that cannot perform that operation fails closed. Clearing/replacing a tree changes its lineage. This primitive provides create-if-absent, not atomic conditional replacement or deletion.
+- Content pages default to 32 KiB and complete encoded results stay within 64 KiB. Durable continuation slots retain unreturned summaries and full v1 backend cursors: 16 slots per agent, at most 2 MiB each, expiring after 30 minutes or earlier eviction. The existing store retention sweep removes expired rows. An expired/evicted cursor never restarts enumeration silently.
+- Managed catalog capture is bounded to 2,048 entries and 16 MiB of topic reads. Captured summaries stay fixed across continuation pages, with deterministic topic order and an inventory digest. The current native-writable filesystem home does **not** certify an atomic store snapshot, so capabilities and results report `live` enumeration. The CP home now supplies transactional file operations, but the common adapter still needs explicit snapshot and strong update/delete integration before advertising those guarantees.
+- Managed context reads index bytes and topic metadata rather than scanning bodies on each request; it reports partial catalog coverage and detects changes across fresh provider instances. External v1 reports unknown freshness/unavailable catalog coverage without automatic enumeration. Delivery of these updates into an already-open runtime session belongs to the projection rollout.
+
+Read-projection implementation notes:
+
+- Additive `describeMemoryEntries`, `listMemoryEntries`, and `getMemoryEntry` tools derive argument descriptors from the strict v1 schemas. They use trusted session/channel or synthetic staging bindings and recheck read authority. Legacy `readMemory`/`writeMemory` and external `getMemory({id})` retain their contracts for warm sessions; no old tool name changes shape.
+- Managed sessions receive all three reads; external sessions receive declared list/get operations and capability discovery. Native/none keep their existing tool sets. Normal, distillation and Dream sessions share the descriptors and scope resolver; refs never substitute for legacy paths or record ids.
+- Additive capabilities/list/get HTTP routes proxy `memory/entries/read/v1` under the current serving daemon epoch and the negotiated `memory-entries-v1` feature. The org/agent read gate runs before dispatch; the daemon rechecks agent ownership. Typed failures retain their codes, including stale binding, cursor expiry and unavailable versus empty/missing results. Older daemons return an explicit unsupported response without receiving an unknown frame.
+- The console still uses its existing file/record browsers; catalog refresh delivery and mutations are not implicitly enabled by read projection.
+
+**Slice B — common mutations and model tools.** Add atomic managed create/update/delete guarantees, honest external capabilities, shared error/receipt mapping, explicit-mutation/capture coordination and schema-derived descriptors. Migrate managed tool prompts and normal/distillation/Dream registration together. New sessions negotiate the new tool contract; already-running sessions retain legacy shapes and dispatch aliases. Aliases invoke the common service where semantics match; legacy file/index behavior remains an explicit managed compatibility adapter. No raw-disk bypass or duplicate writer.
+
+**Slice C — common admin/UI.** Add routes/frames with daemon feature negotiation, move both browsers to the entry shell, preserve Markdown editing and capability-specific extras. Keep old file/record routes for older clients and native mode. Do not change backend selection or migrate data as a side effect.
+
+**Slice D — retirement and separate extensions.** Remove legacy methods/descriptors only after supported old sessions/clients are drained or the documented compatibility window ends. Separately design plugin v2 scope/consistency extensions and any external Dream/export/import. Update `memory-evolution.md`, `memory-system-plan.md`, product conventions and `docs/README.md` to resolve representation/scope documentation drift.
+
+Each slice should be independently reviewable and shippable; this is not a request for a single flag-day rewrite. Backend data migration remains an explicit export/import product, with fidelity, links, provenance, scopes and retry safety reviewed separately. Switching providers continues to follow existing behavior until that product exists.
+
+## 11. Acceptance cases
+
+Use the same conformance scenarios for managed and fake external adapters, then a small real registered-plugin integration fixture:
+
+- List/get returns the same stored text; empty content, missing entry and outage are different.
+- More than 20 records and varying provider page sizes enumerate fully; no final-page loss, duplicate cursor loop or silent budget truncation.
+- UTF-8/JSON escaping, large Markdown, metadata and content paging respect encoded frame budgets; content changes between slices conflict instead of splicing versions.
+- Name/header/unknown YAML metadata/wiki-links survive managed round trips; generated index stays derived; every writer retains provenance and history.
+- Exact create does not replace; omitted metadata preserves; update does not create; empty text does not delete; stale revisions conflict where promised.
+- Foreign refs/cursors, guessed IDs, changed bindings and forged model scope cannot read or write another store; private writes remain blocked.
+- Channel overlay list/search/get agree; inherited updates refuse; deleting an override reveals the base; legacy alias semantics remain tested.
+- Snapshot/strong-CAS claims fail admission if adapters cannot prove them. Ambiguous remote writes are not blindly retried.
+- A Dream alias/new tool always reaches staging, never live; cancellation and digest/revision adoption fences remain intact; no-write extraction cannot wipe the store.
+- A console edit during an open session causes a bounded, authorized catalog update; partial or stale catalogs are not treated as proof of absence.
+- A delayed capture cannot undo a completed explicit correction, including after worker restart; a stale Dream cannot restore an entry covered by the defined suppression workflow.
+- Private evidence links stay private, aliases do not merge identities, and provenance metadata never grants permissions.
+- Old model session + new daemon, new client + old daemon, reconnect/provider change, tool-only recall and native/none all retain explicit behavior.
+
+These acceptance cases are requirements for implementation, not claims of implemented behavior. This documentation change adds no runtime tests.
+
+## 12. Source map and assumptions
+
+Local sources inspected at the baseline above:
+
+- `packages/daemon/src/memory/types.ts`: existing lifecycle, MemoryScope, file/record administration.
+- `packages/daemon/src/memory/providers/{managed,external,dispatching}.ts`: overlay, trusted external key, provider routing.
+- `packages/daemon/src/memory/{tools,store,frontmatter}.ts`: tool shapes, write path, byte limits, generated index and YAML preservation.
+- `packages/daemon/src/mcp/ops/memory.ts` and daemon wiring: read/write gate and bound draft scope.
+- `packages/daemon/src/memory-plugin/client.ts`, `packages/protocol/src/memory-plugin.ts`: reviewed capability projection, scope/budget validation, plugin v1 limitations.
+- `packages/daemon/src/cp/memory-reader.ts`, `packages/protocol/src/frames/memory.ts`, CP agent routes: file/record wire split and limits.
+- `packages/protocol/src/frames/memory-connection.ts`: external agent-only binding; channel/Dream restrictions.
+- `packages/web/src/components/console/{MemoryPanel,UnifiedMemoryPanel,NativeMemoryFiles}.tsx`: the settings card, the common entry browser, and the runtime-native file browser.
+- `docs/designs/memory-evolution.md`: existing rationale, future M-8 home, explicit lossy data-migration distinction.
+- `docs/product-conventions.md`: privacy, backend selection, editing and prompt provenance.
+
+Some documentation already describes future home behavior while code still uses the older binding; some general UI prose still says agent-only despite managed channel support. Treat those as documentation alignment work, not as permission to silently change current behavior.
+
+### External references
+
+- [Anthropic API memory tool](https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool): application-owned persistence and on-demand retrieval support separating model operations from physical storage.
+- [Claude Code memory](https://code.claude.com/docs/en/memory): bounded index, lazy topic reads and frontmatter overlap with existing managed memory.
+- [Public Fable prompt snapshot](https://github.com/asgeirtj/system_prompts_leaks/blob/0f4aeb3e7d04419c7161dd25fbd2dab23341867c/Anthropic/claude-fable-5.1.md#memory_filesystem): third-party material describing catalog-driven reads, conditional editing and background filing. It is an interface/workflow reference, not evidence of a deployed transaction or authorization guarantee. The multi-user scope, capture arbitration and provider requirements in this design are AgentConnect's decisions.
+
+### Atomic CP home publication primitive
+
+The CP-managed home now exposes negotiated `memory/transaction/v1` snapshot and commit operations. A commit references up to two previously staged files (topic and caller-generated index), checks the root fingerprint, target content hashes and staged content hashes under the same agent lock used by legacy file writes, and publishes files, bounded history and a body-free operation receipt in one PostgreSQL transaction. History or receipt failures roll back publication. The binding row stays locked through publication; existing serving-daemon authorization still applies.
+
+Reusing an operation ID with the same request returns its original receipt, including after history retention; a different request conflicts. Receipts persist until their agent or organization is deleted. Large files use bounded staging frames. Snapshots exclude staging and reject roots above 2,048 committed files or 16 MiB. These are current-state fingerprints, not monotonic counters; raw-byte file hashes are distinct from common entry revision tokens.
+
+This is an internal publication primitive, not the common mutation service. Callers still own index generation, entry-token translation, provenance policy, capture suppression and Dream adoption fences. `sourceTurnId` carries the daemon-minted source-turn identity used by the capture fence below. No new model or admin mutation entry points are advertised. Native-writable local/shim homes do not expose this atomic capability, and older CP peers do not receive these frames. Common mutations must integrate those policies before being enabled.
+
+The existing managed `writeMemoryFile` path now uses this primitive for transaction-compatible Markdown names on negotiated CP homes. It prepares the topic and derived index from one root fingerprint, preserves the existing frontmatter/index policy, and lets the home record history inside the commit. A lost response gets one replay of the identical operation and staged references; it never rebuilds a replacement against newer state. An unresolved outcome blocks in-process Dream rebasing conservatively. Local/shim homes, old peers, and legacy filenames outside the transaction path schema retain their compatibility writer. This integration does not yet add common create/update/delete entry points.
+
+### Durable same-turn capture suppression
+
+Negotiated CP homes advertise `memory-capture-fence-v1`. The daemon hashes the trusted active turn identity into an agent-scoped UUID and attaches it to ordinary managed writes and the originating distillation scope; model arguments cannot choose it. A completed explicit `tool` or `console` transaction suppresses later automatic extraction for that same agent, root and source turn. The provider queries this durable status before extraction, including replay from the capture outbox. Every tagged distillation commit checks again under the publication lock, so a capture prepared before the explicit correction cannot bypass suppression with a fresh root fingerprint.
+
+Suppression uses committed mutation receipts, independently of retained history. Failed writes create no suppression record; a completed capture retry still returns its original receipt without writing again. A daemon-side ambiguous outcome is resolved by the home's committed state, not a guessed success flag. Cached distillation sessions resolve the current pass scope, freeze it at tool-call entry and refuse memory access between passes. Existing private-write/capture gates remain in force.
+
+This guarantee covers tagged atomic CP Markdown writes. Older peers, native-writable homes, legacy filenames outside the atomic contract and external plugin capture retain compatibility behavior. It does not implement cross-turn forgetting, history erasure or a new Dream adoption protocol. Common create/update/delete projections remain a subsequent slice.
+
+### Conditional entry service
+
+The common service now has schema-validated create/update/delete methods. Managed adapters expose them only when the caller supplies an explicit write authorization/provenance binding. Existing read projections do not opt in. Authorization and view identity are rechecked per call; inherited refs cannot be updated or deleted from a channel view.
+
+Managed create uses the optional label as a flat Markdown topic filename (adding `.md` when needed), or generates a UUID topic when omitted. It refuses existing files. Update and delete require the revision from the common get result; update never creates missing entries. Exact edits require one non-empty match and treat replacement strings literally. Full text remains the stored Markdown, including unknown frontmatter. Separate metadata fields are explicitly unsupported for managed mutations rather than discarded. The generated overview is excluded from this entry API; the shared writer retains legacy index preservation/adoption rules.
+
+On a home with the transaction primitive (the negotiated Control-Plane home), all three operations use the same atomic publication engine as legacy CP writes, including history, index, durable receipts, source-turn suppression and conservative ambiguous-outcome handling. Result refs are minted from the current authorized view. Known revision conflicts carry the current revision internally.
+
+A native-writable home (the daemon's own disk, a sandbox shim, an older Control Plane) serves the same operations through the compatibility writer's guarantees, so the console and the model tools no longer depend on where the tree lives, and advertises them as `last-write-wins`, as the memory system plan requires of homes without the atomic store: a revision is optional there and, when supplied, is checked under the per-directory lock every daemon-side writer takes, with the filesystem's absent/mtime guard on the replace or the unlink. That refuses a stale daemon-side write outright and catches an out-of-band writer on a best-effort basis; it is not the home authority's atomic compare-and-commit, which is why the view does not claim `conditional`. Exact create holds (an exclusive publish that refuses an existing file) and so does exact edit (one literal match); the stored text is normalized and stamped as every managed write is. Delete is advertised only where the port can verify the file immediately before unlinking (`rmIfMatch`: the daemon's own disk today); a sandbox shim or an older peer offers create and update without delete rather than an unconditional removal. The index and the change log follow the write rather than joining it in one commit (the index is derived and regenerated on the next write regardless), the receipt is minted in process and kept nowhere, and there is no source-turn capture fence, exactly as for a compatibility write on such a home. Outcomes are classified accordingly: once the port has been asked to publish, any failure that is not a refusal the port proves pre-publication (a conflict, a path or size refusal) is reported as `AMBIGUOUS_WRITE` and never replayed, whether the port applied the change and lost its reply or the file changed and the log, index or receipt failed after it; failures before that point stay `UNAVAILABLE`. It does not emulate `atomicTransaction`; a home that has the primitive takes the transactional path.
+
+### Additive model mutation projection
+
+Managed sessions expose `createMemoryEntry`, `updateMemoryEntry`, and
+`deleteMemoryEntry` alongside the existing entry reads. Their input schemas derive
+from the canonical mutation DTOs; the update descriptor preserves the exclusive
+full-text/exact-edit modes. Existing file and external-record tool contracts keep
+their names and arguments for warm-session compatibility. This is an additive
+rollout, not the final retirement of legacy tools.
+
+The descriptor is stable across managed homes; callers use
+`describeMemoryEntries` for live operations and limits before choosing a write.
+Strong mutations still require the atomic home/capture ports, and external/native
+providers gained no new mutation capability in this slice (external record
+mutations arrived later, below). Ordinary model calls bind `tool` source
+and the trusted source turn internally. Every mutation goes through the existing
+write-access/approval gate, and the entry service rechecks access before resolving
+the live provider. A one-call approval permits that payload while a subsequent
+policy denial still wins. Synthetic extraction and Dream bindings retain their
+constrained legacy writer; entry mutations are forbidden there so the topic-name
+rule, staged-root provenance, and adoption checks cannot be bypassed.
+
+Admin HTTP mutation transport and UI remain separate follow-up work. This MCP
+projection does not send large mutation bodies in the bounded daemon/CP read frame;
+the controlled writer continues using staged chunks and atomic home publication.
+
+### Admin conditional mutation projection
+
+The authorized BFF exposes `POST`, `PATCH`, and `DELETE` on
+`/agents/:id/memory/entries`, with the canonical create/update/delete body and an
+optional `channelKey` query. Update/delete carry the opaque `ref` in the body.
+Agent visibility and edit authorization run before dispatch; read-only callers
+also receive capabilities and entry summaries with write operations/editability
+removed. The daemon independently rechecks agent ownership and duty before
+resolving the active home. Console provenance is trusted server input, never a
+field the HTTP caller can choose.
+
+`memory-entries-write-v1` negotiates the new `memory/entries/write/v1` request and
+result. The first transport supports JSON requests up to 192 KiB, measured after
+normalizing the `{ agentId, channelKey?, operation, request }` payload and including
+JSON escaping. `limits.maxMutationRequestBytes` advertises that separate transport
+budget; `maxItemBytes` remains the provider's stored-content budget. CP refuses
+oversized mutations with `TOO_LARGE`/HTTP 413 before sending, leaving envelope
+headroom under the 256 KiB connection cap. The daemon repeats this check. This
+initial transport does not support all maximum-size stored documents; a future
+chunked admin upload may lift this limit. Home publication itself remains staged
+and atomic.
+
+An uncertain reply after dispatch returns `AMBIGUOUS_WRITE`/503 without replay.
+Clients must inspect current state before deciding whether to issue a new write;
+HTTP retries are not idempotency keys. Confirmed conditional conflicts retain
+`currentRevision` where known. Legacy file and record routes remain available.
+The console UI and catalog-refresh integration are subsequent slices.
+
+### Unified console entry browser
+
+The Memory panel shows the capability-driven entry browser for managed and
+external memory, rendered in the console's file-browser shell: a list of named
+topics or nameless records with their last edit, and a preview pane whose header
+carries size, edit time, inheritance and the entry actions (edit, delete, history).
+The existing settings, channel selector, and Dream panel remain in place. A read
+that refuses as a sleeping sandbox presses the same wake the workspace browser does
+(the daemon lets an unreachable home escape the in-band entry error so the Control
+Plane answers 503 with the wake code); the generated overview is a pinned read-only
+row served through the compatibility index route and labelled generated or
+hand-written, whose links open the named file the same read-only way; and a
+record's metadata is listed under its text.
+
+The retained file and record views are gone from the console. Runtime-native
+memory keeps its own file browser (`NativeMemoryFiles`), because the runtime owns
+those files' format and they have no entry projection by design. A daemon that
+does not serve the entry interface gets a notice asking for an upgrade rather than
+a fallback view; the legacy file/record routes stay for old clients and for the
+overview read.
+
+The editor loads every content slice before enabling edits, rejecting missing,
+repeated, changed-revision, or oversized continuation chains. Reads are bounded to
+128 slices and the smaller of the provider item limit or 4 MiB. Scope changes
+remount the browser and invalidate outstanding reads. Conditional writes use the
+ref/revision of the loaded document; inherited entries and read-only callers have
+no edit/delete controls. Create/update respect both item bytes and the advertised
+normalized JSON mutation request budget. Delete requires an explicit confirmation.
+
+Conflicts and unconfirmed writes retain the draft and block another mutation until
+the user reloads saved memory. No write is automatically retried. Refresh rechecks
+capabilities and starts a new list; further pages load explicitly. The initial UI
+shows stored text directly, preserving full Markdown/frontmatter during edits.
+Activation-time catalog refresh and retirement of compatibility tools remain
+separate work.
+
+### Supported activation catalog delivery
+
+System-context-capable hosts receive a bounded common catalog observation at
+session creation and native `session/load`. Fresh sessions retain their existing
+startup index and add only catalog metadata; a native resume receives the current
+overview as well. The common context service reads managed index/metadata,
+including both overlay layers in the catalog revision, without fetching every
+topic body. External v1 retains unknown freshness/unavailable coverage and does
+not enumerate its backend automatically.
+
+The observation requests at most 8 KiB of overview and includes catalog revision,
+freshness, and coverage. XML-escaped JSON marks it as untrusted reference data.
+Observation failures report unknown/unavailable, never an empty store. Native and
+none providers keep their existing behavior. The observation is evaluated only
+when the runtime lifecycle actually requests new/load system context; normal
+already-live turns do not rescan or inject it as user text.
+
+This slice does not claim arbitrary mid-session system prompt replacement. A
+continuously live host without a supported update mechanism still uses explicit
+entry tools for fresh reads. Its automatic refresh requires a separately verified
+runtime capability; silently inserting a leading user-message catalog is not an
+acceptable fallback.
+
+### Live refresh capability audit (2026-09-10)
+
+A repeated `session/load` in an already-live Claude ACP process is not a
+system-context refresh. This was checked against the installed published
+`@agentclientprotocol/claude-agent-acp` packages **0.59.0 and 0.70.0**, not inferred
+from the daemon's `loadSession` method signature:
+
+- `ClaudeAcpAgent.getOrCreateSession` compares a fingerprint containing only
+  `cwd` and sorted `mcpServers`. An unchanged fingerprint returns the existing
+  query; `_meta.systemPrompt` does not participate in that comparison.
+- `createSession` consumes `_meta.systemPrompt` when constructing the SDK query.
+  `prompt` instead converts ACP content to a user message and pushes it into the
+  existing query. Neither path implements a live system-context replacement.
+- A no-model probe called the actual exported agent class with an existing
+  session and instrumented creation/teardown methods. Changing only the system
+  append produced zero creations and zero teardowns in both versions. Changing
+  `cwd` as a positive control produced one of each. This verifies adapter
+  dispatch behavior; it is not a model-level end-to-end refresh test.
+
+Consequently the supported native-resume delivery above means loading a session
+that is **not already live in that adapter process**. The daemon's warm-session
+fast path remains unchanged. Do not force a different cwd or MCP configuration
+just to invalidate the adapter fingerprint: those are session execution and
+permission inputs, not cache-busting fields. Do not silently restart unrelated
+sessions in a shared host process.
+
+Before enabling automatic live delivery, provide and verify an explicit adapter
+capability (or a separately tested, session-scoped close/resume lifecycle) with:
+
+1. A turn-boundary update receipt identifying the accepted catalog revision;
+   failed or unsupported updates must not mark that revision delivered.
+2. Preservation of conversation identity/history, cwd, MCP authorization,
+   protected settings, model configuration, and capture provenance. Loading must
+   not replay history into ordinary live delivery or duplicate a user turn.
+3. Coalesced invalidation after committed writes/adoption, including both base
+   and overlay revisions; unchanged catalogs should not recreate the query.
+4. A runtime integration test showing that a subsequent real turn receives the
+   changed reference context without adding a user message or changing its title.
+   Cover interrupted updates and retry without duplicating content.
+
+These package observations do not establish support for other versions or
+runtimes. Until a supported mechanism passes those checks, new/native-resumed
+sessions receive the bounded observation and live sessions retrieve current
+entries through the common tools. Compatibility retirement is also still pending;
+this audit does not close the overall unified-memory implementation task.
+
+### External entry mutation projection
+
+External v1 connections now project their declared `create`, `update`, and
+`delete` operations through the same entry service, adapter port, model tools,
+admin routes, and console browser. Capabilities stay truthful:
+`writeConsistency: 'last-write-wins'`, `exactCreate: false`, and
+`exactEdit: false`, because a v1 manifest proves neither atomic conditional
+writes nor verbatim storage of authored text. A record backend takes no label (a
+supplied label is refused, never dropped), stores plain text, forwards optional
+metadata, and treats omitted metadata as preserve. Exact edits are refused with
+`UNSUPPORTED`; empty text is refused rather than treated as deletion.
+
+A supplied revision travels to the backend as its optional `version`; a reported
+conflict returns `CONFLICT` with the current revision when `get` can supply it.
+Without a revision the write is last-write-wins, as advertised. Core assigns the
+operation ID before egress. A lost or malformed reply after egress is
+`AMBIGUOUS_WRITE`, never a blind replay, because the profile has no
+operation-status lookup for record writes. Connection loss before egress,
+oversized payloads, and a backend `deleted: false` map to `UNAVAILABLE`,
+`TOO_LARGE`, and `NOT_FOUND`.
+
+Mutations are projected only for callers that carry write provenance (`tool` for
+ordinary sessions, `console` for the authorized BFF); read-only views advertise no
+write operation and mark entries non-editable. The private-session write gate and
+approval card apply unchanged; the approval pre-check compares a revision only
+when the request supplies one, since conditional homes still require it at write
+time. Legacy `saveMemory`/`updateMemory`/`deleteMemory` keep their record-id
+contracts for warm sessions. External Dream, channel scope, and capture remain
+unchanged.
+
+### Unified search projection
+
+`searchMemoryEntries`, `POST /agents/:id/memory/entries/search`, and the console
+search box project one bounded retrieval operation over the authorized view. A
+request carries a query and a hit limit (default 5, at most 20); a result carries
+hits with an entry summary and a snippet, the search `kind` (`lexical`,
+`semantic`, `hybrid`, or `unknown`) and `coverage` (`complete`, `partial`, or
+`unknown`). Search is never enumeration: the tool description, the console note,
+and the result fields all say so, and hits resolve through the same refs as
+`listMemoryEntries`.
+
+Managed memory advertises `searchKind: 'lexical'`: every whitespace-separated
+term must occur, case-insensitively, in the topic label, description, or body
+(frontmatter excluded), scored by where it matched and ordered
+deterministically by score then topic name. The scan runs under the store lock
+in topic order across the channel overlay and the same catalog budget as
+enumeration; exhausting that budget or skipping an oversized topic reports
+`partial` coverage rather than hiding it. Snippets are bounded windows around the
+first body match. No index, vector store, or semantic claim is involved.
+
+External v1 connections that declare `recall` advertise `search` without a
+`searchKind`, because the manifest does not state the backend's retrieval kind;
+results report `unknown` kind and coverage, with the record text prefix as the
+snippet. The recall call is bounded by hit count, byte budget, and timeout, and
+a backend failure is `UNAVAILABLE`, never an empty result.
+
+The search operation rides the `memory/entries/read/v1` frame behind the
+negotiated `memory-entries-search-v1` feature; the Control Plane answers
+`UNSUPPORTED` for an older daemon without sending the frame, and read-only
+callers receive hits with editability removed. Legacy `searchMemory` and the
+record search route remain for warm sessions and older peers.
+
+### Managed graph annotations and console rendering
+
+Managed memory now advertises `graph: true`. A unified `get` annotates the
+entry with one hop of the existing `[[name]]` graph: `links` and `backlinks`
+carry the neighbor's display label, whether it exists, and a ref minted from the
+current authorized view for a target inside that view. In a layered view the
+walk crosses both roots, so an edge from a place or person topic to a shared
+topic resolves to the layer the overlay would actually serve. A dangling
+link keeps its label with `exists: false` and no ref. Annotations are never
+spliced into `text`, stay bounded to 20 per direction, and are omitted (not
+truncated) when the catalog exceeds the enumeration scan budget. Summaries and
+lists remain free of graph reads; external and native entries advertise no graph.
+
+The unified console reader renders `markdown` entries with the shared Markdown
+view used by the file preview, keeping the raw stored text, frontmatter
+included, as the editable draft; `text` entries stay in the plain block. Link
+and backlink annotations render as in-place actions, and a relative Markdown link
+opens a sibling only through a ref the read already annotated, never by guessing
+a ref or a file path.
+
+### Unified history projection
+
+History stays a console operation, as §3 keeps it: `GET
+/agents/:id/memory/entries/:ref/history` and a history view in the unified
+reader project one bounded page of change events per entry (at most 5,
+newest first where the home orders them), and no model tool is advertised. An
+event carries its kind (`create`, `update`, `delete`), an optional time and
+writer source, and bounded before/after snapshots with a `truncated` flag; the
+result names its `order` (`newest-first` for a managed change log, `backend` for
+a record backend). Cursors are view-bound continuations: a page cut by the
+response byte budget retains its unreturned remainder in the continuation, as
+enumeration does, so a write landing between pages can neither repeat nor hide
+an event at the budget edge.
+
+Managed memory advertises `history` when the entry's home pages its change log
+through the daemon. A `daemon` home pages the sidecar it already keeps. A
+`control-plane` home, whose log lives in the Control Plane's table and was so
+far written but never read from the daemon, now pages it back over the new
+`memory/history/read` request behind the `agent-memory-history-read-v1` server
+feature, under the same serving-daemon and home checks as `memory/history/append`;
+until the CP advertises that feature the sink keeps no `list`, the adapter
+advertises no history, and the legacy console route keeps answering from the
+table directly. In a layered view an inherited entry pages the log of the root
+beneath it. External connections that declare `history` project their record
+events in backend order with the event's record text as the bounded snapshot.
+
+The operation rides the `memory/entries/read/v1` frame behind the negotiated
+`memory-entries-history-v1` feature; an older daemon never receives it. Legacy
+file and record history routes remain for older peers and the compatibility
+views.

@@ -1,0 +1,564 @@
+import { describe, it, expect, vi } from 'vitest'
+import {
+  buildRelayDaemonFrame,
+  DECISION_TRIGGER_V1_FEATURE,
+  DECISION_ROUTING_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V2_FEATURE,
+  RD_DECISION_ROUTE_V1,
+  RD_PLATFORM_REQUEST_V1,
+  GITEA_V1_FEATURE,
+  RD_HOOK_NOTICE_V1,
+  RD_HOOK_INSTRUCTIONS_V1,
+  RD_CODEHOST_RELEASE_V1,
+  GITLAB_COM_V1_FEATURE,
+  API_AG_UI_V1_FEATURE,
+  API_AHP_V1_FEATURE,
+  GITLAB_INSTANCE_V1_FEATURE,
+  RD_HEADLESS_AGENT_DELIVERY_V1,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  RD_AGENT_IMPLICIT_ROUTING_V1,
+  RD_AGENT_SESSION_CALL_V1,
+  RD_SESSION_MESSAGE_V1,
+  RD_GITHUB_THREAD_WORKTREE_CLEANUP_V2,
+  RD_WEBCHAT_ATTACH_V1,
+  RD_IM_ADMISSION_V1,
+  RD_WEBCHAT_IMAGES_V1,
+  RELAY_DAEMON_SUBPROTOCOL,
+  type RelayDaemonFrame,
+  type RdMsg,
+  type RdChatEvent,
+  type RdAck
+} from '@agentconnect.md/protocol'
+import { FakeClock, type Transport } from '@agentconnect.md/connection'
+import { RelayClient, type RelayClientDeps } from '../../src/cp/relay-client.js'
+import type { Logger } from '../../src/log.js'
+
+const RELAY_ID = '11111111-1111-4111-8111-111111111111'
+const DAEMON_ID = '22222222-2222-4222-8222-222222222222'
+const URL = 'wss://relay-0.example.test'
+const silentLog = {
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+  child: () => silentLog
+} as unknown as Logger
+
+const flush = (): Promise<void> => new Promise((r) => setTimeout(r, 0))
+
+class FakeTransport implements Transport {
+  bufferedAmount = 0
+  readonly subprotocol = RELAY_DAEMON_SUBPROTOCOL
+  sent: RelayDaemonFrame[] = []
+  closed?: { code: number; reason: string }
+  private msgCb?: (t: string) => void
+  private closeCb?: (c: number, r: string) => void
+  send(text: string): void {
+    this.sent.push(JSON.parse(text) as RelayDaemonFrame)
+  }
+  onMessage(cb: (t: string) => void): void {
+    this.msgCb = cb
+  }
+  onClose(cb: (c: number, r: string) => void): void {
+    this.closeCb = cb
+  }
+  close(code: number, reason: string): void {
+    this.closed = { code, reason }
+  }
+  inject(frame: RelayDaemonFrame): void {
+    this.msgCb?.(JSON.stringify(frame))
+  }
+  simulateClose(code: number): void {
+    this.closeCb?.(code, 'test')
+  }
+  lastReq(type: string): RelayDaemonFrame | undefined {
+    return [...this.sent].reverse().find((f) => f.type === type)
+  }
+}
+
+function make(over: Partial<RelayClientDeps> = {}) {
+  const clock = new FakeClock()
+  const transports: FakeTransport[] = []
+  const connect = vi.fn(async () => {
+    const t = new FakeTransport()
+    transports.push(t)
+    return t
+  })
+  const client = new RelayClient(RELAY_ID, URL, {
+    ...over,
+    apiKey: over.apiKey ?? (() => 'daemon-key'),
+    ...(over.clusterIdentityToken ? { clusterIdentityToken: over.clusterIdentityToken } : {}),
+    daemonId: over.daemonId ?? (() => DAEMON_ID),
+    clock,
+    connect,
+    log: silentLog,
+    jitter: () => 0,
+    onRelayMsg: over.onRelayMsg ?? ((msg: RdMsg) => ({ msgId: msg.msgId, accepted: true }))
+  } as unknown as RelayClientDeps)
+  return { client, clock, transports, connect }
+}
+
+const attachmentId = '33333333-3333-4333-8333-333333333333'
+const authorization = {
+  orgId: 'org',
+  agentId: DAEMON_ID,
+  userId: 'user',
+  user: 'User',
+  callerRole: 'owner' as const,
+  callerApproves: true,
+  grant: { token: 'grant', expiresAtMs: Date.now() + 60_000 }
+}
+const ahpHooks = (): Partial<RelayClientDeps> => ({
+  ahpEnabled: () => true,
+  onAhpOpen: vi.fn(async () => true),
+  onAhpAuthorize: vi.fn(async () => true),
+  onAhpMessage: vi.fn(),
+  onAhpClose: vi.fn(),
+  onAhpRelayLost: vi.fn()
+})
+
+describe('AHP carrier integrated with relay dial-out', () => {
+  it('bounds aggregate queued bytes, per-attachment bytes and pending attachment cardinality', async () => {
+    for (const bound of ['attachment', 'connection', 'count'] as const) {
+      const hooks = ahpHooks()
+      hooks.onAhpOpen = vi.fn(() => new Promise<boolean>(() => {}))
+      const h = make(hooks)
+      const t = await toReady(h.client, h.transports)
+      const count = bound === 'count' ? 257 : bound === 'connection' ? 6 : 1
+      for (let index = 0; index < count; index++) {
+        const id = `33333333-3333-4333-8333-${String(index).padStart(12, '0')}`
+        t.inject(buildRelayDaemonFrame('rd/ahp/open', { attachmentId: id, authorization }))
+        for (let queued = 0; queued < (bound === 'count' ? 0 : bound === 'attachment' ? 5 : 3); queued++)
+          t.inject(buildRelayDaemonFrame('rd/ahp/message', { attachmentId: id, message: 'x'.repeat(60_000) }))
+      }
+      if (bound === 'count') {
+        expect(hooks.onAhpOpen).toHaveBeenCalledTimes(256)
+        expect(t.lastReq('rd/ahp/opened')).toMatchObject({ payload: { accepted: false } })
+      } else {
+        expect(hooks.onAhpClose).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: 'overloaded' }),
+          expect.any(String)
+        )
+      }
+      expect(hooks.onAhpMessage).not.toHaveBeenCalled()
+      await h.client.stop()
+    }
+  })
+
+  it('advertises only a fully wired enabled host and acknowledges open before queued messages', async () => {
+    for (const hooks of [{ ahpEnabled: () => true }, ahpHooks()]) {
+      const h = make(hooks)
+      const t = await toReady(h.client, h.transports)
+      const hello = t.lastReq('rd/hello')!
+      expect(hello.type === 'rd/hello' && hello.payload.capabilities?.includes(API_AHP_V1_FEATURE)).toBe(
+        Boolean(hooks.onAhpOpen)
+      )
+      await h.client.stop()
+    }
+    let accept!: (value: boolean) => void
+    const hooks = ahpHooks()
+    hooks.onAhpOpen = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          accept = resolve
+        })
+    )
+    const h = make(hooks)
+    const t = await toReady(h.client, h.transports)
+    const open = buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization })
+    t.inject(open)
+    t.inject(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' }))
+    expect(hooks.onAhpMessage).not.toHaveBeenCalled()
+    accept(true)
+    await flush()
+    expect(t.lastReq('rd/ahp/opened')).toMatchObject({ corr: open.id, payload: { accepted: true } })
+    expect(hooks.onAhpMessage).toHaveBeenCalledOnce()
+    await h.client.stop()
+  })
+
+  it('fences delayed opens, output and cleanup by transport generation', async () => {
+    let accept!: (value: boolean) => void
+    const wires: Array<{ send(message: string): void }> = []
+    const scopes: string[] = []
+    const hooks = ahpHooks()
+    hooks.onAhpOpen = vi.fn((_input, wire, scope) => {
+      wires.push(wire)
+      scopes.push(scope)
+      return scopes.length === 1
+        ? new Promise<boolean>((resolve) => {
+            accept = resolve
+          })
+        : Promise.resolve(true)
+    })
+    const h = make(hooks)
+    const first = await toReady(h.client, h.transports)
+    const open = buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization })
+    first.inject(open)
+    first.simulateClose(1006)
+    h.clock.advance(10_000)
+    await flush()
+    const second = h.transports.at(-1)!
+    second.inject(buildRelayDaemonFrame('rd/hello/ok', { relayId: RELAY_ID }, { corr: second.lastReq('rd/hello')!.id }))
+    await flush()
+    second.inject(open)
+    await flush()
+    accept(true)
+    await flush()
+    wires[0]!.send('{"stale":true}')
+    wires[1]!.send('{"current":true}')
+    expect(scopes[0]).not.toBe(scopes[1])
+    expect(second.sent.filter((frame) => frame.type === 'rd/ahp/message')).toHaveLength(1)
+    expect(hooks.onAhpClose).toHaveBeenLastCalledWith(expect.anything(), scopes[0])
+    expect(hooks.onAhpRelayLost).toHaveBeenCalledWith(scopes[0])
+    await h.client.stop()
+  })
+
+  it('preempts queued work on close or failed authorization and bounds pending frames', async () => {
+    for (const close of [true, false]) {
+      let accept!: (value: boolean) => void
+      const hooks = ahpHooks()
+      hooks.onAhpOpen = vi.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            accept = resolve
+          })
+      )
+      const h = make(hooks)
+      const t = await toReady(h.client, h.transports)
+      t.inject(buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization }))
+      for (let n = 0; n < (close ? 1 : 32); n++)
+        t.inject(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' }))
+      if (close) t.inject(buildRelayDaemonFrame('rd/ahp/close', { attachmentId, reason: 'client_closed' }))
+      expect(hooks.onAhpClose).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: close ? 'client_closed' : 'overloaded' }),
+        expect.any(String)
+      )
+      accept(true)
+      await flush()
+      expect(hooks.onAhpMessage).not.toHaveBeenCalled()
+      await h.client.stop()
+    }
+    const hooks = ahpHooks()
+    hooks.onAhpAuthorize = vi.fn(async () => false)
+    const h = make(hooks)
+    const t = await toReady(h.client, h.transports)
+    t.inject(buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization }))
+    await flush()
+    t.inject(buildRelayDaemonFrame('rd/ahp/authorize', { attachmentId, authorization }))
+    t.inject(buildRelayDaemonFrame('rd/ahp/message', { attachmentId, message: '{}' }))
+    await flush()
+    expect(hooks.onAhpMessage).not.toHaveBeenCalled()
+    expect(t.lastReq('rd/ahp/authorized')).toMatchObject({ payload: { accepted: false } })
+    await h.client.stop()
+  })
+
+  it('closes oversized host output and the whole hop when even reserved close space is exhausted', async () => {
+    let wire!: { send(message: string): void }
+    const hooks = ahpHooks()
+    hooks.onAhpOpen = vi.fn(async (_input, output) => {
+      wire = output
+      return true
+    })
+    const h = make(hooks)
+    const t = await toReady(h.client, h.transports)
+    t.inject(buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization }))
+    await flush()
+    wire.send('值'.repeat(30_000))
+    expect(t.lastReq('rd/ahp/close')).toMatchObject({ payload: { reason: 'invalid_message' } })
+    t.inject(buildRelayDaemonFrame('rd/ahp/open', { attachmentId, authorization }))
+    await flush()
+    t.bufferedAmount = 2 * 1024 * 1024
+    wire.send('{}')
+    expect(t.closed?.code).toBe(1013)
+    expect(hooks.onAhpRelayLost).toHaveBeenCalledOnce()
+    await h.client.stop()
+  })
+})
+
+async function toReady(
+  client: RelayClient,
+  transports: FakeTransport[],
+  relayIdEcho = RELAY_ID,
+  capabilities?: string[]
+): Promise<FakeTransport> {
+  client.start()
+  await flush()
+  const t = transports[transports.length - 1]!
+  const hello = t.lastReq('rd/hello')!
+  t.inject(buildRelayDaemonFrame('rd/hello/ok', { relayId: relayIdEcho, capabilities }, { corr: hello.id }))
+  await flush()
+  return t
+}
+
+describe('RelayClient (daemon → one relay)', () => {
+  it('rd/hello → rd/hello/ok (matching relayId) → READY', async () => {
+    const { client, transports } = make()
+    const t = await toReady(client, transports)
+    // Hello advertises this build's optional `rd/*` behaviors, so a relay refuses what it cannot honor (send-message-routing-rework.md §8.4).
+    expect(t.lastReq('rd/hello')!.payload).toEqual({
+      apiKey: 'daemon-key',
+      daemonId: DAEMON_ID,
+      capabilities: [
+        RD_HEADLESS_AGENT_DELIVERY_V1,
+        RD_CODEHOST_REPLY_TARGET_V1,
+        RD_AGENT_IMPLICIT_ROUTING_V1,
+        RD_AGENT_SESSION_CALL_V1,
+        RD_SESSION_MESSAGE_V1,
+        RD_GITHUB_THREAD_WORKTREE_CLEANUP_V2,
+        RD_WEBCHAT_ATTACH_V1,
+        API_AG_UI_V1_FEATURE,
+        GITLAB_COM_V1_FEATURE,
+        GITLAB_INSTANCE_V1_FEATURE,
+        GITEA_V1_FEATURE,
+        RD_HOOK_NOTICE_V1,
+        RD_HOOK_INSTRUCTIONS_V1,
+        RD_CODEHOST_RELEASE_V1,
+        DECISION_TRIGGER_V1_FEATURE,
+        DECISION_ROUTING_V1_FEATURE,
+        HOOK_DECISION_ROUTING_V1_FEATURE,
+        HOOK_DECISION_ROUTING_V2_FEATURE,
+        RD_IM_ADMISSION_V1,
+        RD_WEBCHAT_IMAGES_V1
+      ]
+    })
+    expect(client.state).toBe('READY')
+    expect(client.isReady()).toBe(true)
+  })
+
+  it('adds the capabilities a running facet holds, read again on every connect', async () => {
+    let held: string[] = ['azure-devops-v1', 'azure-devops-hooks-v1']
+    const { client, transports } = make({ capabilities: () => held })
+    const first = await toReady(client, transports)
+    const firstHello = first.lastReq('rd/hello')!
+    expect(firstHello.type === 'rd/hello' && firstHello.payload.capabilities).toEqual(expect.arrayContaining(held))
+    await client.stop()
+    held = []
+    const second = await toReady(client, transports)
+    const secondHello = second.lastReq('rd/hello')!
+    expect(secondHello.type === 'rd/hello' && secondHello.payload.capabilities).not.toContain('azure-devops-hooks-v1')
+    await client.stop()
+  })
+
+  it('refuses an old relay that would drop origin snapshots, and preserves them through a capable relay', async () => {
+    const { client, transports } = make()
+    const payload = {
+      claimedFromAgentId: 'parent',
+      toAgentId: 'child',
+      text: 'Inspect this.',
+      coords: { platform: 'dream' as const, channel: 'a2a:parent' },
+      hopCount: 0,
+      deliveryId: 'snapshot',
+      originCodeHostReplyTarget: null,
+      codeHostReplyTarget: { provider: 'github', hookId: 'hook-1', repo: 'acme/project', number: 42 }
+    }
+    const legacy = await toReady(client, transports)
+    expect(await client.sendAgentMsg(payload)).toMatchObject({ delivered: false, reason: 'unsupported' })
+    expect(legacy.lastReq('rd/agentmsg')).toBeUndefined()
+    await client.stop()
+    const current = await toReady(client, transports, RELAY_ID, [RD_CODEHOST_REPLY_TARGET_V1])
+    const result = client.sendAgentMsg(payload)
+    const request = current.lastReq('rd/agentmsg')!
+    expect(request.payload).toEqual(payload)
+    current.inject(
+      buildRelayDaemonFrame('rd/agentmsg/ack', { deliveryId: 'snapshot', delivered: true }, { corr: request.id })
+    )
+    expect(await result).toMatchObject({ delivered: true })
+    await client.stop()
+  })
+
+  it('presents the projected token instead of a key when this daemon has one', async () => {
+    const reads: number[] = []
+    let current = 'projected-1'
+    const { client, transports } = make({
+      apiKey: () => '',
+      clusterIdentityToken: () => {
+        reads.push(reads.length)
+        return current
+      }
+    })
+    const t = await toReady(client, transports)
+    expect(t.lastReq('rd/hello')!.payload).toMatchObject({ serviceAccountToken: 'projected-1' })
+    expect((t.lastReq('rd/hello')!.payload as { apiKey?: string }).apiKey).toBeUndefined()
+    // Re-read per connect for the same reason as the CP socket: the kubelet rotates it.
+    current = 'projected-2'
+    await toReady(client, transports)
+    expect(reads.length).toBeGreaterThan(1)
+  })
+
+  it('treats a relayId echo mismatch as a misroute — never READY, reconnects', async () => {
+    const { client, clock, transports, connect } = make()
+    await toReady(client, transports, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa') // wrong relay
+    expect(client.state).not.toBe('READY') // misroute → never serves this socket
+    expect(transports[0]!.closed?.code).toBe(1011) // dropped the wrong-instance socket
+    clock.advance(1000) // backoff base
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(2) // redials (deployment must fix per-instance routing)
+  })
+
+  it('a 4401 rd/hello rejection is fatal — stops dialing this relay', async () => {
+    const { client, clock, transports, connect } = make()
+    client.start()
+    await flush()
+    transports[0]!.simulateClose(4401)
+    expect(client.state).toBe('CLOSED')
+    clock.advance(60_000)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1) // no redial
+  })
+
+  it('reconnects with backoff on a non-fatal close', async () => {
+    const { client, clock, transports, connect } = make()
+    await toReady(client, transports)
+    transports[0]!.simulateClose(1006)
+    expect(client.state).toBe('DEGRADED')
+    clock.advance(1000)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not dial until the daemonId is adopted', async () => {
+    const held: { id: string | undefined } = { id: undefined }
+    const { client, clock, connect } = make({ daemonId: () => held.id })
+    client.start()
+    await flush()
+    expect(connect).not.toHaveBeenCalled() // no id yet → deferred
+    held.id = DAEMON_ID
+    clock.advance(1000)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1) // dials once the id resolves
+  })
+
+  it('stop() closes the transport and halts reconnect', async () => {
+    const { client, clock, transports, connect } = make()
+    await toReady(client, transports)
+    await client.stop()
+    expect(transports[0]!.closed?.code).toBe(1000)
+    clock.advance(60_000)
+    await flush()
+    expect(connect).toHaveBeenCalledTimes(1)
+  })
+
+  it('stamps a monotonic per-chat seq on rd/chat and prunes the counter on the terminal done', async () => {
+    const CHAT = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+    const AGENT = '11111111-1111-4111-8111-111111111111'
+    const TURN = '22222222-2222-4222-8222-222222222222'
+    // A daemon that streams one output chunk then a done for each inbound turn.
+    const stream = (msg: RdMsg, chat: (e: RdChatEvent) => void): RdAck => {
+      chat({ kind: 'output', output: { conversationId: CHAT, turnId: TURN, index: 0, status: { model: 'm' } } })
+      chat({ kind: 'done', done: { conversationId: CHAT, turnId: TURN } })
+      return { msgId: msg.msgId, accepted: true, turnId: TURN }
+    }
+    const { client, transports } = make({ onRelayMsg: stream })
+    const t = await toReady(client, transports)
+    const turn = (msgId: string): RelayDaemonFrame =>
+      buildRelayDaemonFrame('rd/msg', {
+        source: 'webchat',
+        agentId: AGENT,
+        sessionKey: CHAT,
+        msgId,
+        chatId: CHAT,
+        payload: { op: 'turn', text: 'go' }
+      })
+    const seqs = (): number[] =>
+      t.sent.filter((f) => f.type === 'rd/chat').map((f) => (f.payload as { seq: number }).seq)
+
+    t.inject(turn('m1'))
+    await flush()
+    expect(seqs()).toEqual([1, 2]) // output=1, done=2
+    expect((client as unknown as { seqByChat: Map<string, number> }).seqByChat.has(CHAT)).toBe(false) // pruned on done
+
+    // A second turn on the SAME chat restarts seq at 1 — proves the prune, not a leak.
+    t.inject(turn('m2'))
+    await flush()
+    expect(seqs()).toEqual([1, 2, 1, 2])
+  })
+})
+
+describe('RelayClient — an inbound frame that fails to decode', () => {
+  it('logs the drop with its type, id and size, and answers a correlated error so the relay fails fast', async () => {
+    const warn = vi.fn()
+    const log = { ...silentLog, warn } as unknown as Logger
+    const clock = new FakeClock()
+    const transports: FakeTransport[] = []
+    const onRelayMsg = vi.fn((msg: RdMsg) => ({ msgId: msg.msgId, accepted: true }))
+    const client = new RelayClient(RELAY_ID, URL, {
+      apiKey: () => 'daemon-key',
+      daemonId: () => DAEMON_ID,
+      clock,
+      connect: vi.fn(async () => {
+        const t = new FakeTransport()
+        transports.push(t)
+        return t
+      }),
+      log,
+      jitter: () => 0,
+      onRelayMsg
+    } as unknown as RelayClientDeps)
+    const t = await toReady(client, transports)
+    // A relay-minted `rd/msg` whose payload the schema rejects (no `source`, no `payload`).
+    const bad = buildRelayDaemonFrame('rd/msg', { msgId: 'm-1' } as never)
+    t.inject(bad)
+    await flush()
+    expect(onRelayMsg).not.toHaveBeenCalled()
+    expect(t.lastReq('rd/ack')).toBeUndefined()
+    // The relay learns the reason at once: a correlated `error` settles its request instead of
+    // five silent retries.
+    const nak = t.lastReq('error')!
+    expect(nak.corr).toBe(bad.id)
+    expect(nak.payload).toMatchObject({ code: 'BAD_PAYLOAD', retryable: false })
+    expect(String((nak.payload as { message: string }).message)).toContain('source')
+    const line = warn.mock.calls.map((c) => String(c[0])).find((l) => l.includes('undecodable'))
+    expect(line).toContain(`dropping undecodable rd/msg frame ${bad.id}`)
+    expect(line).toMatch(/\(\d+ bytes\)/)
+  })
+
+  it('sends rd/route and rd/route/report only to a relay advertising the forward leg', async () => {
+    const old = make()
+    await toReady(old.client, old.transports)
+    const route = { deliveryId: 'b:m#a' } as never
+    expect(old.client.supportsRoute()).toBe(false)
+    expect(await old.client.sendRoute(route)).toEqual({
+      deliveryId: 'b:m#a',
+      disposition: 'rejected',
+      reason: 'unsupported'
+    })
+    expect(await old.client.sendRouteReport({} as never)).toEqual({ accepted: false, reason: 'unsupported' })
+
+    const { client, transports } = make()
+    const t = await toReady(client, transports, RELAY_ID, [RD_DECISION_ROUTE_V1])
+    expect(client.supportsRoute()).toBe(true)
+    const pending = client.sendRoute(route)
+    await flush()
+    const req = t.lastReq('rd/route')!
+    t.inject(buildRelayDaemonFrame('rd/route/ack', { deliveryId: 'b:m#a', disposition: 'admitted' }, { corr: req.id }))
+    expect(await pending).toEqual({ deliveryId: 'b:m#a', disposition: 'admitted' })
+    const report = client.sendRouteReport({ botId: RELAY_ID, sessionKey: 'C/C', channel: 'C', participants: [] })
+    await flush()
+    t.inject(
+      buildRelayDaemonFrame('rd/route/report/ack', { accepted: true }, { corr: t.lastReq('rd/route/report')!.id })
+    )
+    expect(await report).toEqual({ accepted: true })
+  })
+
+  it('serves platform requests only over a relay that advertises them, and sends each once', async () => {
+    const old = make()
+    await toReady(old.client, old.transports)
+    expect(old.client.supportsPlatformRequest()).toBe(false)
+
+    const { client, transports } = make()
+    const t = await toReady(client, transports, RELAY_ID, [RD_PLATFORM_REQUEST_V1])
+    expect(client.supportsPlatformRequest()).toBe(true)
+    const pending = client.sendPlatformRequest({
+      platformId: 'msteams',
+      botId: RELAY_ID,
+      payload: { op: 'graph-token' }
+    })
+    await flush()
+    const req = t.lastReq('rd/platform/request')!
+    expect(req.payload).toEqual({ platformId: 'msteams', botId: RELAY_ID, payload: { op: 'graph-token' } })
+    t.inject(buildRelayDaemonFrame('rd/platform/reply', { outcome: 'refused', reason: 'ticket' }, { corr: req.id }))
+    expect(await pending).toEqual({ outcome: 'refused', reason: 'ticket' })
+    expect(t.sent.filter((f) => f.type === 'rd/platform/request')).toHaveLength(1)
+  })
+})

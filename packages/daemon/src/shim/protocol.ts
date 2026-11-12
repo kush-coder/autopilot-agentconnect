@@ -1,0 +1,233 @@
+import { z } from 'zod'
+import { TunnelNameSchema } from './tunnel.js'
+
+/** WS subprotocol and path the daemon uses when dialing the sandbox shim. */
+export const SHIM_SUBPROTOCOL = 'agentconnect.shim.v1'
+export const SHIM_WS_PATH = '/shim/v1'
+
+/** Audience the projected ServiceAccount token is restricted to. A token minted for
+ *  anything else must not authenticate here, which is what makes the pod's own
+ *  credential safe to hand over: it is useless anywhere but this endpoint. */
+export const SHIM_TOKEN_AUDIENCE = 'ac-daemon-callback'
+
+/** Where the pod template projects that token, and where the shim reads it from. */
+export const SHIM_IDENTITY_TOKEN_PATH = '/var/run/ac-identity/token'
+
+/** Port the in-sandbox shim listens on for daemon dial-in. */
+export const SHIM_LISTEN_PORT_ENV = 'AC_SHIM_PORT'
+export const DEFAULT_SHIM_LISTEN_PORT = 8085
+
+/** Root the sandbox permits filesystem work inside — the mounted agent volume. Also non-secret,
+ *  and fixed by the image rather than chosen per request, since the shim uses it to refuse a
+ *  cwd that escapes it. */
+export const SHIM_WORKSPACE_ROOT_ENV = 'AC_SHIM_WORKSPACE_ROOT'
+
+/** The shim's own fallback for that env, and the daemon's assumption for a legacy shim that
+ *  predates workspace-root reporting — every such image mounted the volume here. */
+export const DEFAULT_SHIM_WORKSPACE_ROOT = '/agent'
+
+/** Root of the shim's own runtime files (tunnel sockets, Git config, skill staging); unset keeps the image's fixed layout. */
+export const SHIM_RUNTIME_ROOT_ENV = 'AC_SHIM_RUNTIME_ROOT'
+
+/** Root of the helper entries (bridge, watchers, credential helper); unset keeps the image's fixed layout. */
+export const SHIM_HELPER_ROOT_ENV = 'AC_SHIM_HELPER_ROOT'
+
+/** A unix socket to accept the daemon on instead of a TCP port: a host shim authenticates nobody, and any local user can reach loopback. */
+export const SHIM_LISTEN_SOCKET_ENV = 'AC_SHIM_SOCKET'
+
+/** `1` when the driving daemon is on this machine and sends each runtime's whole environment, so the shim adds no pod fill-in. */
+export const SHIM_COMPLETE_ENV_FLAG = 'AC_SHIM_COMPLETE_ENV'
+
+/** A hosted session's seed as a JSON object: what its executor points each runtime at, filled in beneath the holder's env (session-executors.md §8). */
+export const SHIM_SEED_ENV = 'AC_SHIM_SEED_ENV'
+
+/** A host launcher's per-shim mark, copied into every runtime's environment so a dead shim's descendants can still be found. */
+export const SHIM_RUNTIME_MARK_ENV = 'AC_SHIM_RUNTIME_MARK'
+
+/** A host launcher's inherited descriptor that reaches end-of-file when the daemon that started the shim is gone. */
+export const SHIM_PARENT_FD_ENV = 'AC_SHIM_PARENT_FD'
+
+/** `1` under a boundary that passes stdio alone: stdin stays open past the identity line, and its end-of-file means stop or a gone daemon. */
+export const SHIM_STDIN_LIFELINE_ENV = 'AC_SHIM_STDIN_LIFELINE'
+
+/** Comma-separated: the code-host names an `srt` boundary routes to this shim's codehost socket, set by the executor that started it. */
+export const SHIM_CODEHOST_DOMAINS_ENV = 'AC_SHIM_CODEHOST_DOMAINS'
+
+/** `cluster-skills-v2` widens the manifest; `source-cache-bundle-v1` serves `bundle`; each `skill-git-*` feature serves its `skills-git*` grant. */
+export const ShimFeatureSchema = z.enum([
+  'cluster-skills-v1',
+  'cluster-skills-v2',
+  'cluster-skills-v3',
+  'source-cache-bundle-v1',
+  'skill-git-in-pod-v1',
+  'skill-git-writeback-v1',
+  'skill-git-gitlab-v1',
+  'workspace-transfer-v1'
+])
+export type ShimFeature = z.infer<typeof ShimFeatureSchema>
+
+/** Operations the daemon may ask a bound shim to perform. Every one is authorized
+ *  individually against the binding's grants — a channel is not a blanket permission.
+ *  The bodies land in #814 / #815; this is the authorization vocabulary they use. */
+export const ShimCapabilitySchema = z.enum([
+  /** Write daemon-materialized files (secrets, config files) into the sandbox. */
+  'materialize',
+  /** Run a command in the sandbox and return a structured result (workspace git). */
+  'exec',
+  /** Read a bounded file back out (BFF workspace reads). */
+  'read',
+  /** Proxy an in-pod unix socket back to a daemon-side server (agent channel, gh, MCP). */
+  'tunnel',
+  /** Run the ACP runtime and relay its stdio as a stream (its own channel: ACP is already
+   *  a complete protocol, and reinterpreting it here would add a second place to break). */
+  'acp',
+  /** Run the merge-when-ready watcher in the pod, so the armed set lives and dies with the
+   *  sandbox. Its own capability rather than a widening of `exec`: that channel is git-only and
+   *  enforced in-pod on purpose, and reaching `gh` through it would turn a deliberate boundary
+   *  into an arbitrary-execution surface. */
+  'automerge',
+  /** Install daemon-acquired immutable skills into this pod's workspace. */
+  'skills',
+  /** The same channel at the widened manifest limits — all the daemon learns from `cluster-skills-v2`. */
+  'skills-wide',
+  // Bounded paging of prior and installed skill receipts.
+  'skills-receipts',
+  // Git skill Sources arrive as reconcile plan entries the shim clones itself (source-cache.md §8, §13).
+  'skills-git',
+  // A Git plan entry may ask the shim to bundle its clone for write-back, uploaded over `bundle` (source-cache.md §9, §13).
+  'skills-git-writeback',
+  // A Git plan entry may name a GitLab instance whose credential the pod's window carries (source-cache.md §8, §11).
+  'skills-git-gitlab',
+  // Create, upload and discard a shim-minted Source Cache bundle handle (source-cache.md §9, §13).
+  'bundle',
+  // Snapshot one workspace file into a `bundle` handle for a console file transfer (source-cache-file-transfer.md).
+  'transfer',
+  /** Report which runtimes this image actually provides, by asking them. The daemon cannot learn
+   *  this any other way: `--k8s` runs no local runtime, and anything it states from its own
+   *  configuration is a claim about an image it never opened. */
+  'probe'
+])
+export type ShimCapability = z.infer<typeof ShimCapabilitySchema>
+
+/** The daemon opens a dial-in channel with the launch it expects to bind. */
+export const ShimDialHelloSchema = z.object({
+  type: z.literal('shim/hello'),
+  agentId: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+  supportedFeatures: z.array(z.string().min(1).max(80)).max(16).optional()
+})
+
+/** The shim answers the dialer's hello by proving which pod accepted it. */
+export const ShimIdentitySchema = z.object({
+  type: z.literal('shim/identity'),
+  /** Projected ServiceAccount token, audience-restricted to {@link SHIM_TOKEN_AUDIENCE}. */
+  token: z.string().min(1),
+  /** Shim build, for operator diagnosis only — never an authorization input. */
+  shimVersion: z.string().max(64).optional(),
+  /** This pod's workspace mount; absent on legacy shims means {@link DEFAULT_SHIM_WORKSPACE_ROOT}. */
+  workspaceRoot: z.string().min(1).max(4096).optional(),
+  /** Versioned optional surfaces supported by this image; absent means a legacy shim. */
+  features: z.array(ShimFeatureSchema).max(16).optional()
+})
+
+/** The daemon's answer once the token is verified and mapped to a spawn record. */
+export const ShimBoundSchema = z.object({
+  type: z.literal('shim/bound'),
+  /** Short-TTL credential for subsequent frames, bound to this pod and generation. */
+  sessionCredential: z.string().min(1),
+  /** Seconds until the credential must be re-obtained by re-handshaking. */
+  expiresInSeconds: z.number().int().positive(),
+  agentId: z.string().min(1),
+  /** Monotonic per-agent spawn counter; frames from an older one are refused. */
+  generation: z.number().int().nonnegative(),
+  grants: z.array(ShimCapabilitySchema)
+})
+
+export const ShimRejectedSchema = z.object({
+  type: z.literal('shim/rejected'),
+  /** Coarse, non-probing reason: never leaks which of several checks failed. */
+  reason: z.enum(['unauthenticated', 'unknown_pod', 'stale_generation', 'unavailable']),
+  message: z.string().max(200)
+})
+
+/** Every post-binding frame carries the credential and the generation it was issued
+ *  for, so a replayed frame from a previous pod incarnation is refused on arrival. */
+export const ShimRequestSchema = z.object({
+  type: z.literal('shim/request'),
+  id: z.string().uuid(),
+  sessionCredential: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+  capability: ShimCapabilitySchema,
+  /** Operation payload, shaped per capability by the channels that land later. */
+  payload: z.unknown()
+})
+
+// Cancels an in-flight request by id. Carries credential and generation like every post-binding
+// frame, so a replayed cancel from a previous incarnation cannot kill a live request.
+export const ShimCancelSchema = z.object({
+  type: z.literal('shim/cancel'),
+  id: z.string().uuid(),
+  sessionCredential: z.string().min(1),
+  generation: z.number().int().nonnegative(),
+  reason: z.string().max(200).optional()
+})
+
+export const ShimResponseSchema = z.object({
+  type: z.literal('shim/response'),
+  id: z.string().uuid(),
+  ok: z.boolean(),
+  payload: z.unknown().optional(),
+  error: z.string().max(500).optional()
+})
+
+/** A recurring event on an open stream. Unlike a response, many arrive per request: an ACP
+ *  runtime emits stdout continuously and exits once, and neither fits one-shot correlation. */
+export const ShimEventSchema = z.object({
+  type: z.literal('shim/event'),
+  /** The stream this belongs to: the request id that opened it, or — for a tunnel, whose
+   *  connections are opened by a process inside the pod — an id the shim mints and announces. */
+  streamId: z.string().uuid(),
+  event: z.discriminatedUnion('kind', [
+    /** A process in the sandbox connected to a tunnel's socket; the daemon dials its own end. */
+    z.object({ kind: z.literal('connect'), tunnel: TunnelNameSchema }),
+    z.object({ kind: z.literal('chunk'), data: z.string() }),
+    z.object({
+      kind: z.literal('exit'),
+      code: z.number().int().nullable(),
+      signal: z.string().nullable(),
+      error: z.string().max(500).optional()
+    })
+  ])
+})
+
+export const ShimFrameSchema = z.union([
+  ShimDialHelloSchema,
+  ShimIdentitySchema,
+  ShimBoundSchema,
+  ShimRejectedSchema,
+  ShimRequestSchema,
+  ShimCancelSchema,
+  ShimResponseSchema,
+  ShimEventSchema
+])
+
+export type ShimBound = z.infer<typeof ShimBoundSchema>
+export type ShimRejected = z.infer<typeof ShimRejectedSchema>
+export type ShimRequest = z.infer<typeof ShimRequestSchema>
+export type ShimCancel = z.infer<typeof ShimCancelSchema>
+export type ShimResponse = z.infer<typeof ShimResponseSchema>
+export type ShimEvent = z.infer<typeof ShimEventSchema>
+export type ShimFrame = z.infer<typeof ShimFrameSchema>
+export type ShimDialHello = z.infer<typeof ShimDialHelloSchema>
+export type ShimIdentity = z.infer<typeof ShimIdentitySchema>
+
+/** Parse an inbound frame, returning undefined rather than throwing: a malformed frame
+ *  from a half-trusted peer is a close-the-connection event, not an exception path. */
+export function parseShimFrame(text: string): ShimFrame | undefined {
+  try {
+    const result = ShimFrameSchema.safeParse(JSON.parse(text))
+    return result.success ? result.data : undefined
+  } catch {
+    return undefined
+  }
+}

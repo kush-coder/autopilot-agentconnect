@@ -1,0 +1,263 @@
+/**
+ * PostgreSQL persistence for the deployment-wide singleton configuration.
+ *
+ * Admin reads deliberately omit `deployment_secret.value`; the separate
+ * runtime read is the only query in this repository that selects ciphertext.
+ * Replacement locks one deployment-global advisory key and commits the typed
+ * JSON document, monotonic revision, and secret patch in one transaction.
+ */
+import type { CodeHostProvider } from '@agentconnect.md/protocol'
+import { Prisma, type PrismaClient } from '../../generated/prisma/client.js'
+import type { SecretCipher } from '../../secrets/cipher.js'
+import { withTx } from '../prisma.js'
+import {
+  DeploymentConfigConflictError,
+  DeploymentConfigGiteaBaseUrlLockedError,
+  DeploymentConfigGitlabBaseUrlLockedError,
+  DeploymentConfigMissingSecretsError,
+  DeploymentConfigSecretRefreshRequiredError,
+  DeploymentConfigService,
+  deploymentSecretsRequiringRefresh,
+  effectiveGiteaBaseUrl,
+  effectiveGitlabBaseUrl,
+  parseDeploymentConfigValues,
+  type DeploymentConfigPersistence,
+  type DeploymentSecretKey,
+  type PreparedDeploymentConfigReplace,
+  type StoredDeploymentConfigAdmin,
+  type StoredDeploymentConfigRuntime
+} from '../deployment-config.js'
+
+import { DEPLOYMENT_CONFIG_ID, lockAxisExclusive } from './gitlab-axis.js'
+import { GITLAB_DEFAULT_BASE_URL, normalizeGitlabBaseUrl } from '../../gitlab/config.js'
+import { GITEA_DEFAULT_BASE_URL, normalizeGiteaBaseUrl } from '../../gitea/config.js'
+
+const adminSelect = {
+  schemaVersion: true,
+  revision: true,
+  values: true,
+  adminClaimedFor: true,
+  updatedAt: true,
+  secrets: {
+    select: { key: true, fingerprint: true, updatedAt: true },
+    orderBy: { key: 'asc' }
+  }
+} as const satisfies Prisma.DeploymentConfigSelect
+
+const runtimeSelect = {
+  schemaVersion: true,
+  revision: true,
+  values: true,
+  updatedAt: true,
+  secrets: {
+    select: { key: true, value: true, fingerprint: true, updatedAt: true },
+    orderBy: { key: 'asc' }
+  }
+} as const satisfies Prisma.DeploymentConfigSelect
+
+type AdminRow = Prisma.DeploymentConfigGetPayload<{ select: typeof adminSelect }>
+type RuntimeRow = Prisma.DeploymentConfigGetPayload<{ select: typeof runtimeSelect }>
+
+function toAdmin(row: AdminRow): StoredDeploymentConfigAdmin {
+  return {
+    schemaVersion: row.schemaVersion,
+    revision: row.revision,
+    values: row.values,
+    adminClaimedFor: row.adminClaimedFor,
+    secrets: row.secrets,
+    updatedAt: row.updatedAt
+  }
+}
+
+function toRuntime(row: RuntimeRow): StoredDeploymentConfigRuntime {
+  return {
+    schemaVersion: row.schemaVersion,
+    revision: row.revision,
+    values: row.values,
+    secrets: row.secrets.map(({ value, ...metadata }) => ({ ...metadata, sealedValue: value })),
+    updatedAt: row.updatedAt
+  }
+}
+
+/** Whether one host's state still binds this deployment to its instance (§24.1); keyed here because it counts Prisma models. */
+const CODE_HOST_STATE_EXISTS: Record<CodeHostProvider, (tx: Prisma.TransactionClient) => Promise<boolean>> = {
+  // A GitHub App addresses github.com only: the deployment has no instance axis
+  // for this host, so no state of its can pin one.
+  github: async () => false,
+  // Azure DevOps Services is one fixed host as well.
+  'azure-devops': async () => false,
+  // A `disconnected` connection is credential-free history and does not bind; a
+  // binding (`cleanup_pending` included), an account, a hook, or a claim carrying
+  // a tombstone or an unfinished cleanup obligation does.
+  gitlab: async (tx) => {
+    const [connections, bindings, accounts, hooks, claims] = await Promise.all([
+      tx.gitlabConnection.count({ where: { NOT: { state: 'disconnected' } } }),
+      tx.gitlabProjectBinding.count(),
+      tx.gitlabAgentAccount.count(),
+      tx.hookDef.count({ where: { kind: 'gitlab' } }),
+      tx.codeHostRepositoryClaim.count({ where: { provider: 'gitlab' } })
+    ])
+    return connections + bindings + accounts + hooks + claims > 0
+  },
+  // A connection in any state binds (its bot user id and token are host-relative), as does a
+  // binding in any state (`cleanup_pending` included), a hook, or a claim that still owes cleanup.
+  gitea: async (tx) => {
+    const [connections, bindings, hooks, claims] = await Promise.all([
+      tx.giteaConnection.count(),
+      tx.giteaRepositoryBinding.count(),
+      tx.hookDef.count({ where: { kind: 'gitea' } }),
+      tx.codeHostRepositoryClaim.count({ where: { provider: 'gitea' } })
+    ])
+    return connections + bindings + hooks + claims > 0
+  }
+}
+
+function codeHostStateExists(tx: Prisma.TransactionClient, provider: CodeHostProvider): Promise<boolean> {
+  return CODE_HOST_STATE_EXISTS[provider](tx)
+}
+
+export class PgDeploymentConfigRepository implements DeploymentConfigPersistence {
+  /** The axis the process-level fallback selects, for the FIRST persisted
+   *  document: with no row, `GITLAB_BASE_URL` is what the running deployment
+   *  already serves, so it — not GitLab.com — is what a first write must match. */
+  private readonly envGitlabBaseUrl: string
+  /** The Gitea twin of the axis above: with no row, `GITEA_BASE_URL` is what the deployment serves. */
+  private readonly envGiteaBaseUrl: string
+
+  constructor(
+    private readonly prisma: PrismaClient,
+    envGitlabBaseUrl?: string,
+    envGiteaBaseUrl?: string
+  ) {
+    const raw = envGitlabBaseUrl?.trim()
+    this.envGitlabBaseUrl = raw ? normalizeGitlabBaseUrl(raw) : GITLAB_DEFAULT_BASE_URL
+    const rawGitea = envGiteaBaseUrl?.trim()
+    this.envGiteaBaseUrl = rawGitea ? normalizeGiteaBaseUrl(rawGitea) : GITEA_DEFAULT_BASE_URL
+  }
+
+  async readAdmin(): Promise<StoredDeploymentConfigAdmin | null> {
+    const row = await this.prisma.deploymentConfig.findUnique({
+      where: { id: DEPLOYMENT_CONFIG_ID },
+      select: adminSelect
+    })
+    return row ? toAdmin(row) : null
+  }
+
+  async readRuntime(): Promise<StoredDeploymentConfigRuntime | null> {
+    const row = await this.prisma.deploymentConfig.findUnique({
+      where: { id: DEPLOYMENT_CONFIG_ID },
+      select: runtimeSelect
+    })
+    return row ? toRuntime(row) : null
+  }
+
+  async replace(input: PreparedDeploymentConfigReplace): Promise<StoredDeploymentConfigAdmin> {
+    return withTx(this.prisma, async (tx) => {
+      // A row lock cannot serialize the first write because the singleton row
+      // does not exist yet. One stable advisory key covers both create and
+      // update — and, held exclusively, also excludes GitLab state creation.
+      await lockAxisExclusive(tx)
+
+      const current = await tx.deploymentConfig.findUnique({
+        where: { id: DEPLOYMENT_CONFIG_ID },
+        select: { revision: true, schemaVersion: true, values: true }
+      })
+      const actualRevision = current?.revision ?? 0
+      if (actualRevision !== input.expectedRevision) {
+        throw new DeploymentConfigConflictError(input.expectedRevision, actualRevision)
+      }
+
+      const previousValues = current ? parseDeploymentConfigValues(current.schemaVersion, current.values) : null
+      // §24.1, under the exclusive lock taken above so no GitLab state can be
+      // created alongside this count. The baseline is the axis in effect NOW,
+      // which for the first persisted document is the environment fallback.
+      const previousBaseUrl = previousValues ? effectiveGitlabBaseUrl(previousValues) : this.envGitlabBaseUrl
+      const nextBaseUrl = effectiveGitlabBaseUrl(input.values)
+      if (previousBaseUrl !== nextBaseUrl && (await codeHostStateExists(tx, 'gitlab'))) {
+        throw new DeploymentConfigGitlabBaseUrlLockedError(previousBaseUrl, nextBaseUrl)
+      }
+      // The same lock on the Gitea axis (gitea-integration.md §3), under the same exclusive lock.
+      const previousGiteaBaseUrl = previousValues ? effectiveGiteaBaseUrl(previousValues) : this.envGiteaBaseUrl
+      const nextGiteaBaseUrl = effectiveGiteaBaseUrl(input.values)
+      if (previousGiteaBaseUrl !== nextGiteaBaseUrl && (await codeHostStateExists(tx, 'gitea'))) {
+        throw new DeploymentConfigGiteaBaseUrlLockedError(previousGiteaBaseUrl, nextGiteaBaseUrl)
+      }
+      const refreshKeys = previousValues ? deploymentSecretsRequiringRefresh(previousValues, input.values) : []
+      const missingRefresh = refreshKeys.filter((key) => !input.secrets[key])
+      if (missingRefresh.length > 0) {
+        throw new DeploymentConfigSecretRefreshRequiredError(missingRefresh)
+      }
+
+      const currentSecrets = await tx.deploymentSecret.findMany({
+        where: { deploymentConfigId: DEPLOYMENT_CONFIG_ID },
+        select: { key: true }
+      })
+      const effective = new Set(currentSecrets.map(({ key }) => key))
+      for (const [key, prepared] of Object.entries(input.secrets)) {
+        if (prepared === null) effective.delete(key)
+        else effective.add(key)
+      }
+      const missing = input.requiredSecretKeys.filter((key) => !effective.has(key))
+      if (missing.length > 0) throw new DeploymentConfigMissingSecretsError(missing)
+
+      await tx.deploymentConfig.upsert({
+        where: { id: DEPLOYMENT_CONFIG_ID },
+        create: {
+          id: DEPLOYMENT_CONFIG_ID,
+          schemaVersion: input.schemaVersion,
+          values: input.values as Prisma.InputJsonValue,
+          revision: 1
+        },
+        update: {
+          schemaVersion: input.schemaVersion,
+          values: input.values as Prisma.InputJsonValue,
+          revision: { increment: 1 }
+        }
+      })
+
+      for (const [rawKey, prepared] of Object.entries(input.secrets)) {
+        const key = rawKey as DeploymentSecretKey
+        if (prepared === null) {
+          await tx.deploymentSecret.deleteMany({ where: { deploymentConfigId: DEPLOYMENT_CONFIG_ID, key } })
+          continue
+        }
+        await tx.deploymentSecret.upsert({
+          where: { deploymentConfigId_key: { deploymentConfigId: DEPLOYMENT_CONFIG_ID, key } },
+          create: {
+            deploymentConfigId: DEPLOYMENT_CONFIG_ID,
+            key,
+            value: prepared.sealedValue,
+            fingerprint: prepared.fingerprint
+          },
+          update: { value: prepared.sealedValue, fingerprint: prepared.fingerprint }
+        })
+      }
+
+      const row = await tx.deploymentConfig.findUniqueOrThrow({
+        where: { id: DEPLOYMENT_CONFIG_ID },
+        select: adminSelect
+      })
+      return toAdmin(row)
+    })
+  }
+
+  async markAdminClaimed(expectedRevision: number, claimedFor: string): Promise<void> {
+    const updated = await this.prisma.deploymentConfig.updateMany({
+      where: { id: DEPLOYMENT_CONFIG_ID, revision: expectedRevision },
+      data: { adminClaimedFor: claimedFor }
+    })
+    if (updated.count === 1) return
+    const current = await this.prisma.deploymentConfig.findUnique({
+      where: { id: DEPLOYMENT_CONFIG_ID },
+      select: { revision: true }
+    })
+    throw new DeploymentConfigConflictError(expectedRevision, current?.revision ?? 0)
+  }
+}
+
+/** Composition convenience used by the CP container and tests. */
+export class PgDeploymentConfigStore extends DeploymentConfigService {
+  constructor(prisma: PrismaClient, cipher: SecretCipher, envGitlabBaseUrl?: string, envGiteaBaseUrl?: string) {
+    super(new PgDeploymentConfigRepository(prisma, envGitlabBaseUrl, envGiteaBaseUrl), cipher)
+  }
+}

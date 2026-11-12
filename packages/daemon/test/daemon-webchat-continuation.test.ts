@@ -1,0 +1,657 @@
+import { describe, expect, it, vi } from 'vitest'
+import { MAX_AGENT_CALL_HOPS } from '@agentconnect.md/protocol'
+import { Daemon } from '../src/daemon.js'
+import { transcriptChannelKey } from '../src/store/local-store.js'
+import {
+  NO_RESPONSE,
+  agentPost as agentPostIn,
+  fakeCpClient,
+  fakeRelay as fakeRelayIn,
+  rdFactory,
+  rendezvousKey,
+  scaffold,
+  scriptedHosts,
+  seedCallPolicy,
+  settle,
+  userPost as userPostIn
+} from './webchat-continuation-fixture.js'
+import type { RdChatEvent, WebchatPost } from '@agentconnect.md/protocol'
+import { WAIT, waitBudget } from './wait-support.js'
+
+// #549 parity for multi-agent webchat (webchat-multi-agents.md §5.2a, issue #904):
+// a peer agent's COMMITTED conversation post — delivered to this participant as a
+// relay `context` frame — continues the conversation instead of staying
+// transcript-only, with the platform ladder's protections: the hop transition
+// against MAX_AGENT_CALL_HOPS, exactly-once per (post, target) through the durable
+// activation rendezvous, final-events-only (structural), author exclusion, and the
+// directional call policy. These tests drive the daemon exactly the way the relay
+// does (handleRelayMsg) and play the relay's roster fan-out themselves.
+//
+// The setup helpers live in `webchat-continuation-fixture.ts`, shared with the
+// cross-surface activation parity leg (`evals/test/parity-webchat.test.ts`).
+
+const P1 = 'bot-a'
+const P2 = 'bot-b'
+const REF = 'bot-ref'
+const CONV = '88888888-8888-4888-8888-888888888888'
+const KICKOFF_TURN = '77777777-7777-4777-8777-777777777777'
+
+const rd = rdFactory(CONV, P1)
+const fakeRelay = (daemonRef: { current?: Daemon }, roster: string[]) => fakeRelayIn(daemonRef, roster, CONV)
+const userPost = (text: string, at: number, postId: string): WebchatPost => userPostIn(CONV, text, at, postId)
+const agentPost = (agentId: string, text: string, at: number, postId: string, hopCount?: number): WebchatPost =>
+  agentPostIn(CONV, agentId, text, at, postId, hopCount)
+describe('webchat multi-agent continuation (#549 parity)', () => {
+  it('runs the counting relay: kickoff activates, each committed post wakes roster-minus-author, the silent referee absorbs its wakes', async () => {
+    // player-1 counts odds, player-2 evens; both decline past 6; the referee
+    // always declines — the live regression's exact shape.
+    const next: Record<string, number> = { [P1]: 1, [P2]: 2 }
+    const count = (id: string) => () => {
+      const n = next[id]!
+      if (n > 6) return NO_RESPONSE
+      next[id] = n + 2
+      return String(n)
+    }
+    const { factory, prompts } = scriptedHosts({ [P1]: count(P1), [P2]: count(P2), [REF]: () => NO_RESPONSE })
+    const daemon = new Daemon({ root: scaffold([P1, P2, REF]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2, REF])
+    const holder = { current: daemon }
+    const { posts, fanOut } = fakeRelay(holder, [P1, P2, REF])
+    ;(daemon as any).relays = { sendWebchatPost: fanOut, stop: async () => {} }
+
+    // Human kickoff targeted at player-1 with no structured mentions, so no narrowed scope; peers get the user post as context only.
+    const kickoffText = 'count to 6 together, alternating, one number per message; referee: observe silently'
+    const ack = await (daemon as any).handleRelayMsg(
+      rd(
+        {
+          op: 'turn',
+          text: kickoffText,
+          user: 'owner',
+          turnId: KICKOFF_TURN,
+          post: { postId: KICKOFF_TURN, at: 1_000 }
+        },
+        { agentId: P1, msgId: 'turn-p1' }
+      ),
+      (_e: RdChatEvent) => {}
+    )
+    expect(ack).toMatchObject({ accepted: true })
+    for (const [peer, msgId] of [
+      [P2, 'uctx-p2'],
+      [REF, 'uctx-ref']
+    ] as const) {
+      await (daemon as any).handleRelayMsg(
+        rd({ op: 'context', post: userPost(kickoffText, 1_000, KICKOFF_TURN) }, { agentId: peer, msgId }),
+        () => {}
+      )
+    }
+
+    // The full alternating chain completes with no further human input.
+    await vi.waitFor(() => expect(posts.map((p) => p.post.text)).toEqual(['1', '2', '3', '4', '5', '6']), WAIT)
+    await settle()
+    expect(posts).toHaveLength(6) // the declines past 6 commit no post and fan nothing out
+
+    // Alternating attribution, and every post carries its author turn's depth: the
+    // kickoff turn is depth 0, each continuation charges exactly one transition.
+    expect(posts.map((p) => p.agentId)).toEqual([P1, P2, P1, P2, P1, P2])
+    expect(posts.map((p) => (p.post.author.kind === 'agent' ? p.post.author.hopCount : undefined))).toEqual([
+      0, 1, 2, 3, 4, 5
+    ])
+
+    // Exact wake accounting: P1 = kickoff + wakes on 2/4/6 (the last declines), P2 = wakes on 1/3/5; the wake on 6 commits no post, so it is awaited, not assumed.
+    await vi.waitFor(() => expect(prompts.get(P1)).toHaveLength(4), WAIT)
+    await settle()
+    expect(prompts.get(P1)).toHaveLength(4)
+    expect(prompts.get(P2)).toHaveLength(3)
+    for (const p of posts) {
+      expect(await (daemon as any).store.getActivation(rendezvousKey(p.post.postId, p.agentId))).toBeUndefined()
+    }
+    // …while the delivered edges are admitted exactly-once records.
+    const firstWake = await (daemon as any).store.getActivation(rendezvousKey(posts[0]!.post.postId, P2))
+    expect(firstWake?.state).toBe('admitted')
+
+    // The silent referee: woken (at least once; queued wakes may coalesce into a
+    // regeneration), never a post, never a transcript reply row.
+    expect(prompts.get(REF)!.length).toBeGreaterThanOrEqual(1)
+    expect(posts.some((p) => p.agentId === REF)).toBe(false)
+    const refRows = (
+      await (daemon as any).store.transcriptSince(
+        {
+          transcriptChannel: transcriptChannelKey(CONV, undefined),
+          coordinate: `webchat:${CONV}`,
+          sessionKey: 'webchat',
+          agentId: 'bot-a'
+        },
+        null
+      )
+    ).filter((row: { sender: string }) => row.sender === REF)
+    expect(refRows).toEqual([])
+
+    // A woken player's prompt names the author of the post that woke it.
+    expect(prompts.get(P2)![0]).toContain(`[${P1}] 1`)
+    await daemon.stop()
+  })
+
+  it('activates the whole roster on an unnarrowed human kickoff (standing mention, unchanged)', async () => {
+    const { factory, prompts } = scriptedHosts({ [P1]: () => 'a1', [P2]: () => 'a2' })
+    const daemon = new Daemon({ root: scaffold([P1, P2]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    for (const [agentId, msgId] of [
+      [P1, 'turn-a'],
+      [P2, 'turn-b']
+    ] as const) {
+      const ack = await (daemon as any).handleRelayMsg(
+        rd(
+          {
+            op: 'turn',
+            text: 'hello both',
+            user: 'owner',
+            turnId: KICKOFF_TURN,
+            post: { postId: KICKOFF_TURN, at: 1_000 }
+          },
+          { agentId, msgId }
+        ),
+        () => {}
+      )
+      expect(ack).toMatchObject({ accepted: true })
+    }
+    await vi.waitFor(() => {
+      expect(prompts.get(P1)).toHaveLength(1)
+      expect(prompts.get(P2)).toHaveLength(1)
+    }, WAIT)
+    await daemon.stop()
+  })
+
+  it('a full alternating chain terminates at the hop cap with a recorded refusal', async () => {
+    // Neither player ever declines — the loop protections are the only terminator,
+    // exactly the post-#549 expectation. Chain depth: kickoff turn 0, then one
+    // continuation per post until the +1 transition reaches MAX_AGENT_CALL_HOPS.
+    let n = 0
+    const always = () => String(++n)
+    const { factory } = scriptedHosts({ [P1]: always, [P2]: always })
+    const daemon = new Daemon({ root: scaffold([P1, P2]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2])
+    const infoSpy = vi.spyOn((daemon as any).log, 'info')
+    const holder = { current: daemon }
+    const { posts, fanOut } = fakeRelay(holder, [P1, P2])
+    ;(daemon as any).relays = { sendWebchatPost: fanOut, stop: async () => {} }
+
+    await (daemon as any).handleRelayMsg(
+      rd(
+        {
+          op: 'turn',
+          text: 'count forever, alternating',
+          user: 'owner',
+          turnId: KICKOFF_TURN,
+          post: { postId: KICKOFF_TURN, at: 1_000 }
+        },
+        { agentId: P1, msgId: 'turn-p1' }
+      ),
+      () => {}
+    )
+
+    // Posts at depths 0..MAX-1; the wake that would run at depth MAX is refused.
+    await vi.waitFor(() => expect(posts).toHaveLength(MAX_AGENT_CALL_HOPS), waitBudget(25_000))
+    await settle()
+    expect(posts).toHaveLength(MAX_AGENT_CALL_HOPS)
+    const last = posts.at(-1)!
+    expect(last.post.author.kind === 'agent' && last.post.author.hopCount).toBe(MAX_AGENT_CALL_HOPS - 1)
+    expect(infoSpy.mock.calls.map((c) => c[0])).toContainEqual(
+      expect.stringContaining(`hop_limit: source depth ${MAX_AGENT_CALL_HOPS - 1} + 1 reaches ${MAX_AGENT_CALL_HOPS}`)
+    )
+    await daemon.stop()
+  }, 60_000)
+
+  it('admits one wake per (post, target): a re-fanned copy under a fresh relay msgId does not double-wake', async () => {
+    const { factory, prompts } = scriptedHosts({ [P1]: () => NO_RESPONSE })
+    const daemon = new Daemon({ root: scaffold([P1]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2]) // the author lives on another daemon — only the edge matters
+    const post = agentPost(P2, 'peer says hi', 2_000, '00000001-0000-4000-8000-000000000001', 0)
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { msgId: 'c-1' }), () => {})
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { msgId: 'c-2' }), () => {})
+    await vi.waitFor(() => expect(prompts.get(P1)).toHaveLength(1), WAIT)
+    await settle()
+    expect(prompts.get(P1)).toHaveLength(1)
+    await daemon.stop()
+  })
+
+  it('an agent post with no depth stamp stays transcript-only (pre-parity daemon, fail closed)', async () => {
+    const { factory, prompts } = scriptedHosts({ [P1]: () => 'should never run' })
+    const daemon = new Daemon({ root: scaffold([P1]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2])
+    const post = agentPost(P2, 'legacy peer post', 2_000, '00000002-0000-4000-8000-000000000002')
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { msgId: 'c-1' }), () => {})
+    await settle()
+    // Recorded for §8.5 catch-up…
+    const rows = (
+      await (daemon as any).store.transcriptSince(
+        {
+          transcriptChannel: transcriptChannelKey(CONV, undefined),
+          coordinate: `webchat:${CONV}`,
+          sessionKey: 'webchat',
+          agentId: 'bot-a'
+        },
+        null
+      )
+    ).map((row: { text: string }) => row.text)
+    expect(rows).toEqual(['legacy peer post'])
+    // …but no activation.
+    expect(prompts.get(P1)).toHaveLength(0)
+    await daemon.stop()
+  })
+
+  // The fan-out leg of the #912 regression: a user turn targeted at one participant
+  // reaches the rest as a `context` post, and that copy wrote the author's DISPLAY NAME
+  // as the transcript sender too. Both writers must agree on the stable principal, or a
+  // peer's copy of one post identifies its author differently from the target's copy.
+  it("records a user context post under the author's principal, and caches their handle", async () => {
+    const { factory } = scriptedHosts({ [P1]: () => NO_RESPONSE })
+    const daemon = new Daemon({ root: scaffold([P1]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2])
+    const post: WebchatPost = {
+      ...userPost('a peer sees this', 2_000, '00000009-0000-4000-8000-000000000009'),
+      author: { kind: 'user', user: 'Ada Lovelace', userId: 'user-1' }
+    }
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { msgId: 'c-1' }), () => {})
+    await settle()
+
+    const rows = (await (daemon as any).store.transcriptSince(
+      {
+        transcriptChannel: transcriptChannelKey(CONV, undefined),
+        coordinate: `webchat:${CONV}`,
+        sessionKey: 'webchat',
+        agentId: 'bot-a'
+      },
+      null
+    )) as { sender: string; text: string }[]
+    expect(rows.map((r) => r.text)).toEqual(['a peer sees this'])
+    expect(rows[0]!.sender).toBe('user-1')
+    expect((await (daemon as any).store.getDisplayNames(['user-1'])).get('user-1')).toBe('Ada Lovelace')
+    await daemon.stop()
+  })
+
+  it('the author never self-activates: a context frame mis-addressed to the author is dropped', async () => {
+    const { factory, prompts } = scriptedHosts({ [P1]: () => 'should never run' })
+    const daemon = new Daemon({ root: scaffold([P1]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1])
+    // A (buggy or malicious) relay addressing the author's own post back at it.
+    const post = agentPost(P1, 'my own words', 2_000, '00000003-0000-4000-8000-000000000003', 0)
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { agentId: P1, msgId: 'c-1' }), () => {})
+    await settle()
+    expect(prompts.get(P1)).toHaveLength(0)
+    expect(await (daemon as any).store.getActivation(rendezvousKey(post.postId, P1))).toBeUndefined()
+    await daemon.stop()
+  })
+
+  it('the directional call policy gates the continuation edge', async () => {
+    const { factory, prompts } = scriptedHosts({ [P1]: () => 'should never run' })
+    const daemon = new Daemon({ root: scaffold([P1]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2], { [P1]: { callPolicy: 'selected', allowedCallerAgentIds: [] } })
+    const post = agentPost(P2, 'not allowed to wake you', 2_000, '00000004-0000-4000-8000-000000000004', 0)
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { msgId: 'c-1' }), () => {})
+    await settle()
+    expect(prompts.get(P1)).toHaveLength(0) // transcript-only; the row still records
+    const rows = (
+      await (daemon as any).store.transcriptSince(
+        {
+          transcriptChannel: transcriptChannelKey(CONV, undefined),
+          coordinate: `webchat:${CONV}`,
+          sessionKey: 'webchat',
+          agentId: 'bot-a'
+        },
+        null
+      )
+    ).map((row: { text: string }) => row.text)
+    expect(rows).toEqual(['not allowed to wake you'])
+    await daemon.stop()
+  })
+
+  it('streaming never activates: peers wake only on the committed post, not while the author is generating', async () => {
+    let releaseP1!: () => void
+    const p1Blocked = new Promise<void>((resolve) => (releaseP1 = resolve))
+    const { factory, prompts } = scriptedHosts({
+      [P1]: async () => {
+        await p1Blocked
+        return 'the committed answer'
+      },
+      [P2]: () => NO_RESPONSE
+    })
+    const daemon = new Daemon({ root: scaffold([P1, P2]), hostFactory: factory })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2])
+    const holder = { current: daemon }
+    const { posts, fanOut } = fakeRelay(holder, [P1, P2])
+    ;(daemon as any).relays = { sendWebchatPost: fanOut, stop: async () => {} }
+    await (daemon as any).handleRelayMsg(
+      rd(
+        { op: 'turn', text: 'go', user: 'owner', turnId: KICKOFF_TURN, post: { postId: KICKOFF_TURN, at: 1_000 } },
+        { agentId: P1, msgId: 'turn-p1' }
+      ),
+      () => {}
+    )
+    await vi.waitFor(() => expect(prompts.get(P1)).toHaveLength(1), WAIT)
+    await settle()
+    // Mid-generation: nothing committed, nothing fanned, peer untouched.
+    expect(posts).toHaveLength(0)
+    expect(prompts.get(P2)).toHaveLength(0)
+    releaseP1()
+    await vi.waitFor(() => expect(prompts.get(P2)).toHaveLength(1), WAIT)
+    expect(posts.map((p) => p.post.text)).toEqual(['the committed answer'])
+    await daemon.stop()
+  })
+})
+
+// #2865: a human @mention never gates the wake (#549 parity), but a left-out peer is told to stay silent by default.
+describe('webchat continuation narrowed by a human @mention', () => {
+  const outsideScope = (prompt: string | undefined) => prompt?.includes('the human @-mentioned other participants')
+  async function narrowedKickoff(
+    replies: Parameters<typeof scriptedHosts>[0],
+    decorate?: (agentId: string, host: Record<string, any>) => void
+  ) {
+    const scripted = scriptedHosts(replies)
+    const prompts = scripted.prompts
+    const factory = (agent: { id: string }, onUpdate: (sid: string, u: unknown) => void) => {
+      const host = scripted.factory(agent, onUpdate)
+      decorate?.(agent.id, host)
+      return host
+    }
+    const daemon = new Daemon({ root: scaffold([P1, P2, REF]), hostFactory: factory as any })
+    await daemon.start()
+    ;(daemon as any).cpClient = fakeCpClient()
+    seedCallPolicy(daemon, [P1, P2, REF])
+    const { posts, fanOut } = fakeRelay({ current: daemon }, [P1, P2, REF])
+    ;(daemon as any).relays = { sendWebchatPost: fanOut, stop: async () => {} }
+    const text = `@${P1} what do you think?`
+    // The browser's stream for the kickoff turn: a left-out peer must never reach it.
+    const browserEvents: RdChatEvent[] = []
+    const ack = await (daemon as any).handleRelayMsg(
+      rd(
+        {
+          op: 'turn',
+          text,
+          user: 'owner',
+          turnId: KICKOFF_TURN,
+          mentions: [P1],
+          post: { postId: KICKOFF_TURN, at: 1_000 }
+        },
+        { agentId: P1, msgId: 'turn-p1' }
+      ),
+      (e: RdChatEvent) => browserEvents.push(e)
+    )
+    expect(ack).toMatchObject({ accepted: true })
+    for (const [peer, msgId] of [
+      [P2, 'uctx-p2'],
+      [REF, 'uctx-ref']
+    ] as const) {
+      await (daemon as any).handleRelayMsg(
+        rd({ op: 'context', post: userPost(text, 1_000, KICKOFF_TURN) }, { agentId: peer, msgId }),
+        () => {}
+      )
+    }
+    return { daemon, prompts, posts, browserEvents }
+  }
+
+  // A peer post injected straight into one participant, the way the relay fans it out.
+  async function deliverPeerPost(daemon: Daemon, to: string, post: WebchatPost, msgId: string) {
+    await (daemon as any).handleRelayMsg(rd({ op: 'context', post }, { agentId: to, msgId }), () => {})
+  }
+  const scopedPost = (author: string, text: string, at: number, postId: string, scope: string[]): WebchatPost => {
+    const post = agentPost(author, text, at, postId, 0)
+    return { ...post, author: { ...post.author, addressedAgentIds: scope } as WebchatPost['author'] }
+  }
+  const gate = () => {
+    let open!: () => void
+    const opened = new Promise<void>((resolve) => (open = resolve))
+    return { open, opened }
+  }
+  const agentOf = (e: RdChatEvent) => (e.kind === 'output' ? e.output.agentId : e.done.agentId)
+
+  it('still wakes the left-out peers, who stay silent in the browser and in every post', async () => {
+    const { daemon, prompts, posts, browserEvents } = await narrowedKickoff({
+      [P1]: () => 'here is my answer',
+      [P2]: () => NO_RESPONSE,
+      // Prose that ends in the sentinel is a decline too: it must not leak as a post.
+      [REF]: () => `Sounds right to me.\n${NO_RESPONSE}`
+    })
+    await vi.waitFor(() => {
+      expect(prompts.get(P2)).toHaveLength(1)
+      expect(prompts.get(REF)).toHaveLength(1)
+    }, WAIT)
+    await settle()
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.post.author).toMatchObject({ kind: 'agent', agentId: P1, hopCount: 0, addressedAgentIds: [P1] })
+    expect(outsideScope(prompts.get(P2)![0])).toBe(true)
+    expect(outsideScope(prompts.get(REF)![0])).toBe(true)
+    expect(outsideScope(prompts.get(P1)![0])).toBe(false)
+    expect(browserEvents.length).toBeGreaterThan(0)
+    expect(browserEvents.every((e) => agentOf(e) === P1)).toBe(true)
+    await daemon.stop()
+  })
+
+  it('does not let an uninvited reply widen the scope or end its author’s reminders', async () => {
+    let refTurns = 0
+    const { daemon, prompts, posts } = await narrowedKickoff({
+      [P1]: () => NO_RESPONSE,
+      [P2]: () => NO_RESPONSE,
+      [REF]: () => (++refTurns === 1 ? 'chiming in anyway' : NO_RESPONSE)
+    })
+    // P1 answers the human first, then the referee speaks up despite its reminder.
+    await deliverPeerPost(
+      daemon,
+      REF,
+      scopedPost(P1, 'here is my answer', 2_000, '00000005-0000-4000-8000-000000000005', [P1]),
+      'p1-to-ref'
+    )
+    await vi.waitFor(() => expect(posts.map((p) => p.agentId)).toEqual([REF]), WAIT)
+    await settle()
+    expect(posts[0]!.post.author).toMatchObject({ agentId: REF, addressedAgentIds: [P1] })
+    // Its post wakes P1 inside the scope and P2 outside it, with no widening.
+    await vi.waitFor(() => expect(prompts.get(P2)!.length).toBeGreaterThanOrEqual(1), WAIT)
+    expect(prompts.get(P2)!.every(outsideScope)).toBe(true)
+    await daemon.stop()
+  })
+
+  it('an addressed turn that absorbs a left-out post keeps its scope and is told whose exchange that is', async () => {
+    const release = gate()
+    const drafting = gate()
+    let p2Turns = 0
+    let p1Turns = 0
+    const { daemon, prompts, posts } = await narrowedKickoff({
+      [P1]: () => (++p1Turns === 1 ? `@${P2} your turn` : NO_RESPONSE),
+      [P2]: async () => {
+        if (++p2Turns === 1) {
+          drafting.open()
+          await release.opened
+          return 'first draft'
+        }
+        return 'my turn, revised'
+      },
+      [REF]: () => NO_RESPONSE
+    })
+    await drafting.opened
+    // While P2 drafts its invited reply, the referee's exchange with the human lands on P2 as an out-of-scope wake.
+    await deliverPeerPost(
+      daemon,
+      P2,
+      scopedPost(REF, 'unrelated chatter', 3_000, '00000006-0000-4000-8000-000000000006', [REF]),
+      'ref-to-p2'
+    )
+    release.open()
+    await vi.waitFor(() => expect(posts.some((p) => p.agentId === P2)).toBe(true), WAIT)
+    await settle()
+    const replacement = prompts.get(P2)![1]!
+    expect(replacement).toContain('unrelated chatter')
+    expect(replacement).toContain(`from [${REF}] in this update belong to an exchange the human addressed to other`)
+    expect(outsideScope(replacement)).toBe(false)
+    const reply = posts.find((p) => p.agentId === P2)!
+    expect(reply.post.text).toBe('my turn, revised')
+    expect(reply.post.author).toMatchObject({ addressedAgentIds: [P1, P2] })
+    await daemon.stop()
+  })
+
+  it('a left-out turn that absorbs an invitation is released and joins the scope', async () => {
+    const release = gate()
+    const drafting = gate()
+    let p2Turns = 0
+    const { daemon, prompts, posts } = await narrowedKickoff({
+      [P1]: () => 'here is my answer',
+      [P2]: async () => {
+        if (++p2Turns === 1) {
+          drafting.open()
+          await release.opened
+          return NO_RESPONSE
+        }
+        return 'checked'
+      },
+      [REF]: () => NO_RESPONSE
+    })
+    await drafting.opened
+    expect(outsideScope(prompts.get(P2)![0])).toBe(true)
+    // While P2 holds its reminded wake, P1 explicitly invites it.
+    await deliverPeerPost(
+      daemon,
+      P2,
+      scopedPost(P1, `@${P2} can you check this?`, 3_000, '00000007-0000-4000-8000-000000000007', [P1]),
+      'invite-to-p2'
+    )
+    release.open()
+    await vi.waitFor(() => expect(posts.some((p) => p.agentId === P2)).toBe(true), WAIT)
+    await settle()
+    const replacement = prompts.get(P2)![1]!
+    expect(replacement).toContain('no longer applies')
+    expect(outsideScope(replacement)).toBe(false)
+    const reply = posts.find((p) => p.agentId === P2)!
+    expect(reply.post.text).toBe('checked')
+    expect(reply.post.author).toMatchObject({ addressedAgentIds: [P1, P2] })
+    await daemon.stop()
+  })
+
+  it('an invitation absorbed before the first prompt drops the stale reminder from that prompt', async () => {
+    const starting = gate()
+    const go = gate()
+    let p1Turns = 0
+    let p2Turns = 0
+    const { daemon, prompts, posts } = await narrowedKickoff(
+      {
+        [P1]: () => (++p1Turns === 1 ? 'here is my answer' : NO_RESPONSE),
+        [P2]: () => (++p2Turns === 1 ? 'checked' : NO_RESPONSE),
+        [REF]: () => NO_RESPONSE
+      },
+      (agentId, host) => {
+        if (agentId !== P2) return
+        const create = host.newSession
+        host.newSession = vi.fn(async (...args: unknown[]) => {
+          starting.open()
+          await go.opened
+          return create(...args)
+        })
+      }
+    )
+    // P2's left-out wake is held in its startup gates when P1 invites it.
+    await starting.opened
+    await deliverPeerPost(
+      daemon,
+      P2,
+      scopedPost(P1, `@${P2} can you check this?`, 3_000, '00000008-0000-4000-8000-000000000008', [P1]),
+      'invite-before-prompt'
+    )
+    go.open()
+    await vi.waitFor(() => expect(posts.some((p) => p.agentId === P2)).toBe(true), WAIT)
+    await settle()
+    expect(prompts.get(P2)).toHaveLength(1)
+    expect(prompts.get(P2)![0]).toContain('can you check this?')
+    expect(outsideScope(prompts.get(P2)![0])).toBe(false)
+    expect(prompts.get(P2)![0]).not.toContain('no longer applies')
+    expect(posts.find((p) => p.agentId === P2)!.post.author).toMatchObject({ addressedAgentIds: [P1, P2] })
+    await daemon.stop()
+  })
+
+  it('a message steered into a left-out turn carries the release with it', async () => {
+    const drafting = gate()
+    const release = gate()
+    const steered: string[][] = []
+    let p2Turns = 0
+    const { daemon, posts } = await narrowedKickoff(
+      {
+        [P1]: () => 'here is my answer',
+        [P2]: async () => {
+          if (++p2Turns === 1) {
+            drafting.open()
+            await release.opened
+            return 'checked'
+          }
+          return NO_RESPONSE
+        },
+        [REF]: () => NO_RESPONSE
+      },
+      (agentId, host) => {
+        if (agentId !== P2) return
+        host.steeringSupported = () => true
+        host.steer = vi.fn(async (_sid: string, blocks: Array<{ text?: string }>) => {
+          steered.push(blocks.map((b) => b.text ?? ''))
+          return 'injected'
+        })
+      }
+    )
+    await drafting.opened
+    const STEER_TURN = '66666666-6666-4666-8666-666666666666'
+    const ack = await (daemon as any).handleRelayMsg(
+      rd(
+        {
+          op: 'turn',
+          text: `@${P2} please check this too`,
+          user: 'owner',
+          turnId: STEER_TURN,
+          mentions: [P2],
+          steer: true,
+          post: { postId: STEER_TURN, at: 4_000 }
+        },
+        { agentId: P2, msgId: 'steer-p2' }
+      ),
+      () => {}
+    )
+    expect(ack).toMatchObject({ accepted: true, steered: true })
+    expect(steered).toHaveLength(1)
+    expect(steered[0]!.join('\n')).toContain('please check this too')
+    expect(steered[0]!.join('\n')).toContain('no longer applies')
+    release.open()
+    await vi.waitFor(() => expect(posts.some((p) => p.agentId === P2)).toBe(true), WAIT)
+    await settle()
+    expect(posts.find((p) => p.agentId === P2)!.post.author).toMatchObject({ addressedAgentIds: [P2] })
+    await daemon.stop()
+  })
+
+  it('treats a peer the reply @-names as addressed, and carries the widened scope on', async () => {
+    let p1Turns = 0
+    const { daemon, prompts, posts } = await narrowedKickoff({
+      [P1]: () => (++p1Turns === 1 ? `@${P2} your turn: 1` : NO_RESPONSE),
+      [P2]: () => '2',
+      [REF]: () => NO_RESPONSE
+    })
+    await vi.waitFor(() => expect(posts.map((p) => p.post.text)).toEqual([`@${P2} your turn: 1`, '2']), WAIT)
+    await vi.waitFor(() => expect(prompts.get(P1)).toHaveLength(2), WAIT)
+    await settle()
+    expect(outsideScope(prompts.get(P2)![0])).toBe(false)
+    expect(outsideScope(prompts.get(REF)![0])).toBe(true)
+    // P2's reply carries the widened scope, so P1 is woken inside it and the referee stays outside.
+    expect(posts[1]!.post.author).toMatchObject({ agentId: P2, hopCount: 1, addressedAgentIds: [P1, P2] })
+    expect(outsideScope(prompts.get(P1)![1])).toBe(false)
+    expect(prompts.get(REF)!.every(outsideScope)).toBe(true)
+    await daemon.stop()
+  })
+})

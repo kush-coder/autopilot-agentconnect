@@ -1,0 +1,189 @@
+import type {
+  WebchatMcpGrantAccept,
+  WebchatMcpGrantIssue,
+  WebchatMcpGrantRenew,
+  WebchatMcpGrantRenewed,
+  WebchatMcpGrantRevoke,
+  WebchatRemoteMcpEntitlement
+} from '@agentconnect.md/protocol'
+import { AgentId, OrgId } from '../domain/ids.js'
+import type { Clock } from '../domain/clock.js'
+import type { WebchatMcpAccessGrantRepo, WebchatMcpDelegationRepo } from '../persistence/ports.js'
+import type { WebchatMcpGrantTokenCodec } from './webchatMcpGrantToken.js'
+import { resolveLiveWebchatMcpAuthority, type LiveWebchatMcpAuthorityDeps } from './webchatMcpAuthority.js'
+
+export const WEBCHAT_MCP_AUTHORITY_TTL_MS = 12 * 60 * 60_000
+export const WEBCHAT_MCP_GRANT_TTL_MS = 30 * 60_000
+export const WEBCHAT_MCP_PENDING_TTL_MS = 2 * 60_000
+
+export interface EstablishRemoteMcpInput {
+  conversationId: string
+  verifiedUserId: string
+  orgId: string
+  agentId: string
+  daemonId: string
+  sessionExpiresAt?: Date
+}
+
+export interface WebchatRemoteMcpServiceDeps extends LiveWebchatMcpAuthorityDeps {
+  clock: Pick<Clock, 'now'>
+  tokenCodec: WebchatMcpGrantTokenCodec
+  authorities: Pick<WebchatMcpDelegationRepo, 'establish' | 'getCurrent'>
+  grants: WebchatMcpAccessGrantRepo
+  mcpUrl: string
+}
+
+export class WebchatRemoteMcpService {
+  constructor(private readonly deps: WebchatRemoteMcpServiceDeps) {}
+
+  async establish(input: EstablishRemoteMcpInput): Promise<WebchatRemoteMcpEntitlement | null> {
+    const now = new Date(this.deps.clock.now())
+    const defaultExpiry = new Date(now.getTime() + WEBCHAT_MCP_AUTHORITY_TTL_MS)
+    const expiresAt =
+      input.sessionExpiresAt && input.sessionExpiresAt < defaultExpiry ? input.sessionExpiresAt : defaultExpiry
+    if (expiresAt <= now) return null
+    const live = await resolveLiveWebchatMcpAuthority(this.deps, {
+      conversationId: input.conversationId,
+      expectedUserId: input.verifiedUserId,
+      orgId: input.orgId,
+      agentId: input.agentId,
+      actingDaemonId: input.daemonId
+    })
+    if (!live.ok) return null
+    const authority = await this.deps.authorities.establish({
+      conversationId: input.conversationId,
+      userId: live.userId,
+      orgId: OrgId(input.orgId),
+      agentId: AgentId(input.agentId),
+      expectedPlacement: live.placement,
+      now,
+      expiresAt
+    })
+    return authority
+      ? {
+          authorityId: authority.id,
+          authorityGeneration: authority.generation,
+          expiresAt: authority.expiresAt.toISOString()
+        }
+      : null
+  }
+
+  async issue(input: WebchatMcpGrantIssue & { authenticatedDaemonId: string; authenticatedOrgId?: string }) {
+    const now = new Date(this.deps.clock.now())
+    const authority = await this.deps.authorities.getCurrent(input.authorityId)
+    if (
+      !authority ||
+      authority.generation !== input.authorityGeneration ||
+      authority.conversationId !== input.conversationId ||
+      (input.authenticatedOrgId && authority.orgId !== input.authenticatedOrgId) ||
+      authority.revokedAt ||
+      authority.expiresAt <= now
+    ) {
+      return null
+    }
+    // The connected daemon must be one that serves the agent right now — the fence the row's
+    // daemon column used to stand in for, and the one it got wrong for a pool agent.
+    const live = await resolveLiveWebchatMcpAuthority(this.deps, {
+      conversationId: authority.conversationId,
+      expectedUserId: authority.userId,
+      orgId: authority.orgId,
+      agentId: authority.agentId,
+      actingDaemonId: input.authenticatedDaemonId
+    })
+    if (!live.ok) return null
+
+    const token = this.deps.tokenCodec.mint()
+    const expiresAt = new Date(Math.min(authority.expiresAt.getTime(), now.getTime() + WEBCHAT_MCP_GRANT_TTL_MS))
+    const grant = await this.deps.grants.issue({
+      ...input,
+      tokenHash: token.tokenHash,
+      now,
+      pendingExpiresAt: new Date(now.getTime() + WEBCHAT_MCP_PENDING_TTL_MS),
+      expiresAt
+    })
+    return grant
+      ? {
+          authorityId: input.authorityId,
+          authorityGeneration: input.authorityGeneration,
+          conversationId: input.conversationId,
+          descriptorInstanceId: input.descriptorInstanceId,
+          grantRevision: grant.grantRevision,
+          grantId: grant.id,
+          token: token.plaintext,
+          expiresAt: grant.expiresAt.toISOString(),
+          mcpUrl: this.deps.mcpUrl
+        }
+      : null
+  }
+
+  async accept(input: WebchatMcpGrantAccept & { authenticatedDaemonId: string; authenticatedOrgId?: string }) {
+    const authority = await this.deps.authorities.getCurrent(input.authorityId)
+    if (!authority || (input.authenticatedOrgId && authority.orgId !== input.authenticatedOrgId)) return null
+    if (!(await this.mayAct(authority.agentId, input.authenticatedDaemonId))) return null
+    return this.deps.grants.accept({ ...input, now: new Date(this.deps.clock.now()) })
+  }
+
+  /** Slides the active grant's expiry forward, capped by its authority, under the same live checks as issuance. */
+  async renew(
+    input: WebchatMcpGrantRenew & { authenticatedDaemonId: string; authenticatedOrgId?: string }
+  ): Promise<WebchatMcpGrantRenewed | null> {
+    const now = new Date(this.deps.clock.now())
+    const authority = await this.deps.authorities.getCurrent(input.authorityId)
+    if (
+      !authority ||
+      authority.generation !== input.authorityGeneration ||
+      authority.conversationId !== input.conversationId ||
+      (input.authenticatedOrgId && authority.orgId !== input.authenticatedOrgId) ||
+      authority.revokedAt ||
+      authority.expiresAt <= now
+    ) {
+      return null
+    }
+    const live = await resolveLiveWebchatMcpAuthority(this.deps, {
+      conversationId: authority.conversationId,
+      expectedUserId: authority.userId,
+      orgId: authority.orgId,
+      agentId: authority.agentId,
+      actingDaemonId: input.authenticatedDaemonId
+    })
+    if (!live.ok) return null
+    const grant = await this.deps.grants.renew({
+      grantId: input.grantId,
+      authorityId: input.authorityId,
+      authorityGeneration: input.authorityGeneration,
+      conversationId: input.conversationId,
+      descriptorInstanceId: input.descriptorInstanceId,
+      grantRevision: input.grantRevision,
+      now,
+      expiresAt: new Date(Math.min(authority.expiresAt.getTime(), now.getTime() + WEBCHAT_MCP_GRANT_TTL_MS))
+    })
+    if (!grant) return null
+    return {
+      authorityId: input.authorityId,
+      authorityGeneration: input.authorityGeneration,
+      conversationId: input.conversationId,
+      descriptorInstanceId: input.descriptorInstanceId,
+      grantRevision: grant.grantRevision,
+      grantId: grant.id,
+      expiresAt: grant.expiresAt.toISOString()
+    }
+  }
+
+  async revoke(
+    input: WebchatMcpGrantRevoke & { authenticatedDaemonId: string; authenticatedOrgId?: string }
+  ): Promise<boolean> {
+    const authority = await this.deps.authorities.getCurrent(input.authorityId)
+    if (!authority || (input.authenticatedOrgId && authority.orgId !== input.authenticatedOrgId)) return false
+    if (!(await this.mayAct(authority.agentId, input.authenticatedDaemonId))) return false
+    return this.deps.grants.revokeAuthority({
+      ...input,
+      now: new Date(this.deps.clock.now())
+    })
+  }
+
+  /** The daemon fence the grant SQL no longer carries: authority is a live resolver question. */
+  private async mayAct(agentId: string, daemonId: string): Promise<boolean> {
+    const agent = await this.deps.agents.getUnscoped(AgentId(agentId))
+    return agent ? this.deps.placement.mayAct(agent, daemonId) : false
+  }
+}

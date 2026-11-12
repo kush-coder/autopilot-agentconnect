@@ -1,0 +1,83 @@
+/** §11.1 desired-events union: the managed webhook subscribes to exactly what
+ *  the enabled gitlab hooks on the project need, comments over-subscribed. */
+import { describe, expect, it } from 'vitest'
+import { unionGitlabWebhookEvents } from './webhook-events.js'
+
+const PROJECT = 4455667n
+const hook = (over: Partial<Parameters<typeof unionGitlabWebhookEvents>[0][number]> = {}) => ({
+  enabled: true,
+  kind: 'gitlab' as const,
+  repoId: PROJECT,
+  events: ['issues:*'],
+  commentFamilies: [],
+  ...over
+})
+
+describe('unionGitlabWebhookEvents', () => {
+  it('returns null when no enabled gitlab hook targets the project', () => {
+    expect(unionGitlabWebhookEvents([], PROJECT)).toBeNull()
+    expect(unionGitlabWebhookEvents([hook({ enabled: false })], PROJECT)).toBeNull()
+    expect(unionGitlabWebhookEvents([hook({ kind: 'github' })], PROJECT)).toBeNull()
+    expect(unionGitlabWebhookEvents([hook({ repoId: 1n })], PROJECT)).toBeNull()
+  })
+
+  it('unions event families across hooks', () => {
+    const events = unionGitlabWebhookEvents(
+      [hook(), hook({ events: ['merge_request:opened'] }), hook({ events: ['push:*'] })],
+      PROJECT
+    )
+    expect(events).toEqual({
+      push_events: true,
+      issues_events: true,
+      merge_requests_events: true,
+      note_events: true,
+      pipeline_events: false,
+      releases_events: false
+    })
+  })
+
+  it('subscribes a release hook to release events alone — nobody comments on a release', () => {
+    expect(unionGitlabWebhookEvents([hook({ events: ['release:published'] })], PROJECT)).toEqual({
+      push_events: false,
+      issues_events: false,
+      merge_requests_events: false,
+      note_events: false,
+      pipeline_events: false,
+      releases_events: true
+    })
+  })
+
+  it('thread-bearing triggers and comment families subscribe notes; a push-only hook does not', () => {
+    expect(unionGitlabWebhookEvents([hook({ events: ['push:*'] })], PROJECT)?.note_events).toBe(false)
+    expect(
+      unionGitlabWebhookEvents([hook({ events: ['push:*'], commentFamilies: ['merge_request'] })], PROJECT)?.note_events
+    ).toBe(true)
+    expect(unionGitlabWebhookEvents([hook({ events: ['merge_request:*'] })], PROJECT)).toMatchObject({
+      merge_requests_events: true,
+      note_events: true,
+      issues_events: false,
+      push_events: false
+    })
+  })
+  it('subscribes feedback without requiring a review trigger', () => {
+    expect(unionGitlabWebhookEvents([], PROJECT, true)).toMatchObject({
+      note_events: true,
+      merge_requests_events: true,
+      pipeline_events: true
+    })
+  })
+})
+
+describe('unionGitlabWebhookEvents for follow-ups (assistant-mode.md §5.14)', () => {
+  it('subscribes a project a follow-up watches to merge-request, issue, note and pipeline events', () => {
+    expect(unionGitlabWebhookEvents([], PROJECT, false, true)).toEqual({
+      push_events: false,
+      issues_events: true,
+      merge_requests_events: true,
+      note_events: true,
+      pipeline_events: true,
+      releases_events: false
+    })
+    expect(unionGitlabWebhookEvents([], PROJECT, true, false)?.issues_events).toBe(false)
+  })
+})

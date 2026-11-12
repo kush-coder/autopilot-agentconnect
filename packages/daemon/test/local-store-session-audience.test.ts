@@ -1,0 +1,133 @@
+import { describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { LocalStore, SCHEMA_VERSION } from '../src/store/local-store.js'
+
+const TENANT = '11111111-1111-4111-8111-111111111111'
+
+describe('chat audience upgrade', () => {
+  it('preserves known conversations and inherited audiences without claiming synthetic or console sessions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ac-audience-'))
+    const path = join(dir, 'store.sqlite')
+    let store = await LocalStore.open(path)
+    try {
+      for (const [key, platform, channel, parent, direct] of [
+        ['telegram', 'telegram', '-10042', null, false],
+        ['discord', 'discord', '100000000000000004', null, false],
+        ['child', 'telegram', 'a2a:parent', 'session-telegram', false],
+        ['synthetic', 'discord', 'cron:example', null, false],
+        ['console', 'telegram', '123', null, false],
+        ['direct', 'telegram', '-10043', 'session-discord', true],
+        ['googlechat', 'googlechat', 'spaces/AAAAAAAAAAA', null, false],
+        ['google-child', 'googlechat', 'a2a:parent', 'session-googlechat', false],
+        ['google-direct', 'googlechat', 'spaces/BBBBBBBBBBB', 'session-googlechat', true],
+        ['google-console', 'googlechat', 'spaces/CCCCCCCCCCC', null, false],
+        ['google-synthetic', 'googlechat', 'cron:example', null, false],
+        ['msteams', 'msteams', '19:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@thread.tacv2', null, false],
+        ['teams-child', 'msteams', 'a2a:parent', 'session-msteams', false],
+        ['teams-dm', 'msteams', 'a:1AAAAAAAAAAAAAAAAAAAA-AAAAAAAAAAAAAAAA', null, false],
+        ['teams-console', 'msteams', '19:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@thread.tacv2', null, false],
+        ['teams-synthetic', 'msteams', 'cron:example', null, false]
+      ] as const) {
+        await store.upsertSession({
+          key,
+          platform,
+          channel,
+          agentId: 'agent-1',
+          thread: key === 'discord' ? '100000000000000005' : 'thread',
+          transportScope: 'transport-1',
+          sessionId: `session-${key}`,
+          acpSessionId: `acp-${key}`,
+          originSessionId: parent,
+          state: 'idle',
+          lastDeliveredTs: null,
+          updatedAt: 1
+        })
+        await store.setSessionClassification(key, {
+          conversationKind: 'channel',
+          sourceBindingKind: 'local',
+          tenantScope: {
+            telegram: 'bot42',
+            discord: 'mint:old',
+            googlechat: '123456789012',
+            msteams: TENANT
+          }[platform],
+          ...(key.endsWith('console') ? { launchCorrelationId: 'launch-1' } : {}),
+          ...(direct ? { directDestination: true } : {})
+        })
+      }
+      await store.close()
+      const old = new DatabaseSync(path)
+      old.exec('PRAGMA user_version = 57')
+      old.close()
+      store = await LocalStore.open(path)
+      expect(await store.getSession('telegram')).toMatchObject({
+        acpSessionId: 'acp-telegram',
+        externalProvider: 'telegram',
+        externalRealmKey: 'bot42',
+        externalResourceKey: '-10042',
+        sourceBindingKind: 'external'
+      })
+      expect(await store.getSession('discord')).toMatchObject({
+        acpSessionId: 'acp-discord',
+        externalProvider: 'discord',
+        externalRealmKey: null,
+        externalResourceKey: '100000000000000005',
+        sourceBindingKind: 'external'
+      })
+      expect(await store.getSession('child')).toMatchObject({
+        externalProvider: 'telegram',
+        externalRealmKey: 'bot42',
+        externalResourceKey: '-10042'
+      })
+      expect(await store.getSession('direct')).toMatchObject({
+        externalProvider: 'telegram',
+        externalResourceKey: '-10043'
+      })
+      for (const key of [
+        'synthetic',
+        'console',
+        'google-synthetic',
+        'google-console',
+        'teams-synthetic',
+        'teams-console'
+      ])
+        expect(await store.getSession(key)).toMatchObject({ externalProvider: null, sourceBindingKind: 'local' })
+      for (const key of ['googlechat', 'google-child', 'google-direct'])
+        expect(await store.getSession(key)).toMatchObject({
+          acpSessionId: `acp-${key}`,
+          externalProvider: 'googlechat',
+          externalRealmKey: '123456789012',
+          externalResourceKey: key === 'google-direct' ? 'spaces/BBBBBBBBBBB' : 'spaces/AAAAAAAAAAA',
+          sourceBindingKind: 'external'
+        })
+      for (const key of ['msteams', 'teams-child', 'teams-dm'])
+        expect(await store.getSession(key)).toMatchObject({
+          acpSessionId: `acp-${key}`,
+          externalProvider: 'msteams',
+          externalRealmKey: TENANT,
+          externalResourceKey:
+            key === 'teams-dm'
+              ? 'a:1AAAAAAAAAAAAAAAAAAAA-AAAAAAAAAAAAAAAA'
+              : '19:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@thread.tacv2',
+          sourceBindingKind: 'external'
+        })
+      await store.setSessionClassification('discord', {
+        externalRealmKey: 'bot100000000000000001',
+        externalIntegrationId: 'integration-1'
+      })
+      expect(await store.getSession('discord')).toMatchObject({
+        externalRealmKey: 'bot100000000000000001',
+        acpSessionId: 'acp-discord'
+      })
+      const check = new DatabaseSync(path)
+      expect(check.prepare('PRAGMA user_version').get()).toEqual({ user_version: SCHEMA_VERSION })
+      check.close()
+    } finally {
+      await store.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

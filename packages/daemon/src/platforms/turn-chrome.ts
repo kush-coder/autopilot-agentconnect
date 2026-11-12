@@ -1,0 +1,83 @@
+/**
+ * The **turn-chrome facet** (§7.4, stage S2) — the declarative half of Layer 2:
+ * which pieces of per-turn CHROME a platform's output surface offers. The
+ * behavior behind each flag stays where it always ran (core sequencing, or the
+ * platform's turn-output module); this facet only answers "does `platform` have
+ * one?", which used to be a `=== 'slack'` literal at every consulting site.
+ *
+ * THIS IS THE STRATEGY #532 SENT HERE. `statusSurface` was first proposed as a
+ * manifest axis and rejected by review — correctly: every read happens with a
+ * `Pending` in hand, i.e. AFTER dispatch, which is D2's line between a manifest
+ * capability and an adapter strategy. The Layer-2 surface family is the home
+ * that review named for it; the other flags are the same shape of fact.
+ *
+ * LOOKUP IS EXACT, NOT CORE-FALLBACK, and the difference is load-bearing:
+ * webchat / hook / dream RENDER through the core (Slack-shaped) surface, but
+ * they must not inherit Slack's chrome — a hook turn gets no attribution
+ * footer, no DM title. An unregistered platform gets `{}`: every flag reads
+ * absent, and each site's legacy default arm applies. Approval cards are a
+ * Layer-2 facet now (`TurnOutputSurface.approvalCards`), exact-looked-up too.
+ *
+ * `statusSurface` is deliberately THREE-state: `'turn-bar'` (Slack's in-place
+ * session status row), `'on-demand'` (state answered by `/status`; the emit
+ * path records its dedup key but posts nothing), and ABSENT (no declaration —
+ * the emit path's legacy default arm, which is what webchat/hook/headless and
+ * unknown platforms take today).
+ */
+
+export interface TurnChrome {
+  /** How session status reaches the user: an in-place per-turn status bar, or
+   *  on demand via `/status`. Absent ⇒ the legacy default arm. */
+  readonly statusSurface?: 'turn-bar' | 'on-demand'
+  /** Attribution footer lifecycle: blocks pre-built at prompt start so reply
+   *  sections are born with them, refreshed once more at final. */
+  readonly attributionFooter?: boolean
+  /** Live session titles pushed onto the platform's threads. Slack renders them as the
+   *  thread panel's header in DMs AND channels — a thread becomes eligible once any
+   *  agents.sessions call or a card stream registers it (verified live 2026-08-29). */
+  readonly sessionTitle?: boolean
+  /** Failure notices are posted with a chrome marker (and agent identity) so a
+   *  peer daemon's thread backfill skips them. */
+  readonly chromeMarkedNotices?: boolean
+  /** How the surface PARSES a plain notice's text, so agent-authored text quoted in one can be
+   *  defused before the surface turns it into a tappable link. Absent ⇒ no markup at all: the
+   *  text is shown verbatim and there is no label syntax to spoof a destination with. */
+  readonly noticeMarkup?: NoticeMarkup
+}
+
+/** The markup dialects a NOTICE's text is read as — `markdown` autolinks and honours
+ *  `[label](url)`. Slack's notice is one of these: `postMessage` sends a `type: 'markdown'`
+ *  block, NOT the `mrkdwn` section its elicitation CARD uses, which is defused separately in
+ *  `elicitCardMessage`. Getting those two confused leaves the label syntax live. */
+export type NoticeMarkup = 'markdown'
+
+const CHROME = new Map<string, TurnChrome>([
+  [
+    'slack',
+    {
+      statusSurface: 'turn-bar',
+      attributionFooter: true,
+      sessionTitle: true,
+      chromeMarkedNotices: true,
+      noticeMarkup: 'markdown'
+    }
+  ],
+  // The three on-demand platforms declare so EXPLICITLY: their status emit path
+  // records the dedup key and posts nothing, which is different from having no
+  // declaration at all (the legacy default arm).
+  ['telegram', { statusSurface: 'on-demand' }],
+  ['discord', { statusSurface: 'on-demand', noticeMarkup: 'markdown' }],
+  ['feishu', { statusSurface: 'on-demand' }],
+  // No status bar, and notices render as Markdown, so agent text quoted in one is defused first.
+  ['googlechat', { statusSurface: 'on-demand', noticeMarkup: 'markdown' }],
+  // The same for Teams: notices are sent as extended Markdown (teams-integration.md §4.3).
+  ['msteams', { statusSurface: 'on-demand', noticeMarkup: 'markdown' }]
+])
+
+const NONE: TurnChrome = {}
+
+/** `platform`'s chrome declaration. Exact lookup — see the class doc for why
+ *  this must NOT fall back to the core surface's declaration. */
+export function turnChromeFor(platform: string): TurnChrome {
+  return CHROME.get(platform) ?? NONE
+}

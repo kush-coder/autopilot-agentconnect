@@ -1,0 +1,257 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { MessageKind, SessionStatus, TurnState, type ChatState, type Turn } from '@microsoft/agent-host-protocol'
+import type { LocalStore } from '../../src/store/local-store.js'
+import { openTestStore } from '../store-support.js'
+import { LocalAhpCheckpoints } from '../../src/ahp/checkpoint-store.js'
+import { AhpActionJournal } from '../../src/ahp/action-journal.js'
+import { AhpAgentState } from '../../src/ahp/agent-state.js'
+const stores: LocalStore[] = []
+afterEach(async () => {
+  for (const store of stores.splice(0)) await store.close()
+})
+const binding = {
+  sessionUri: 'ahp-session:/one',
+  sessionId: 'physical',
+  conversationId: 'conversation',
+  reservationId: 'reservation'
+}
+const chat = 'ahp-chat:/one/main'
+function turn(id: string): Turn {
+  return {
+    id,
+    message: { text: id, origin: { kind: MessageKind.User } },
+    responseParts: [],
+    usage: undefined,
+    state: TurnState.Complete
+  }
+}
+async function fixture(warn?: (message: string) => void) {
+  const store = await openTestStore()
+  stores.push(store)
+  const checkpoints = new LocalAhpCheckpoints(
+    store,
+    'org',
+    'agent',
+    () => false,
+    () => 1000
+  )
+  const journal = await AhpActionJournal.create({
+    reserve: (size) => store.reserveAhpSequenceBlock('org', 'agent', size)
+  })
+  const state = new AhpAgentState(
+    { provider: 'agent', displayName: 'Agent', description: '', models: [] },
+    journal,
+    () => 1000,
+    checkpoints,
+    warn
+  )
+  return { store, checkpoints, journal, state }
+}
+
+describe('AHP checkpoint integration', () => {
+  it('journals and delivers a turn too large to checkpoint', async () => {
+    const warn = vi.fn()
+    const { state, journal } = await fixture(warn)
+    await state.add(binding)
+    const event = { sessionId: 'physical', turnId: 'long', generation: 0, at: 1000 }
+    await state.accept({ ...event, kind: 'started', text: 'Hello', origin: 'user' })
+    await state.accept({ ...event, kind: 'text', text: 'x'.repeat(600 * 1024) })
+    await state.accept({ ...event, kind: 'finished', outcome: 'complete' })
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('checkpoint skipped'))
+    expect(journal.replay(1, new Set([chat]))!.map((envelope) => envelope.action.type)).toContain('chat/turnComplete')
+    expect(state.summary(binding.sessionUri)?.status).toBe(SessionStatus.Idle)
+  })
+
+  it('journals and delivers a turn whose checkpoint save is refused', async () => {
+    const warn = vi.fn()
+    const { state, journal, checkpoints } = await fixture(warn)
+    await state.add(binding)
+    vi.spyOn(checkpoints, 'save').mockRejectedValue(new Error('AHP checkpoint exceeds storage budget'))
+    const event = { sessionId: 'physical', turnId: 'long', generation: 0, at: 1000 }
+    await state.accept({ ...event, kind: 'started', text: 'Hello', origin: 'user' })
+    await state.accept({ ...event, kind: 'text', text: 'World' })
+    await state.accept({ ...event, kind: 'finished', outcome: 'complete' })
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('storage budget'))
+    expect(journal.replay(1, new Set([chat]))!.map((envelope) => envelope.action.type)).toContain('chat/turnComplete')
+    expect(state.summary(binding.sessionUri)?.status).toBe(SessionStatus.Idle)
+  })
+
+  it('preserves the archive chronology while a client loads older pages', async () => {
+    const { store, state, journal } = await fixture()
+    const initial: ChatState = {
+      resource: chat,
+      title: 'History',
+      status: SessionStatus.Idle,
+      modifiedAt: new Date(0).toISOString(),
+      turns: [turn('first'), turn('second')],
+      turnsNextCursor: 'history:older'
+    }
+    await state.add(binding, initial)
+    const loaded = await state.fetchTurns(chat, undefined, async () => ({ turns: [turn('older')] }))
+    expect((state.snapshot(chat) as ChatState).turns.map((turn) => turn.id)).toEqual(['first', 'second'])
+    expect((state.snapshot(chat) as ChatState).turnsNextCursor).toBe('history:older')
+    expect(journal.replay(1, new Set([chat]))).toEqual([])
+    expect(loaded).toMatchObject({
+      type: 'chat/turnsLoaded',
+      turns: [{ id: 'older' }]
+    })
+    await expect(store.ahpTurnPage('org', 'agent', 'physical', 'older')).rejects.toThrow('Unknown')
+    expect(
+      (await store.ahpTurnPage('org', 'agent', 'physical', 'second')).values.map((value) => JSON.parse(value).id)
+    ).toEqual(['first'])
+  })
+
+  it('keeps Apps presentation on the session channel and expires cold unfinished cards', async () => {
+    const { state, checkpoints, store } = await fixture()
+    await state.add(binding)
+    await state.output('physical', {
+      conversationId: 'private-conversation',
+      turnId: 'turn',
+      index: 1,
+      status: { model: 'model', steerable: true },
+      event: { kind: 'app', appId: 'app', title: 'Chart', toolName: 'charts__show', htmlBytes: 10 }
+    })
+    const first = state.snapshot(binding.sessionUri)
+    expect(first).toMatchObject({
+      _meta: {
+        'agentconnect.md': {
+          agentId: 'agent',
+          sessionId: 'physical',
+          status: { model: 'model' },
+          steerable: true,
+          apps: [{ card: { appId: 'app' } }]
+        }
+      }
+    })
+    expect(JSON.stringify(state.snapshot(chat))).not.toContain('charts__show')
+    expect(JSON.stringify(first)).not.toContain('private-conversation')
+    const before = JSON.stringify(first)
+    await state.output('physical', {
+      conversationId: 'private-conversation',
+      turnId: 'turn',
+      index: 2,
+      event: {
+        kind: 'app_rpc_result',
+        appId: 'app',
+        callId: 'private-call',
+        outcome: { ok: true, result: 'secret-result' }
+      }
+    })
+    expect(JSON.stringify(state.snapshot(binding.sessionUri))).toBe(before)
+    const journal = await AhpActionJournal.create({
+      reserve: (size) => store.reserveAhpSequenceBlock('org', 'agent', size)
+    })
+    const restored = new AhpAgentState(state.provider, journal, () => 2000, checkpoints)
+    await restored.add(binding)
+    expect(restored.snapshot(binding.sessionUri)).toMatchObject({
+      _meta: { 'agentconnect.md': { apps: [{ outcome: 'expired' }] } }
+    })
+  })
+
+  it('keeps only the latest bounded plan snapshot on the session channel', async () => {
+    const { state } = await fixture()
+    await state.add(binding)
+    const plan = (turnId: string, entries: { content: string; status: string }[]) =>
+      state.output('physical', { conversationId: 'c', turnId, index: 1, event: { kind: 'plan', entries } })
+    await plan('first', [{ content: 'Read', status: 'completed' }])
+    await plan('second', [
+      { content: 'x'.repeat(600), status: 'in_progress' },
+      ...Array.from({ length: 60 }, (_, i) => ({ content: `step ${i}`, status: 'pending' }))
+    ])
+    const fields = (state.snapshot(binding.sessionUri) as { _meta: Record<string, { plan: unknown }> })._meta[
+      'agentconnect.md'
+    ]!.plan as { turnId: string; entries: { content: string }[] }
+    expect(fields.turnId).toBe('second')
+    expect(fields.entries).toHaveLength(50)
+    expect(fields.entries[0]!.content).toHaveLength(500)
+    expect(JSON.stringify(state.snapshot(chat))).not.toContain('step 1')
+  })
+
+  it('keeps capability request cards on their turn and settles them in place', async () => {
+    const { state } = await fixture()
+    await state.add(binding)
+    const card = (requestId: string, generation = 1) => ({
+      kind: 'capability_request' as const,
+      requestId,
+      generation,
+      summary: `Add ${requestId}`,
+      reason: 'Needed',
+      link: `https://console.example.test/requests/${requestId}`
+    })
+    const send = (turnId: string, event: Parameters<typeof state.output>[1]['event']) =>
+      state.output('physical', { conversationId: 'c', turnId, index: 1, event })
+    const cards = () =>
+      (state.snapshot(binding.sessionUri) as { _meta: Record<string, { capabilities: unknown }> })._meta[
+        'agentconnect.md'
+      ]!.capabilities as Array<{ turnId: string; requestId: string; generation: number; resolved?: unknown }>
+    await send('first', card('a'))
+    await send('later', { kind: 'capability_request_resolved', requestId: 'a', status: 'declined', text: 'Declined' })
+    expect(cards()).toEqual([
+      expect.objectContaining({ turnId: 'first', resolved: { status: 'declined', text: 'Declined' } })
+    ])
+    await send('later', card('a', 2))
+    expect(cards()).toEqual([expect.objectContaining({ turnId: 'first', generation: 2 })])
+    expect(cards()[0]).not.toHaveProperty('resolved')
+    await send('first', { kind: 'capability_request_resolved', requestId: 'a', status: 'completed', text: 'Done' })
+    for (let i = 0; i < 16; i++) await send('next', card(`r${i}`))
+    expect(cards()).toHaveLength(16)
+    expect(cards().map((item) => item.requestId)).not.toContain('a')
+  })
+
+  it('keeps Fill cards in session metadata as descriptors with their outcome', async () => {
+    const { state } = await fixture()
+    await state.add(binding)
+    const card = (requestId: string) => ({
+      requestId,
+      computerName: 'Desk',
+      website: { origin: 'https://login.example.test' },
+      kind: 'login' as const,
+      fields: [
+        {
+          id: 'f1',
+          control: 'password' as const,
+          purpose: 'current-password' as const,
+          required: true,
+          secret: true,
+          empty: true
+        }
+      ],
+      expiresAt: '2026-11-10T10:10:00.000Z'
+    })
+    const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
+    const send = (turnId: string, event: Parameters<typeof state.output>[1]['event']) =>
+      state.output('physical', { conversationId: 'c', turnId, index: 1, event })
+    const fills = () =>
+      (state.snapshot(binding.sessionUri) as { _meta: Record<string, { fills: unknown }> })._meta['agentconnect.md']!
+        .fills as Array<{ turnId: string; requestId: string; resolved?: string }>
+    await send('first', { kind: 'fill_request', card: card(id(1)) })
+    expect(fills()).toEqual([
+      expect.objectContaining({ turnId: 'first', requestId: id(1), website: { origin: 'https://login.example.test' } })
+    ])
+    await send('first', { kind: 'fill_resolved', requestId: id(1), outcome: 'filled' })
+    expect(fills()[0]!.resolved).toBe('filled')
+    for (let i = 2; i < 12; i++) await send('next', { kind: 'fill_request', card: card(id(i)) })
+    expect(fills()).toHaveLength(8)
+    expect(fills().map((item) => item.requestId)).not.toContain(id(1))
+  })
+
+  it('continues from the last archive page into existing transcript history', async () => {
+    const { checkpoints } = await fixture()
+    const value: ChatState = {
+      resource: chat,
+      title: 'History',
+      status: SessionStatus.Idle,
+      modifiedAt: new Date(0).toISOString(),
+      turns: [turn('first'), turn('second')],
+      _meta: { 'agentconnect.md': { historyCursor: 'history:older' } }
+    }
+    await checkpoints.save('physical', value, 1, 1, value.turns)
+    const page = await checkpoints.page('physical', `archive:${Buffer.from('second').toString('base64url')}`)
+    expect(page.turns.map((turn) => turn.id)).toEqual(['first'])
+    expect(page.nextCursor).toBe('history:older')
+    await expect(checkpoints.page('physical', 'archive:not=canonical')).rejects.toThrow('cursor')
+    await expect(checkpoints.page('other', `archive:${Buffer.from('second').toString('base64url')}`)).rejects.toThrow(
+      'cursor'
+    )
+  })
+})

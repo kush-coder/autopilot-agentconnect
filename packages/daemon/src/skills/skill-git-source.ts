@@ -1,0 +1,1270 @@
+import { spawn } from 'node:child_process'
+import { promises as fsp } from 'node:fs'
+import { join, posix } from 'node:path'
+import { Readable, Writable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { createGunzip } from 'node:zlib'
+import {
+  isGitHubSkillSource,
+  skillSourceCredential,
+  workspaceGitOriginOf,
+  type AgentSkillEntry
+} from '@agentconnect.md/protocol'
+import { extract as extractTar, list as listTar, type ReadEntry } from 'tar'
+import { authorizeWorkspaceGitUrl } from '../workspace/git-origin-policy.js'
+import { daemonLocalGitEnv, openDaemonSkillCredentialWindow, workspaceGitEnvBase } from '../workspace/git-injection.js'
+import { AGENT_CHANNEL_CAPABILITY_ENV } from '../agent-channel/env.js'
+import { TLS_TRUST_ENV } from '../config/tls-trust-env.js'
+import { MAX_SKILL_FILE_BYTES } from './skill-limits.js'
+import { discardResponse, fetchWithRedirectPolicy, readBoundedBody, retryAfterMs } from '../codehost/rest-read.js'
+import { GITHUB_API_BASE, githubApiHeaders, parseGithubRepositoryIdentity } from '../github/rest.js'
+import { gitlabSkillReads, gitlabSkillRepository, type GitlabSkillRepository } from './gitlab-skill-source.js'
+import { acquireAnonymousGitSkillSource, type HostedGitSkillTransport } from './skill-git-hosted.js'
+import { SkillSourceFailure, httpFailureCode, httpSkillFailure } from './skill-source-failure.js'
+
+const GITHUB_SHORTHAND = /^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/
+const GITHUB_TREE = /^\/([^/]+)\/([^/]+)\/tree\/([^/]+)(?:\/(.*))?$/
+const SCP_SOURCE = /^([\w.-]+)@([\w.-]+):(.+)$/
+const SAFE_REF = /^[^\0\r\n]{1,256}$/
+const GITHUB_REPOSITORY_COMPONENT = /^[A-Za-z0-9_.-]+$/
+const COMMIT_SHA = /^[a-f0-9]{40}$/i
+const MAX_ARCHIVE_LOCATION_BYTES = 8 * 1024
+const MAX_CREDENTIAL_OUTPUT_BYTES = 16 * 1024
+const MAX_REPOSITORY_METADATA_BYTES = 128 * 1024
+
+export interface GitSkillArchiveLimits {
+  maxCompressedBytes: number
+  maxTarBytes: number
+  maxEntries: number
+  maxFileBytes: number
+  maxTotalFileBytes: number
+  maxDepth: number
+  maxPathBytes: number
+}
+
+export const DEFAULT_GIT_SKILL_ARCHIVE_LIMITS: Readonly<GitSkillArchiveLimits> = {
+  // These cover a 128 MiB / 8192-entry Git collection — a marketplace of several
+  // 50 MB plugins — plus tar headers and incompressible gzip overhead; the per-file
+  // ceiling matches the installer's (skills-cli-cell.ts), so an asset the CLI cell
+  // admits is never refused here.
+  maxCompressedBytes: 160 * 1024 * 1024,
+  maxTarBytes: 160 * 1024 * 1024,
+  maxEntries: 8_192,
+  maxFileBytes: MAX_SKILL_FILE_BYTES,
+  maxTotalFileBytes: 128 * 1024 * 1024,
+  maxDepth: 64,
+  maxPathBytes: 1_024
+}
+
+export interface GitSkillCredential {
+  username: string
+  password: string
+}
+
+export interface GitSkillCredentialRequest {
+  agentId: string
+  cloneUrl: string
+  privateHome: string
+  repositoryPath: string
+  signal: AbortSignal
+}
+
+export type GitSkillCredentialProvider = (request: GitSkillCredentialRequest) => Promise<GitSkillCredential>
+
+export interface ParsedGitSkillSource {
+  cloneUrl: string
+  ref?: string
+  subDir?: string
+}
+
+function githubSshRepositoryPath(source: string): string | undefined {
+  const scp = SCP_SOURCE.exec(source)
+  if (scp) {
+    if (scp[1] !== 'git') return undefined
+    const path = scp[3]!
+    // scp's leading slash and tilde forms have server-side path semantics that
+    // are not equivalent to GitHub's HTTPS owner/repository path.
+    return path.startsWith('/') || path.startsWith('~') ? undefined : path
+  }
+
+  const url = new URL(source)
+  if (url.username !== 'git') return undefined
+  if (!url.pathname.startsWith('/') || url.pathname.startsWith('//')) return undefined
+  const path = url.pathname.slice(1)
+  return path && !path.startsWith('~') ? path : undefined
+}
+
+/** Resolve the canonical repository identity used for acquisition. Both the
+ * tenant-provided transport and a canonicalized transport must pass the
+ * daemon's shared origin policy.
+ * GitHub's standard SSH/scp spellings name the same owner/repository as HTTPS,
+ * so prefer HTTPS there to use the daemon's scoped GitHub credential helper.
+ * If an operator allows SSH but not HTTPS, preserve SSH and forward no helper
+ * capability instead of silently widening that policy. */
+export function resolveAuthorizedGitSkillCloneUrl(input: string): string {
+  const authorized = authorizeWorkspaceGitUrl(input)
+  if (workspaceGitOriginOf(authorized) !== 'ssh://github.com') return authorized
+
+  const repositoryPath = githubSshRepositoryPath(authorized)
+  if (!repositoryPath) return authorized
+  try {
+    return authorizeWorkspaceGitUrl(`https://github.com/${repositoryPath}`)
+  } catch {
+    return authorized
+  }
+}
+
+function safeSubDir(value: string | undefined): string | undefined {
+  if (value === undefined || value === '') return undefined
+  if (
+    value.includes('\\') ||
+    value.includes('\0') ||
+    value.startsWith('/') ||
+    /^[A-Za-z]:/.test(value) ||
+    posix.normalize(value) !== value ||
+    value.split('/').some((part) => part === '' || part === '.' || part === '..')
+  ) {
+    throw new Error('skill source contains an unsafe subdirectory')
+  }
+  return value
+}
+
+/** Normalize the protocol's shorthand / GitHub tree forms into a clone target.
+ * This is source acquisition only: skill discovery and harness layout remain
+ * entirely owned by the pinned skills CLI. */
+export function parseGitSkillSource(entry: AgentSkillEntry): ParsedGitSkillSource {
+  const shorthand = GITHUB_SHORTHAND.exec(entry.source)
+  if (shorthand) {
+    if (entry.ref && !SAFE_REF.test(entry.ref)) throw new Error('skill source contains an unsafe ref')
+    const subDir = safeSubDir(entry.subDir)
+    return {
+      cloneUrl: authorizeWorkspaceGitUrl(
+        `https://github.com/${shorthand[1]}/${shorthand[2]!.replace(/\.git$/i, '')}.git`
+      ),
+      ...(entry.ref ? { ref: entry.ref } : {}),
+      ...(subDir ? { subDir } : {})
+    }
+  }
+
+  let ref = entry.ref
+  let subDir = entry.subDir
+  let cloneInput = authorizeWorkspaceGitUrl(entry.source)
+  // GitHub's browser-only /tree/<ref>/<path> form is not itself cloneable.
+  // The raw form has already passed the shared exact-origin policy; the
+  // rewritten clone target is authorized again below.
+  if (workspaceGitOriginOf(cloneInput) === 'https://github.com') {
+    try {
+      const url = new URL(cloneInput)
+      const tree = GITHUB_TREE.exec(decodeURIComponent(url.pathname))
+      if (tree) {
+        url.pathname = `/${tree[1]}/${tree[2]!.replace(/\.git$/i, '')}.git`
+        cloneInput = url.toString()
+        ref ??= tree[3]
+        subDir ??= tree[4]
+      }
+    } catch {
+      throw new Error('skill source contains malformed URL encoding')
+    }
+  }
+  if (ref && !SAFE_REF.test(ref)) throw new Error('skill source contains an unsafe ref')
+  const normalizedSubDir = safeSubDir(subDir)
+  return {
+    cloneUrl: authorizeWorkspaceGitUrl(cloneInput),
+    ...(ref ? { ref } : {}),
+    ...(normalizedSubDir ? { subDir: normalizedSubDir } : {})
+  }
+}
+
+export function buildSkillGitAcquisitionEnv(opts: {
+  agentId: string
+  cloneUrl: string
+  privateHome: string
+  useGitCredential: boolean
+  /** A skill credential window's capability, presented in place of the agent's (source-cache.md §8). */
+  windowCapability?: string
+}): Record<string, string> {
+  const credentialed = opts.useGitCredential && workspaceGitOriginOf(opts.cloneUrl) === 'https://github.com'
+  const configured = {
+    ...workspaceGitEnvBase(opts.cloneUrl),
+    // Acquisition runs on THIS daemon even for a cluster agent, so the helper names the daemon's own shim and socket.
+    ...(credentialed ? daemonLocalGitEnv(opts.agentId, opts.cloneUrl) : {}),
+    ...(credentialed && opts.windowCapability ? { [AGENT_CHANNEL_CAPABILITY_ENV]: opts.windowCapability } : {})
+  }
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '',
+    HOME: opts.privateHome,
+    TMPDIR: join(opts.privateHome, 'tmp'),
+    GIT_TERMINAL_PROMPT: '0'
+  }
+  for (const [key, value] of Object.entries(configured)) {
+    if (value === undefined) continue
+    const upper = key.toUpperCase()
+    if (
+      upper.startsWith('GIT_') ||
+      upper.startsWith('AC_AGENT_CHANNEL_') ||
+      TLS_TRUST_ENV.includes(upper as (typeof TLS_TRUST_ENV)[number]) ||
+      upper === 'LANG' ||
+      upper === 'LC_ALL'
+    ) {
+      env[key] = value
+    }
+  }
+  // Never let a source or host config turn acquisition into a local-file or
+  // helper-protocol read. URL-scoped credential helpers still work over HTTPS.
+  env.GIT_ALLOW_PROTOCOL = 'https:ssh'
+  return env
+}
+
+function githubRepository(cloneUrl: string): { owner: string; repo: string; path: string } {
+  if (workspaceGitOriginOf(cloneUrl) !== 'https://github.com') {
+    throw new Error('skill Git acquisition supports only canonical GitHub HTTPS sources')
+  }
+  const url = new URL(cloneUrl)
+  if (!url.pathname.startsWith('/') || url.pathname.startsWith('//')) {
+    throw new Error('skill GitHub source must identify exactly owner/repository')
+  }
+  let parts: string[]
+  try {
+    parts = url.pathname.slice(1).split('/').map(decodeURIComponent)
+  } catch {
+    throw new Error('skill GitHub source contains malformed URL encoding')
+  }
+  if (parts.length !== 2) throw new Error('skill GitHub source must identify exactly owner/repository')
+  const owner = parts[0]!
+  const repo = parts[1]!.replace(/\.git$/i, '')
+  if (!GITHUB_REPOSITORY_COMPONENT.test(owner) || !GITHUB_REPOSITORY_COMPONENT.test(repo)) {
+    throw new Error('skill GitHub source contains an invalid owner or repository')
+  }
+  return { owner, repo, path: `${owner}/${repo}` }
+}
+
+/** The numeric identity a GitHub skill acquisition verifies first; admission drops an entry without one. */
+function githubRepoIdOf(entry: AgentSkillEntry): string {
+  if (entry.githubRepoId === undefined) throw new Error('skill GitHub source has no repository id')
+  return entry.githubRepoId
+}
+
+/** A clone address off GitHub: plain https with a path, nothing Git could read as credentials, a query or an option. */
+function hostedGitSkillUrl(cloneUrl: string): void {
+  let url: URL
+  try {
+    url = new URL(cloneUrl)
+  } catch {
+    throw new Error('skill Git source outside GitHub must be an https address')
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname.replace(/\/+$/, '') === '' ||
+    cloneUrl.startsWith('-')
+  ) {
+    throw new Error('skill Git source outside GitHub must be an https address')
+  }
+}
+
+/** Bounded-acquisition admission: GitHub as exact HTTPS owner/repository, any other host as plain https, both origin-policed. */
+export function resolveBoundedGitSkillSource(entry: AgentSkillEntry): ParsedGitSkillSource {
+  const parsed = parseGitSkillSource(entry)
+  const source = { ...parsed, cloneUrl: resolveAuthorizedGitSkillCloneUrl(parsed.cloneUrl) }
+  if (isGitHubSkillSource(entry.source)) githubRepository(source.cloneUrl)
+  else hostedGitSkillUrl(source.cloneUrl)
+  return source
+}
+
+function mergedArchiveLimits(overrides: Partial<GitSkillArchiveLimits> = {}): GitSkillArchiveLimits {
+  const limits = { ...DEFAULT_GIT_SKILL_ARCHIVE_LIMITS, ...overrides }
+  for (const name of Object.keys(DEFAULT_GIT_SKILL_ARCHIVE_LIMITS) as (keyof GitSkillArchiveLimits)[]) {
+    const value = limits[name]
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`skill Git archive ${name} must be positive`)
+    if (value > DEFAULT_GIT_SKILL_ARCHIVE_LIMITS[name]) {
+      throw new Error(`skill Git archive ${name} may not exceed the daemon ceiling`)
+    }
+  }
+  return limits
+}
+
+function parseCredentialOutput(output: Buffer): GitSkillCredential {
+  const fields = new Map<string, string>()
+  for (const line of output.toString('utf8').split('\n')) {
+    const separator = line.indexOf('=')
+    if (separator > 0) fields.set(line.slice(0, separator), line.slice(separator + 1).replace(/\r$/, ''))
+  }
+  const username = fields.get('username') ?? ''
+  const password = fields.get('password') ?? ''
+  if (
+    !username ||
+    !password ||
+    username.length > 256 ||
+    password.length > 8 * 1024 ||
+    /[\0\r\n]/.test(username) ||
+    /[\0\r\n]/.test(password)
+  ) {
+    throw new Error('skill GitHub credential helper returned an invalid response')
+  }
+  return { username, password }
+}
+
+/** Ask only the daemon-configured, GitHub URL-scoped helper. Stdout is bounded
+ * and never included in errors because it carries the short-lived token. */
+export async function loadScopedGitSkillCredential(request: GitSkillCredentialRequest): Promise<GitSkillCredential> {
+  // The daemon's own window for exactly this repository while this fill runs; none for the agent's workspace repo (source-cache.md §8).
+  const window = openDaemonSkillCredentialWindow(request.agentId, request.repositoryPath)
+  try {
+    return await fillScopedGitSkillCredential(request, window?.capability)
+  } finally {
+    window?.close()
+  }
+}
+
+async function fillScopedGitSkillCredential(
+  request: GitSkillCredentialRequest,
+  windowCapability: string | undefined
+): Promise<GitSkillCredential> {
+  const env = buildSkillGitAcquisitionEnv({
+    agentId: request.agentId,
+    cloneUrl: request.cloneUrl,
+    privateHome: request.privateHome,
+    useGitCredential: true,
+    ...(windowCapability ? { windowCapability } : {})
+  })
+  return await new Promise<GitSkillCredential>((resolve, reject) => {
+    let child
+    try {
+      child = spawn('git', ['credential', 'fill'], {
+        env,
+        signal: request.signal,
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+    } catch {
+      reject(new Error('skill GitHub credential helper could not start'))
+      return
+    }
+
+    const stdout: Buffer[] = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
+    let settled = false
+    const wipeStdout = () => {
+      for (const chunk of stdout) chunk.fill(0)
+      stdout.length = 0
+    }
+    const fail = (message: string) => {
+      if (settled) return
+      settled = true
+      wipeStdout()
+      child.kill()
+      reject(new Error(message))
+    }
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (settled) {
+        chunk.fill(0)
+        return
+      }
+      stdoutBytes += chunk.length
+      if (stdoutBytes > MAX_CREDENTIAL_OUTPUT_BYTES) {
+        chunk.fill(0)
+        return fail('skill GitHub credential helper output exceeded limit')
+      }
+      stdout.push(chunk)
+    })
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length
+      chunk.fill(0)
+      if (stderrBytes > MAX_CREDENTIAL_OUTPUT_BYTES) fail('skill GitHub credential helper output exceeded limit')
+    })
+    child.on('error', () => fail('skill GitHub credential helper failed'))
+    child.on('close', (code) => {
+      if (settled) return
+      if (code !== 0) return fail('skill GitHub credentials are unavailable')
+      const output = Buffer.concat(stdout, stdoutBytes)
+      try {
+        const credential = parseCredentialOutput(output)
+        settled = true
+        resolve(credential)
+      } catch {
+        fail('skill GitHub credential helper returned an invalid response')
+      } finally {
+        output.fill(0)
+        wipeStdout()
+      }
+    })
+    child.stdin.on('error', () => fail('skill GitHub credential helper failed'))
+    child.stdin.end(`protocol=https\nhost=github.com\npath=${request.repositoryPath}.git\n\n`, 'utf8')
+  })
+}
+
+async function* bufferChunks(buffer: Buffer, signal: AbortSignal): AsyncGenerator<Buffer> {
+  const chunkSize = 64 * 1024
+  for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+    signal.throwIfAborted()
+    yield buffer.subarray(offset, Math.min(offset + chunkSize, buffer.length))
+  }
+}
+
+async function* boundedResponseChunks(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal
+): AsyncGenerator<Buffer> {
+  const contentLength = response.headers.get('content-length')
+  if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxBytes) {
+    await discardResponse(response)
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive exceeded the compressed byte limit')
+  }
+  if (!response.body) throw new Error('skill GitHub archive returned no body')
+
+  const reader = response.body.getReader()
+  let total = 0
+  try {
+    while (true) {
+      signal.throwIfAborted()
+      const { done, value } = await reader.read()
+      if (done) return
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive exceeded the compressed byte limit')
+      }
+      yield Buffer.from(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+async function downloadAndGunzipBounded(
+  response: Response,
+  compressedLimit: number,
+  tarLimit: number,
+  signal: AbortSignal
+): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let total = 0
+  const sink = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      total += chunk.length
+      if (total > tarLimit) return callback(new Error('skill GitHub archive exceeded the uncompressed byte limit'))
+      chunks.push(Buffer.from(chunk))
+      callback()
+    }
+  })
+  try {
+    await pipeline(Readable.from(boundedResponseChunks(response, compressedLimit, signal)), createGunzip(), sink, {
+      signal
+    })
+  } catch (error) {
+    if (signal.aborted) throw error
+    if (
+      error instanceof Error &&
+      (error.message === 'skill GitHub archive exceeded the compressed byte limit' ||
+        error.message === 'skill GitHub archive exceeded the uncompressed byte limit')
+    ) {
+      throw error
+    }
+    throw new Error('skill GitHub archive is not a valid gzip stream')
+  }
+  return Buffer.concat(chunks, total)
+}
+
+interface SeenArchivePath {
+  type: 'directory' | 'file'
+}
+
+interface ArchiveValidationState {
+  root?: string
+  entries: number
+  files: number
+  totalFileBytes: number
+  seen: Map<string, SeenArchivePath>
+  ancestors: Set<string>
+  inventory: Map<string, SeenArchivePath['type']>
+  /** Symlink/hardlink entries admitted for SKIPPING only — never extracted.
+   * Whether each one is actually tolerable (outside every skill directory) is
+   * decided after the full inventory is known. */
+  skippedLinks: Set<string>
+}
+
+function archiveCollisionComponent(value: string): string {
+  return value.normalize('NFKC').toLowerCase().replaceAll('\u00df', 'ss').replaceAll('\u03c2', '\u03c3')
+}
+
+function registerArchivePath(state: ArchiveValidationState, key: string, type: SeenArchivePath['type']): void {
+  if (state.seen.has(key))
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a normalized path collision')
+  const parts = key.split('/')
+  for (let index = 1; index < parts.length; index++) {
+    const ancestor = parts.slice(0, index).join('/')
+    if (state.seen.get(ancestor)?.type === 'file') {
+      throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a file/ancestor collision')
+    }
+    state.ancestors.add(ancestor)
+  }
+  if (type === 'file' && state.ancestors.has(key))
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a file/ancestor collision')
+  state.seen.set(key, { type })
+}
+
+function countArchiveEntry(state: ArchiveValidationState, limits: GitSkillArchiveLimits): void {
+  state.entries += 1
+  if (state.entries > limits.maxEntries)
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains too many entries')
+}
+
+function validateArchiveEntry(entry: ReadEntry, state: ArchiveValidationState, limits: GitSkillArchiveLimits): void {
+  countArchiveEntry(state, limits)
+  // Git can only record files, directories, and symlinks (hardlinks can appear
+  // in tar re-encodings of identical blobs). Repositories routinely carry
+  // repo-level links like AGENTS.md -> CLAUDE.md that are unrelated to any
+  // skill, so link entries are admitted here for skipping — never extraction —
+  // and rejected after the full inventory is known if one sits inside a skill
+  // directory (see rejectLinksInsideSkills). Anything else stays fatal.
+  const linkLike = entry.type === 'SymbolicLink' || entry.type === 'Link'
+  if (!linkLike && entry.type !== 'File' && entry.type !== 'Directory') {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a link or special entry')
+  }
+
+  let path = entry.path
+  if (entry.type === 'Directory') path = path.replace(/\/$/, '')
+  if (
+    !path ||
+    path.includes('\\') ||
+    path.includes('\0') ||
+    path.includes('\uFFFD') ||
+    /[\u0000-\u001f\u007f]/.test(path) ||
+    path.startsWith('/') ||
+    /^[A-Za-z]:/.test(path) ||
+    posix.normalize(path) !== path
+  ) {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains an unsafe path')
+  }
+  const parts = path.split('/')
+  if (
+    parts.some(
+      (part) =>
+        !part || part === '.' || part === '..' || part !== part.normalize('NFC') || Buffer.byteLength(part) > 255
+    )
+  ) {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains an unsafe path')
+  }
+  state.root ??= parts[0]
+  if (parts[0] !== state.root)
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains multiple roots')
+
+  const relative = parts.slice(1)
+  if (relative.length === 0) {
+    if (entry.type !== 'Directory' || entry.size !== 0) {
+      throw new Error('skill GitHub archive has an invalid root entry')
+    }
+    if (state.inventory.has(path))
+      throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a duplicate path')
+    state.inventory.set(path, 'directory')
+    return
+  }
+  if (relative.length > limits.maxDepth)
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive exceeds the depth limit')
+  const relativePath = relative.join('/')
+  if (Buffer.byteLength(relativePath) > limits.maxPathBytes) {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains an oversized path')
+  }
+
+  if (linkLike) {
+    state.skippedLinks.add(path)
+    return
+  }
+  const type = entry.type === 'Directory' ? 'directory' : 'file'
+  if (state.inventory.has(path))
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains a duplicate path')
+  state.inventory.set(path, type)
+
+  const collisionKey = relative.map(archiveCollisionComponent).join('/')
+  registerArchivePath(state, collisionKey, type)
+  if (type === 'directory') {
+    if (entry.size !== 0)
+      throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains an invalid directory')
+    return
+  }
+
+  if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > limits.maxFileBytes) {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains an oversized file')
+  }
+  state.files += 1
+  state.totalFileBytes += entry.size
+  if (!Number.isSafeInteger(state.totalFileBytes) || state.totalFileBytes > limits.maxTotalFileBytes) {
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive exceeds the total file byte limit')
+  }
+}
+
+/** A skipped link is tolerable only OUTSIDE every skill directory (any
+ * directory holding a SKILL.md, recursively): the installed bundles then
+ * cannot silently diverge from the upstream skill content. A link inside a
+ * skill stays fail-closed — such a skill is uninstallable through AgentConnect
+ * anyway (the snapshot and CLI-cell layers both refuse links). */
+function rejectLinksInsideSkills(state: ArchiveValidationState): void {
+  if (state.skippedLinks.size === 0) return
+  const skillDirs = [...state.inventory.keys()]
+    .filter((path) => path.endsWith('/SKILL.md'))
+    .map((path) => path.slice(0, -'/SKILL.md'.length))
+  for (const link of state.skippedLinks) {
+    if (skillDirs.some((dir) => link.startsWith(`${dir}/`))) {
+      throw new SkillSourceFailure(
+        'limits_exceeded',
+        'skill GitHub archive contains a link or special entry inside a skill directory'
+      )
+    }
+  }
+}
+
+async function validateAndExtractArchive(
+  tarBody: Buffer,
+  destination: string,
+  limits: GitSkillArchiveLimits,
+  signal: AbortSignal
+) {
+  const state: ArchiveValidationState = {
+    entries: 0,
+    files: 0,
+    totalFileBytes: 0,
+    seen: new Map(),
+    ancestors: new Set(),
+    inventory: new Map(),
+    skippedLinks: new Set()
+  }
+  let validationError: Error | undefined
+  const parser = listTar({
+    gzip: false,
+    strict: true,
+    maxMetaEntrySize: limits.maxFileBytes,
+    onReadEntry: (entry) => {
+      try {
+        validateArchiveEntry(entry, state, limits)
+      } catch (error) {
+        validationError = error instanceof Error ? error : new Error('skill GitHub archive contains an invalid entry')
+        throw validationError
+      }
+    }
+  })
+  parser.on('ignoredEntry', () => {
+    validationError ??= new Error('skill GitHub archive contains a link or special entry')
+    parser.abort(validationError)
+  })
+  parser.on('meta', () => {
+    try {
+      countArchiveEntry(state, limits)
+    } catch (error) {
+      validationError = error instanceof Error ? error : new Error('skill GitHub archive contains too many entries')
+      parser.abort(validationError)
+    }
+  })
+  try {
+    await pipeline(Readable.from(bufferChunks(tarBody, signal)), parser, { signal })
+  } catch (error) {
+    if (validationError) throw validationError
+    if (error instanceof Error && error.message.startsWith('skill GitHub archive')) throw error
+    if (signal.aborted) throw error
+    throw new Error('skill GitHub archive is not a valid tar stream')
+  }
+  if (!state.root || state.files === 0)
+    throw new SkillSourceFailure('limits_exceeded', 'skill GitHub archive contains no files')
+  rejectLinksInsideSkills(state)
+
+  const remaining = new Map(state.inventory)
+  let extractionError: Error | undefined
+  const extractor = extractTar({
+    cwd: destination,
+    gzip: false,
+    strict: true,
+    strip: 1,
+    maxDepth: limits.maxDepth + 1,
+    maxMetaEntrySize: limits.maxFileBytes,
+    preservePaths: false,
+    preserveOwner: false,
+    noMtime: true,
+    chmod: true,
+    // Also constrains directories that tar creates implicitly for archives
+    // that omit explicit Directory entries.
+    processUmask: 0o077,
+    dmode: 0o700,
+    fmode: 0o600,
+    filter: (_path, entry) => {
+      if (!('type' in entry) || (entry.type !== 'File' && entry.type !== 'Directory')) {
+        // Validated links are skipped without being materialized.
+        if ('type' in entry && (entry.type === 'SymbolicLink' || entry.type === 'Link')) {
+          if (state.skippedLinks.has(entry.path)) return false
+        }
+        extractionError = new Error('skill GitHub archive extraction inventory changed')
+        return false
+      }
+      const path = entry.type === 'Directory' ? entry.path.replace(/\/$/, '') : entry.path
+      const type = entry.type === 'Directory' ? 'directory' : 'file'
+      if (remaining.get(path) !== type) {
+        extractionError = new Error('skill GitHub archive extraction inventory changed')
+        return false
+      }
+      remaining.delete(path)
+      entry.mode = type === 'directory' ? 0o700 : 0o600
+      return true
+    }
+  })
+  extractor.on('ignoredEntry', (entry) => {
+    if (state.skippedLinks.has(entry.path)) return
+    extractionError ??= new Error('skill GitHub archive extraction inventory changed')
+    extractor.abort(extractionError)
+  })
+  try {
+    await pipeline(Readable.from(bufferChunks(tarBody, signal)), extractor, { signal })
+  } catch (error) {
+    if (extractionError) throw extractionError
+    if (signal.aborted) throw error
+    throw new Error('skill GitHub archive extraction failed')
+  }
+  if (remaining.size !== 0) throw new Error('skill GitHub archive extraction inventory changed')
+}
+
+function archiveLocation(
+  value: string | null,
+  repository: { owner: string; repo: string },
+  expectedCommit: string
+): { url: URL; resolvedCommit: string } {
+  if (!value || Buffer.byteLength(value) > MAX_ARCHIVE_LOCATION_BYTES) {
+    throw new Error('skill GitHub archive returned an invalid location')
+  }
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    throw new Error('skill GitHub archive returned an invalid location')
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname.toLowerCase().replace(/\.+$/, '') !== 'codeload.github.com' ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.hash
+  ) {
+    throw new Error('skill GitHub archive returned a disallowed location')
+  }
+
+  let parts: string[]
+  try {
+    if (!url.pathname.startsWith('/') || url.pathname.startsWith('//')) {
+      throw new Error('invalid path')
+    }
+    parts = url.pathname.slice(1).split('/').map(decodeURIComponent)
+  } catch {
+    throw new Error('skill GitHub archive returned an invalid location')
+  }
+  const [owner, repo, format, resolvedCommit] = parts
+  if (
+    parts.length !== 4 ||
+    owner?.toLowerCase() !== repository.owner.toLowerCase() ||
+    repo?.toLowerCase() !== repository.repo.toLowerCase() ||
+    (format !== 'tar.gz' && format !== 'legacy.tar.gz') ||
+    !resolvedCommit ||
+    !COMMIT_SHA.test(resolvedCommit) ||
+    resolvedCommit.toLowerCase() !== expectedCommit.toLowerCase()
+  ) {
+    throw new Error('skill GitHub archive returned a mismatched location')
+  }
+  return { url, resolvedCommit: resolvedCommit.toLowerCase() }
+}
+
+interface GitHubApiState {
+  token?: string
+  credentialAttempted: boolean
+}
+
+async function githubApiRequest(opts: {
+  url: URL
+  cloneUrl: string
+  repositoryPath: string
+  agentId: string
+  privateHome: string
+  useGitCredential: boolean
+  signal: AbortSignal
+  fetchImpl: typeof globalThis.fetch
+  credentialProvider: GitSkillCredentialProvider
+  state: GitHubApiState
+  accept: string
+  redirect: 'error' | 'manual'
+  /** Conditional read: a 304 answer costs no primary rate-limit budget. */
+  ifNoneMatch?: string
+}): Promise<Response> {
+  const request = async () =>
+    await fetchWithRedirectPolicy(
+      opts.fetchImpl,
+      opts.url,
+      {
+        method: 'GET',
+        signal: opts.signal,
+        headers: githubApiHeaders({
+          accept: opts.accept,
+          ...(opts.ifNoneMatch ? { ifNoneMatch: opts.ifNoneMatch } : {}),
+          ...(opts.state.token ? { token: opts.state.token } : {})
+        })
+      },
+      opts.redirect,
+      'skill GitHub API'
+    )
+
+  let response = await request()
+  if (
+    opts.useGitCredential &&
+    !opts.state.token &&
+    !opts.state.credentialAttempted &&
+    (response.status === 401 || response.status === 403 || response.status === 404)
+  ) {
+    opts.state.credentialAttempted = true
+    await discardResponse(response)
+    let credential: GitSkillCredential
+    try {
+      credential = await opts.credentialProvider({
+        agentId: opts.agentId,
+        cloneUrl: opts.cloneUrl,
+        privateHome: opts.privateHome,
+        repositoryPath: opts.repositoryPath,
+        signal: opts.signal
+      })
+    } catch {
+      throw new SkillSourceFailure('access_denied', 'skill GitHub credentials are unavailable')
+    }
+    if (!credential.password || credential.password.length > 8 * 1024 || /[\0\r\n]/.test(credential.password)) {
+      throw new Error('skill GitHub credential helper returned an invalid response')
+    }
+    opts.state.token = credential.password
+    response = await request()
+  }
+  return response
+}
+
+/** The per-call shape `githubApiRequest` needs beyond the URL and accept header. */
+type GithubApiCallOptions = {
+  cloneUrl: string
+  repositoryPath: string
+  agentId: string
+  privateHome: string
+  useGitCredential: boolean
+  signal: AbortSignal
+  fetchImpl: typeof globalThis.fetch
+  credentialProvider: GitSkillCredentialProvider
+  state: GitHubApiState
+}
+
+/** Fence name-based reads against a rename/delete plus squatter: the numeric endpoint cannot be captured. */
+async function verifyGithubRepositoryIdentity(
+  api: GithubApiCallOptions,
+  githubRepoId: string,
+  repositoryPath: string
+): Promise<void> {
+  const identityResponse = await githubApiRequest({
+    ...api,
+    url: new URL(`${GITHUB_API_BASE}/repositories/${githubRepoId}`),
+    accept: 'application/vnd.github+json',
+    redirect: 'error'
+  })
+  if (identityResponse.status !== 200) {
+    const status = identityResponse.status
+    await discardResponse(identityResponse)
+    // GitHub answers 404 for a private repository the reader cannot see.
+    throw new SkillSourceFailure(
+      status === 404 ? 'access_denied' : httpFailureCode(status, 'resolution_failed'),
+      `skill GitHub repository identity lookup failed with status ${status}`
+    )
+  }
+
+  const raw = (
+    await readBoundedBody(identityResponse, MAX_REPOSITORY_METADATA_BYTES, 'skill GitHub repository identity lookup')
+  ).toString('utf8')
+  const identity = parseGithubRepositoryIdentity(raw)
+  if (!identity)
+    throw new SkillSourceFailure(
+      'resolution_failed',
+      'skill GitHub repository identity lookup returned invalid metadata'
+    )
+  if (
+    identity.id !== githubRepoId ||
+    identity.fullName === undefined ||
+    identity.fullName.toLowerCase() !== repositoryPath.toLowerCase()
+  ) {
+    throw new SkillSourceFailure(
+      'resolution_failed',
+      'skill GitHub repository identity does not match the configured source'
+    )
+  }
+  // A private repository is admitted: identity and name fence it, not visibility (shared-skills.md §3).
+}
+
+/** The exact `owner/repo` a bounded GitHub skill entry acquires from; the agent channel matches window asks against it. */
+export function gitSkillRepositoryPath(entry: Pick<AgentSkillEntry, 'source' | 'ref' | 'subDir'>): string | undefined {
+  try {
+    // Only the source string decides the repository; the numeric id is verified at acquisition.
+    return githubRepository(resolveBoundedGitSkillSource(entry as AgentSkillEntry).cloneUrl).path
+  } catch {
+    return undefined
+  }
+}
+
+/** A ref the operator pinned to exact bytes: never re-read, never tracked. */
+export function isPinnedGitSkillRef(entry: AgentSkillEntry): boolean {
+  const ref = resolveBoundedGitSkillSource(entry).ref
+  return ref !== undefined && /^[0-9a-f]{40}$/i.test(ref)
+}
+
+export interface ResolveGitSkillCommitOptions {
+  agentId: string
+  useGitCredential: boolean
+  /** Private HOME the credential helper may write into; the caller owns it. */
+  privateHome: string
+  /** Last seen etag — a matching one answers `unchanged` and costs no budget. */
+  etag?: string
+  timeoutMs?: number
+  fetch?: typeof globalThis.fetch
+  credentialProvider?: GitSkillCredentialProvider
+}
+
+export type GitSkillCommitResolution = { status: 'resolved'; commit: string; etag?: string } | { status: 'unchanged' }
+
+/** A refused commit lookup, carrying how long the host asked us to wait when it said. */
+export class GitSkillCommitResolutionError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs?: number
+  ) {
+    super(message)
+    this.name = 'GitSkillCommitResolutionError'
+  }
+}
+
+/** What `entry.ref` points at right now — one bounded API read (a bare SHA),
+ * conditional when the caller carries an etag. This deliberately SKIPS the
+ * repository identity fence {@link acquireGitSkillSource} runs twice: the answer
+ * is only a SHA used to decide whether to acquire, and acquisition verifies
+ * identity before it reads a single byte, so a rename squatter can at worst
+ * provoke an acquisition that fails closed and leaves the installed tree alone. */
+export async function resolveGitSkillCommit(
+  entry: AgentSkillEntry,
+  opts: ResolveGitSkillCommitOptions
+): Promise<GitSkillCommitResolution> {
+  const source = resolveBoundedGitSkillSource(entry)
+  const github = githubRepository(source.cloneUrl)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 10_000)
+  try {
+    const requestedRef = source.ref ?? 'HEAD'
+    const response = await githubApiRequest({
+      url: new URL(
+        `https://api.github.com/repos/${github.owner}/${github.repo}/commits/${encodeURIComponent(requestedRef)}`
+      ),
+      cloneUrl: source.cloneUrl,
+      repositoryPath: github.path,
+      agentId: opts.agentId,
+      privateHome: opts.privateHome,
+      useGitCredential: opts.useGitCredential,
+      signal: controller.signal,
+      fetchImpl: opts.fetch ?? globalThis.fetch,
+      credentialProvider: opts.credentialProvider ?? loadScopedGitSkillCredential,
+      state: { credentialAttempted: false },
+      accept: 'application/vnd.github.sha',
+      redirect: 'error',
+      ...(opts.etag ? { ifNoneMatch: opts.etag } : {})
+    })
+    if (response.status === 304) {
+      await discardResponse(response)
+      return { status: 'unchanged' }
+    }
+    if (response.status !== 200) {
+      const status = response.status
+      const wait = retryAfterMs(response)
+      await discardResponse(response)
+      throw new GitSkillCommitResolutionError(`skill GitHub commit resolution failed with status ${status}`, wait)
+    }
+    const etag = response.headers.get('etag') ?? undefined
+    const commit = (await readBoundedBody(response, 128, 'skill GitHub commit resolution')).toString('utf8').trim()
+    if (!COMMIT_SHA.test(commit)) throw new Error('skill GitHub commit resolution returned an invalid SHA')
+    return { status: 'resolved', commit: commit.toLowerCase(), ...(etag ? { etag } : {}) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export interface AcquireGitSkillOptions extends HostedGitSkillTransport {
+  destination: string
+  agentId: string
+  useGitCredential: boolean
+  timeoutMs?: number
+  fetch?: typeof globalThis.fetch
+  credentialProvider?: GitSkillCredentialProvider
+  archiveLimits?: Partial<GitSkillArchiveLimits>
+}
+
+/**
+ * Prove that `agentId` can still read the source's repository and that the repository is still the
+ * one configured: the identity request an acquisition starts with, and nothing after it. A cached
+ * snapshot is served only after this, so revoking an agent's access, or deleting or replacing the
+ * repository, stops a cache hit exactly as it stops a fresh acquisition.
+ */
+export async function verifyGitSkillSourceAccess(
+  entry: AgentSkillEntry,
+  opts: Omit<AcquireGitSkillOptions, 'destination' | 'archiveLimits'> & { privateHome: string }
+): Promise<void> {
+  const source = admittedGitSkillSource(entry)
+  if (!isGitHubSkillSource(entry.source)) {
+    // An anonymous Source elsewhere is trusted by URL and has nothing to re-prove; a GitLab one re-proves the project.
+    if (skillSourceCredential(entry)?.provider === 'gitlab') await resolveGitlabSkillCommit(entry, source, opts.agentId)
+    return
+  }
+  const github = githubRepository(source.cloneUrl)
+  await fsp.mkdir(join(opts.privateHome, 'tmp'), { recursive: true, mode: 0o700 })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20_000)
+  try {
+    await verifyGithubRepositoryIdentity(
+      {
+        cloneUrl: source.cloneUrl,
+        repositoryPath: github.path,
+        agentId: opts.agentId,
+        privateHome: opts.privateHome,
+        useGitCredential: opts.useGitCredential,
+        signal: controller.signal,
+        fetchImpl: opts.fetch ?? globalThis.fetch,
+        credentialProvider: opts.credentialProvider ?? loadScopedGitSkillCredential,
+        state: { credentialAttempted: false }
+      },
+      githubRepoIdOf(entry),
+      github.path
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** The bounded source, or a `resolution_failed` failure when the entry or the origin policy refuses it. */
+function admittedGitSkillSource(entry: AgentSkillEntry): ParsedGitSkillSource {
+  try {
+    return resolveBoundedGitSkillSource(entry)
+  } catch (error) {
+    throw new SkillSourceFailure('resolution_failed', (error as Error).message)
+  }
+}
+
+/** Acquire one Git source as a private, commit-pinned repository snapshot and
+ * return the selected local tree. The caller snapshots that tree before the CLI
+ * sees it. */
+export async function acquireGitSkillSource(
+  entry: AgentSkillEntry,
+  opts: AcquireGitSkillOptions
+): Promise<{ sourceDir: string; resolvedCommit: string; source: ParsedGitSkillSource }> {
+  // This final daemon boundary applies both the operator-owned exact-origin
+  // policy and the narrower transport contract required for bounded archives.
+  const source = admittedGitSkillSource(entry)
+  if (!isGitHubSkillSource(entry.source)) {
+    const credential = skillSourceCredential(entry)
+    if (credential?.provider === 'gitlab') return await acquireGitlabSkillSource(entry, source, opts)
+    if (credential)
+      throw new SkillSourceFailure(
+        'resolution_failed',
+        'skill Git source outside GitHub carries a credential this daemon cannot use'
+      )
+    return await acquireAnonymousGitSkillSource(source, opts)
+  }
+  const github = githubRepository(source.cloneUrl)
+  const limits = mergedArchiveLimits(opts.archiveLimits)
+  const repository = join(opts.destination, 'repository')
+  const privateHome = join(opts.destination, 'home')
+  await fsp.mkdir(join(privateHome, 'tmp'), { recursive: true, mode: 0o700 })
+  await fsp.mkdir(repository, { recursive: false, mode: 0o700 })
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20_000)
+  try {
+    const fetchImpl = opts.fetch ?? globalThis.fetch
+    const credentialProvider = opts.credentialProvider ?? loadScopedGitSkillCredential
+    const apiState: GitHubApiState = { credentialAttempted: false }
+    const commonApiOptions = {
+      cloneUrl: source.cloneUrl,
+      repositoryPath: github.path,
+      agentId: opts.agentId,
+      privateHome,
+      // A scoped credential resolves a private repository's numeric identity
+      // (anonymously it reads as 404) and raises GitHub's API rate limit.
+      // Crucially, credential fallback happens on the numeric endpoint before
+      // any potentially captured owner/name is queried.
+      useGitCredential: opts.useGitCredential,
+      signal: controller.signal,
+      fetchImpl,
+      credentialProvider,
+      state: apiState
+    }
+
+    const verifyRepositoryIdentity = () =>
+      verifyGithubRepositoryIdentity(commonApiOptions, githubRepoIdOf(entry), github.path)
+
+    // The numeric endpoint cannot be captured by a replacement at the old
+    // owner/name. Fence both name-based operations: if the original repository
+    // was deleted or renamed at either boundary, acquisition fails closed.
+    await verifyRepositoryIdentity()
+
+    const requestedRef = source.ref ?? 'HEAD'
+    const commitUrl = new URL(
+      `https://api.github.com/repos/${github.owner}/${github.repo}/commits/${encodeURIComponent(requestedRef)}`
+    )
+    const commitResponse = await githubApiRequest({
+      ...commonApiOptions,
+      url: commitUrl,
+      accept: 'application/vnd.github.sha',
+      redirect: 'error'
+    })
+    if (commitResponse.status !== 200) {
+      const status = commitResponse.status
+      await discardResponse(commitResponse)
+      throw httpSkillFailure(status, 'resolution_failed', `skill GitHub commit resolution failed with status ${status}`)
+    }
+    const resolvedCommit = (await readBoundedBody(commitResponse, 128, 'skill GitHub commit resolution'))
+      .toString('utf8')
+      .trim()
+    if (!COMMIT_SHA.test(resolvedCommit)) throw new Error('skill GitHub commit resolution returned an invalid SHA')
+
+    await verifyRepositoryIdentity()
+
+    const archiveApiUrl = new URL(
+      `https://api.github.com/repos/${github.owner}/${github.repo}/tarball/${resolvedCommit}`
+    )
+    const archiveApiResponse = await githubApiRequest({
+      ...commonApiOptions,
+      url: archiveApiUrl,
+      accept: 'application/vnd.github+json',
+      redirect: 'manual'
+    })
+    if (archiveApiResponse.status !== 302) {
+      const status = archiveApiResponse.status
+      await discardResponse(archiveApiResponse)
+      throw httpSkillFailure(status, 'fetch_failed', `skill GitHub archive lookup failed with status ${status}`)
+    }
+    const { url: codeloadUrl } = archiveLocation(archiveApiResponse.headers.get('location'), github, resolvedCommit)
+    await discardResponse(archiveApiResponse)
+    apiState.token = undefined
+
+    // The archive URL may carry GitHub's short-lived private-download query.
+    // It is sent only to the exact validated codeload host, never logged, and
+    // the longer-lived installation token is deliberately not forwarded.
+    const archiveResponse = await fetchWithRedirectPolicy(
+      fetchImpl,
+      codeloadUrl,
+      {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          accept: 'application/x-gzip',
+          'accept-encoding': 'identity',
+          'user-agent': 'agentconnect-daemon'
+        }
+      },
+      'error',
+      'skill GitHub codeload'
+    )
+    if (archiveResponse.status !== 200) {
+      const status = archiveResponse.status
+      await discardResponse(archiveResponse)
+      throw httpSkillFailure(status, 'fetch_failed', `skill GitHub codeload failed with status ${status}`)
+    }
+    const tarBody = await downloadAndGunzipBounded(
+      archiveResponse,
+      limits.maxCompressedBytes,
+      limits.maxTarBytes,
+      controller.signal
+    )
+    await validateAndExtractArchive(tarBody, repository, limits, controller.signal)
+
+    return {
+      sourceDir: source.subDir ? join(repository, ...source.subDir.split('/')) : repository,
+      resolvedCommit,
+      source
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** The project and the agent's verified commit for a credentialed GitLab Source: identity by project id, then its ref. */
+async function resolveGitlabSkillCommit(
+  entry: AgentSkillEntry,
+  source: ParsedGitSkillSource,
+  agentId: string
+): Promise<{ repository: GitlabSkillRepository; commit: string }> {
+  const reads = gitlabSkillReads()
+  const repository = gitlabSkillRepository(entry, source.cloneUrl, reads.host(agentId))
+  if (!repository)
+    throw new SkillSourceFailure(
+      'resolution_failed',
+      "skill GitLab source does not name a project on this deployment's GitLab instance"
+    )
+  const resolved = await reads.resolve(entry, agentId)
+  if (!resolved.ok)
+    throw new SkillSourceFailure(
+      resolved.reason === 'access_denied' ? 'access_denied' : 'resolution_failed',
+      `skill GitLab source resolution failed (${resolved.reason})`
+    )
+  return { repository, commit: resolved.commit.toLowerCase() }
+}
+
+/** A credentialed GitLab Source by project id: the archive endpoint cannot be captured by a replacement at the old path. */
+async function acquireGitlabSkillSource(
+  entry: AgentSkillEntry,
+  source: ParsedGitSkillSource,
+  opts: AcquireGitSkillOptions
+): Promise<{ sourceDir: string; resolvedCommit: string; source: ParsedGitSkillSource }> {
+  const limits = mergedArchiveLimits(opts.archiveLimits)
+  const { repository, commit } = await resolveGitlabSkillCommit(entry, source, opts.agentId)
+  if (source.ref !== undefined && COMMIT_SHA.test(source.ref) && source.ref.toLowerCase() !== commit) {
+    throw new SkillSourceFailure('commit_unavailable', 'skill GitLab source did not resolve to its pinned commit')
+  }
+  const token = await gitlabSkillReads().token(opts.agentId, repository)
+  const repositoryDir = join(opts.destination, 'repository')
+  await fsp.mkdir(repositoryDir, { recursive: true, mode: 0o700 })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20_000)
+  try {
+    // Concatenated onto the API root, never URL-resolved, so an instance path prefix survives.
+    const archiveUrl = new URL(
+      `${repository.apiBaseUrl}/projects/${repository.externalId}/repository/archive.tar.gz?sha=${commit}`
+    )
+    const response = await fetchWithRedirectPolicy(
+      opts.fetch ?? globalThis.fetch,
+      archiveUrl,
+      {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          accept: 'application/x-gzip',
+          'accept-encoding': 'identity',
+          'user-agent': 'agentconnect-daemon',
+          'private-token': token
+        }
+      },
+      'error',
+      'skill GitLab archive'
+    )
+    if (response.status !== 200) {
+      const status = response.status
+      await discardResponse(response)
+      throw httpSkillFailure(status, 'fetch_failed', `skill GitLab archive download failed with status ${status}`)
+    }
+    const tarBody = await downloadAndGunzipBounded(
+      response,
+      limits.maxCompressedBytes,
+      limits.maxTarBytes,
+      controller.signal
+    )
+    await validateAndExtractArchive(tarBody, repositoryDir, limits, controller.signal)
+    return {
+      sourceDir: source.subDir ? join(repositoryDir, ...source.subDir.split('/')) : repositoryDir,
+      resolvedCommit: commit,
+      source
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}

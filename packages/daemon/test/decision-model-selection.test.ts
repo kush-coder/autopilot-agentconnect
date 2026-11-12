@@ -1,0 +1,559 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { DecisionToolDefinition, AgentModelSelection } from '@agentconnect.md/protocol'
+import {
+  evaluateSessionModel,
+  modelSelectionState,
+  type SessionModelEvaluationEvidence
+} from '../src/decisions/model-selection.js'
+import { codeHostPullRequestContext, type CodeHostTurnFinalHost } from '../src/codehost/turn-final.js'
+import { PULL_CONTEXT_TIMEOUT_MS, readPullRequestContext } from '../src/codehost/pull-context.js'
+import { restPullRequestFile } from '../src/codehost/pull-files.js'
+
+const decision: DecisionToolDefinition = {
+  id: '33333333-3333-4333-8333-333333333333',
+  name: 'Complexity',
+  providerId: 'typesafe',
+  model: 'jev-latest',
+  question: {
+    type: 'boolean',
+    instructions: 'Is currentMessage.text complex?',
+    criteria: { true: 'Complex', false: 'Simple' }
+  }
+}
+const selection: AgentModelSelection = {
+  decisionId: decision.id,
+  rules: [{ when: { type: 'boolean', values: [true] }, runtime: 'claude', model: 'model-capable' }]
+}
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
+// The worker is shared (isolate: false), so track only the fake timers `call` schedules, not another file's.
+function ownTimers<T>(call: () => T): { result: T; pending: Set<unknown> } {
+  const scope = new AsyncLocalStorage<true>()
+  const pending = new Set<unknown>()
+  const { setTimeout: set, clearTimeout: clear } = globalThis
+  vi.stubGlobal('setTimeout', (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+    if (!scope.getStore()) return set(callback, ms, ...args)
+    const timer = set(() => {
+      pending.delete(timer)
+      scope.run(true, callback, ...args)
+    }, ms)
+    pending.add(timer)
+    return timer
+  })
+  vi.stubGlobal('clearTimeout', (timer: Parameters<typeof clearTimeout>[0]) => {
+    pending.delete(timer)
+    clear(timer)
+  })
+  return { result: scope.run(true, call), pending }
+}
+const lease = {
+  token: async () => 'fixture-token',
+  invalidateToken: () => {},
+  apiBaseUrl: () => 'https://code.example.test'
+}
+const paths = {
+  description: '/pulls/42',
+  descriptionField: 'body' as const,
+  baseShaPath: ['base', 'sha'],
+  headShaPaths: [['head', 'sha']],
+  commits: '/pulls/42/commits',
+  commitMessagePath: ['commit', 'message'],
+  files: '/pulls/42/files',
+  fileCountPath: ['changed_files'],
+  file: restPullRequestFile
+}
+const patch = 'diff --git a/app.ts b/app.ts\n--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-old\n+new\n'
+const fileRow = { filename: 'app.ts', status: 'modified', additions: 1, deletions: 1, patch }
+const file = { path: 'app.ts', status: 'modified', additions: 1, deletions: 1, diff: patch, diffTruncated: false }
+const revision = {
+  sha: 'head',
+  base: { sha: 'base' },
+  head: { sha: 'head' },
+  diff_refs: { base_sha: 'base', head_sha: 'head' },
+  changed_files: 1,
+  changes_count: '1'
+}
+const revisionState = { baseSha: 'base', headSha: 'head' }
+
+describe('session model evaluation', () => {
+  it('evaluates only the chosen path against one input snapshot and falls back on a failed next step', async () => {
+    const next = {
+      ...decision,
+      id: '44444444-4444-4444-8444-444444444444',
+      name: 'Urgency',
+      question: { ...decision.question, instructions: 'x'.repeat(14_000) }
+    }
+    const chain: AgentModelSelection = {
+      decisionId: decision.id,
+      rules: [{ when: { type: 'boolean', values: [true] }, nextStepId: 'urgency' }],
+      steps: [{ id: 'urgency', decisionId: next.id, rules: selection.rules }]
+    }
+    const state = vi.fn(async () => modelSelectionState('chat', 'Opening message'))
+    const get = vi.fn(async (id: string) => ({ decision: id === decision.id ? decision : next }))
+    const evaluate = vi.fn(async () => ({
+      status: 'answered' as const,
+      model: 'jev-latest',
+      usage: { inputTokens: 1, outputTokens: 0 },
+      answer: { type: 'boolean' as const, value: true, probability: 0.9 }
+    }))
+    let evidence: SessionModelEvaluationEvidence | undefined
+    const input = {
+      agentId: 'example-agent',
+      selection: chain,
+      supported: () => true,
+      signal: new AbortController().signal,
+      evaluationId: 'example-evaluation',
+      current: () => true,
+      decision: get,
+      state,
+      evaluate,
+      onResult: (result: SessionModelEvaluationEvidence) => (evidence = result)
+    }
+    expect(await evaluateSessionModel(input)).toEqual({ runtime: 'claude', model: 'model-capable' })
+    // Each reached step keeps the Decision it asked, so its Model result reads the question it answered.
+    expect(evidence?.steps?.map((step) => [step.stepId, step.decisionId, step.question.instructions])).toEqual([
+      ['', decision.id, decision.question.instructions],
+      ['urgency', next.id, 'x'.repeat(14_000)]
+    ])
+    expect(get.mock.calls.map(([id]) => id)).toEqual([decision.id, next.id])
+    expect(state).toHaveBeenCalledOnce()
+    expect(state).toHaveBeenCalledWith(next)
+    const calls = evaluate.mock.calls as unknown as Array<
+      [{ state: unknown; deadlineAt: number; evaluationId: string }]
+    >
+    expect(calls[1]![0].state).toBe(calls[0]![0].state)
+    expect(calls[1]![0].deadlineAt).toBe(calls[0]![0].deadlineAt)
+    expect(calls[1]![0].evaluationId).not.toBe(calls[0]![0].evaluationId)
+    get.mockClear()
+    evaluate.mockResolvedValueOnce({
+      status: 'answered',
+      model: 'jev-latest',
+      usage: { inputTokens: 1, outputTokens: 0 },
+      answer: { type: 'boolean', value: false, probability: 0.1 }
+    })
+    expect(await evaluateSessionModel(input)).toBeUndefined()
+    expect(get.mock.calls.map(([id]) => id)).toEqual([decision.id, next.id])
+    expect(
+      await evaluateSessionModel({
+        ...input,
+        decision: async (id) => ({ decision: id === decision.id ? decision : null })
+      })
+    ).toBeUndefined()
+    expect(
+      await evaluateSessionModel({
+        ...input,
+        evaluate: async (request) =>
+          request.decision === next ? { status: 'unavailable', reason: 'provider' } : evaluate()
+      })
+    ).toBeUndefined()
+  })
+
+  it('stops a chain at its shared deadline even when the next definition read stalls', async () => {
+    vi.useFakeTimers()
+    let release!: (value: { decision: DecisionToolDefinition }) => void
+    const evaluate = vi.fn(async () => ({
+      status: 'answered' as const,
+      model: 'jev-latest',
+      usage: { inputTokens: 1, outputTokens: 0 },
+      answer: { type: 'boolean' as const, value: true, probability: 0.9 }
+    }))
+    const nextId = '44444444-4444-4444-8444-444444444444'
+    const { result, pending } = ownTimers(() =>
+      evaluateSessionModel({
+        agentId: 'example-agent',
+        supported: () => true,
+        signal: new AbortController().signal,
+        evaluationId: 'example-evaluation',
+        current: () => true,
+        selection: {
+          decisionId: decision.id,
+          rules: [{ when: { type: 'boolean', values: [true] }, nextStepId: 'next' }],
+          steps: [{ id: 'next', decisionId: nextId, rules: selection.rules }]
+        },
+        state: async () => ({}),
+        evaluate,
+        decision: async (id) =>
+          id === decision.id
+            ? { decision }
+            : new Promise((resolve) => {
+                release = resolve
+              })
+      })
+    )
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(await result).toBeUndefined()
+    release({ decision: { ...decision, id: nextId } })
+    await vi.advanceTimersByTimeAsync(1)
+    expect(evaluate).not.toHaveBeenCalled()
+    expect(pending.size).toBe(0)
+  })
+
+  it('bounds input and ignores stale, invalid, failed and unadvertised results', async () => {
+    const state = modelSelectionState('chat', '界'.repeat(4000))
+    expect(Buffer.byteLength((state.currentMessage as { text: string }).text)).toBeLessThanOrEqual(8192)
+    expect(state).toMatchObject({ history: [], truncated: true })
+    const current = vi.fn(() => true)
+    const evaluate = vi.fn(async () => ({
+      status: 'answered' as const,
+      model: 'jev-latest',
+      usage: { inputTokens: 1, outputTokens: 1 },
+      answer: { type: 'boolean' as const, value: true, probability: 0.9 }
+    }))
+    const input = {
+      agentId: 'example-agent',
+      selection,
+      supported: (target: { runtime: string; model: string }) =>
+        target.runtime === 'claude' && target.model === 'model-capable',
+      signal: new AbortController().signal,
+      evaluationId: 'example-evaluation',
+      current,
+      decision: async () => ({ decision }),
+      state: async () => state,
+      evaluate
+    }
+    expect(await evaluateSessionModel(input)).toEqual({ runtime: 'claude', model: 'model-capable' })
+    expect(await evaluateSessionModel({ ...input, supported: () => false })).toBeUndefined()
+    current.mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValueOnce(false)
+    expect(await evaluateSessionModel(input)).toBeUndefined()
+    expect(
+      await evaluateSessionModel({ ...input, evaluate: async () => ({ status: 'unavailable', reason: 'timeout' }) })
+    ).toBeUndefined()
+    expect(
+      await evaluateSessionModel({
+        ...input,
+        selection: {
+          ...selection,
+          rules: [{ when: { type: 'choice', thresholds: { unknown: 0.5 } }, runtime: 'claude', model: 'model-capable' }]
+        }
+      })
+    ).toBeUndefined()
+    const abort = new AbortController()
+    await expect(
+      evaluateSessionModel({
+        ...input,
+        signal: abort.signal,
+        evaluate: async () => {
+          abort.abort()
+          return { status: 'unavailable', reason: 'timeout' }
+        }
+      })
+    ).rejects.toThrow()
+  })
+
+  it('reads metadata, then files, then commits under one GitHub repository grant', async () => {
+    const fetcher = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).includes('/commits?')) return Response.json([{ commit: { message: 'Fix login' } }])
+      if (String(url).includes('/files?')) return Response.json([fileRow])
+      return Response.json({ ...revision, body: 'The PR description', title: 'Not the input' })
+    })
+    vi.stubGlobal('fetch', fetcher)
+    const getPostToken = vi.fn(async () => ({ token: 'fixture-token' }))
+    const host = { getPostToken, invalidatePost: vi.fn() } as unknown as CodeHostTurnFinalHost
+    const source = {
+      hookId: 'hook-1',
+      context: { source: 'github' as const, repo: 'example-org/example-repo', number: 42 },
+      github: {
+        repoId: '100',
+        sourceInstallationId: '200',
+        repoFullName: 'example-org/example-repo',
+        subjectKind: 'pull_request' as const,
+        pullNumber: 42,
+        issueCommentId: '17'
+      }
+    }
+    expect(await codeHostPullRequestContext(source, 'example-agent', host, new AbortController().signal)).toEqual({
+      description: 'The PR description',
+      ...revisionState,
+      commitMessages: ['Fix login'],
+      files: [file],
+      filesTruncated: false,
+      reasons: [],
+      timings: expect.any(Object)
+    })
+    expect(getPostToken).toHaveBeenCalledOnce()
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.github.com/repos/example-org/example-repo/pulls/42',
+      'https://api.github.com/repos/example-org/example-repo/pulls/42/files?per_page=100&page=1',
+      'https://api.github.com/repos/example-org/example-repo/pulls/42/commits?per_page=10&page=1'
+    ])
+    expect(getPostToken).toHaveBeenCalledWith('example-agent', 'example-org/example-repo', 'hook-1')
+    expect(fetcher).toHaveBeenCalledWith(
+      'https://api.github.com/repos/example-org/example-repo/pulls/42',
+      expect.objectContaining({
+        redirect: 'error',
+        headers: { authorization: 'Bearer fixture-token', accept: 'application/json' }
+      })
+    )
+    fetcher.mockClear()
+    const withRevision = { ...source, github: { ...source.github, headSha: 'webhook-head', baseSha: 'webhook-base' } }
+    expect(await codeHostPullRequestContext(withRevision, 'example-agent', host, new AbortController().signal)).toEqual(
+      {
+        baseSha: 'webhook-base',
+        headSha: 'webhook-head',
+        commitMessages: ['Fix login'],
+        files: [file],
+        filesTruncated: false,
+        reasons: [],
+        timings: expect.any(Object)
+      }
+    )
+    expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
+      'https://api.github.com/repos/example-org/example-repo/pulls/42/files?per_page=100&page=1',
+      'https://api.github.com/repos/example-org/example-repo/pulls/42/commits?per_page=10&page=1'
+    ])
+    fetcher.mockClear()
+    expect(
+      await codeHostPullRequestContext({ hookId: 'hook-1' }, 'example-agent', host, new AbortController().signal)
+    ).toBeUndefined()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it.each(['gitlab', 'gitea'] as const)(
+    'reads %s context through its existing instance-bound lease',
+    async (provider) => {
+      const token = vi.fn(async () => ({ token: 'fixture-token' }))
+      const host = {
+        getGitlabPostToken: token,
+        gitlabHostFor: () => 'https://code.example.test',
+        getGiteaPostToken: token,
+        giteaHostFor: () => 'https://code.example.test'
+      } as unknown as CodeHostTurnFinalHost
+      const source =
+        provider === 'gitlab'
+          ? {
+              hookId: 'hook-1',
+              gitlab: {
+                host: 'https://code.example.test',
+                projectId: '100',
+                projectPath: 'example-org/example-repo',
+                target: { kind: 'merge_request' as const, iid: 42 }
+              }
+            }
+          : {
+              hookId: 'hook-1',
+              gitea: {
+                host: 'https://code.example.test',
+                repoId: '100',
+                repoPath: 'example-org/example-repo',
+                target: { kind: 'pull' as const, index: 42 }
+              }
+            }
+      const fetcher = vi.fn<typeof fetch>(async (url) => {
+        if (String(url).includes('/commits?'))
+          return Response.json([
+            provider === 'gitlab' ? { message: 'Fix login' } : { commit: { message: 'Fix login' } }
+          ])
+        if (String(url).includes('/diffs?'))
+          return Response.json([{ old_path: 'app.ts', new_path: 'app.ts', diff: patch }])
+        if (String(url).includes('/files?')) return Response.json([{ ...fileRow, patch: undefined }])
+        if (String(url).endsWith('.diff')) return new Response(patch)
+        return Response.json({ ...revision, body: 'Description', description: 'Description' })
+      })
+      vi.stubGlobal('fetch', fetcher)
+      expect(await codeHostPullRequestContext(source, 'example-agent', host, new AbortController().signal)).toEqual({
+        description: 'Description',
+        ...revisionState,
+        commitMessages: ['Fix login'],
+        files: [file],
+        filesTruncated: false,
+        reasons: [],
+        timings: expect.any(Object)
+      })
+      expect(token).toHaveBeenCalledExactlyOnceWith('example-agent', '100', 'hook-1')
+      const urls = fetcher.mock.calls.map(([url]) => String(url))
+      expect(urls).toEqual(
+        provider === 'gitlab'
+          ? [
+              'https://code.example.test/api/v4/projects/100/merge_requests/42',
+              'https://code.example.test/api/v4/projects/100/merge_requests/42/diffs?per_page=100&page=1',
+              'https://code.example.test/api/v4/projects/100/merge_requests/42/commits?per_page=10&page=1'
+            ]
+          : [
+              'https://code.example.test/api/v1/repos/example-org/example-repo/pulls/42',
+              'https://code.example.test/api/v1/repos/example-org/example-repo/pulls/42/files?limit=100&page=1',
+              'https://code.example.test/api/v1/repos/example-org/example-repo/pulls/42.diff',
+              'https://code.example.test/api/v1/repos/example-org/example-repo/pulls/42/commits?limit=10&page=1&verification=false&files=false'
+            ]
+      )
+      for (const [, init] of fetcher.mock.calls)
+        expect(init).toMatchObject({
+          redirect: 'error',
+          headers: { authorization: `${provider === 'gitlab' ? 'Bearer' : 'token'} fixture-token` }
+        })
+      if (provider === 'gitlab') {
+        fetcher.mockImplementation(async (url) => {
+          if (String(url).includes('/commits?')) return Response.json([])
+          if (String(url).includes('/diffs?'))
+            return Response.json([
+              { new_path: 'large.ts', diff: '', too_large: true },
+              { new_path: 'folded.ts', diff: '', collapsed: true },
+              { new_path: 'unavailable.ts' }
+            ])
+          return Response.json({ ...revision, changes_count: '3', description: 'Description' })
+        })
+        const partial = await codeHostPullRequestContext(source, 'example-agent', host, new AbortController().signal)
+        expect(partial).toMatchObject({ filesTruncated: false, reasons: ['diff_truncated', 'diff_unavailable'] })
+        expect(partial!.files).toEqual(
+          ['large.ts', 'folded.ts', 'unavailable.ts'].map((path, index) => ({
+            path,
+            status: 'modified',
+            diff: '',
+            diffTruncated: index < 2,
+            diffUnavailable: true
+          }))
+        )
+        fetcher.mockImplementation(async () =>
+          Response.json({ ...revision, sha: 'new-head', description: 'Description' })
+        )
+        expect(await codeHostPullRequestContext(source, 'example-agent', host, new AbortController().signal)).toEqual({
+          description: 'Description',
+          commitMessages: [],
+          files: [],
+          filesTruncated: true,
+          reasons: ['revision_unverified'],
+          timings: expect.any(Object)
+        })
+      }
+    }
+  )
+
+  it('retains a later file and full statistics when an earlier patch exceeds the total diff budget', async () => {
+    const big = { ...fileRow, additions: 5000, patch: '@@ -1 +1,5000 @@\n-old\n' + '+界\n'.repeat(5000) }
+    const fetcher = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith(paths.commits)) return Response.json([])
+      if (String(url).endsWith(paths.files)) return Response.json([big, { ...fileRow, filename: 'later.ts' }])
+      return Response.json({ ...revision, changed_files: 2, body: 'Description' })
+    })
+    const result = await readPullRequestContext(lease, paths, new AbortController().signal, fetcher)
+    expect(result).toMatchObject({
+      filesTruncated: false,
+      reasons: ['diff_truncated'],
+      files: [
+        { path: 'app.ts', additions: 5000, diffTruncated: true },
+        { path: 'later.ts', diff: patch, diffTruncated: false }
+      ]
+    })
+    expect(result!.files.reduce((sum, file) => sum + Buffer.byteLength(file.diff), 0)).toBeLessThanOrEqual(12 * 1024)
+  })
+
+  it.each([
+    {
+      slow: 'files' as const,
+      requests: 2,
+      files: [],
+      filesTruncated: true,
+      reasons: ['files_unavailable', 'commits_unavailable'],
+      timings: { tokenMs: 0, metadataMs: 0 }
+    },
+    {
+      slow: 'commits' as const,
+      requests: 3,
+      files: [file],
+      filesTruncated: false,
+      reasons: ['commits_unavailable'],
+      timings: { tokenMs: 0, metadataMs: 0, filesMs: 0 }
+    }
+  ])('keeps what arrived when slow $slow reach the shared deadline', async ({ slow, requests, ...expected }) => {
+    vi.useFakeTimers()
+    const cancelled = vi.fn()
+    const fetcher = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith(paths[slow])) return new Response(new ReadableStream({ cancel: cancelled }))
+      if (String(url).endsWith(paths.commits)) return Response.json([{ commit: { message: 'Fix login' } }])
+      if (String(url).endsWith(paths.files)) return Response.json([fileRow])
+      return Response.json({ ...revision, body: 'Description' })
+    })
+    const { result, pending } = ownTimers(() =>
+      readPullRequestContext(lease, paths, new AbortController().signal, fetcher)
+    )
+    const settled = vi.fn()
+    void result.then(settled)
+    await vi.advanceTimersByTimeAsync(PULL_CONTEXT_TIMEOUT_MS - 1)
+    expect(fetcher).toHaveBeenCalledTimes(requests)
+    expect(settled).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await result).toEqual({ description: 'Description', ...revisionState, commitMessages: [], ...expected })
+    expect(fetcher).toHaveBeenCalledTimes(requests)
+    expect(cancelled).toHaveBeenCalledOnce()
+    expect(pending.size).toBe(0)
+  })
+
+  it('bounds raw diff reads while retaining a separately paginated file inventory', async () => {
+    const cancel = vi.fn()
+    const rawDiff = '/pulls/42.diff'
+    const fetcher = vi.fn<typeof fetch>(async (url) => {
+      if (String(url).endsWith(paths.commits))
+        return Response.json(Array.from({ length: 10 }, () => ({ commit: { message: 'Fix' } })))
+      if (String(url).endsWith(paths.files))
+        return Response.json(
+          [
+            { ...fileRow, patch: undefined },
+            { filename: 'later.ts', status: 'added', additions: 1, deletions: 0 }
+          ],
+          { headers: { link: '</pulls/42/files?page=2>; rel="next"' } }
+        )
+      if (String(url).endsWith(rawDiff))
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(Buffer.from(patch + '+界\n'.repeat(220_000)))
+            },
+            cancel
+          })
+        )
+      return Response.json({ ...revision, body: 'Description' })
+    })
+    const result = await readPullRequestContext(lease, { ...paths, rawDiff }, new AbortController().signal, fetcher)
+    expect(result).toMatchObject({
+      filesTruncated: true,
+      reasons: ['files_truncated', 'diff_truncated', 'diff_unavailable', 'commit_limit']
+    })
+    expect(result!.files.map(({ path }) => path)).toEqual(['app.ts', 'later.ts'])
+    expect(Buffer.byteLength(result!.files[0]!.diff)).toBeLessThanOrEqual(12 * 1024)
+    expect(result!.files[0]!.diff).not.toContain('�')
+    expect(result!.files[0]!.diffTruncated).toBe(true)
+    expect(result!.files[1]).toMatchObject({ additions: 1, diff: '', diffUnavailable: true })
+    expect(cancel).toHaveBeenCalledOnce()
+    const oversized = vi.fn()
+    fetcher.mockImplementation(async (url) =>
+      String(url).endsWith(paths.description)
+        ? new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.enqueue(new Uint8Array(1024 * 1024 + 1))
+              },
+              cancel: oversized
+            })
+          )
+        : new Response('[]')
+    )
+    expect(await readPullRequestContext(lease, paths, new AbortController().signal, fetcher)).toBeUndefined()
+    expect(oversized).toHaveBeenCalledOnce()
+  })
+
+  it('does not wait for a stalled token mint or issue requests after cancellation', async () => {
+    const abort = new AbortController()
+    let release!: (token: string) => void
+    const fetcher = vi.fn<typeof fetch>()
+    const result = readPullRequestContext(
+      {
+        ...lease,
+        token: () =>
+          new Promise((resolve) => {
+            release = resolve
+          })
+      },
+      paths,
+      abort.signal,
+      fetcher
+    )
+    const rejected = expect(result).rejects.toThrow('Cancelled')
+    abort.abort(new Error('Cancelled'))
+    await rejected
+    release('fixture-token')
+    await Promise.resolve()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+})

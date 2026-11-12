@@ -1,0 +1,189 @@
+// Guardrail: the published daemon is a single self-contained bundle with zero
+// runtime deps (tsdown inlines everything; release.config.js strips
+// package.json "dependencies" to {} before publish). If tsdown ever fails to
+// inline a workspace/runtime import — e.g. @agentconnect.md/protocol when its
+// dist/ wasn't built before tsdown ran — rolldown SILENTLY externalizes it
+// (it can't resolve a missing file, so it leaves the bare `import`). With deps
+// stripped, that bundle then throws ERR_MODULE_NOT_FOUND on first run.
+//
+// This check turns that silent degradation into a hard build failure. It runs
+// after tsdown in the daemon's `build` script; it ships nowhere (files: ["dist"]).
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { builtinModules } from 'node:module'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const nodeBuiltins = new Set(builtinModules.flatMap((spec) => [spec, `node:${spec}`]))
+
+const bundlePath = new URL('../dist/index.js', import.meta.url)
+const bundle = readFileSync(bundlePath, 'utf8')
+
+const prepareRoot = mkdtempSync(join(tmpdir(), 'ac-prepare-upgrade-'))
+try {
+  const prepared = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL('../dist/prepare-upgrade.js', import.meta.url)), '--root', prepareRoot],
+    { encoding: 'utf8', timeout: 10_000, env: { PATH: process.env.PATH ?? '' } }
+  )
+  if (prepared.status !== 0 || existsSync(join(prepareRoot, 'microsandbox'))) {
+    throw new Error(`bundled SRT upgrade preparation failed: ${prepared.stderr}`)
+  }
+} finally {
+  rmSync(prepareRoot, { recursive: true, force: true })
+}
+
+// These packages must be embedded because the published manifest has no runtime
+// dependencies. Cover both static imports and the dynamic import used by the
+// daemon's hidden, exact-pinned skills CLI entry.
+const specs = [
+  ...bundle.matchAll(/\bfrom\s*["']([^"']+)["']/g),
+  ...bundle.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)/g)
+].map((match) => match[1])
+const leaked = specs.filter(
+  (spec) => spec.startsWith('@agentconnect.md/') || spec === 'skills' || spec.startsWith('skills/')
+)
+
+if (leaked.length > 0) {
+  const unique = [...new Set(leaked)].sort()
+  console.error(
+    '✗ daemon bundle is not self-contained — these required imports were left external:\n' +
+      unique.map((s) => `    ${s}`).join('\n') +
+      '\n  tsdown must inline them. Ensure workspace deps are built before tsdown runs\n' +
+      '  (the build dependency selector needs `dependencies` intact).\n'
+  )
+  process.exit(1)
+}
+
+const skillsCli = new URL('../dist/skills/dist/cli.js', import.meta.url)
+if (!existsSync(skillsCli)) {
+  console.error('✗ daemon bundle is missing the separately bundled skills CLI')
+  process.exit(1)
+}
+for (const asset of ['LICENSE', 'ThirdPartyNoticeText.txt', 'workspace-mutation.js']) {
+  if (!existsSync(new URL(`../dist/skills/${asset}`, import.meta.url))) {
+    console.error(`✗ daemon bundle is missing skills redistribution asset ${asset}`)
+    process.exit(1)
+  }
+}
+const version = spawnSync(process.execPath, [fileURLToPath(skillsCli), '--version'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+  env: { PATH: process.env.PATH ?? '' }
+})
+if (version.status !== 0 || version.stdout.trim() !== '1.5.21') {
+  console.error('✗ bundled skills CLI did not report the audited 1.5.21 version')
+  process.exit(1)
+}
+
+// SRT's native apply-seccomp helper cannot be inlined by tsdown; it must be
+// staged beside the bundle for both released Linux arches or the confined skills
+// sandbox silently loses Unix-socket blocking at runtime.
+for (const arch of ['x64', 'arm64']) {
+  if (!existsSync(new URL(`../dist/vendor/seccomp/${arch}/apply-seccomp`, import.meta.url))) {
+    console.error(`✗ daemon bundle is missing the SRT apply-seccomp helper for ${arch}`)
+    process.exit(1)
+  }
+}
+
+// Shared-image previews decode in a worker entry and load codec WebAssembly beside the bundle.
+const previewWorker = new URL('../dist/image-preview-worker.js', import.meta.url)
+if (!existsSync(previewWorker)) {
+  console.error('✗ daemon bundle is missing the image preview worker')
+  process.exit(1)
+}
+const workerLeaks = [...readFileSync(previewWorker, 'utf8').matchAll(/\bfrom\s*["']([^"'./][^"']*)["']/g)]
+  .map((match) => match[1])
+  .filter((spec) => !nodeBuiltins.has(spec))
+if (workerLeaks.length > 0) {
+  console.error(`✗ image preview worker left imports external: ${[...new Set(workerLeaks)].join(', ')}`)
+  process.exit(1)
+}
+for (const asset of ['resvg.wasm', 'webp_dec.wasm']) {
+  if (!existsSync(new URL(`../dist/wasm/${asset}`, import.meta.url))) {
+    console.error(`✗ daemon bundle is missing image codec ${asset}`)
+    process.exit(1)
+  }
+}
+
+// The in-sandbox shim is a SEPARATE bundle, and its self-containment is a stronger
+// requirement than the daemon's: it ships in the runtime image, so a relative import here
+// means the image must also carry the daemon's chunk graph — its CP client, platform SDKs
+// and credential paths — into the half-trusted sandbox. One file, or the build fails.
+// Every entry the image ships, checked identically: the credential helper and the secrets helper are separate
+// bundles precisely so their graphs stay disjoint from the channel's, and a shared module would show up here
+// as a relative chunk import — a file the image never copies.
+for (const entry of ['index.js', 'git-credential.js', 'secrets.js', 'skills/workspace-mutation.js']) {
+  const shimPath = new URL(`../dist/shim/${entry}`, import.meta.url)
+  if (!existsSync(shimPath)) {
+    console.error(`✗ shim bundle ${entry} is missing — \`tsdown --config tsdown.shim.config.ts\` did not run`)
+    process.exit(1)
+  }
+  const shim = readFileSync(shimPath, 'utf8')
+  // Statement-anchored, so an inlined dependency's doc comment (yaml's `* import … from 'yaml'`) is not read as an import.
+  const shimSpecs = [
+    ...shim.matchAll(/^\s*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/gm),
+    ...shim.matchAll(/\bimport\(\s*["']([^"']+)["']\s*\)/g)
+  ].map((match) => match[1])
+  const shimLeaked = shimSpecs.filter((spec) => !nodeBuiltins.has(spec))
+  if (shimLeaked.length > 0) {
+    console.error(
+      `✗ shim bundle ${entry} is not self-contained — it imports outside Node builtins:\n` +
+        [...new Set(shimLeaked)]
+          .sort()
+          .map((s) => `    ${s}`)
+          .join('\n') +
+        '\n  Each entry ships alone in the runtime image, so every dependency must be inlined.\n'
+    )
+    process.exit(1)
+  }
+}
+
+const shimEntry = new URL('../dist/shim/index.js', import.meta.url)
+const shimOfflineProvider = spawnSync(process.execPath, [fileURLToPath(shimEntry), '__sandbox-runtime-offline'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+  env: { PATH: process.env.PATH ?? '' }
+})
+if (
+  shimOfflineProvider.status !== 2 ||
+  !shimOfflineProvider.stderr.includes('expected <settings> <owner-pid> <cwd> -- <command> [args...]')
+) {
+  console.error('✗ shim bundle does not dispatch its confined offline-sandbox provider entry')
+  process.exit(1)
+}
+
+const shimSkillsCli = new URL('../dist/shim/skills/dist/cli.js', import.meta.url)
+const shimSkillsVersion = spawnSync(process.execPath, [fileURLToPath(shimSkillsCli), '--version'], {
+  encoding: 'utf8',
+  timeout: 10_000,
+  env: { PATH: process.env.PATH ?? '' }
+})
+if (shimSkillsVersion.status !== 0 || shimSkillsVersion.stdout.trim() !== '1.5.21') {
+  console.error('✗ shim skills CLI did not report the audited 1.5.21 version')
+  process.exit(1)
+}
+
+// The live secrets helper the image puts on the agent's PATH (capability-requests.md §4.9.2), from the daemon's own generator.
+const secretsWrapper = new URL('../dist/shim/agentconnect-secrets', import.meta.url)
+if (
+  !existsSync(secretsWrapper) ||
+  !readFileSync(secretsWrapper, 'utf8').includes('/opt/agentconnect/shim/secrets.js')
+) {
+  console.error('✗ the sandbox agentconnect-secrets wrapper is missing or does not call the in-image entry')
+  process.exit(1)
+}
+
+// The host and srt strategies hand git `<helperRoot>/bin/git-credential` with this `dist` as the helper root, so a
+// build that skipped the emit step would fail every credentialed clone of a session placed on this installation.
+const gitCredentialWrapper = new URL('../dist/bin/git-credential', import.meta.url)
+if (!existsSync(gitCredentialWrapper) || (statSync(gitCredentialWrapper).mode & 0o111) === 0) {
+  console.error(
+    '✗ the installation git credential helper is missing — `node scripts/emit-shim-git-credential-wrapper.mjs` did not run'
+  )
+  process.exit(1)
+}
+
+console.log('✓ daemon bundle is self-contained (including skills CLI 1.5.21 and SRT seccomp helpers)')
+console.log('✓ shim bundles are self-contained (channel + credential helper + gh token, Node builtins only)')

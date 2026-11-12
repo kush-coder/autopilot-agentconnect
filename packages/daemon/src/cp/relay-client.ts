@@ -1,0 +1,490 @@
+/**
+ * `RelayClient` — the daemon's dial-out client to ONE relay over the `rd/*` wire
+ * (shared-bot-relay.md §11 / §7.2). The daemon holds one to every relay in its
+ * roster; {@link RelayManager} set-converges them.
+ *
+ * Milestone A2 establishes the connection: dial → `rd/hello` (presenting the
+ * daemon's existing CP API key, which the relay delegates to the CP via
+ * `rc/verify`) → `rd/hello/ok`, whose echoed `relayId` MUST match the roster entry
+ * dialed (a mismatch = a pool LB in front of the daemon dial path → close +
+ * backoff, never continue on the wrong instance, §5). Content (`rd/msg`) flows in
+ * PR 3. Built on the shared `@agentconnect.md/connection` primitives — the first
+ * daemon consumer of that package.
+ */
+import {
+  buildRelayDaemonFrame,
+  decodeRelayDaemonFrame,
+  NIL_UUID,
+  RD_AGENT_SESSION_CALL_V1,
+  RD_SESSION_MESSAGE_V1,
+  RD_HEADLESS_AGENT_DELIVERY_V1,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  RD_AGENT_IMPLICIT_ROUTING_V1,
+  RD_GITHUB_THREAD_WORKTREE_CLEANUP_V2,
+  RD_WEBCHAT_ATTACH_V1,
+  API_AG_UI_V1_FEATURE,
+  API_AHP_V1_FEATURE,
+  API_AHP_HANDSHAKE_V1_FEATURE,
+  API_AHP_IDENTITIES_V1_FEATURE,
+  type RelayDaemonFrame,
+  type RdHelloOk,
+  type RdMsg,
+  type RdAck,
+  type RdAgentMsg,
+  type RdAgentMsgFwd,
+  type RdAgentMsgAck,
+  type RdChatEvent,
+  type RdWebchatPost,
+  GITEA_V1_FEATURE,
+  RD_CODEHOST_RELEASE_V1,
+  RD_HOOK_NOTICE_V1,
+  RD_HOOK_INSTRUCTIONS_V1,
+  GITLAB_COM_V1_FEATURE,
+  GITLAB_INSTANCE_V1_FEATURE,
+  DECISION_ROUTING_V1_FEATURE,
+  DECISION_TRIGGER_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  HOOK_DECISION_ROUTING_V2_FEATURE,
+  RD_DECISION_ROUTE_V1,
+  RD_IM_ADMISSION_V1,
+  RD_WEBCHAT_IMAGES_V1,
+  RD_WEBCHAT_PROMPT_SUGGESTION_V1,
+  type WebchatImageUpdate,
+  type WebchatPromptSuggestion,
+  type RdRoute,
+  type RdRouteAck,
+  type RdRouteReport,
+  type RdRouteReportAck,
+  RD_PLATFORM_REQUEST_BUDGET_MS,
+  RD_PLATFORM_REQUEST_V1,
+  type RdPlatformRequest,
+  type RdPlatformReply
+} from '@agentconnect.md/protocol'
+import { Backoff, ReqRep, WireError, type Clock, type TimerHandle, type Transport } from '@agentconnect.md/connection'
+import type { Logger } from '../log.js'
+import { AhpCarrier, ahpAvailable, type AhpCarrierDeps } from './ahp-carrier.js'
+
+const ACK_TIMEOUT_MS = 5000
+/** Longer than the relay's inner 5 s forward, so a slow target reads as the relay's `retry`, never a lost request. */
+const ROUTE_REQUEST_TIMEOUT_MS = 12_000
+/** Above the relay's whole-request budget, so a slow provider reads as the relay's answer, not a lost request. */
+const PLATFORM_REQUEST_TIMEOUT_MS = RD_PLATFORM_REQUEST_BUDGET_MS + 3_000
+/** rd/hello definitively rejected (bad/revoked key, daemonId mismatch) → stop dialing THIS relay. */
+const CLOSE_AUTH_FAILED = 4401
+
+/**
+ * Optional `rd/*` behaviors THIS daemon build supports, advertised on every
+ * `rd/hello` (send-message-routing-rework.md §8.4). A relay refuses a delivery that
+ * needs a capability the daemon did not list, rather than degrading it — so a
+ * capability belongs here only once the corresponding behavior actually ships.
+ */
+const DAEMON_RD_CAPABILITIES: readonly string[] = [
+  RD_HEADLESS_AGENT_DELIVERY_V1,
+  RD_CODEHOST_REPLY_TARGET_V1,
+  RD_AGENT_IMPLICIT_ROUTING_V1,
+  // send-message-guide.md §9.2: a `session-call` is admitted only into the session it names.
+  RD_AGENT_SESSION_CALL_V1,
+  // send-message-guide.md §9.3: a session message's id is recorded here, and a reply checked against what was sent.
+  RD_SESSION_MESSAGE_V1,
+  RD_GITHUB_THREAD_WORKTREE_CLEANUP_V2,
+  // The relay refuses the webchat `attach` probe for daemons without this.
+  RD_WEBCHAT_ATTACH_V1,
+  // The relay sends an AG-UI chat API turn only here: an older daemon cannot decode its `origin`.
+  API_AG_UI_V1_FEATURE,
+  // The relay gates gitlab rd/msg dispatch on this capability.
+  GITLAB_COM_V1_FEATURE,
+  // §24.4: and gates a SELF-MANAGED gitlab delivery on this one, per delivery attempt.
+  GITLAB_INSTANCE_V1_FEATURE,
+  // gitea-integration.md §11: the relay gates every gitea rd/msg dispatch on this one, gitea.com and self-hosted alike.
+  GITEA_V1_FEATURE,
+  // The relay sends a `notice` delivery only here: a daemon without it would run the fixed-text post as a prompt.
+  RD_HOOK_NOTICE_V1,
+  // The relay sends a generic delivery with owner instructions only here: an older daemon would run the payload as the instruction.
+  RD_HOOK_INSTRUCTIONS_V1,
+  // The relay sends a GitLab or Gitea `release` target only here: an older daemon cannot decode the member.
+  RD_CODEHOST_RELEASE_V1,
+  // The relay forwards By decision candidates only to daemons that list this.
+  DECISION_TRIGGER_V1_FEATURE,
+  // The relay sends trustedRouting / trustedRouteSelection only here; an older daemon would read them as plain deliveries.
+  DECISION_ROUTING_V1_FEATURE,
+  // The relay sends hook host copies (`routing`) and routed fires (`routeSelection`) only here.
+  HOOK_DECISION_ROUTING_V1_FEATURE,
+  // The relay sends GitLab and Gitea host copies and routed fires only here.
+  HOOK_DECISION_ROUTING_V2_FEATURE,
+  // An im ack answered through a platform strategy carries the strict routeAdmission/recoverable verdict; the shared path carries none, which the relay's strict forward reads as unsupported.
+  RD_IM_ADMISSION_V1,
+  // Shared-image cards: `image` events, post images and `rd/webchat-image-update`.
+  RD_WEBCHAT_IMAGES_V1
+]
+
+export type RelayClientState = 'CONNECTING' | 'HELLO' | 'READY' | 'CLOSED' | 'DEGRADED'
+
+/** The per-client deps, shared across every relay a daemon dials. */
+export interface RelayClientDeps extends AhpCarrierDeps {
+  /** The daemon's existing CP API key (presented on `rd/hello`); empty when it has none. */
+  apiKey: () => string
+  /** This pod's projected ServiceAccount token, re-read per connect because the kubelet
+   *  rotates it. Present ⇒ it is the credential and the API key is not sent. */
+  clusterIdentityToken?: () => string | undefined
+  /** The daemon's adopted id (undefined until `auth/ok`; `rd/hello.daemonId` needs it). */
+  daemonId: () => string | undefined
+  /** Capabilities that hold only while a runtime facet runs, read per connect. */
+  capabilities?: () => readonly string[]
+  clock: Clock
+  /** Dial factory — prod passes `ClientTransport.dial(url, { subprotocol, path })`; tests fake it. */
+  connect: (url: string) => Promise<Transport>
+  log: Logger
+  /** Backoff jitter in [0,1); defaults to Math.random. Injected as `() => 0` in tests. */
+  jitter?: () => number
+  /** Admit one relay delivery; chat streams over this socket, while completed posts fan out through RelayManager. */
+  onRelayMsg: (msg: RdMsg, chat: (event: RdChatEvent) => void, relayId?: string) => RdAck | Promise<RdAck>
+  /**
+   * Handle a forwarded cross-daemon agent-call (`rd/agentmsg/fwd`, agent-collaboration
+   * P2): the relay validated the caller and minted a TRUSTED claim. The daemon
+   * terminal-verifies + dispatches, returning the typed admission verdict (ACK/NAK on
+   * durable admission, NOT the model turn — §6.4). Async so the terminal verify can
+   * consult local state.
+   */
+  onRelayAgentMsg: (msg: RdAgentMsgFwd) => Promise<RdAgentMsgAck>
+}
+
+export class RelayClient {
+  state: RelayClientState = 'CLOSED'
+
+  private transport?: Transport
+  private ahp?: AhpCarrier
+  private generation = 0
+  private readonly correlator: ReqRep<RelayDaemonFrame>
+  private readonly backoff: Backoff
+  private stopped = false
+  private fatal = false // 4401 — never redial this relay
+  private reconnectTimer?: TimerHandle
+  private relayCapabilities?: Set<string>
+  private readonly seqByChat = new Map<string, number>() // per-chat monotonic rd/chat seq
+
+  constructor(
+    readonly relayId: string,
+    readonly url: string,
+    private readonly deps: RelayClientDeps
+  ) {
+    this.correlator = new ReqRep<RelayDaemonFrame>(deps.clock, ACK_TIMEOUT_MS)
+    this.backoff = new Backoff(deps.jitter ? { jitter: deps.jitter } : {})
+  }
+
+  start(): void {
+    this.stopped = false
+    this.fatal = false
+    void this.attemptConnect()
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true
+    this.generation++
+    if (this.reconnectTimer !== undefined) {
+      this.deps.clock.clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    this.correlator.rejectAll(new Error('stopping'))
+    this.ahp?.dispose()
+    this.transport?.close(1000, 'shutdown')
+    this.state = 'CLOSED'
+  }
+
+  isReady(): boolean {
+    return this.state === 'READY'
+  }
+
+  /**
+   * Send a cross-daemon agent-call to the relay (`rd/agentmsg` REQ, agent-collaboration
+   * §2.3/§6.4) and resolve with the relay's admission verdict. `claimedFromAgentId` is
+   * this daemon's trusted caller — the relay re-validates it against the socket's
+   * authenticated daemonId. Rejects (retryable) if the socket isn't READY.
+   */
+  async sendAgentMsg(payload: RdAgentMsg): Promise<RdAgentMsgAck> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    if (
+      (payload.originCodeHostReplyTarget !== undefined || payload.codeHostReplyTarget !== undefined) &&
+      !this.relayCapabilities?.has(RD_CODEHOST_REPLY_TARGET_V1)
+    ) {
+      return { deliveryId: payload.deliveryId, delivered: false, reason: 'unsupported' }
+    }
+    const rep = await this.sendRequest(buildRelayDaemonFrame('rd/agentmsg', payload))
+    if (rep.type !== 'rd/agentmsg/ack') {
+      throw new WireError('INTERNAL', `expected rd/agentmsg/ack, got ${rep.type}`, false)
+    }
+    return rep.payload
+  }
+
+  /** Did this relay advertise shared-image cards for its console? */
+  advertisesWebchatImages(): boolean | undefined {
+    return this.relayCapabilities?.has(RD_WEBCHAT_IMAGES_V1)
+  }
+
+  /** Can this connection carry shared-image cards now? */
+  supportsWebchatImages(): boolean {
+    return this.isReady() && this.advertisesWebchatImages() === true
+  }
+
+  /** Send one shared image's original-state change; the relay hands it to the conversation's browsers only. */
+  sendWebchatImageUpdate(update: WebchatImageUpdate): void {
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/webchat-image-update', update)))
+  }
+
+  /** Can this connection carry a conversation's predicted next prompt now? */
+  supportsWebchatPromptSuggestion(): boolean {
+    return this.isReady() && this.relayCapabilities?.has(RD_WEBCHAT_PROMPT_SUGGESTION_V1) === true
+  }
+
+  /** Send a conversation's predicted next prompt; the relay hands it to that conversation's browsers only. */
+  sendWebchatPromptSuggestion(suggestion: WebchatPromptSuggestion): void {
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/webchat-prompt-suggestion', suggestion)))
+  }
+
+  /** Did this relay advertise the routed-forward leg (`rd/route`, `rd/route/report`)? */
+  supportsRoute(): boolean {
+    return this.isReady() && this.relayCapabilities?.has(RD_DECISION_ROUTE_V1) === true
+  }
+
+  /** One frozen router target to the relay, single-shot with a timeout above the relay's own forward bound. */
+  async sendRoute(payload: RdRoute): Promise<RdRouteAck> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    if (!this.relayCapabilities?.has(RD_DECISION_ROUTE_V1))
+      return { deliveryId: payload.deliveryId, disposition: 'rejected', reason: 'unsupported' }
+    const rep = await this.correlator.request(
+      buildRelayDaemonFrame('rd/route', payload),
+      (e) => this.transport!.send(e),
+      {
+        maxTries: 1,
+        ackTimeoutMs: ROUTE_REQUEST_TIMEOUT_MS
+      }
+    )
+    if (rep.type !== 'rd/route/ack') throw new WireError('INTERNAL', `expected rd/route/ack, got ${rep.type}`, false)
+    return rep.payload
+  }
+
+  /** A finished selection's owner and participants, for the relay's rc/thread-assign / rc/thread-participant legs. */
+  async sendRouteReport(payload: RdRouteReport): Promise<RdRouteReportAck> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    if (!this.relayCapabilities?.has(RD_DECISION_ROUTE_V1)) return { accepted: false, reason: 'unsupported' }
+    const rep = await this.correlator.request(
+      buildRelayDaemonFrame('rd/route/report', payload),
+      (e) => this.transport!.send(e),
+      { maxTries: 1, ackTimeoutMs: ROUTE_REQUEST_TIMEOUT_MS }
+    )
+    if (rep.type !== 'rd/route/report/ack')
+      throw new WireError('INTERNAL', `expected rd/route/report/ack, got ${rep.type}`, false)
+    return rep.payload
+  }
+
+  /** Did this relay advertise `rd/platform/request`? */
+  supportsPlatformRequest(): boolean {
+    return this.isReady() && this.relayCapabilities?.has(RD_PLATFORM_REQUEST_V1) === true
+  }
+
+  /** One platform module's provider call through this relay, single-shot: a provider write must never be sent twice by a retransmit. */
+  async sendPlatformRequest(payload: RdPlatformRequest): Promise<RdPlatformReply> {
+    if (this.state !== 'READY') throw new WireError('INTERNAL', `rd link not ready (${this.state})`, true)
+    const rep = await this.correlator.request(
+      buildRelayDaemonFrame('rd/platform/request', payload),
+      (e) => this.transport!.send(e),
+      { maxTries: 1, ackTimeoutMs: PLATFORM_REQUEST_TIMEOUT_MS }
+    )
+    if (rep.type !== 'rd/platform/reply')
+      throw new WireError('INTERNAL', `expected rd/platform/reply, got ${rep.type}`, false)
+    return rep.payload
+  }
+
+  private async attemptConnect(): Promise<void> {
+    if (this.stopped || this.fatal) return
+    const generation = ++this.generation
+    const daemonId = this.deps.daemonId()
+    if (!daemonId) {
+      // Id not adopted yet (token onboarding). Back off and retry — auth/ok normally
+      // sets it before the roster ever converges, so this is a rare defensive path.
+      this.state = 'DEGRADED'
+      this.scheduleReconnect()
+      return
+    }
+    this.state = 'CONNECTING'
+    try {
+      const t = await this.deps.connect(this.url)
+      if (this.stopped || this.fatal || this.generation !== generation) {
+        t.close(1000, 'shutdown')
+        return
+      }
+      this.transport = t
+      const ahp = new AhpCarrier(t, this.deps)
+      this.ahp = ahp
+      t.onMessage((txt) => {
+        if (this.transport === t) void this.onText(txt)
+      })
+      t.onClose((c, r) => {
+        ahp.dispose()
+        if (this.transport === t) this.onClose(c, r)
+      })
+      await this.handshake(daemonId, t)
+      this.backoff.reset()
+    } catch (err) {
+      if (this.generation !== generation) return
+      this.deps.log.warn(`relay(${this.relayId}): connect/hello failed: ${(err as Error).message}`)
+      this.transport?.close(1011, 'handshake failed')
+      this.ahp?.dispose()
+      this.transport = undefined
+      this.scheduleReconnect()
+    }
+  }
+
+  private async handshake(daemonId: string, transport: Transport): Promise<void> {
+    this.state = 'HELLO'
+    // Read per connect, never cached — the same credential and the same reason as the CP socket.
+    const identityToken = this.deps.clusterIdentityToken?.()
+    const apiKey = this.deps.apiKey()
+    const rep = await this.sendRequest(
+      buildRelayDaemonFrame('rd/hello', {
+        ...(identityToken ? { serviceAccountToken: identityToken } : apiKey ? { apiKey } : {}),
+        daemonId,
+        capabilities: [
+          ...DAEMON_RD_CAPABILITIES,
+          ...(this.deps.capabilities?.() ?? []),
+          ...(ahpAvailable(this.deps)
+            ? [API_AHP_V1_FEATURE, API_AHP_HANDSHAKE_V1_FEATURE, API_AHP_IDENTITIES_V1_FEATURE]
+            : [])
+        ]
+      })
+    )
+    if (rep.type !== 'rd/hello/ok') {
+      throw new WireError('INTERNAL', `expected rd/hello/ok, got ${rep.type}`, false)
+    }
+    const ok = rep.payload as RdHelloOk
+    if (this.transport !== transport || this.stopped) throw new Error('relay connection replaced')
+    if (ok.relayId !== this.relayId) {
+      // Misroute: dialed relay A, reached relay B ⇒ a pool LB is in the daemon dial
+      // path. Deployment error — retry (the operator must fix per-instance routing).
+      throw new WireError('INTERNAL', `relay misroute: dialed ${this.relayId}, reached ${ok.relayId}`, true)
+    }
+    this.relayCapabilities = new Set(ok.capabilities ?? [])
+    this.state = 'READY'
+    this.deps.log.info(`relay(${this.relayId}): rd/* connected`)
+  }
+
+  private sendRequest(frame: RelayDaemonFrame): Promise<RelayDaemonFrame> {
+    return this.correlator.request(frame, (e) => this.transport!.send(e))
+  }
+
+  /** The `type` of a frame that failed to decode, for the log line — never its payload. */
+  private static frameTypeOf(text: string): string {
+    try {
+      const type = (JSON.parse(text) as { type?: unknown }).type
+      return typeof type === 'string' ? type : 'untyped'
+    } catch {
+      return 'non-JSON'
+    }
+  }
+
+  private async onText(text: string): Promise<void> {
+    const decoded = decodeRelayDaemonFrame(text)
+    if (!decoded.ok) {
+      const code =
+        decoded.msg === 'FRAME_TOO_LARGE'
+          ? 'FRAME_TOO_LARGE'
+          : decoded.msg === 'UNKNOWN_FRAME'
+            ? 'UNKNOWN_FRAME'
+            : 'BAD_PAYLOAD'
+      if (decoded.corr) {
+        this.correlator.reject(decoded.corr, new WireError(code, `invalid correlated reply: ${decoded.msg}`, false))
+        return
+      }
+      // A request this build cannot read: say so here AND answer the relay with a correlated
+      // `error`, so its forward fails at once with the reason instead of timing out in silence.
+      const reason = decoded.msg.slice(0, 300)
+      this.deps.log.warn(
+        `relay(${this.relayId}): dropping undecodable ${RelayClient.frameTypeOf(text)} frame ${decoded.id} (${Buffer.byteLength(text)} bytes): ${reason}`
+      )
+      if (decoded.id !== NIL_UUID) {
+        this.transport?.send(
+          JSON.stringify(
+            buildRelayDaemonFrame('error', { code, message: reason, retryable: false }, { corr: decoded.id })
+          )
+        )
+      }
+      return
+    }
+    const frame = decoded.frame
+    if (frame.corr && this.correlator.settle(frame)) return
+    if (this.state === 'READY' && this.ahp?.receive(frame)) return
+    this.deps.log.debug(`relay(${this.relayId}): ← ${frame.type} ${frame.id} (${Buffer.byteLength(text)} bytes)`)
+    if (frame.type === 'rd/msg') {
+      await this.handleMsg(frame.id, frame.payload)
+      return
+    }
+    if (frame.type === 'rd/agentmsg/fwd') {
+      void this.handleAgentMsgFwd(frame.id, frame.payload)
+      return
+    }
+    this.deps.log.debug(`relay(${this.relayId}): ignoring ${frame.type}`)
+  }
+
+  /** An inbound rd/msg: dispatch it, reply `rd/ack`; only a webchat op streams
+   *  `rd/chat` back over this socket. A shared-bot `im` replies out-of-band via the
+   *  daemon's own Slack send, and a hook fire has no reply stream — both get a noop. */
+  private async handleMsg(reqId: string, msg: RdMsg): Promise<void> {
+    const chat =
+      msg.source === 'webchat' ? (event: RdChatEvent) => this.sendChat(msg.chatId, event) : (): void => undefined
+    const ack = await this.deps.onRelayMsg(msg, chat, this.relayId)
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/ack', ack, { corr: reqId })))
+  }
+
+  /** A forwarded cross-daemon agent-call: terminal-verify + dispatch, reply the typed
+   *  admission verdict (`rd/agentmsg/ack`, corr = the relay's fwd id). */
+  private async handleAgentMsgFwd(reqId: string, msg: RdAgentMsgFwd): Promise<void> {
+    let ack: RdAgentMsgAck
+    try {
+      ack = await this.deps.onRelayAgentMsg(msg)
+    } catch (err) {
+      this.deps.log.error(`relay(${this.relayId}): rd/agentmsg/fwd handler threw: ${(err as Error).message}`)
+      ack = { deliveryId: msg.deliveryId, delivered: false, reason: 'offline' }
+    }
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/agentmsg/ack', ack, { corr: reqId })))
+  }
+  /** Send one completed post on this relay; RelayManager owns daemon-wide fan-out. */
+  sendWebchatPost(post: RdWebchatPost): void {
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/webchat-post', post)))
+  }
+
+  private sendChat(chatId: string, event: RdChatEvent): void {
+    const seq = (this.seqByChat.get(chatId) ?? 0) + 1
+    this.seqByChat.set(chatId, seq)
+    this.transport?.send(JSON.stringify(buildRelayDaemonFrame('rd/chat', { chatId, seq, event })))
+    // A turn's terminal `done` ends this chat's stream — drop the counter so the map
+    // doesn't accumulate one permanent entry per lifetime conversation. The next turn of
+    // the same conversation restarts seq at 1 (seq is per-stream for assembly, not global).
+    if (event.kind === 'done') this.seqByChat.delete(chatId)
+  }
+
+  private onClose(code: number, _reason: string): void {
+    this.transport = undefined
+    this.correlator.rejectAll(new WireError('INTERNAL', 'connection closed', true))
+    if (code === CLOSE_AUTH_FAILED) {
+      this.fatal = true
+      this.state = 'CLOSED'
+      this.deps.log.warn(`relay(${this.relayId}): rd/hello rejected (4401) — not redialing`)
+      return
+    }
+    if (this.stopped) {
+      this.state = 'CLOSED'
+      return
+    }
+    this.state = 'DEGRADED'
+    this.scheduleReconnect()
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.fatal) return
+    if (this.reconnectTimer !== undefined) return
+    const delay = this.backoff.next()
+    this.reconnectTimer = this.deps.clock.setTimeout(() => {
+      this.reconnectTimer = undefined
+      void this.attemptConnect()
+    }, delay)
+  }
+}

@@ -1,0 +1,284 @@
+import type { AgentCronService } from '../orchestrator/agentCrons.js'
+import type { FileTransferService } from '../file-transfer/service.js'
+import type { SharedImageService } from '../file-transfer/shared-image.js'
+import type { AgentMemoryTransactionService } from '../agent-memory/transaction.service.js'
+/**
+ * `DaemonWsDeps` — the dependency bundle every connection actor and frame
+ * handler receives (design §2.4 `createDaemonWsServer(app, deps)`).
+ *
+ * It is the composition-root's view of the WS edge: the C4 auth/registry
+ * services, the C3 reconcile service, the in-memory connection index, the clock,
+ * and the config slice the FSM needs. Kept in its own module so `connection.ts`
+ * and `handlers/*` share the type without a cycle.
+ *
+ * Grows per phase: secrets/watchdog/full-orchestrator deps join in Phase 3.
+ */
+import type { AhpSessionService } from '../registry/ahpSessions.js'
+import type { DaemonReleaseResolver } from '../registry/daemonRelease.js'
+import type { DaemonAuth, DaemonRegistry } from '../ports.js'
+import type {
+  SessionRepo,
+  IntegrationRepo,
+  IntegrationChannelRepo,
+  CronRepo,
+  HookRepo,
+  MemberSetRepo,
+  AgentRepo,
+  ExternalMemoryConnectionRepo,
+  WebchatConversationRepo,
+  LaunchRepo,
+  UserRepo,
+  OrganizationKnowledgeRepo,
+  BotRepo,
+  GithubInstallationRepo,
+  GitlabProjectBindingRepo,
+  DaemonLifecycleOpRepo,
+  AgentRecord,
+  BotRecord,
+  AgentMemoryHistoryRepo,
+  ProviderKeyStore,
+  DecisionRepo,
+  AgentSkillSourceStatusRepo
+} from '../persistence/ports.js'
+import type { AgentMemoryStoreService } from '../agent-memory/store.service.js'
+import type { UsageWriter } from '../usage/writer.js'
+import type { SessionVisibilityPushService } from '../orchestrator/visibilityPush.js'
+import type {
+  DutyAgentBundle,
+  IntegrationRevoked,
+  IntegrationTenant,
+  RelayRosterEntry
+} from '@agentconnect.md/protocol'
+import type { GithubService } from '../github/service.js'
+import type { RepoCandidatesService } from '../github/repo-candidates.js'
+import type { GitlabGitcredService } from '../gitlab/gitcred.service.js'
+import type { GiteaGitcredService } from '../gitea/gitcred.service.js'
+import type { AzureDevOpsGitcredService } from '../azure-devops/gitcred.service.js'
+import type { LinearTokenService } from '../platforms/linear/token-service.js'
+import type { CodeHostReviewBrokerService } from '../codehost/review-lease.service.js'
+import type { GithubReviewBrokerService } from '../github/review-broker.service.js'
+import type { GithubRunCoordinator } from '../github/run-reporter.js'
+import type { countReviewCheckout } from '../observability/review-checkout.js'
+import type { CodeHostNoteProjectionService } from '../codehost/note-projection.service.js'
+import type { GiteaStatusCoordinator } from '../gitea/status-projection.js'
+import type { AzureDevOpsStatusCoordinator } from '../azure-devops/status-projection.js'
+import type { ReconcileService } from '../orchestrator/placement.js'
+import type { ConnectionRegistry } from './registry.js'
+import type { Clock } from '../domain/clock.js'
+import type { SessionEventSink } from '../events/sink.js'
+import type { AgentMutationGate } from '../orchestrator/agentMutationGate.js'
+import type { PlacementResolver } from '../orchestrator/placementResolver.js'
+import type { CollabRoutesService } from '../orchestrator/collabRoutes.service.js'
+import type { GatedDmSeedResolver } from '../orchestrator/linkedDm.js'
+import type { ApprovalRouteResolver } from '../orchestrator/approvalRoute.js'
+import type { ReadAccessResolver } from '../orchestrator/readAccess.js'
+import type { DutyLeaseService } from '../orchestrator/dutyLease.js'
+import type { ComputerLeaseService } from '../registry/computerLeaseService.js'
+import type { ComputerPool } from '../registry/computerPool.js'
+import type { ComputerChannelGrants } from '../registry/computerChannelGrants.js'
+import type { AgentId, BotId, DaemonId } from '../domain/ids.js'
+import type { WebchatRemoteMcpService } from '../registry/webchatRemoteMcpService.js'
+import type { SlackSessionAccessService } from '../http/slack-session-access.js'
+import type { SessionAccessWarmer } from '../http/session-access-warmer.js'
+import type { SessionPullRequestFeedbackService } from '../codehost/session-pull-request-feedback.service.js'
+import type { FollowUpWatchService } from '../codehost/follow-up-watch.service.js'
+import type { CapabilityRequestService } from '../capability/capability-request.service.js'
+import type { CodeHostFeedbackService } from '../codehost/feedback.service.js'
+import type { CpPlatformRegistry } from '../platforms/provider.js'
+
+/** The two CP facts an `integration/revoked` report needs beyond the repositories. */
+export interface SocketBotRevocation {
+  /** The platform provider's verdict that the reporting socket's identity is this bot's current one. */
+  matches(bot: BotRecord, reported: Pick<IntegrationRevoked, 'botUserId' | 'workspaceId'>): boolean
+  /** The fenced revocation `rc/bot-revoked` applies, fenced here by the event time alone. */
+  revoke(botId: BotId, reason: IntegrationRevoked['reason'], eventAtMs: number): Promise<{ applied: boolean }>
+}
+
+/** Applies a daemon socket's `integration/tenant` to one bot it may speak for. */
+export interface SocketBotTenant {
+  /** Record the tenant and name it; false ⇒ the report was refused. */
+  record(bot: BotRecord, reported: Pick<IntegrationTenant, 'botUserId' | 'tenantId'>): Promise<boolean>
+}
+
+/** Config slice the WS edge reads. */
+export interface WsConfig {
+  HEARTBEAT_SEC: number
+  ACK_TIMEOUT_MS: number
+  /** The path the daemon socket is mounted at (default `/daemon/ws`). */
+  WS_PATH?: string
+  /** The database pool the handshake limit is sized against (pg's default of 10 when absent). */
+  DATABASE_POOL_MAX?: number
+  /** Daemon auth/register steps run at once; defaults to three quarters of the pool. */
+  DAEMON_HANDSHAKE_CONCURRENCY?: number
+}
+
+export interface DaemonWsDeps {
+  admission: import('../persistence/ports.js').DaemonAdmissionRepo
+  ahpSessions?: AhpSessionService
+  /** Structured server log sink for failures handled at the daemon WS edge. */
+  log: {
+    error: (obj: Record<string, unknown>, message: string) => void
+    warn?: (obj: Record<string, unknown>, message: string) => void
+  }
+  auth: DaemonAuth
+  /** Durable lifecycle intent exposed during auth-only bootstrap. */
+  lifecycleOps: DaemonLifecycleOpRepo
+  /** The deployment's announced daemon release for `register/ok.release`; absent ⇒ never announced. */
+  daemonRelease?: Pick<DaemonReleaseResolver, 'current'>
+  registry: DaemonRegistry
+  orchestrator: ReconcileService
+  connReg: ConnectionRegistry
+  /** The shared usage report interface — this plane is its `daemon`-source adapter. */
+  usageWriter: UsageWriter
+  /** Persists milestones from `event/session` EVT or acknowledged sync request. */
+  session: SessionRepo
+  /** Resolves a webchat conversation's owning user for session-visibility ingest
+   *  (session-visibility.md §4.2); absent ⇒ webchat sessions record no owner
+   *  (null — visible to no one until a repair/backfill). */
+  webchatConversation?: WebchatConversationRepo
+  /** Confidential two-phase grant lifecycle for session-scoped remote MCP. */
+  webchatRemoteMcp?: Pick<WebchatRemoteMcpService, 'issue' | 'accept' | 'renew' | 'revoke'>
+  /** Resolves Web API launch provenance for the same classification (§4.4). */
+  launch?: LaunchRepo
+  /** Tells a service-account owner apart for the same classification; absent ⇒ every owner reads as a person. */
+  user?: Pick<UserRepo, 'isServiceAccount'>
+  /** Tells whether a DM's platform can name its people (§4.2); absent ⇒ every DM stays private to its sender. */
+  platforms?: CpPlatformRegistry
+  /** Pushes the CP-confirmed capture gate to the owning daemon (§5.1); absent ⇒
+   *  daemons converge on their next register snapshot instead. */
+  visibilityPush?: SessionVisibilityPushService
+  /** Recompiles relay routes held for this daemon's missing decision-trigger-v1 once it is READY; absent ⇒ next sync. */
+  httpBotDaemonReady?: (daemonId: string) => Promise<void>
+  /** Moves the evaluation host of routed conversations that depended on a daemon whose connection closed. */
+  httpBotDaemonOffline?: (daemonId: string) => Promise<void>
+  /** Persists exact-session PR capture obligations and drains durable PR feedback after daemon readiness. */
+  pullRequestFeedback?: Pick<SessionPullRequestFeedbackService, 'trackSession' | 'kick'>
+  /** Event wake's subscriptions (assistant-mode.md §5.14); absent ⇒ `assistant/follow-up-watch` is refused and not advertised. */
+  followUpWatch?: Pick<FollowUpWatchService, 'apply' | 'kick' | 'agentWatches'>
+  /** Capability requests (capability-requests.md); absent ⇒ `capability/*` is refused and not advertised. */
+  capabilityRequests?: Pick<CapabilityRequestService, 'request' | 'withdraw' | 'decide' | 'daemonReady'>
+  codeHostFeedback?: Pick<CodeHostFeedbackService, 'outputPublished'>
+  /** Publishes persisted session milestones to the WebUI SSE feed. */
+  events: SessionEventSink
+  /** Ownership check for the `integration/channels` EVT (integration → daemon scope). */
+  integration: IntegrationRepo
+  /** Validates a daemon-reported external credential locator before a Session is bound to its
+   *  immutable provider scope, and resolves the workspace bot behind a `linearcred/request`. */
+  bot?: BotRepo
+  /** Applies a daemon socket's `integration/revoked`; absent ⇒ the frame is refused and `register/ok` does not advertise it. */
+  socketBotRevocation?: SocketBotRevocation
+  /** Applies a daemon socket's `integration/tenant`; absent ⇒ the frame is dropped and `register/ok` does not advertise it. */
+  socketBotTenant?: SocketBotTenant
+  /** Resolves a trusted GitHub delivery's installation id to this org's
+   * durable credential locator before binding a repository ExternalScope. */
+  githubInstallation?: GithubInstallationRepo
+  gitlabProjectBinding?: Pick<GitlabProjectBindingRepo, 'byProject'>
+  gitlabBaseUrl?: string
+  /** Persists authoritative membership snapshots and partial conversation reports. */
+  integrationChannel: IntegrationChannelRepo
+  /** §4.2(4) `isPrivate` cross-check (session-access-cold-visit.md): a snapshot observing a
+   *  channel private drops its cached `public` audience verdict — invalidation only. */
+  slackSessionAccess?: Pick<SlackSessionAccessService, 'dropPublicAudiences'>
+  /** §14.8: which of a gated install's reported DMs seed to the ordinary DM default
+   *  because their counterpart is in the agent's own audience; absent ⇒ all stay Off. */
+  gatedDmSeeds?: GatedDmSeedResolver
+  /** slack-approval-dm.md §4.2: pick / revalidate a pending approval's DM recipient;
+   *  absent ⇒ `agent/approval-route` fails closed and the daemon keeps today's behavior. */
+  approvalRoute?: ApprovalRouteResolver
+  /** The console's session visibility for whoever asks a cross-platform read; absent ⇒ every asker is unidentifiable. */
+  readAccess?: ReadAccessResolver
+  /** Republish the agent's integrations. Needed because §14.8 is the one path where a
+   *  daemon REPORT creates an ENABLED row: the reporter is still holding bindRules that
+   *  predate it, and it has already cached the conversation, so nothing re-reports and
+   *  the DM stays refused until an unrelated push or reconnect. Absent ⇒ exactly that. */
+  integrationConverge?: (agent: AgentRecord) => Promise<void>
+  /** §4.1 activity poke (session-access-cold-visit.md): a committed live `event/session`
+   *  milestone marks its external scope active so the warmer keeps its resource facts
+   *  leased. Replayed `event/session-sync` frames never poke (§4.2(6)). */
+  sessionAccessWarmer?: Pick<SessionAccessWarmer, 'poke'>
+  /** Shares the HTTP agent-move boundary with daemon-originated conversation reports. */
+  agentMutations: AgentMutationGate
+  /** Resumes durable move tombstones advertised by a reconnecting daemon. */
+  recoverStagedAgent: (agentId: AgentId, daemonId: DaemonId, moveId: string) => Promise<void>
+  /** Refreshes relay and daemon collaboration snapshots after accepted conversation changes. */
+  collabRoutes: CollabRoutesService
+  /** The duty lease exchange riding the heartbeat (k8s daemons). */
+  dutyLease: DutyLeaseService
+  /** Computer control leases (computer-use.md §4.4); absent in tests that do not exercise them. */
+  computerLeases?: Pick<ComputerLeaseService, 'acquire' | 'release' | 'sessionEnded' | 'daemonHeartbeat'>
+  /** Per-session data-plane tokens for a desktop daemon's `/mcp` (computer-use.md §3.7); absent in tests that do not exercise them. */
+  computerChannelGrants?: Pick<ComputerChannelGrants, 'grant'>
+  /** Managed computers in the Kubernetes pool (computer-use.md §15.1); absent when the deployment runs no pool. */
+  computerPool?: Pick<ComputerPool, 'acquire'>
+  /** The set a connection may claim duties within (daemon-groups.md §3), re-read once registered; the executor requests also read the set's switch and members. */
+  memberSets: Pick<MemberSetRepo, 'setIdOf' | 'get' | 'memberIdsOf'>
+  /** Assembles one agent's complete installable definition for `duty/fetch` —
+   *  the same bundle an `agent/activate` carries; absent ⇒ the fetch answers
+   *  empty and the member installs nothing. */
+  agentBundle?: (agent: AgentRecord) => Promise<DutyAgentBundle>
+  /** Stamps `lastRunAt` from the `cron/report` EVT (daemon-scoped, latest-wins). */
+  cron: CronRepo
+  /** An agent's own crons (`cron/self`) and a one-shot's retirement after its run; absent ⇒ refused and not advertised. */
+  agentCrons?: Pick<AgentCronService, 'list' | 'save' | 'remove' | 'retireOneShot'>
+  /** Closes `HookRun` rows from the correlated `hook/report` completion request. */
+  hook: HookRepo
+  /** Viewer-free agent reads for the `gitcred/request` placement check — a DATA-PLANE
+   *  path (resource-visibility §9): restricted-but-active agents must keep minting. */
+  agent: AgentRepo
+  /** "May this connection act for that agent?" — placement OR a held duty. A pool member serves
+   *  agents its row does not name, so placement equality is no longer the fence. Absent ⇒
+   *  placement alone, which is the pre-duty behavior. */
+  placementResolver?: PlacementResolver
+  /** Accepted Knowledge/skills and retained suggestion metadata. */
+  organizationKnowledge?: OrganizationKnowledgeRepo
+  /** The organization record an assistant-mode agent reads and writes (assistant-mode.md §5.16). */
+  organizationRecord?: import('../persistence/ports.js').OrganizationRecordRepo
+  /** Revision-fenced sink for daemon external-memory conformance facts. */
+  externalMemoryConnection?: ExternalMemoryConnectionRepo
+  /** The `control-plane` memory home's op set (memory-evolution.md §3.2.1); absent ⇒ `memory/store` answers INTERNAL. */
+  agentMemoryTransaction?: Pick<AgentMemoryTransactionService, 'apply'>
+  agentMemoryStore?: Pick<AgentMemoryStoreService, 'apply' | 'applyOnce' | 'deduplicatesOperations'>
+  /** The change-log table behind `memory/history/append` and `memory/history/read`; absent ⇒ INTERNAL. */
+  agentMemoryHistory?: Pick<AgentMemoryHistoryRepo, 'append' | 'page'>
+  /** Stores `agent/skill-status` reports; absent ⇒ the frame is ignored and `agent-skill-status-v1` not advertised. */
+  agentSkillSourceStatus?: Pick<AgentSkillSourceStatusRepo, 'replace'>
+  /** github-app workspaces façade; absent ⇒ gitcred/request answers SCOPE_DENIED. */
+  github?: GithubService
+  /** The selector's installation rosters; absent ⇒ `repo-candidates/request` answers SCOPE_DENIED and is not advertised. */
+  repoCandidates?: Pick<RepoCandidatesService, 'forAgent'>
+  /** gitcred v2 GitLab grants (§13.1); absent ⇒ gitlab workspaces disabled. */
+  gitlabGitcred?: GitlabGitcredService
+  /** gitcred v2 Gitea grants (gitea-integration.md §4.2, §9); absent ⇒ gitea workspaces disabled. */
+  giteaGitcred?: GiteaGitcredService
+  /** gitcred leases for Azure DevOps, served to the credential proxy only (azure-devops-integration.md §6.1); absent ⇒ disabled. */
+  azureDevOpsGitcred?: AzureDevOpsGitcredService
+  /** Linear workspace token custody (linear-integration.md §7.3) — the one seam the `linearcred`
+   *  broker calls; absent ⇒ `linearcred/request` answers SCOPE_DENIED. */
+  linearTokens?: Pick<LinearTokenService, 'accessToken'>
+  providerKey?: Pick<ProviderKeyStore, 'get'>
+  decision?: Pick<DecisionRepo, 'listForAgent' | 'getForAgent'>
+  /** Console file transfer signer; absent ⇒ `transfer/sign` and `transfer/get` answer SCOPE_DENIED. */
+  fileTransfer?: FileTransferService
+  /** Shared-image originals (webchat-generated-images.md §5); absent ⇒ `image/original/*` answers SCOPE_DENIED. */
+  sharedImages?: SharedImageService
+  /** R1 action-time formal-review broker; absent ⇒ review/start REQs fail closed. */
+  githubReviewBroker?: GithubReviewBrokerService
+  /** Provider-neutral formal reviews: publication lease, operation ledger, outcome
+   *  store (§15.1/§15.2). Absent ⇒ every `codehost/*` REQ fails closed. */
+  codeHostReviewBroker?: CodeHostReviewBrokerService
+  /** R2a metadata-only lifecycle → informational Check projection. */
+  githubRunCoordinator?: GithubRunCoordinator
+  /** Counts an acknowledged github review's checkout outcome; absent ⇒ the default OTel counter. */
+  reviewCheckoutMetric?: typeof countReviewCheckout
+  /** §16 desired-generation ledger for the daemon-written run projection; absent ⇒ no GitLab bindings. */
+  codeHostNoteProjection?: CodeHostNoteProjectionService
+  /** gitea-integration.md §10.4: the Control-Plane-written commit-status projection's lifecycle edges. */
+  giteaStatusProjection?: GiteaStatusCoordinator
+  /** azure-devops-integration.md §11.7: the Control-Plane-written pull-request status projection's lifecycle edges. */
+  azureDevOpsStatusProjection?: AzureDevOpsStatusCoordinator
+  /** The current relay roster, injected into `register/ok.relays` so a (re)connecting
+   *  daemon converges to the relays it should dial (shared-bot-relay.md §5). */
+  relayRoster: () => Promise<RelayRosterEntry[]>
+  clock: Clock
+  config: WsConfig
+}

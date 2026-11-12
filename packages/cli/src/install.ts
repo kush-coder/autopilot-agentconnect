@@ -1,0 +1,137 @@
+/**
+ * Install a daemon version into the store (cli-daemon-split.md §5.1): resolve from
+ * the registry → verify integrity → engines check → extract to `versions/<v>.tmp`
+ * → atomic rename to `versions/<v>`. Idempotent: an already-installed version is a
+ * no-op success — unless `force` re-downloads and replaces it (the recovery path
+ * for a corrupt bundle). Must run inside the version lock (version-lock.ts).
+ */
+import { execFileSync } from 'node:child_process'
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from 'node:fs'
+import { win32 } from 'node:path'
+import { nodeSatisfies } from './node-engines.js'
+import { versionDir, versionsDir } from './paths.js'
+import {
+  downloadTarball,
+  resolveDaemonTarget,
+  verifyTarball,
+  type ManagedPackage,
+  type ResolvedTarget
+} from './registry.js'
+import { isInstalled, type Channel } from './version-store.js'
+
+const SECCOMP_HELPER_PATHS = [
+  'dist/vendor/seccomp/x64/apply-seccomp',
+  'dist/vendor/seccomp/arm64/apply-seccomp'
+] as const
+
+// Windows' own bsdtar: a GNU tar earlier on PATH (Git's) reads `D:\…` as a remote host and fails.
+export function tarCommand(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
+  return platform === 'win32' ? win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar'
+}
+
+/** npm normalizes non-`bin` payload files to 0644 while packing, including the
+ * native sandbox-runtime helpers staged by the daemon build. Restore their
+ * executable mode after the integrity-verified tarball is extracted. */
+export function repairDaemonBundleModes(root: string): void {
+  for (const relative of SECCOMP_HELPER_PATHS) {
+    const path = `${root}/${relative}`
+    if (existsSync(path)) chmodSync(path, 0o755)
+  }
+}
+
+/**
+ * A pinned `--to` version. Rejects anything that is not a plain version token —
+ * notably a leading `-`, which would make the value look like a second option to
+ * any argv scan that sees it. The value can originate from the Control Plane (the
+ * daemon spawns `upgrade --to <version>`), so it is not the operator's own typing.
+ */
+const VERSION_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/
+
+// Resolves without downloading; `async` so a rejected version surfaces as a rejected promise.
+export async function resolveTarget(
+  opts: { to?: string; channel: Channel },
+  name?: ManagedPackage
+): Promise<ResolvedTarget> {
+  if (opts.to !== undefined && !VERSION_TOKEN.test(opts.to)) {
+    throw new Error(`invalid version ${JSON.stringify(opts.to)}`)
+  }
+  return name ? resolveDaemonTarget(opts, name) : resolveDaemonTarget(opts)
+}
+
+/** What a version store holds: its name in messages, the entry a valid bundle must contain, and post-extract repair. */
+export interface StorePackage {
+  label: string
+  entry: string
+  repair?: (dir: string) => void
+}
+
+export const DAEMON_STORE: StorePackage = { label: 'daemon', entry: 'dist/index.js', repair: repairDaemonBundleModes }
+
+/**
+ * Ensure `target.version` is installed under `versions/<v>`. Returns the version.
+ * If already present, returns immediately (idempotent). `onLog` surfaces progress.
+ */
+export async function installTarget(
+  root: string,
+  target: ResolvedTarget,
+  onLog: (msg: string) => void = () => {},
+  opts: { force?: boolean; pkg?: StorePackage } = {}
+): Promise<string> {
+  const { label, entry, repair } = opts.pkg ?? DAEMON_STORE
+  if (!opts.force && isInstalled(root, target.version)) {
+    onLog(`${label} ${target.version} already installed`)
+    return target.version
+  }
+
+  // Fail before downloading if the version declares an incompatible Node.
+  if (!nodeSatisfies(target.enginesNode, process.versions.node)) {
+    throw new Error(
+      `${label} ${target.version} requires Node ${target.enginesNode} but this CLI runs on ${process.versions.node} — upgrade Node first`
+    )
+  }
+
+  onLog(`downloading ${label} ${target.version}…`)
+  const buf = await downloadTarball(target.tarball)
+  verifyTarball(buf, target)
+
+  const dest = versionDir(root, target.version)
+  const tmp = `${dest}.tmp`
+  mkdirSync(versionsDir(root), { recursive: true })
+  rmSync(tmp, { recursive: true, force: true })
+  mkdirSync(tmp, { recursive: true })
+  try {
+    // npm tarballs wrap everything under `package/`; --strip-components=1 lands
+    // dist/ + package.json directly in tmp. tar reads the tarball from stdin.
+    execFileSync(tarCommand(), ['-xzf', '-', '-C', tmp, '--strip-components=1'], { input: buf })
+
+    // Re-verify engines against the authoritative extracted manifest.
+    const manifest = JSON.parse(readFileSync(`${tmp}/package.json`, 'utf8')) as { engines?: { node?: string } }
+    if (!nodeSatisfies(manifest.engines?.node, process.versions.node)) {
+      throw new Error(
+        `${label} ${target.version} requires Node ${manifest.engines?.node} but this CLI runs on ${process.versions.node} — upgrade Node first`
+      )
+    }
+    if (!existsSync(`${tmp}/${entry}`)) {
+      throw new Error(`${label} ${target.version} tarball has no ${entry} — refusing to install`)
+    }
+    repair?.(tmp)
+
+    // Atomic publish. A racing install that already produced `dest` wins; drop
+    // tmp — except a forced re-install, whose point is replacing the existing dir.
+    if (existsSync(dest)) {
+      if (opts.force) {
+        rmSync(dest, { recursive: true, force: true })
+        renameSync(tmp, dest)
+      } else {
+        rmSync(tmp, { recursive: true, force: true })
+      }
+    } else {
+      renameSync(tmp, dest)
+    }
+  } catch (err) {
+    rmSync(tmp, { recursive: true, force: true })
+    throw err
+  }
+  onLog(`installed ${label} ${target.version}`)
+  return target.version
+}

@@ -1,0 +1,146 @@
+{{- $reconciler := .Values.daemonPool.reconciler }}
+{{- if .Values.daemonPool.enabled }}
+{{- $daemonTag := .Values.daemonPool.tag | default (include "agentconnect.imageTag" .) }}
+# The pool's orphan reconciler: one sweep of the agents namespace for sandbox objects nobody will
+# ever clean up — including a session pod whose session row is gone — then exit.
+# It used to be a timer inside every member with a lease for mutual exclusion; the cluster already
+# owns all three of those things, so it is a CronJob instead — the schedule is the schedule,
+# `concurrencyPolicy: Forbid` is the mutual exclusion, and a sweep that could not read the control
+# plane is a failed Job rather than a warning inside a daemon that keeps serving.
+#
+# It runs the daemon image at the pool's own tag as the pool's ServiceAccount, so its cluster
+# rights are exactly the members' claim Role and its control-plane identity is the same projected
+# `ac-control-plane` token. The connection registers as an OBSERVER: same TokenReview path, but
+# enrolled in no member set and granted no duty, so the sweeper is never handed work to serve.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "agentconnect.fullname" . }}-daemon-pool-reconciler
+  labels:
+    {{- include "agentconnect.labels" . | nindent 4 }}
+    {{- include "agentconnect.componentLabels" (dict "ctx" . "component" "daemon-pool-reconciler") | nindent 4 }}
+spec:
+  schedule: {{ $reconciler.schedule | quote }}
+  # The mutual exclusion the in-process lease used to provide. Two concurrent sweeps would read
+  # the same listing and race each other's deletes.
+  concurrencyPolicy: Forbid
+  # A tick the controller could not start on time is dropped rather than run late; the next one
+  # sweeps the same objects, only older.
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 1
+  # Keep failures around — a sweep that cannot complete is the signal, and it is the only place
+  # its reason is recorded.
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # No retry inside a tick: a sweep that failed has a reason (the control plane is
+      # unreachable, the namespace is unset) that a retry 10 seconds later does not change, and
+      # the next tick is 10 minutes away. Bounded by its own deadline so a hung run cannot sit
+      # across the following tick and block it under `Forbid`.
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        metadata:
+          labels:
+            {{- include "agentconnect.labels" . | nindent 12 }}
+            {{- include "agentconnect.componentLabels" (dict "ctx" . "component" "daemon-pool-reconciler") | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          # The pool members' identity: same TokenReview subject, same sandbox-namespace Role
+          # (list/delete on claims and Sandboxes). Nothing extra is granted for the sweep.
+          serviceAccountName: ac-cloud-daemon
+          # The Kubernetes API credential the sweep lists and deletes with; the projected token
+          # below is the separate CP-audience identity.
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10002
+            runAsGroup: 10002
+            fsGroup: 10002
+            seccompProfile:
+              type: RuntimeDefault
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: reconcile
+              # The daemon image at the pool's effective tag: the sweep's rules ship with the
+              # daemon the members run, so the two cannot disagree about what an orphan is.
+              image: "{{ .Values.image.registry }}/{{ .Values.daemonPool.image }}:{{ $daemonTag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # `args` replaces the image's CMD; the ENTRYPOINT already carries the node invocation.
+              args: ['reconcile', '--once']
+              env:
+                # The same partial the members read (daemon-pool.yaml), so the namespace swept,
+                # the warm pool and the control-plane address cannot drift from the pool's.
+                {{- include "agentconnect.daemonPoolClusterEnv" . | nindent 16 }}
+                {{- with $reconciler.movedGraceMs }}
+                # AC_MOVED_AGENT_GRACE_MS: how long the objects and session rows of an agent that
+                # MOVED off this pool are kept. Its own window, deliberately much longer than the
+                # leak grace above — a move is reversible by design and the volume left behind is
+                # that promise, so this is where the promise ends. Unset ⇒ the daemon's 7-day
+                # default, which matches its default session retention.
+                - name: AC_MOVED_AGENT_GRACE_MS
+                  value: {{ . | quote }}
+                {{- end }}
+                {{- if $reconciler.delete }}
+                # Collection is opt-in and off by default: deleting a claim deletes the agent's
+                # workspace PVC with it, so observe the dry-run summary lines first and turn
+                # this on afterwards. Unset ⇒ the sweep reports what it would collect and
+                # deletes nothing.
+                #
+                # BOTH flags ride the one decision, on purpose. The sweep's two halves collect the
+                # two halves of the same thing — a departed agent's claims and the session rows
+                # those claims exist for — so an install that enabled one would delete the pods and
+                # PVCs while their rows stayed dry-run forever, and the leak this exists to close
+                # would stay half open with nothing in the summary lines saying so.
+                - name: AC_K8S_ORPHAN_DELETE
+                  value: 'true'
+                - name: AC_STORE_ORPHAN_DELETE
+                  value: 'true'
+                {{- end }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ['ALL']
+              resources:
+                {{- toYaml $reconciler.resources | nindent 16 }}
+              volumeMounts:
+                {{- with .Values.daemonPool.dataPlane.existingSecret }}
+                - name: data-plane
+                  mountPath: /var/run/ac-data-plane
+                  readOnly: true
+                {{- end }}
+                - name: cp-identity
+                  mountPath: /var/run/ac-cp-identity
+                  readOnly: true
+          volumes:
+            {{- with .Values.daemonPool.dataPlane.existingSecret }}
+            # The members' own data plane, read-only and by the same Secret. Without it the sweep
+            # cannot ask which session pods still have a row, so every one of them reads as live and
+            # nothing reclaims a session pod whose direct teardown failed; the store retention half
+            # is skipped outright.
+            - name: data-plane
+              secret:
+                secretName: {{ . }}
+                defaultMode: 0400
+                items:
+                  - key: {{ $.Values.daemonPool.dataPlane.key }}
+                    path: config.json
+            {{- end }}
+            # The projected control-plane audience token, exactly as the members mount it — the
+            # observer registration presents this and nothing else.
+            - name: cp-identity
+              projected:
+                defaultMode: 0400
+                sources:
+                  - serviceAccountToken:
+                      path: token
+                      audience: ac-control-plane
+                      expirationSeconds: 3600
+{{- end }}

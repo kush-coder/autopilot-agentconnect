@@ -1,0 +1,80 @@
+// Teams' daemon platform module (§7.4): relay ingress, the reply-chain thread strategy, the chat-member key, relayed card clicks and installs.
+import {
+  MSTEAMS_CARD_NOTE_MAX,
+  MSTEAMS_PLATFORM,
+  MSTEAMS_RELAY_EGRESS_V1_FEATURE,
+  WireMsTeamsCardAction,
+  WireMsTeamsMembersAdded,
+  type RdMsgPlatformAction,
+  type WireMsTeamsCardActionResponse
+} from '@agentconnect.md/protocol'
+import type {
+  ChatCardClick,
+  DaemonPlatformModule,
+  InteractionActor,
+  RelayCardClicks,
+  RelayMemberJoins
+} from '../contract.js'
+import { parseMsTeamsApprovalClick } from './approval-card.js'
+import { parseMsTeamsElicitClick } from './elicit-card.js'
+import { msTeamsRelayIngress, type MsTeamsRelayIngressHost } from './relay-ingress.js'
+import { canonicalizeMsTeamsThread } from './threading.js'
+import { msTeamsBotAdds } from './welcome.js'
+
+const ENTRA_OBJECT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** The clicker's Entra object ID, the person within the integration's tenant (§4.4); a bot-specific `29:` ID is never linkable, so it refuses. */
+export function msTeamsChatMemberKey(actor: InteractionActor): string | undefined {
+  const id = actor.memberId ?? actor.userId
+  return ENTRA_OBJECT_ID.test(id) ? id.toLowerCase() : undefined
+}
+
+/** One forwarded card click: the answer it carries, the card it was on, and the clicker by Entra object ID where Teams sent one. Pure. */
+export function decodeMsTeamsCardClick(msg: Pick<RdMsgPlatformAction, 'payload'>): ChatCardClick | null {
+  const parsed = WireMsTeamsCardAction.safeParse(msg.payload)
+  if (!parsed.success) return null
+  const click = parsed.data
+  const name = click.userName?.trim()
+  const actor: InteractionActor = {
+    userId: click.aadObjectId ?? click.userId,
+    ...(click.aadObjectId ? { memberId: click.aadObjectId } : {}),
+    ...(name ? { name } : {})
+  }
+  const at = { ts: click.cardActivityId, actor }
+  const pick = parseMsTeamsApprovalClick(click)
+  if (pick) return { answer: { kind: 'approval', ...pick }, ...at }
+  const elicit = parseMsTeamsElicitClick(click)
+  return elicit ? { answer: elicit, ...at } : null
+}
+
+export const msTeamsCardClicks: RelayCardClicks = {
+  decode: decodeMsTeamsCardClick,
+  response: (privateText) =>
+    ({ note: privateText.slice(0, MSTEAMS_CARD_NOTE_MAX) }) satisfies WireMsTeamsCardActionResponse
+}
+
+/** People a roster change added, looked up through the integration's live connection; none while it is unbound. */
+export function msTeamsMemberJoins(host: MsTeamsRelayIngressHost): RelayMemberJoins {
+  return {
+    decode: (msg) => {
+      const parsed = WireMsTeamsMembersAdded.safeParse(msg.payload)
+      if (!parsed.success) return null
+      return { reasons: async () => (await host.connection(msg.integrationId)?.joinedMemberReasons(parsed.data)) ?? [] }
+    }
+  }
+}
+
+/** Teams' daemon platform module, bound to one daemon's host. */
+export function msTeamsPlatformModule(host: MsTeamsRelayIngressHost): DaemonPlatformModule {
+  return {
+    platformId: MSTEAMS_PLATFORM,
+    relayIngress: msTeamsRelayIngress(host),
+    canonicalizeThread: canonicalizeMsTeamsThread,
+    chatMemberKey: msTeamsChatMemberKey,
+    cardClicks: msTeamsCardClicks,
+    memberJoins: msTeamsMemberJoins(host),
+    botAdds: msTeamsBotAdds(host),
+    // A deployment app's row sends through the relay; the CP connects one only to a daemon listing this (§8.5).
+    registrationFeatures: [MSTEAMS_RELAY_EGRESS_V1_FEATURE]
+  }
+}

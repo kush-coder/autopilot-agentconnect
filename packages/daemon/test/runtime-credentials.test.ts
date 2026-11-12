@@ -1,0 +1,912 @@
+import { afterEach, describe, expect, it } from 'vitest'
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { prepareRuntimeLaunch } from '../src/launch/prepare.js'
+import { CODEX_ACP_PERMISSION_PROFILE_CONFIG_ENV } from '../src/acp/codex-permission-profiles.js'
+import {
+  discoverRuntimeCredentials,
+  runtimeCredentialsConfigured
+} from '../src/runtimes/runtime-credential-discovery.js'
+import { resolveQoderCredentialSources } from '../src/runtimes/runtime-credential-sources.js'
+import { fifoWriter, killFifoWriters, mkfifo, statsBeforeSwap } from './fifo-support.js'
+
+const roots: string[] = []
+
+afterEach(() => {
+  killFifoWriters()
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
+
+function fixture(): { root: string; daemonRoot: string; hostHome: string; scopeDir: string; cwd: string } {
+  const root = mkdtempSync(join(tmpdir(), 'ac-shared-login-'))
+  roots.push(root)
+  const daemonRoot = join(root, 'daemon')
+  const hostHome = join(root, 'host')
+  const scopeDir = join(daemonRoot, 'agents', 'agent-a')
+  const cwd = join(scopeDir, 'workspace')
+  mkdirSync(cwd, { recursive: true })
+  mkdirSync(hostHome)
+  return { root, daemonRoot, hostHome, scopeDir, cwd }
+}
+
+function settings(path: string): { filesystem: { allowWrite: string[] } } {
+  return JSON.parse(readFileSync(path, 'utf8')) as { filesystem: { allowWrite: string[] } }
+}
+
+describe('stored runtime credential discovery', () => {
+  it('uses META_API_KEY for Muse and seeds settings without copying the host browser login', () => {
+    const { hostHome, scopeDir, cwd } = fixture()
+    const config = join(hostHome, 'xdg')
+    const env = { HOME: hostHome, USERPROFILE: hostHome, XDG_CONFIG_HOME: config }
+    const auth = join(config, 'muse', 'auth.json')
+    mkdirSync(dirname(auth), { recursive: true })
+    writeFileSync(
+      auth,
+      JSON.stringify({ schema_version: 1, providers: { meta: { access_token: 'synthetic-access' } } })
+    )
+    writeFileSync(join(dirname(auth), 'settings.json'), '{"schema_version":1,"model":"test-model"}')
+    writeFileSync(join(dirname(auth), 'trust.json'), '{"host-workspace":true}')
+    expect(runtimeCredentialsConfigured('muse-acp', undefined, env)).toBe(false)
+    expect(discoverRuntimeCredentials('muse-acp', undefined, { ...env, META_API_KEY: 'synthetic-key' })).toEqual({
+      paths: [],
+      providers: ['meta']
+    })
+    const options = { runtimeId: 'muse-acp', scopeDir, cwd, runInSandbox: false, isolateHome: true, hostEnv: env }
+    const launch = prepareRuntimeLaunch(options)
+    const privateConfig = join(launch.env!.XDG_CONFIG_HOME!, 'muse')
+    expect(readFileSync(join(privateConfig, 'settings.json'), 'utf8')).toContain('test-model')
+    expect(existsSync(join(privateConfig, 'auth.json'))).toBe(false)
+    expect(existsSync(join(privateConfig, 'trust.json'))).toBe(false)
+    writeFileSync(join(privateConfig, 'auth.json'), '{"agent-login":true}')
+    prepareRuntimeLaunch(options)
+    expect(readFileSync(join(privateConfig, 'auth.json'), 'utf8')).toBe('{"agent-login":true}')
+  })
+
+  it('finds only stored OMP provider records in the configured database, including expired login', () => {
+    const { hostHome } = fixture()
+    const configDir = join(hostHome, 'custom-omp')
+    mkdirSync(configDir)
+    const sourcePath = join(configDir, 'agent.db')
+    const db = new DatabaseSync(sourcePath)
+    db.exec(`
+      CREATE TABLE auth_credentials(provider TEXT, credential_type TEXT, data TEXT, disabled_cause TEXT);
+      CREATE TABLE history(payload BLOB);
+      INSERT INTO history VALUES (zeroblob(3145728));
+      INSERT INTO auth_credentials VALUES
+        ('anthropic', 'oauth', '{"access":"synthetic-expired","refresh":"synthetic-refresh","expires":1}', 'expired'),
+        ('openai', 'api_key', '{"key":"synthetic-key"}', NULL),
+        ('invalid', 'api_key', 'not-json', NULL),
+        ('empty', 'api_key', '{"key":""}', NULL);
+    `)
+    db.close()
+    expect(discoverRuntimeCredentials('omp', undefined, { HOME: hostHome })).toEqual({ paths: [], providers: [] })
+    expect(discoverRuntimeCredentials('omp', undefined, { HOME: hostHome, PI_CODING_AGENT_DIR: configDir })).toEqual({
+      paths: [sourcePath],
+      providers: ['anthropic', 'openai']
+    })
+  })
+
+  it('does not create login directories or mistake config files for credentials', () => {
+    const { hostHome } = fixture()
+    const env = { HOME: hostHome }
+    for (const id of ['claude-acp', 'codex-acp', 'qoder-cli', 'qoder-cli-cn']) {
+      expect(discoverRuntimeCredentials(id, undefined, env)).toEqual({ paths: [], providers: [] })
+    }
+    expect(existsSync(join(hostHome, '.claude'))).toBe(false)
+    expect(existsSync(join(hostHome, '.codex'))).toBe(false)
+    expect(existsSync(join(hostHome, '.qoder'))).toBe(false)
+    mkdirSync(join(hostHome, '.claude'))
+    writeFileSync(join(hostHome, '.claude', 'settings.json'), '{"theme":"dark"}')
+    mkdirSync(join(hostHome, '.codex'))
+    writeFileSync(join(hostHome, '.codex', 'auth.json'), '{"last_refresh":"2020-01-01"}')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).paths).toEqual([])
+    expect(discoverRuntimeCredentials('codex-acp', undefined, env).paths).toEqual([])
+  })
+
+  it('uses the same Claude secure-storage selection as launch without excluding expired OAuth', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const configDir = join(hostHome, '.claude')
+    const settingsDir = join(configDir, 'settings-auth')
+    const environmentDir = join(configDir, 'environment-auth')
+    mkdirSync(settingsDir, { recursive: true })
+    mkdirSync(environmentDir)
+    writeFileSync(
+      join(configDir, 'settings.json'),
+      JSON.stringify({ env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: settingsDir } })
+    )
+    const credentials = JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-expired', expiresAt: 1 } })
+    writeFileSync(join(settingsDir, '.credentials.json'), credentials)
+    writeFileSync(join(environmentDir, '.credentials.json'), credentials)
+    expect(discoverRuntimeCredentials('claude-acp', undefined, { HOME: hostHome })).toEqual({
+      paths: [join(settingsDir, '.credentials.json')],
+      providers: ['anthropic']
+    })
+    const env = { HOME: hostHome, CLAUDE_SECURESTORAGE_CONFIG_DIR: environmentDir }
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env)).toEqual({
+      paths: [join(environmentDir, '.credentials.json')],
+      providers: ['anthropic']
+    })
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'claude-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: env
+    })
+    expect(launch.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(realpathSync(environmentDir))
+  })
+
+  it('recognizes saved Claude API-key login only in the active global config', () => {
+    const { hostHome } = fixture()
+    const defaultConfig = join(hostHome, '.claude.json')
+    writeFileSync(defaultConfig, '{"primaryApiKey":"synthetic-key"}')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, { HOME: hostHome })).toEqual({
+      paths: [defaultConfig],
+      providers: ['anthropic']
+    })
+    const configDir = join(hostHome, 'custom-claude')
+    mkdirSync(configDir)
+    const env = { HOME: hostHome, CLAUDE_CONFIG_DIR: configDir }
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).paths).toEqual([])
+    writeFileSync(join(configDir, '.claude.json'), '{"primaryApiKey":"synthetic-key"}')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).paths).toEqual([join(configDir, '.claude.json')])
+    writeFileSync(join(configDir, '.config.json'), '{"additionalModelOptionsCache":[]}')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).paths).toEqual([])
+    writeFileSync(join(configDir, '.config.json'), '{"primaryApiKey":"synthetic-key"}')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).paths).toEqual([join(configDir, '.config.json')])
+  })
+
+  it('recognizes Claude custom-provider secrets in host env or settings.env', () => {
+    const { hostHome } = fixture()
+    const env = { HOME: hostHome }
+    mkdirSync(join(hostHome, '.claude'))
+    writeFileSync(
+      join(hostHome, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:8318' } })
+    )
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env)).toEqual({ paths: [], providers: [] })
+    expect(runtimeCredentialsConfigured('claude-acp', undefined, env)).toBe(false)
+
+    writeFileSync(
+      join(hostHome, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'synthetic-bearer' } })
+    )
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env)).toEqual({
+      paths: [join(hostHome, '.claude', 'settings.json')],
+      providers: ['anthropic']
+    })
+    expect(runtimeCredentialsConfigured('claude-acp', undefined, env)).toBe(true)
+
+    writeFileSync(
+      join(hostHome, '.claude', 'settings.json'),
+      JSON.stringify({ env: { ANTHROPIC_API_KEY: 'synthetic-key' } })
+    )
+    expect(discoverRuntimeCredentials('claude-acp', undefined, env).providers).toEqual(['anthropic'])
+
+    const hostToken = { HOME: hostHome, ANTHROPIC_AUTH_TOKEN: 'synthetic-host-bearer' }
+    expect(discoverRuntimeCredentials('claude-acp', undefined, hostToken)).toEqual({
+      paths: [],
+      providers: ['anthropic']
+    })
+    expect(runtimeCredentialsConfigured('claude-acp', undefined, hostToken)).toBe(true)
+
+    const hostIdentity = { HOME: hostHome, ANTHROPIC_IDENTITY_TOKEN: 'synthetic-identity' }
+    expect(discoverRuntimeCredentials('claude-acp', undefined, hostIdentity)).toEqual({
+      paths: [],
+      providers: ['anthropic']
+    })
+    expect(runtimeCredentialsConfigured('claude-acp', undefined, hostIdentity)).toBe(true)
+
+    writeFileSync(join(hostHome, '.claude', 'settings.json'), 'not-json')
+    expect(discoverRuntimeCredentials('claude-acp', undefined, hostToken)).toEqual({
+      paths: [],
+      providers: ['anthropic']
+    })
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'refuses a FIFO planted as Claude settings.json instead of reading what its writer sends',
+    () => {
+      const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+      const settingsPath = join(hostHome, '.claude', 'settings.json')
+      mkdirSync(join(hostHome, '.claude'))
+      mkfifo(settingsPath)
+      fifoWriter(settingsPath, JSON.stringify({ env: { ANTHROPIC_API_KEY: 'synthetic-planted' } }))
+      expect(discoverRuntimeCredentials('claude-acp', undefined, { HOME: hostHome })).toEqual({
+        paths: [],
+        providers: []
+      })
+
+      killFifoWriters()
+      fifoWriter(settingsPath, '{}')
+      expect(() =>
+        prepareRuntimeLaunch({
+          runtimeId: 'claude-acp',
+          scopeDir,
+          cwd,
+          daemonRoot,
+          runInSandbox: true,
+          sandboxMechanism: 'bwrap',
+          credentialPlatform: 'linux',
+          hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+        })
+      ).toThrow(/settings\.json is not a regular file/)
+    }
+  )
+
+  it.skipIf(process.platform === 'win32')(
+    'does not count a Claude login streamed through a FIFO swapped in after the check',
+    () => {
+      const { hostHome } = fixture()
+      const configDir = join(hostHome, '.claude')
+      mkdirSync(configDir)
+      const regular = join(hostHome, 'regular.json')
+      writeFileSync(regular, '{"theme":"dark"}')
+      // A runtime-created `.config.json` becomes the global config; the shared config dir is sandbox-writable on Linux.
+      const credential = join(configDir, '.credentials.json')
+      const legacy = join(configDir, '.config.json')
+      mkfifo(credential)
+      mkfifo(legacy)
+      fifoWriter(credential, JSON.stringify({ claudeAiOauth: { accessToken: 'synthetic-planted' } }))
+      fifoWriter(legacy, JSON.stringify({ primaryApiKey: 'synthetic-planted' }))
+      const restore = statsBeforeSwap([credential, legacy], regular)
+      try {
+        expect(discoverRuntimeCredentials('claude-acp', undefined, { HOME: hostHome })).toEqual({
+          paths: [],
+          providers: []
+        })
+      } finally {
+        restore()
+      }
+    }
+  )
+
+  it('recognizes Codex file login and respects CODEX_HOME without falling back to another login', () => {
+    const { hostHome } = fixture()
+    const defaultDir = join(hostHome, '.codex')
+    mkdirSync(defaultDir)
+    writeFileSync(join(defaultDir, 'auth.json'), '{"OPENAI_API_KEY":"synthetic-key"}')
+    expect(discoverRuntimeCredentials('codex-acp', undefined, { HOME: hostHome })).toEqual({
+      paths: [join(defaultDir, 'auth.json')],
+      providers: ['openai']
+    })
+    const configDir = join(hostHome, 'custom-codex')
+    mkdirSync(configDir)
+    const env = { HOME: hostHome, CODEX_HOME: configDir }
+    expect(discoverRuntimeCredentials('codex-acp', undefined, env).paths).toEqual([])
+    writeFileSync(
+      join(configDir, 'auth.json'),
+      '{"tokens":{"refresh_token":"synthetic-expired"},"last_refresh":"2020-01-01"}'
+    )
+    expect(discoverRuntimeCredentials('custom-codex', { command: 'codex-acp', args: [], env: [] }, env)).toEqual({
+      paths: [join(configDir, 'auth.json')],
+      providers: ['openai']
+    })
+    writeFileSync(join(configDir, 'auth.json'), 'not-json')
+    expect(discoverRuntimeCredentials('codex-acp', undefined, env).paths).toEqual([])
+  })
+
+  it.each(['qoder', 'qoder-cn'] as const)(
+    'requires the configured %s user login rather than machine identity',
+    (profile) => {
+      const { hostHome } = fixture()
+      const configDir = join(hostHome, 'custom-qoder')
+      const env = { HOME: hostHome, [profile === 'qoder' ? 'QODER_CONFIG_DIR' : 'QODERCN_CONFIG_DIR']: configDir }
+      const source = resolveQoderCredentialSources(profile, env)
+      const id = profile === 'qoder' ? 'qoder-cli' : 'qoder-cli-cn'
+      mkdirSync(source.credentialDir, { recursive: true })
+      writeFileSync(join(source.credentialDir, 'machine_id'), 'synthetic-machine')
+      expect(discoverRuntimeCredentials(id, undefined, env).paths).toEqual([])
+      writeFileSync(source.credentialFile, 'synthetic-encrypted-login')
+      expect(discoverRuntimeCredentials(id, undefined, env)).toEqual({
+        paths: [source.credentialFile],
+        providers: [profile]
+      })
+      writeFileSync(source.credentialFile, '')
+      expect(discoverRuntimeCredentials(id, undefined, env).paths).toEqual([])
+    }
+  )
+})
+
+describe('Linux shared runtime login', () => {
+  it('opens only the canonical Git metadata directory to the inner Codex agent', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const gitDir = join(cwd, '.git')
+    mkdirSync(gitDir)
+
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'codex-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+
+    const profileConfig = JSON.parse(launch.env[CODEX_ACP_PERMISSION_PROFILE_CONFIG_ENV]!) as {
+      configOverrides: string[]
+    }
+    const agentFilesystem = profileConfig.configOverrides.find((value) =>
+      value.startsWith('permissions.agentconnect-protected-workspace.filesystem=')
+    )
+    const readOnlyFilesystem = profileConfig.configOverrides.find((value) =>
+      value.startsWith('permissions.agentconnect-protected-read-only.filesystem=')
+    )
+    expect(agentFilesystem).toContain(`${JSON.stringify(realpathSync(gitDir))} = "write"`)
+    expect(readOnlyFilesystem).not.toContain(realpathSync(gitDir))
+    expect(profileConfig.configOverrides).toContain('features.unified_exec=false')
+  })
+
+  it('opens the Codex credential channel even when the outer sandbox is disabled', () => {
+    const { scopeDir, cwd } = fixture()
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'codex-acp',
+      scopeDir,
+      cwd,
+      runInSandbox: false,
+      allowModelToolUnixSockets: true,
+      explicitEnv: {
+        CODEX_CONFIG: JSON.stringify({
+          model: 'gpt-test',
+          permissions: { attacker: { extends: ':workspace' } },
+          features: { fast_mode: true }
+        })
+      }
+    })
+
+    const profileConfig = JSON.parse(launch.env[CODEX_ACP_PERMISSION_PROFILE_CONFIG_ENV]!) as {
+      configOverrides: string[]
+      modeProfiles: Record<string, string>
+    }
+    expect(launch.inheritProcessEnv).toBe(true)
+    expect(launch.sandbox).toBeUndefined()
+    expect(profileConfig.modeProfiles.agent).toBe('agentconnect-protected-workspace')
+    expect(profileConfig.configOverrides).toContain('permissions.agentconnect-protected-workspace.network.enabled=true')
+    expect(profileConfig.configOverrides).toContain('permissions.agentconnect-protected-read-only.network.enabled=true')
+    expect(JSON.parse(launch.env.CODEX_CONFIG!)).toEqual({ model: 'gpt-test', features: { fast_mode: true } })
+  })
+
+  it('trusts the host Claude config directory by default without rewriting its settings', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostClaude = join(hostHome, '.claude')
+    const privateClaude = join(scopeDir, 'home', '.claude')
+    mkdirSync(hostClaude)
+    mkdirSync(privateClaude, { recursive: true })
+    writeFileSync(join(hostClaude, 'settings.json'), '{"theme":"dark"}')
+    writeFileSync(join(hostClaude, '.credentials.json'), '{"claudeAiOauth":{"expiresAt":1,"accessToken":"host-old"}}')
+    writeFileSync(
+      join(privateClaude, '.credentials.json'),
+      '{"claudeAiOauth":{"expiresAt":2,"accessToken":"agent-new"}}'
+    )
+
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'claude-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+
+    const sharedDir = realpathSync(hostClaude)
+    expect(launch.env.HOME).toBe(join(scopeDir, 'home'))
+    expect(launch.env.CLAUDE_CONFIG_DIR).toBe(join(scopeDir, 'home', '.claude'))
+    expect(launch.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(sharedDir)
+    expect(JSON.parse(readFileSync(join(hostClaude, 'settings.json'), 'utf8'))).toEqual({ theme: 'dark' })
+    expect(readFileSync(join(sharedDir, '.credentials.json'), 'utf8')).toContain('agent-new')
+    expect(existsSync(join(privateClaude, '.credentials.json'))).toBe(false)
+    expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).toContain(sharedDir)
+    expect(launch.toolSandbox?.protectedCredentialRoots).toEqual([sharedDir])
+
+    writeFileSync(join(sharedDir, '.credentials.json'), '{"accessToken":"refreshed"}')
+    const scopeB = join(daemonRoot, 'agents', 'agent-b')
+    const cwdB = join(scopeB, 'workspace')
+    mkdirSync(cwdB, { recursive: true })
+    const second = prepareRuntimeLaunch({
+      runtimeId: 'claude-acp',
+      scopeDir: scopeB,
+      cwd: cwdB,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+    expect(second.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(sharedDir)
+    expect(readFileSync(join(sharedDir, '.credentials.json'), 'utf8')).toContain('refreshed')
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'refuses a private Claude credential swapped for a FIFO after its lstat instead of comparing what it sends',
+    () => {
+      const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+      const hostClaude = join(hostHome, '.claude')
+      const privateClaude = join(scopeDir, 'home', '.claude')
+      mkdirSync(hostClaude)
+      mkdirSync(privateClaude, { recursive: true })
+      const login = '{"claudeAiOauth":{"expiresAt":1,"accessToken":"host"}}'
+      writeFileSync(join(hostClaude, '.credentials.json'), login)
+      const privateCredential = join(privateClaude, '.credentials.json')
+      mkfifo(privateCredential)
+      fifoWriter(privateCredential, login)
+      const restore = statsBeforeSwap([privateCredential], join(hostClaude, '.credentials.json'))
+      try {
+        expect(() =>
+          prepareRuntimeLaunch({
+            runtimeId: 'claude-acp',
+            scopeDir,
+            cwd,
+            daemonRoot,
+            runInSandbox: true,
+            sandboxMechanism: 'bwrap',
+            credentialPlatform: 'linux',
+            hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+          })
+        ).toThrow(/\.credentials\.json is not a regular file/)
+      } finally {
+        restore()
+      }
+    }
+  )
+
+  it('follows a Claude settings secure-storage directory without moving the default credential', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostClaude = join(hostHome, '.claude')
+    const secureDir = join(hostClaude, 'agentconnect-auth')
+    mkdirSync(secureDir, { recursive: true })
+    writeFileSync(
+      join(hostClaude, 'settings.json'),
+      JSON.stringify({ theme: 'dark', env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: secureDir } })
+    )
+    writeFileSync(join(hostClaude, '.credentials.json'), '{"accessToken":"default-login"}')
+    writeFileSync(join(secureDir, '.credentials.json'), '{"accessToken":"isolated-login"}')
+
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'claude-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+
+    const canonicalSecureDir = realpathSync(secureDir)
+    expect(launch.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(canonicalSecureDir)
+    expect(JSON.parse(readFileSync(join(hostClaude, 'settings.json'), 'utf8'))).toEqual({
+      theme: 'dark',
+      env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: secureDir }
+    })
+    expect(readFileSync(join(hostClaude, '.credentials.json'), 'utf8')).toContain('default-login')
+    expect(readFileSync(join(secureDir, '.credentials.json'), 'utf8')).toContain('isolated-login')
+    expect(existsSync(join(scopeDir, 'home', '.claude', 'settings.json'))).toBe(false)
+    expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).toContain(canonicalSecureDir)
+    expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).not.toContain(realpathSync(hostClaude))
+    expect(launch.toolSandbox?.protectedCredentialRoots).toEqual([canonicalSecureDir])
+  })
+
+  it('prefers the daemon environment secure-storage directory over Claude settings', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostClaude = join(hostHome, '.claude')
+    const settingsDir = join(hostClaude, 'settings-auth')
+    const environmentDir = join(hostClaude, 'environment-auth')
+    mkdirSync(settingsDir, { recursive: true })
+    mkdirSync(environmentDir)
+    writeFileSync(
+      join(hostClaude, 'settings.json'),
+      JSON.stringify({ env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: settingsDir } })
+    )
+
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'claude-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: {
+        HOME: hostHome,
+        PATH: '/usr/bin',
+        CLAUDE_SECURESTORAGE_CONFIG_DIR: environmentDir
+      }
+    })
+
+    expect(launch.env.CLAUDE_SECURESTORAGE_CONFIG_DIR).toBe(realpathSync(environmentDir))
+  })
+
+  it('refuses a secure-storage override that would reopen the entire host HOME', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+
+    expect(() =>
+      prepareRuntimeLaunch({
+        runtimeId: 'claude-acp',
+        scopeDir,
+        cwd,
+        daemonRoot,
+        agentsRoot: join(daemonRoot, 'agents'),
+        runInSandbox: true,
+        sandboxMechanism: 'bwrap',
+        credentialPlatform: 'linux',
+        hostEnv: {
+          HOME: hostHome,
+          PATH: '/usr/bin',
+          CLAUDE_SECURESTORAGE_CONFIG_DIR: hostHome
+        }
+      })
+    ).toThrow(/would reopen protected path/)
+  })
+
+  it('replaces a private Codex auth copy that holds only a credential-proxy placeholder with the shared link', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostCodex = join(hostHome, '.codex')
+    const privateCodex = join(scopeDir, 'home', '.codex')
+    mkdirSync(hostCodex)
+    mkdirSync(privateCodex, { recursive: true })
+    const hostText = '{"auth_mode":"apikey","OPENAI_API_KEY":"synthetic-key"}'
+    writeFileSync(join(hostCodex, 'auth.json'), hostText)
+    writeFileSync(
+      join(privateCodex, 'auth.json'),
+      '{"auth_mode":"apikey","OPENAI_API_KEY":"acph1_fixture-placeholder"}'
+    )
+    prepareRuntimeLaunch({
+      runtimeId: 'codex-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+    const privateAuth = join(privateCodex, 'auth.json')
+    expect(lstatSync(privateAuth).isSymbolicLink()).toBe(true)
+    expect(readFileSync(privateAuth, 'utf8')).toBe(hostText)
+  })
+
+  it('links private Codex homes to the newest shared auth file and preserves the link across refresh', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostCodex = join(hostHome, '.codex')
+    const privateCodex = join(scopeDir, 'home', '.codex')
+    mkdirSync(hostCodex)
+    mkdirSync(privateCodex, { recursive: true })
+    writeFileSync(join(hostCodex, 'auth.json'), '{"last_refresh":"2026-01-01T00:00:00Z","token":"old"}')
+    writeFileSync(join(privateCodex, 'auth.json'), '{"last_refresh":"2026-02-01T00:00:00Z","token":"new"}')
+
+    const launch = prepareRuntimeLaunch({
+      runtimeId: 'codex-acp',
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      allowModelToolUnixSockets: true,
+      credentialPlatform: 'linux',
+      explicitEnv: {
+        [CODEX_ACP_PERMISSION_PROFILE_CONFIG_ENV]: '{"modeProfiles":{"agent":"attacker"}}',
+        CODEX_CONFIG: JSON.stringify({
+          model: 'gpt-test',
+          default_permissions: 'attacker',
+          permissions: { 'agentconnect-protected-workspace': { extends: ':workspace' } },
+          'permissions.agentconnect-protected-full-access.filesystem': { ':root': 'write' },
+          features: { fast_mode: true }
+        })
+      },
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+
+    const privateAuth = join(privateCodex, 'auth.json')
+    const hostAuth = join(hostCodex, 'auth.json')
+    expect(lstatSync(privateAuth).isSymbolicLink()).toBe(true)
+    expect(realpathSync(privateAuth)).toBe(realpathSync(hostAuth))
+    expect(readFileSync(hostAuth, 'utf8')).toContain('"new"')
+    expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).toContain(realpathSync(hostAuth))
+    // The shared file the link points at is denied, not the link under the writable HOME; the rest of the private
+    // `.codex` is read-only, so the link cannot be swapped and reading through it reaches the denied file.
+    const protectedRoots = [realpathSync(hostAuth)]
+    expect(launch.toolSandbox?.protectedCredentialRoots).toEqual(expect.arrayContaining(protectedRoots))
+    expect(launch.toolSandbox?.protectedCredentialRoots).not.toContain(join(realpathSync(privateCodex), 'auth.json'))
+    expect(launch.toolSandbox?.protectedCredentialRoots).not.toContain(realpathSync(privateCodex))
+    expect(launch.toolSandbox?.readOnlyStateRoots).toEqual([realpathSync(privateCodex)])
+    const profileConfig = JSON.parse(launch.env[CODEX_ACP_PERMISSION_PROFILE_CONFIG_ENV]!) as {
+      configOverrides: string[]
+      modeProfiles: Record<string, string>
+    }
+    expect(profileConfig.modeProfiles.agent).toBe('agentconnect-protected-workspace')
+    expect(launch.toolSandbox?.allowModelToolUnixSockets).toBe(true)
+    expect(profileConfig.configOverrides).toContain('permissions.agentconnect-protected-workspace.network.enabled=true')
+    expect(profileConfig.configOverrides).toContain('permissions.agentconnect-protected-read-only.network.enabled=true')
+    expect(JSON.parse(launch.env.CODEX_CONFIG!)).toEqual({
+      model: 'gpt-test',
+      features: { fast_mode: true }
+    })
+    const filesystemOverrides = profileConfig.configOverrides.filter((value) => value.includes('filesystem='))
+    expect(filesystemOverrides).toHaveLength(3)
+    for (const root of protectedRoots) {
+      expect(filesystemOverrides.every((value) => value.includes(`${JSON.stringify(root)} = "deny"`))).toBe(true)
+    }
+
+    writeFileSync(privateAuth, '{"last_refresh":"2026-03-01T00:00:00Z","token":"refreshed"}')
+    expect(lstatSync(privateAuth).isSymbolicLink()).toBe(true)
+    expect(readFileSync(hostAuth, 'utf8')).toContain('refreshed')
+  })
+
+  it('does not silently choose between divergent Codex credentials with the same refresh generation', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostCodex = join(hostHome, '.codex')
+    const privateCodex = join(scopeDir, 'home', '.codex')
+    mkdirSync(hostCodex)
+    mkdirSync(privateCodex, { recursive: true })
+    writeFileSync(join(hostCodex, 'auth.json'), '{"last_refresh":"2026-01-01T00:00:00Z","token":"host"}')
+    writeFileSync(join(privateCodex, 'auth.json'), '{"last_refresh":"2026-01-01T00:00:00Z","token":"agent"}')
+
+    expect(() =>
+      prepareRuntimeLaunch({
+        runtimeId: 'codex-acp',
+        scopeDir,
+        cwd,
+        daemonRoot,
+        runInSandbox: true,
+        sandboxMechanism: 'bwrap',
+        credentialPlatform: 'linux',
+        hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+      })
+    ).toThrow(/conflicting Codex credentials/)
+    expect(lstatSync(join(privateCodex, 'auth.json')).isSymbolicLink()).toBe(false)
+  })
+
+  it.each([
+    {
+      runtimeId: 'qoder-cli',
+      command: 'qodercli',
+      configName: '.qoder',
+      hostConfigName: '\u00e9-qoder',
+      hostConfigNameValue: 'e\u0301-qoder',
+      hostConfigNameEnv: 'QODER_CONFIG_DIR_NAME',
+      privateConfigEnv: 'QODER_CONFIG_DIR'
+    },
+    {
+      runtimeId: 'qoder-cli-cn',
+      command: 'qoderclicn',
+      configName: '.qoder-cn',
+      hostConfigName: 'custom-qoder-cn',
+      hostConfigNameValue: 'custom-qoder-cn',
+      hostConfigNameEnv: 'QODERCN_CONFIG_DIR_NAME',
+      privateConfigEnv: 'QODERCN_CONFIG_DIR'
+    }
+  ])(
+    'shares refreshable $runtimeId auth while keeping the rest of HOME private',
+    ({ runtimeId, command, configName, hostConfigName, hostConfigNameValue, hostConfigNameEnv, privateConfigEnv }) => {
+      const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+      const hostConfig = join(hostHome, hostConfigName)
+      const sharedAuth = join(hostConfig, '.auth')
+      mkdirSync(sharedAuth, { recursive: true })
+      writeFileSync(join(hostConfig, 'settings.json'), '{"theme":"dark"}')
+      writeFileSync(join(sharedAuth, 'machine_id'), 'host-machine')
+      writeFileSync(join(sharedAuth, 'user'), 'host-login')
+
+      const launch = prepareRuntimeLaunch({
+        runtimeId,
+        runtime: { command, args: ['--acp'], env: [] },
+        scopeDir,
+        cwd,
+        daemonRoot,
+        agentsRoot: join(daemonRoot, 'agents'),
+        runInSandbox: true,
+        sandboxMechanism: 'bwrap',
+        credentialPlatform: 'linux',
+        hostEnv: { HOME: hostHome, PATH: '/usr/bin', [hostConfigNameEnv]: hostConfigNameValue }
+      })
+
+      const privateAuth = join(scopeDir, 'home', configName, '.auth')
+      expect(launch.env[privateConfigEnv]).toBe(join(scopeDir, 'home', configName))
+      expect(lstatSync(privateAuth).isSymbolicLink()).toBe(true)
+      expect(realpathSync(privateAuth)).toBe(realpathSync(sharedAuth))
+      expect(readFileSync(join(scopeDir, 'home', configName, 'settings.json'), 'utf8')).toContain('dark')
+      expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).toContain(realpathSync(sharedAuth))
+
+      writeFileSync(join(privateAuth, 'user'), 'refreshed-login')
+      expect(readFileSync(join(sharedAuth, 'user'), 'utf8')).toBe('refreshed-login')
+    }
+  )
+
+  const kimiLaunch = (scopeDir: string, cwd: string, daemonRoot: string, hostHome: string) =>
+    prepareRuntimeLaunch({
+      runtimeId: 'kimi',
+      runtime: { command: './kimi', args: ['acp'], env: [] },
+      scopeDir,
+      cwd,
+      daemonRoot,
+      agentsRoot: join(daemonRoot, 'agents'),
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+  const kimiLogin = (expiresAt: number) =>
+    JSON.stringify({ access_token: 'synthetic', refresh_token: 'synthetic', expires_at: expiresAt })
+
+  it('shares the rotating Kimi Code login directory instead of copying it', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostKimi = join(hostHome, '.kimi-code')
+    const sharedDir = join(hostKimi, 'credentials')
+    mkdirSync(sharedDir, { recursive: true })
+    writeFileSync(
+      join(hostKimi, 'config.toml'),
+      '[providers."managed:kimi-code".oauth]\nstorage = "file"\nkey = "oauth/kimi-code-env-example"\n'
+    )
+    writeFileSync(join(sharedDir, 'kimi-code-env-example.json'), kimiLogin(1))
+
+    const launch = kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)
+
+    const privateDir = join(scopeDir, 'home', '.kimi-code', 'credentials')
+    expect(lstatSync(privateDir).isSymbolicLink()).toBe(true)
+    expect(realpathSync(privateDir)).toBe(realpathSync(sharedDir))
+    expect(readFileSync(join(scopeDir, 'home', '.kimi-code', 'config.toml'), 'utf8')).toContain('kimi-code-env-example')
+    expect(settings(launch.sandbox!.settingsPath).filesystem.allowWrite).toContain(realpathSync(sharedDir))
+    // A refresh inside the private HOME rotates the host's copy, so the host login stays valid.
+    writeFileSync(join(privateDir, 'kimi-code-env-example.json'), kimiLogin(2))
+    expect(readFileSync(join(sharedDir, 'kimi-code-env-example.json'), 'utf8')).toBe(kimiLogin(2))
+  })
+
+  it('relaunches Kimi Code against the same private HOME through its validated credentials link', () => {
+    const { root, daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const hostKimi = join(hostHome, '.kimi-code')
+    const sharedDir = join(hostKimi, 'credentials')
+    mkdirSync(sharedDir, { recursive: true })
+    // One ref resolves to a host file, the other names a login the host has not written yet.
+    writeFileSync(
+      join(hostKimi, 'config.toml'),
+      [
+        '[providers."managed:kimi-code".oauth]',
+        'storage = "file"',
+        'key = "oauth/kimi-code-env-example"',
+        '[services.search.oauth]',
+        'storage = "file"',
+        'key = "oauth/kimi-code-env-pending"'
+      ].join('\n')
+    )
+    writeFileSync(join(sharedDir, 'kimi-code-env-example.json'), kimiLogin(1))
+
+    kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)
+    kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)
+
+    const privateDir = join(scopeDir, 'home', '.kimi-code', 'credentials')
+    expect(realpathSync(privateDir)).toBe(realpathSync(sharedDir))
+    expect(readFileSync(join(privateDir, 'kimi-code-env-example.json'), 'utf8')).toBe(kimiLogin(1))
+
+    // A link redirected anywhere but the host directory is still refused on the next launch.
+    const elsewhere = join(root, 'elsewhere')
+    mkdirSync(elsewhere)
+    renameSync(privateDir, `${privateDir}.moved`)
+    symlinkSync(elsewhere, privateDir)
+    expect(() => kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)).toThrow(/points outside host credentials/)
+  })
+
+  it('folds a copy-seeded private Kimi login into the host, keeping the later expiry', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const sharedDir = join(hostHome, '.kimi-code', 'credentials')
+    const privateDir = join(scopeDir, 'home', '.kimi-code', 'credentials')
+    mkdirSync(sharedDir, { recursive: true })
+    mkdirSync(join(privateDir, 'mcp'), { recursive: true })
+    // The host was logged out by a rotation the private copy won; the private record is the live one.
+    writeFileSync(join(sharedDir, 'kimi-code-env-example.json'), kimiLogin(0))
+    writeFileSync(join(privateDir, 'kimi-code-env-example.json'), kimiLogin(5))
+    writeFileSync(join(sharedDir, 'kimi-code.json'), kimiLogin(9))
+    writeFileSync(join(privateDir, 'kimi-code.json'), kimiLogin(3))
+    writeFileSync(join(privateDir, 'mcp', 'server.json'), '{}')
+
+    kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)
+
+    expect(lstatSync(privateDir).isSymbolicLink()).toBe(true)
+    expect(readFileSync(join(sharedDir, 'kimi-code-env-example.json'), 'utf8')).toBe(kimiLogin(5))
+    expect(readFileSync(join(sharedDir, 'kimi-code.json'), 'utf8')).toBe(kimiLogin(9))
+    expect(readFileSync(join(sharedDir, 'mcp', 'server.json'), 'utf8')).toBe('{}')
+  })
+
+  it('never follows a link the runtime planted in the shared Kimi credentials directory', () => {
+    const { root, daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const sharedDir = join(hostHome, '.kimi-code', 'credentials')
+    const privateDir = join(scopeDir, 'home', '.kimi-code', 'credentials')
+    const outside = join(root, 'outside')
+    mkdirSync(sharedDir, { recursive: true })
+    mkdirSync(outside)
+    mkdirSync(join(privateDir, 'mcp'), { recursive: true })
+    writeFileSync(join(privateDir, 'mcp', 'planted.json'), '{}')
+    symlinkSync(outside, join(sharedDir, 'mcp'))
+
+    expect(() => kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)).toThrow(/not a real directory/)
+    expect(existsSync(join(outside, 'planted.json'))).toBe(false)
+  })
+
+  it('refuses to pick between divergent Kimi logins it cannot order', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const sharedDir = join(hostHome, '.kimi-code', 'credentials')
+    const privateDir = join(scopeDir, 'home', '.kimi-code', 'credentials')
+    mkdirSync(sharedDir, { recursive: true })
+    mkdirSync(privateDir, { recursive: true })
+    writeFileSync(join(sharedDir, 'kimi-code.json'), 'host-login')
+    writeFileSync(join(privateDir, 'kimi-code.json'), 'private-login')
+
+    expect(() => kimiLaunch(scopeDir, cwd, daemonRoot, hostHome)).toThrow(/conflicting kimi credentials/)
+    expect(readFileSync(join(sharedDir, 'kimi-code.json'), 'utf8')).toBe('host-login')
+  })
+
+  it('migrates an existing private Qoder login when the host has none', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const privateAuth = join(scopeDir, 'home', '.qoder', '.auth')
+    mkdirSync(privateAuth, { recursive: true })
+    writeFileSync(join(privateAuth, 'machine_id'), 'private-machine')
+    writeFileSync(join(privateAuth, 'user'), 'private-login')
+
+    prepareRuntimeLaunch({
+      runtimeId: 'qoder-cli',
+      runtime: { command: 'qodercli', args: ['--acp'], env: [] },
+      scopeDir,
+      cwd,
+      daemonRoot,
+      runInSandbox: true,
+      sandboxMechanism: 'bwrap',
+      credentialPlatform: 'linux',
+      hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+    })
+
+    const sharedAuth = join(hostHome, '.qoder', '.auth')
+    expect(lstatSync(privateAuth).isSymbolicLink()).toBe(true)
+    expect(readFileSync(join(sharedAuth, 'user'), 'utf8')).toBe('private-login')
+    expect(readFileSync(join(sharedAuth, 'machine_id'), 'utf8')).toBe('private-machine')
+  })
+
+  it('refuses to replace a divergent host Qoder login with private credentials', () => {
+    const { daemonRoot, hostHome, scopeDir, cwd } = fixture()
+    const sharedAuth = join(hostHome, '.qoder', '.auth')
+    const privateAuth = join(scopeDir, 'home', '.qoder', '.auth')
+    mkdirSync(sharedAuth, { recursive: true })
+    mkdirSync(privateAuth, { recursive: true })
+    writeFileSync(join(sharedAuth, 'user'), 'host-login')
+    writeFileSync(join(privateAuth, 'user'), 'private-login')
+
+    expect(() =>
+      prepareRuntimeLaunch({
+        runtimeId: 'qoder-cli',
+        runtime: { command: 'qodercli', args: ['--acp'], env: [] },
+        scopeDir,
+        cwd,
+        daemonRoot,
+        runInSandbox: true,
+        sandboxMechanism: 'bwrap',
+        credentialPlatform: 'linux',
+        hostEnv: { HOME: hostHome, PATH: '/usr/bin' }
+      })
+    ).toThrow(/conflicting qoder credentials/)
+    expect(lstatSync(privateAuth).isDirectory()).toBe(true)
+  })
+})

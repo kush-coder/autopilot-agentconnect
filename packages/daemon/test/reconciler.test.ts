@@ -1,0 +1,424 @@
+import { describe, it, expect } from 'vitest'
+import { diffAgents } from '../src/reconciler/reconciler.js'
+import type { Agent } from '../src/agents/agent-schema.js'
+
+const a = (id: string): Agent =>
+  ({
+    id,
+    name: id,
+    status: 'active',
+    runtime: 'claude',
+    execution: 'host',
+    workspace: { mode: 'from-scratch', path: '/tmp', gitBranch: 'main', pullOnNewSession: true, skills: [] },
+    skills: [],
+    managedSkills: [],
+    integrations: [],
+    output: { mode: 'medium' },
+    permissions: { policy: 'ask', autoApprove: [] },
+    crons: []
+  }) as unknown as Agent
+
+const slackInt = (id: string) => ({
+  id,
+  platform: 'slack' as const,
+  core: { bindRules: [] },
+  config: { botToken: 'xoxb', appToken: 'xapp' }
+})
+
+const actual = (...agents: Agent[]) => new Map(agents.map((g) => [g.id, g]))
+
+describe('diffAgents', () => {
+  it('computes start/stop sets from desired vs actual', () => {
+    const { toStart, toStop, toChange } = diffAgents([a('x'), a('y')], actual(a('y'), a('z')))
+    expect(toStart.map((g) => g.id)).toEqual(['x'])
+    expect(toStop).toEqual(['z'])
+    expect(toChange).toEqual([])
+  })
+
+  it('does not emit a change when the config is unchanged', () => {
+    const { toStart, toStop, toChange } = diffAgents([a('x')], actual(a('x')))
+    expect(toStart).toEqual([])
+    expect(toStop).toEqual([])
+    expect(toChange).toEqual([])
+  })
+
+  it('refreshes the runtime tool set when Decision attachments are added or removed', () => {
+    const bound = { ...a('x'), decisionIds: ['11111111-1111-4111-8111-111111111111'] }
+    expect(diffAgents([bound], actual(a('x'))).toChange[0]).toMatchObject({ hostRespawn: true })
+    expect(diffAgents([{ ...bound, decisionIds: [] }], actual(bound)).toChange[0]).toMatchObject({ hostRespawn: true })
+    expect(diffAgents([{ ...a('x'), decisionIds: [] }], actual(a('x'))).toChange[0]).toMatchObject({
+      hostRespawn: false
+    })
+  })
+
+  it('classifies a runtime edit as a host-spawn change (only)', () => {
+    const after = { ...a('x'), runtime: 'codex' } as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange).toHaveLength(1)
+    expect(toChange[0]).toMatchObject({ hostRespawn: true, workspace: false, integrations: false })
+    expect(toChange[0]!.agent.id).toBe('x')
+  })
+
+  it('classifies a managed memory home change — the flip, its completed copy, the forced return — as a host-spawn change', () => {
+    const at = (memory: Agent['memory']) => ({ ...a('x'), memory }) as Agent
+    const local = at({ provider: 'managed', home: 'daemon' })
+    const flipped = at({ provider: 'managed', home: 'control-plane', homeMigration: 'pending' })
+    const settled = at({ provider: 'managed', home: 'control-plane' })
+    for (const [before, after] of [
+      [local, flipped],
+      [flipped, settled],
+      [settled, local]
+    ]) {
+      expect(diffAgents([after!], actual(before!)).toChange[0]).toMatchObject({
+        hostRespawn: true,
+        workspace: false,
+        integrations: false
+      })
+    }
+    expect(diffAgents([settled], actual(at({ provider: 'managed', home: 'control-plane' }))).toChange).toEqual([])
+  })
+
+  it('respawns the host when the agent switches GitHub App, since the commit identity is baked into its env', () => {
+    const builtIn = a('x')
+    const own = {
+      ...builtIn,
+      gitCommitIdentity: {
+        name: 'ops-agent-example[bot]',
+        email: '5150+ops-agent-example[bot]@users.noreply.github.com'
+      }
+    } as Agent
+    for (const [before, after] of [
+      [builtIn, own],
+      [own, builtIn]
+    ]) {
+      expect(diffAgents([after!], actual(before!)).toChange[0]).toMatchObject({
+        hostRespawn: true,
+        workspace: false,
+        integrations: false
+      })
+    }
+  })
+
+  it('classifies a change of execution strategy as a host-spawn change', () => {
+    const unsandboxed = a('x')
+    const sandboxed = { ...unsandboxed, execution: 'srt' } as Agent
+
+    expect(diffAgents([sandboxed], actual(unsandboxed)).toChange[0]).toMatchObject({
+      hostRespawn: true,
+      workspace: false,
+      integrations: false
+    })
+    expect(diffAgents([unsandboxed], actual(sandboxed)).toChange[0]).toMatchObject({
+      hostRespawn: true,
+      workspace: false,
+      integrations: false
+    })
+  })
+
+  it('classifies runtime session preferences and child inputs as host-spawn changes', () => {
+    const cases: Array<Partial<Agent>> = [
+      { runtimeOverrides: { model: 'opus', env: [], secrets: [] } },
+      { description: 'be terse' },
+      { reasoningEffort: 'high' },
+      { executionMode: 'yolo' },
+      // fastMode is baked into the host's configPrefs at construction, so an edit
+      // must evict the host (unlike output.mode, which is read live per dispatch).
+      { fastMode: true },
+      { permissionMode: 'agent-full-access' },
+      { runtimeOverrides: { model: undefined as any, env: [{ name: 'FOO', value: 'bar' }], secrets: [] } },
+      // Secrets are baked into the child env (and materialized as config files)
+      // at spawn — a value rotation must evict the host or the child keeps the
+      // stale value until the idle reap.
+      { runtimeOverrides: { model: undefined as any, env: [], secrets: [{ name: 'KUBECONFIG_DATA', value: 'k' }] } }
+    ]
+    for (const patch of cases) {
+      const after = { ...a('x'), ...patch } as Agent
+      const { toChange } = diffAgents([after], actual(a('x')))
+      expect(toChange[0], JSON.stringify(patch)).toMatchObject({
+        hostRespawn: true,
+        workspace: false,
+        integrations: false
+      })
+    }
+  })
+
+  // capability-requests.md §4.9.2: a live secret is fetched at use time, so saving or rotating one restarts nothing.
+  it('classifies a live secret change as soft, never a host respawn', () => {
+    const before = a('x')
+    const after = { ...before, liveSecrets: [{ name: 'GRAFANA_TOKEN', value: 'v1', description: 'Grafana' }] } as Agent
+    const rotated = { ...after, liveSecrets: [{ name: 'GRAFANA_TOKEN', value: 'v2', description: 'Grafana' }] } as Agent
+    for (const [from, to] of [
+      [before, after],
+      [after, rotated]
+    ] as const) {
+      expect(diffAgents([to], actual(from)).toChange[0]).toMatchObject({
+        hostRespawn: false,
+        workspace: false,
+        integrations: false
+      })
+    }
+  })
+
+  it('respawns the host when the enabled workspace skills change', () => {
+    const before = {
+      ...a('x'),
+      skills: [{ name: 'kit', source: 'acme/skills', skills: ['review-pr', 'safe-deploy'] }]
+    } as Agent
+    const after = {
+      ...before,
+      skills: [{ name: 'kit', source: 'acme/skills', skills: ['safe-deploy'] }]
+    } as Agent
+
+    expect(diffAgents([after], actual(before)).toChange[0]).toMatchObject({
+      hostRespawn: true,
+      workspace: false,
+      integrations: false
+    })
+  })
+
+  it('classifies a workspace edit as a workspace change (only)', () => {
+    const after = {
+      ...a('x'),
+      workspace: { mode: 'git-repo', path: '/tmp', gitRepo: 'r', gitBranch: 'main', pullOnNewSession: true, skills: [] }
+    } as unknown as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange[0]).toMatchObject({
+      hostRespawn: false,
+      workspace: true,
+      workspaceRepoRename: false,
+      integrations: false
+    })
+  })
+
+  it('respawns the host when either skill-definition collection changes', () => {
+    const gitSkills = {
+      ...a('x'),
+      skills: [{ name: 'team-skills', source: 'acme/skills', githubRepoId: '42', skills: ['review'] }]
+    } as Agent
+    expect(diffAgents([gitSkills], actual(a('x'))).toChange[0]).toMatchObject({
+      hostRespawn: true,
+      workspace: false,
+      integrations: false
+    })
+
+    const managedSkills = {
+      ...a('x'),
+      managedSkills: [
+        {
+          id: '11111111-1111-4111-8111-111111111111',
+          name: 'review',
+          revision: 1,
+          digest: `sha256:${'a'.repeat(64)}`
+        }
+      ]
+    } as Agent
+    expect(diffAgents([managedSkills], actual(a('x'))).toChange[0]).toMatchObject({
+      hostRespawn: true,
+      workspace: false,
+      integrations: false
+    })
+  })
+
+  it('keeps the host for an additional repository or installation grant change, which reaches later sessions only', () => {
+    const repo = { repoFullName: 'example-org/tools', repoId: '42', provider: 'github', materialize: 'always' }
+    const before = { ...a('x'), workspace: { ...a('x').workspace, additionalRepos: [repo] } } as unknown as Agent
+    const cases = [
+      { additionalRepos: [{ ...repo, materialize: 'on-demand' }] },
+      { additionalRepos: [] },
+      {
+        additionalInstallations: [
+          { provider: 'github', accountLogin: 'example-org', access: 'read', materialize: 'decision' }
+        ]
+      }
+    ]
+    for (const change of cases) {
+      const after = { ...before, workspace: { ...before.workspace, ...change } } as unknown as Agent
+      const { toChange } = diffAgents([after], actual(before))
+      expect(toChange[0]).toMatchObject({
+        hostRespawn: false,
+        workspace: false,
+        workspaceRepoRename: false,
+        additionalRepos: true,
+        alwaysRootAdded: false,
+        integrations: false
+      })
+    }
+  })
+
+  it('flags a repository joining the always set, which a shared process can only write after a relaunch', () => {
+    const repo = { repoFullName: 'example-org/tools', repoId: '42', provider: 'github', materialize: 'on-demand' }
+    const before = { ...a('x'), workspace: { ...a('x').workspace, additionalRepos: [repo] } } as unknown as Agent
+    const joined = [
+      [{ ...repo, materialize: 'always' }],
+      [repo, { repoFullName: 'example-org/docs', repoId: '43', provider: 'github', materialize: 'always' }]
+    ]
+    for (const additionalRepos of joined) {
+      const after = { ...before, workspace: { ...before.workspace, additionalRepos } } as unknown as Agent
+      expect(diffAgents([after], actual(before)).toChange[0]).toMatchObject({
+        additionalRepos: true,
+        alwaysRootAdded: true
+      })
+    }
+    // A rename keeps the id, so the checkout it names is the one the process already writes.
+    const always = {
+      ...before,
+      workspace: { ...before.workspace, additionalRepos: [{ ...repo, materialize: 'always' }] }
+    }
+    const renamed = {
+      ...always,
+      workspace: {
+        ...always.workspace,
+        additionalRepos: [{ ...repo, materialize: 'always', repoFullName: 'example-org/tooling' }]
+      }
+    }
+    expect(diffAgents([renamed as unknown as Agent], actual(always as unknown as Agent)).toChange[0]).toMatchObject({
+      additionalRepos: true,
+      alwaysRootAdded: false
+    })
+  })
+
+  it('still evicts the host when the workspace’s own checkout moves beside an additional repository change', () => {
+    const after = {
+      ...a('x'),
+      workspace: {
+        ...a('x').workspace,
+        gitBranch: 'release',
+        additionalRepos: [
+          { repoFullName: 'example-org/tools', repoId: '42', provider: 'github', materialize: 'always' }
+        ]
+      }
+    } as unknown as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange[0]).toMatchObject({ workspace: true, additionalRepos: true })
+  })
+
+  it('classifies an App-backed URL-only rename as non-destructive origin convergence', () => {
+    const before = {
+      ...a('x'),
+      workspace: {
+        mode: 'git-repo',
+        path: '/tmp',
+        gitRepo: 'https://github.com/acme/old-name',
+        gitBranch: 'main',
+        gitCredential: 'github-app' as const,
+        pullOnNewSession: true,
+        skills: []
+      }
+    } as unknown as Agent
+    const after = {
+      ...before,
+      workspace: { ...before.workspace, gitRepo: 'https://github.com/acme/new-name' }
+    } as Agent
+
+    expect(diffAgents([after], actual(before)).toChange[0]).toMatchObject({
+      hostRespawn: false,
+      workspace: false,
+      workspaceRepoRename: true,
+      integrations: false
+    })
+
+    const anonymous = {
+      ...after,
+      workspace: { ...after.workspace, gitCredential: undefined }
+    } as Agent
+    expect(diffAgents([anonymous], actual(before)).toChange[0]).toMatchObject({
+      workspace: true,
+      workspaceRepoRename: false
+    })
+
+    const wrongHost = {
+      ...before,
+      workspace: { ...before.workspace, gitRepo: 'https://other-host.example/acme/new-name' }
+    } as Agent
+    expect(diffAgents([after], actual(wrongHost)).toChange[0]).toMatchObject({
+      workspace: true,
+      workspaceRepoRename: false
+    })
+
+    const shorthand = {
+      ...before,
+      workspace: { ...before.workspace, gitRepo: 'acme/old-name' }
+    } as Agent
+    expect(diffAgents([after], actual(shorthand)).toChange[0]).toMatchObject({
+      workspace: true,
+      workspaceRepoRename: false
+    })
+  })
+
+  it('respawns for an external connection switch but keeps policy-only edits hot', () => {
+    const before = {
+      ...a('x'),
+      memory: {
+        provider: 'external' as const,
+        connectionId: '11111111-1111-4111-8111-111111111111',
+        recall: { mode: 'auto' as const, topK: 5, maxBytes: 8192, timeoutMs: 1000 },
+        capture: { mode: 'manual' as const }
+      }
+    } as Agent
+    const switched = {
+      ...before,
+      memory: { ...before.memory!, connectionId: '22222222-2222-4222-8222-222222222222' }
+    } as Agent
+    expect(diffAgents([switched], actual(before)).toChange[0]).toMatchObject({ hostRespawn: true })
+
+    const policyOnly = {
+      ...before,
+      memory: {
+        ...before.memory!,
+        recall: { mode: 'tool-only' as const, topK: 10, maxBytes: 4096, timeoutMs: 500 }
+      }
+    } as Agent
+    expect(diffAgents([policyOnly], actual(before)).toChange[0]).toMatchObject({ hostRespawn: false })
+  })
+
+  it('classifies an integrations edit as an integration change (only)', () => {
+    const after = { ...a('x'), integrations: [slackInt('int-1')] } as unknown as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange[0]).toMatchObject({ hostRespawn: false, workspace: false, integrations: true })
+  })
+
+  it('treats a replica ownership marker as soft-only so rolling upgrades do not flap sockets', () => {
+    const before = { ...a('x'), integrations: [slackInt('int-1')] } as unknown as Agent
+    const after = {
+      ...before,
+      origin: 'cp',
+      integrations: [{ ...slackInt('int-1'), origin: 'cp' as const }]
+    } as unknown as Agent
+    const { toChange } = diffAgents([after], actual(before))
+    expect(toChange).toHaveLength(1)
+    expect(toChange[0]).toMatchObject({ hostRespawn: false, workspace: false, integrations: false })
+  })
+
+  it('classifies an output/permissions edit as a soft-only change (all dims false)', () => {
+    const after = { ...a('x'), output: { mode: 'high' } } as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange).toHaveLength(1)
+    expect(toChange[0]).toMatchObject({ hostRespawn: false, workspace: false, integrations: false })
+  })
+
+  it('classifies a pause flip as a soft-only change (all dims false) — no host respawn (#288)', () => {
+    // Pausing cancels active turns at runtime, but must NOT evict the host or tear
+    // down ACP sessions. It remains a soft-only reconcile change.
+    const after = { ...a('x'), pause: true } as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange).toHaveLength(1)
+    expect(toChange[0]).toMatchObject({ hostRespawn: false, workspace: false, integrations: false })
+  })
+
+  it('classifies a displayName edit as a soft-only change', () => {
+    const after = { ...a('x'), displayName: 'Release Captain' } as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange).toHaveLength(1)
+    expect(toChange[0]).toMatchObject({ hostRespawn: false, workspace: false, integrations: false })
+  })
+
+  it('flags multiple moved dimensions on one change entry', () => {
+    const after = {
+      ...a('x'),
+      runtime: 'codex',
+      integrations: [slackInt('int-1')]
+    } as unknown as Agent
+    const { toChange } = diffAgents([after], actual(a('x')))
+    expect(toChange[0]).toMatchObject({ hostRespawn: true, workspace: false, integrations: true })
+  })
+})
